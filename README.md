@@ -47,7 +47,7 @@ fork adds:
 
 | Feature | API |
 | --- | --- |
-| In-process suspension of running code | `JS_RequestSuspend()`, `JS_IsSuspended()`, `JS_Resume()` |
+| In-process suspension of running code | `JS_RequestSuspend()`, `JS_IsSuspended()`, `JS_Resume()`, `JS_GetProgramBranchCount()` |
 | Durable host calls: a C function parks its JS caller until the host supplies a result | `JS_SuspendCall()`, `JS_ResumeWith()` |
 | Heap snapshots of a whole runtime, including a suspended call stack | `JS_WriteSnapshot()`, `JS_ReadSnapshot()` |
 | Incremental snapshots: a delta holds only what changed since a base | `JS_SNAPSHOT_BASE`, `JS_SNAPSHOT_DELTA`, `JS_DropSnapshotBase()` |
@@ -375,6 +375,14 @@ If any frame was entered on behalf of native code, the request stays pending unt
 safepoint. That includes getters and setters, `valueOf`/`toString` conversions, Proxy traps,
 `forEach`/`JSON.stringify` callbacks, `eval` code and promise jobs. Because of this rule, the
 engine never has to save a C stack.
+
+`JS_GetProgramBranchCount(ctx)` returns the number of backward and conditional bytecode branches
+executed in `ctx`. It increments unconditionally at every safepoint and is not saved in snapshots
+(a restored context starts at zero), so adding the counts of each slice of a hibernated execution
+gives the exact count of an uninterrupted run. Unlike counting `JSInterruptHandler` calls—which
+also fire on function entry and during suspension housekeeping, and depend on
+`JS_INTERRUPT_COUNTER_INIT`—this count depends only on the guest program's branches, so a host
+coordinator can meter or time-slice work without penalizing preempted executions.
 
 **Writing.** The writer walks the heap from the roots:
 

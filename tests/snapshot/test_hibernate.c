@@ -66,6 +66,7 @@ typedef struct {
     int calls; /* interrupt handler calls */
     int hibernations;
     size_t max_size;
+    uint64_t branches;
 } Stats;
 
 static int interrupt_handler(JSRuntime *rt, void *opaque)
@@ -143,7 +144,8 @@ static void report_completion(JSContext *ctx, JSValue val)
     }
 }
 
-static char *run_plain(const char *src, size_t len, const char *filename)
+static char *run_plain(const char *src, size_t len, const char *filename,
+                       uint64_t *pbranches)
 {
     JSRuntime *rt = new_runtime(NULL);
     JSContext *ctx = new_context(rt), *ctx1;
@@ -156,6 +158,7 @@ static char *run_plain(const char *src, size_t len, const char *filename)
         if (ret < 0)
             print_exception(ctx1);
     }
+    *pbranches = JS_GetProgramBranchCount(ctx);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     return strdup(out.buf);
@@ -194,6 +197,7 @@ static JSRuntime *hibernate(JSRuntime *rt, JSContext **pctx, Stats *st)
     buf = write_snapshot(ctx, &size, base_buf ? JS_SNAPSHOT_DELTA : 0);
     if (!buf)
         return NULL;
+    st->branches += JS_GetProgramBranchCount(ctx);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 
@@ -265,6 +269,7 @@ static char *run_hibernating(const char *src, size_t len, const char *filename, 
         if (ret < 0)
             print_exception(ctx1);
     }
+    st->branches += JS_GetProgramBranchCount(ctx);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     return strdup(out.buf);
@@ -284,6 +289,7 @@ int main(int argc, char **argv)
     }
     for(; i < argc; i++) {
         Stats st;
+        uint64_t plain_branches = 0;
         size_t len;
         char *src = load_file(argv[i], &len);
         char *expected, *got;
@@ -292,10 +298,15 @@ int main(int argc, char **argv)
             failed++;
             continue;
         }
-        expected = run_plain(src, len, argv[i]);
+        expected = run_plain(src, len, argv[i], &plain_branches);
         got = run_hibernating(src, len, argv[i], &st);
         if (strcmp(expected, got) != 0) {
             printf("FAIL %s\n--- expected:\n%s--- got:\n%s", argv[i], expected, got);
+            failed++;
+        } else if (plain_branches != st.branches) {
+            printf("FAIL %s: branch count %llu != %llu\n", argv[i],
+                   (unsigned long long)st.branches,
+                   (unsigned long long)plain_branches);
             failed++;
         } else {
             if (delta_mode)

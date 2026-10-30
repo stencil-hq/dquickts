@@ -14,9 +14,9 @@ unreleased:
 - added JS_SuspendCall() and JS_ResumeWith(): a C function suspends its
   JS caller until the host gives the result of the call
 - added JS_IsSuspendException(), JS_IsUncatchableException(),
-  JS_IsEqual(), JS_NewProxy(), JS_IsProxy(), JS_GetProxyTarget(),
-  JS_GetProxyHandler(), JS_GetTypedArrayType(), JS_GetFunctionProto()
-  and JS_PromiseMarkAsHandled()
+  JS_GetProgramBranchCount(), JS_IsEqual(), JS_NewProxy(), JS_IsProxy(),
+  JS_GetProxyTarget(), JS_GetProxyHandler(), JS_GetTypedArrayType(),
+  JS_GetFunctionProto() and JS_PromiseMarkAsHandled()
 - added rquickjs/: the rquickjs Rust bindings built on this engine, with
   suspension, snapshots and the optional snapshot()/restore() builtins
 - added TypeScript (JS_EVAL_FLAG_TYPESCRIPT; .ts/.mts/.cts files in qjs,

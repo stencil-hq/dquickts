@@ -3208,6 +3208,116 @@ static void test_std_array_prototype(void)
     JS_FreeRuntime(rt);
 }
 
+static int suspend_every_poll_handler(JSRuntime *rt, void *opaque)
+{
+    int *polls = opaque;
+    (*polls)++;
+    JS_RequestSuspend(rt);
+    return 0;
+}
+
+static void test_program_branch_count(void)
+{
+    static const char loop_src[] =
+        "let acc = 0;\n"
+        "function step(n) {\n"
+        "  let s = 0;\n"
+        "  for (let i = 0; i < n; i++) {\n"
+        "    s = (s + ((i & 1) ? i * 3 : i)) | 0;\n"
+        "  }\n"
+        "  return s;\n"
+        "}\n"
+        "for (let r = 0; r < 250; r++) acc = (acc + step(200)) | 0;\n"
+        "acc;\n";
+    static const JSSnapshotHost snap_host = { NULL, 0, NULL, 0 };
+    JSRuntime *rt, *rt2;
+    JSContext *ctx, *ctx2;
+    JSValue val;
+    int32_t ref_res = 0, res = 0;
+    uint64_t ref_branches, sum_branches;
+    int polls, suspensions;
+
+    /* starts at zero and is isolated per context */
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    ctx2 = JS_NewContext(rt);
+    CHECK(JS_GetProgramBranchCount(ctx) == 0);
+    CHECK(JS_GetProgramBranchCount(ctx2) == 0);
+    val = eval_str(ctx, loop_src);
+    CHECK(!JS_IsException(val));
+    CHECK(JS_ToInt32(ctx, &ref_res, val) == 0);
+    JS_FreeValue(ctx, val);
+    ref_branches = JS_GetProgramBranchCount(ctx);
+    CHECK(ref_branches > 50000);
+    CHECK(JS_GetProgramBranchCount(ctx2) == 0);
+    JS_FreeContext(ctx2);
+    JS_FreeContext(ctx);
+
+    ctx = JS_NewContextRaw(rt);
+    CHECK(JS_GetProgramBranchCount(ctx) == 0);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+
+    /* in-process suspension and resume preserves exact branch count */
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    polls = 0;
+    suspensions = 0;
+    JS_SetInterruptHandler(rt, suspend_every_poll_handler, &polls);
+    val = eval_str(ctx, loop_src);
+    while (JS_IsException(val) && JS_IsSuspended(rt)) {
+        suspensions++;
+        val = JS_Resume(ctx);
+    }
+    CHECK(suspensions > 0);
+    CHECK(!JS_IsException(val));
+    CHECK(JS_ToInt32(ctx, &res, val) == 0 && res == ref_res);
+    JS_FreeValue(ctx, val);
+    CHECK(JS_GetProgramBranchCount(ctx) == ref_branches);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+
+    /* snapshot restore starts at zero; sum across slices equals uninterrupted run */
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    polls = 0;
+    suspensions = 0;
+    sum_branches = 0;
+    JS_SetInterruptHandler(rt, suspend_every_poll_handler, &polls);
+    val = eval_str(ctx, loop_src);
+    while (JS_IsException(val) && JS_IsSuspended(rt)) {
+        JSSnapshotResult snap_res;
+        char errbuf[128];
+        size_t snap_len = 0;
+        uint8_t *snap = JS_WriteSnapshot(ctx, &snap_len, &snap_host, NULL, 0, 0);
+        CHECK(snap != NULL);
+        sum_branches += JS_GetProgramBranchCount(ctx);
+        suspensions++;
+
+        rt2 = JS_NewRuntime();
+        JS_SetInterruptHandler(rt2, suspend_every_poll_handler, &polls);
+        CHECK(JS_ReadSnapshot(rt2, snap, snap_len, NULL, 0, &snap_host,
+                              &snap_res, errbuf, sizeof(errbuf)) == 0);
+        js_free(ctx, snap);
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+
+        rt = rt2;
+        ctx = snap_res.contexts[0];
+        JS_FreeSnapshotResult(rt, &snap_res);
+        CHECK(JS_GetProgramBranchCount(ctx) == 0);
+        val = JS_Resume(ctx);
+    }
+    sum_branches += JS_GetProgramBranchCount(ctx);
+    CHECK(suspensions > 0);
+    CHECK(!JS_IsException(val));
+    CHECK(JS_ToInt32(ctx, &res, val) == 0 && res == ref_res);
+    JS_FreeValue(ctx, val);
+    CHECK(sum_branches == ref_branches);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     JSRuntime *rt;
@@ -3235,6 +3345,7 @@ int main(void)
     test_object_from();
     test_pending_jobs();
     test_std_array_prototype();
+    test_program_branch_count();
 
     rt = JS_NewRuntime();
     ctx = JS_NewContext(rt);

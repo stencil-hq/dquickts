@@ -1570,6 +1570,18 @@ a result that only exists after a hibernation. The caller must call
 the C function directly from a suspendable stack, otherwise
 @code{JS_SuspendCall()} throws a @code{TypeError}.
 
+@code{JS_GetProgramBranchCount(ctx)} returns the number of bytecode
+branch safepoints (backward and conditional branches) executed in
+@code{ctx}. The count is incremented unconditionally at every such
+branch and is process- and context-local (a context restored with
+@code{JS_ReadSnapshot()} starts at zero), so summing it across the
+process slices of a suspended-and-restored execution gives the same
+count as an uninterrupted execution. Unlike counting calls to
+@code{JSInterruptHandler} (which also polls on function entry and
+during suspension housekeeping, and depends on
+@code{JS_INTERRUPT_COUNTER_INIT}), @code{JS_GetProgramBranchCount(ctx)}
+counts only guest program branches.
+
 @subsection Heap snapshots
 
 @code{JS_WriteSnapshot()} serializes the complete state of a runtime:

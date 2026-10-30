@@ -1382,6 +1382,19 @@ JSInterruptHandler *JS_GetInterruptHandler(JSRuntime *rt, void **popaque);
    'ctx', e.g. in a native function. */
 void JS_TriggerInterruptHandler(JSContext *ctx);
 
+/* Return the number of executed bytecode branch safepoints in 'ctx': the
+   backward and conditional branches of the bytecode, the only points
+   where a running synchronous execution can be suspended. The count is
+   incremented unconditionally at every such branch, so summing it over
+   every process slice of a suspended-and-restored execution gives the
+   count of the uninterrupted execution.
+
+   It is process and context local and deliberately not serialized: a
+   context restored with JS_ReadSnapshot() starts again at zero. It
+   counts executed safepoints, not calls to the interrupt handler
+   (JSInterruptHandler), whose rate depends on JS_INTERRUPT_COUNTER_INIT. */
+uint64_t JS_GetProgramBranchCount(JSContext *ctx);
+
 /* Suspension
 
    A running synchronous execution can be suspended in-process, then
