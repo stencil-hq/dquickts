@@ -622,6 +622,9 @@ struct JSContext {
        handler (see __js_poll_interrupts()) */
     int suspend_poll_budget;
 
+    /* executed branch safepoints; not saved in snapshots */
+    uint64_t program_branch_count;
+
     struct list_head loaded_modules; /* list of JSModuleDef.link */
 
     /* if NULL, RegExp compilation is not supported */
@@ -2589,6 +2592,11 @@ JSInterruptHandler *JS_GetInterruptHandler(JSRuntime *rt, void **popaque)
     if (popaque)
         *popaque = rt->interrupt_opaque;
     return rt->interrupt_handler;
+}
+
+uint64_t JS_GetProgramBranchCount(JSContext *ctx)
+{
+    return ctx->program_branch_count;
 }
 
 void JS_SetLocaleCallbacks(JSContext *ctx, const JSLocaleCallbacks *callbacks)
@@ -21743,6 +21751,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        instruction. */
 #define SAFEPOINT()                                             \
     do {                                                        \
+        ctx->program_branch_count++;                            \
         if (unlikely(--ctx->interrupt_counter <= 0)) {          \
             if (js_poll_safepoint(ctx, sf, pc))                 \
                 goto exception;                                 \
