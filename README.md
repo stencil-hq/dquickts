@@ -376,13 +376,9 @@ safepoint. That includes getters and setters, `valueOf`/`toString` conversions, 
 `forEach`/`JSON.stringify` callbacks, `eval` code and promise jobs. Because of this rule, the
 engine never has to save a C stack.
 
-`JS_GetProgramBranchCount(ctx)` returns the number of backward and conditional bytecode branches
-executed in `ctx`. It increments unconditionally at every safepoint and is not saved in snapshots
-(a restored context starts at zero), so adding the counts of each slice of a hibernated execution
-gives the exact count of an uninterrupted run. Unlike counting `JSInterruptHandler` calls—which
-also fire on function entry and during suspension housekeeping, and depend on
-`JS_INTERRUPT_COUNTER_INIT`—this count depends only on the guest program's branches, so a host
-coordinator can meter or time-slice work without penalizing preempted executions.
+`JS_GetProgramBranchCount(ctx)` returns the number of backward and conditional branches executed in
+`ctx`. It increments unconditionally at every safepoint and is not saved in snapshots (a restored
+context starts at zero), so summing it across hibernated slices equals an uninterrupted run.
 
 **Writing.** The writer walks the heap from the roots:
 

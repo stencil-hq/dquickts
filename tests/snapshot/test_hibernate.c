@@ -144,13 +144,13 @@ static void report_completion(JSContext *ctx, JSValue val)
     }
 }
 
-static char *run_plain(const char *src, size_t len, const char *filename,
-                       uint64_t *pbranches)
+static char *run_plain(const char *src, size_t len, const char *filename, Stats *st)
 {
     JSRuntime *rt = new_runtime(NULL);
     JSContext *ctx = new_context(rt), *ctx1;
     int ret;
 
+    memset(st, 0, sizeof(*st));
     out.len = 0;
     out_append("", 0);
     report_completion(ctx, JS_Eval(ctx, src, len, filename, JS_EVAL_TYPE_GLOBAL));
@@ -158,7 +158,7 @@ static char *run_plain(const char *src, size_t len, const char *filename,
         if (ret < 0)
             print_exception(ctx1);
     }
-    *pbranches = JS_GetProgramBranchCount(ctx);
+    st->branches = JS_GetProgramBranchCount(ctx);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     return strdup(out.buf);
@@ -288,8 +288,7 @@ int main(int argc, char **argv)
             delta_mode = 1;
     }
     for(; i < argc; i++) {
-        Stats st;
-        uint64_t plain_branches = 0;
+        Stats plain, st;
         size_t len;
         char *src = load_file(argv[i], &len);
         char *expected, *got;
@@ -298,15 +297,15 @@ int main(int argc, char **argv)
             failed++;
             continue;
         }
-        expected = run_plain(src, len, argv[i], &plain_branches);
+        expected = run_plain(src, len, argv[i], &plain);
         got = run_hibernating(src, len, argv[i], &st);
         if (strcmp(expected, got) != 0) {
             printf("FAIL %s\n--- expected:\n%s--- got:\n%s", argv[i], expected, got);
             failed++;
-        } else if (plain_branches != st.branches) {
+        } else if (plain.branches != st.branches) {
             printf("FAIL %s: branch count %llu != %llu\n", argv[i],
                    (unsigned long long)st.branches,
-                   (unsigned long long)plain_branches);
+                   (unsigned long long)plain.branches);
             failed++;
         } else {
             if (delta_mode)

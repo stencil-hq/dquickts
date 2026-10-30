@@ -622,13 +622,7 @@ struct JSContext {
        handler (see __js_poll_interrupts()) */
     int suspend_poll_budget;
 
-    /* number of executed bytecode branch safepoints (see SAFEPOINT()).
-       Unconditional, so that the sum over the process slices of a
-       suspended-and-restored execution equals the count of the
-       uninterrupted one. Process and context local: deliberately not
-       serialized, a restored context starts at zero (JS_NewContextRaw()
-       allocates the context zero filled). Not the interrupt handler call
-       count (that one depends on the interrupt period). */
+    /* executed branch safepoints; not saved in snapshots */
     uint64_t program_branch_count;
 
     struct list_head loaded_modules; /* list of JSModuleDef.link */
