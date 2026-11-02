@@ -1989,6 +1989,9 @@ unsafe extern "C" {
     pub fn JS_TriggerInterruptHandler(ctx: *mut JSContext);
 }
 unsafe extern "C" {
+    pub fn JS_GetProgramBranchCount(ctx: *mut JSContext) -> u64;
+}
+unsafe extern "C" {
     pub fn JS_RequestSuspend(rt: *mut JSRuntime);
 }
 unsafe extern "C" {

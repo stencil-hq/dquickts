@@ -3208,6 +3208,68 @@ static void test_std_array_prototype(void)
     JS_FreeRuntime(rt);
 }
 
+static int suspend_handler(JSRuntime *rt, void *opaque)
+{
+    JS_RequestSuspend(rt);
+    return 0;
+}
+
+static void test_program_branch_count(void)
+{
+    static const char loop_src[] =
+        "let acc = 0;\n"
+        "function step(n) {\n"
+        "  let s = 0;\n"
+        "  for (let i = 0; i < n; i++) s = (s + ((i & 1) ? i * 3 : i)) | 0;\n"
+        "  return s;\n"
+        "}\n"
+        "for (let r = 0; r < 250; r++) acc = (acc + step(200)) | 0;\n"
+        "acc;\n";
+    JSRuntime *rt;
+    JSContext *ctx, *ctx2;
+    JSValue val;
+    int32_t ref_res = 0, res = 0;
+    uint64_t ref_branches;
+    int suspensions = 0;
+
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    ctx2 = JS_NewContext(rt);
+    CHECK(JS_GetProgramBranchCount(ctx) == 0);
+    val = eval_str(ctx, loop_src);
+    CHECK(!JS_IsException(val));
+    CHECK(JS_ToInt32(ctx, &ref_res, val) == 0);
+    JS_FreeValue(ctx, val);
+    ref_branches = JS_GetProgramBranchCount(ctx);
+    CHECK(ref_branches > 50000);
+    CHECK(JS_GetProgramBranchCount(ctx2) == 0);
+    JS_FreeContext(ctx2);
+    JS_FreeContext(ctx);
+
+    ctx = JS_NewContextRaw(rt);
+    CHECK(JS_GetProgramBranchCount(ctx) == 0);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+
+    /* in-process suspend/resume preserves exact branch count */
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    JS_SetInterruptHandler(rt, suspend_handler, NULL);
+    val = eval_str(ctx, loop_src);
+    while (JS_IsException(val) && JS_IsSuspended(rt)) {
+        suspensions++;
+        val = JS_Resume(ctx);
+    }
+    CHECK(suspensions > 0);
+    CHECK(!JS_IsException(val));
+    CHECK(JS_ToInt32(ctx, &res, val) == 0);
+    CHECK(res == ref_res);
+    JS_FreeValue(ctx, val);
+    CHECK(JS_GetProgramBranchCount(ctx) == ref_branches);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     JSRuntime *rt;
@@ -3235,6 +3297,7 @@ int main(void)
     test_object_from();
     test_pending_jobs();
     test_std_array_prototype();
+    test_program_branch_count();
 
     rt = JS_NewRuntime();
     ctx = JS_NewContext(rt);
