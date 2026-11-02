@@ -35,7 +35,8 @@ typedef struct QPGen {
     JSValue func;               /* the function that created it (gi_code) */
     JSValue name, qualname;     /* __name__, __qualname__ */
     QPExcStackItem exc_state;   /* gi_exc_state */
-    JSValue ag_finalizer;       /* async generators: sys asyncgen finalizer hook or QP_NULL */
+    JSValue ag_finalizer;       /* async generators: sys asyncgen finalizer hook; coroutines:
+                                   cr_origin (CPython cr_origin_or_finalizer); QP_NULL: none */
     uint8_t kind;               /* QP_GENK_* */
     uint8_t state;              /* QP_GEN_* */
     uint8_t started;            /* first resume done (a sent value has a slot) */
@@ -115,7 +116,12 @@ static uint32_t qp__gen_co_flags(QPGen *g)
 {
     JSFunctionBytecode *b = JS_VALUE_GET_OBJ(g->func)->u.func.function_bytecode;
     QPCodeInfo *ci = qp_code_info(b);
-    return ci ? ci->co_flags : 0;
+    QPFuncData *d = qp_function_data(g->func);
+    uint32_t flags = ci ? ci->co_flags : 0;
+    /* the function's __code__ may carry CO_ITERABLE_COROUTINE (types.coroutine) */
+    if (d && !QP_IS_NULL(d->code_obj))
+        flags |= qp_code_extra_flags(d->code_obj);
+    return flags;
 }
 
 /* gen_is_coroutine: generator whose code has CO_ITERABLE_COROUTINE
@@ -192,6 +198,7 @@ static void qp__gen_clear(JSContext *ctx, QPGen *g)
     if (g->s) {
         JSAsyncFunctionState *s = g->s;
         g->s = NULL;
+        s->py_gen = NULL;
         async_func_free(ctx->rt, s);
     }
     if (!JS_IsUndefined(g->exc_state.exc_value)) {
@@ -751,26 +758,17 @@ static JSValue qp__g_state(JSContext *ctx, JSValueConst self, int magic)
     return qp_str_from_cstr(ctx, buf);
 }
 
-/* gi_frame / cr_frame / ag_frame: None once finished, else a frame facade
-   of the heap frame at its suspension point. */
+/* gi_frame / cr_frame / ag_frame: None once finished, else the frame
+   object of the heap frame (the one sys._getframe() returns while it
+   runs, CPython _PyFrame_GetFrameObject). */
 static JSValue qp__g_frame(JSContext *ctx, JSValueConst self, int magic)
 {
     QPGen *g = qp__gen(self);
-    JSFunctionBytecode *b;
-    uint32_t pc;
-    JSValue locals, f;
+    JSValue f;
     if (QP_GEN_FINISHED(g->state) || !g->s)
         return JS_UNDEFINED;
-    b = JS_VALUE_GET_OBJ(g->func)->u.func.function_bytecode;
-    pc = (uint32_t)(g->s->frame.cur_pc - b->byte_code_buf);
-    if (pc > 0)
-        pc--;   /* inside the suspending instruction */
-    locals = qp_frame_locals(ctx, &g->s->frame);
-    if (JS_IsException(locals))
-        return locals;
-    f = qp_frame_new(ctx, g->func, pc, JS_UNDEFINED, locals);
-    JS_FreeValue(ctx, locals);
-    return f;
+    f = qp_frame_of(ctx, &g->s->frame);
+    return JS_IsException(f) ? f : JS_DupValue(ctx, f);
 }
 
 static JSValue qp__g_code(JSContext *ctx, JSValueConst self, int magic)
@@ -779,9 +777,67 @@ static JSValue qp__g_code(JSContext *ctx, JSValueConst self, int magic)
     return qp_getattr(ctx, qp__gen(self)->func, QP_ATOM(ctx, __code__));
 }
 
-static JSValue qp__g_none(JSContext *ctx, JSValueConst self, int magic)
+static JSValue qp__g_origin(JSContext *ctx, JSValueConst self, int magic)
 {
-    return JS_UNDEFINED;   /* cr_origin: origin tracking depth is 0 */
+    QPGen *g = qp__gen(self);
+    if (g->kind != QP_GENK_CORO || QP_IS_NULL(g->ag_finalizer))
+        return JS_UNDEFINED;
+    return JS_DupValue(ctx, g->ag_finalizer);
+}
+
+/* cr_origin of a coroutine created now (CPython _PyCoro_ComputeOrigin):
+   ((co_filename, f_lineno, co_name), ...) of the `depth` innermost Python
+   frames, the creating frame first */
+static JSValue qp__coro_origin(JSContext *ctx, int depth)
+{
+    JSStackFrame *sf;
+    JSValue *items, r;
+    int n = 0, i = 0;
+
+    for (sf = ctx->rt->current_stack_frame; sf && n < depth; sf = sf->prev_frame) {
+        if (qp_frame_py_bytecode(sf))
+            n++;
+    }
+    items = js_mallocz(ctx, sizeof(JSValue) * (n ? n : 1));
+    if (!items)
+        return JS_EXCEPTION;
+    for (sf = ctx->rt->current_stack_frame; sf && i < n; sf = sf->prev_frame) {
+        JSFunctionBytecode *b = qp_frame_py_bytecode(sf);
+        JSValue code, info[3];
+        QPLoc loc;
+        int line;
+
+        if (!b)
+            continue;
+        code = qp_getattr(ctx, sf->cur_func, QP_ATOM(ctx, __code__));
+        if (JS_IsException(code))
+            goto fail;
+        info[0] = qp_co_get_filename(ctx, code);
+        info[2] = qp_co_get_name(ctx, code);
+        JS_FreeValue(ctx, code);
+        line = b->py_code->firstlineno;
+        if (sf->cur_pc > b->byte_code_buf &&
+            qp_code_addr2loc(b, qp_fr_sf_pc(sf, b), &loc) == 0 && loc.lineno >= 0)
+            line = loc.lineno;
+        info[1] = JS_NewInt32(ctx, line);
+        if (JS_IsException(info[0]) || JS_IsException(info[2])) {
+            JS_FreeValue(ctx, info[0]);
+            JS_FreeValue(ctx, info[2]);
+            goto fail;
+        }
+        items[i] = qp_tuple_new_steal(ctx, 3, info);
+        if (JS_IsException(items[i]))
+            goto fail;
+        i++;
+    }
+    r = qp_tuple_new_steal(ctx, n, items);
+    js_free(ctx, items);
+    return r;
+fail:
+    while (i > 0)
+        JS_FreeValue(ctx, items[--i]);
+    js_free(ctx, items);
+    return JS_EXCEPTION;
 }
 
 static JSValue qp__gen_repr(JSContext *ctx, JSValueConst self)
@@ -1275,6 +1331,7 @@ static JSValue qp_gen_new(JSContext *ctx, JSValueConst func, JSValue *arg_buf)
         return JS_EXCEPTION;
     }
     g->s = s;
+    s->py_gen = JS_VALUE_GET_OBJ(obj);
     g->func = JS_DupValue(ctx, func);
     if (fd) {
         g->name = JS_DupValue(ctx, fd->name);
@@ -1292,6 +1349,14 @@ static JSValue qp_gen_new(JSContext *ctx, JSValueConst func, JSValue *arg_buf)
     if (JS_IsException(g->name) || JS_IsException(g->qualname)) {
         JS_FreeValue(ctx, obj);
         return JS_EXCEPTION;
+    }
+    if (kind == QP_GENK_CORO && QP_STATE(ctx)->coro_origin_depth > 0) {
+        g->ag_finalizer = qp__coro_origin(ctx, QP_STATE(ctx)->coro_origin_depth);
+        if (JS_IsException(g->ag_finalizer)) {
+            g->ag_finalizer = QP_NULL;
+            JS_FreeValue(ctx, obj);
+            return JS_EXCEPTION;
+        }
     }
     return obj;
 }
@@ -1519,11 +1584,54 @@ static JSValue qp_asyncgen_wrap_value(JSContext *ctx, JSValueConst v)
 /* finalization                                                              */
 /* ------------------------------------------------------------------------ */
 
-static void qp__report_unraisable(JSContext *ctx, JSValueConst obj)
+/* PyErr_FormatUnraisable("Exception ignored while <what> %R", obj) */
+static void qp__report_unraisable(JSContext *ctx, const char *what, JSValueConst obj)
 {
     JSValue exc = qp_exc_fetch(ctx);
-    qp_exc_write_unraisable(ctx, exc, obj);
+    JSValue msg = qp_str_from_format(ctx, "Exception ignored while %s %R", what, obj);
+    const char *s = NULL;
+
+    if (!JS_IsException(msg))
+        s = qp_str_utf8(ctx, msg, NULL);
+    if (!s)
+        qp_err_clear(ctx);
+    qp_exc_write_unraisable_msg(ctx, exc, s, QP_NULL);
+    if (!JS_IsException(msg))
+        JS_FreeValue(ctx, msg);
     JS_FreeValue(ctx, exc);
+}
+
+/* _PyErr_WarnUnawaitedCoroutine: warnings._warn_unawaited_coroutine (which
+   shows cr_origin), falling back to a plain RuntimeWarning */
+static void qp__warn_unawaited_coro(JSContext *ctx, JSValueConst obj, QPGen *g)
+{
+    BOOL warned = FALSE;
+    JSValue mod, fn, res;
+    JSAtom name;
+
+    mod = qp_import_module(ctx, "warnings");
+    if (!JS_IsException(mod)) {
+        name = JS_NewAtom(ctx, "_warn_unawaited_coroutine");
+        fn = name == JS_ATOM_NULL ? JS_EXCEPTION : qp_getattr(ctx, mod, name);
+        JS_FreeAtom(ctx, name);
+        JS_FreeValue(ctx, mod);
+        if (!JS_IsException(fn)) {
+            res = qp_call1(ctx, fn, obj);
+            JS_FreeValue(ctx, fn);
+            if (!JS_IsException(res)) {
+                warned = TRUE;
+                JS_FreeValue(ctx, res);
+            } else if (qp_exc_pending_matches(ctx, QP_EXC(ctx, RuntimeWarning))) {
+                warned = TRUE;
+            }
+        }
+    }
+    if (JS_HasException(ctx))
+        qp__report_unraisable(ctx, "finalizing coroutine", obj);
+    if (!warned &&
+        qp_warn(ctx, QP_EXC(ctx, RuntimeWarning), 1,
+                "coroutine '%S' was never awaited", g->qualname) < 0)
+        qp__report_unraisable(ctx, "finalizing coroutine", obj);
 }
 
 /* tp_finalize (gen_finalize, async_gen_asend_finalize,
@@ -1543,7 +1651,7 @@ static void qp_gen_finalize(JSContext *ctx, JSValueConst obj)
             if (qp_warn(ctx, QP_EXC(ctx, RuntimeWarning), 1,
                         "coroutine method '%s' of %R was never awaited",
                         method, qp__gen(o->gen)->qualname) < 0)
-                qp__report_unraisable(ctx, o->gen);
+                qp__report_unraisable(ctx, "finalizing async generator", o->gen);
         }
     } else if (id == JS_CLASS_PY_GENERATOR || id == JS_CLASS_PY_COROUTINE ||
                id == JS_CLASS_PY_ASYNC_GEN) {
@@ -1555,20 +1663,17 @@ static void qp_gen_finalize(JSContext *ctx, JSValueConst obj)
             JSValue res = qp_call1(ctx, fin, obj);
             JS_FreeValue(ctx, fin);
             if (JS_IsException(res))
-                qp__report_unraisable(ctx, obj);
+                qp__report_unraisable(ctx, "finalizing generator", obj);
             else
                 JS_FreeValue(ctx, res);
         } else if (g->kind == QP_GENK_CORO && g->state == QP_GEN_CREATED) {
-            /* _PyErr_WarnUnawaitedCoroutine */
-            if (qp_warn(ctx, QP_EXC(ctx, RuntimeWarning), 1,
-                        "coroutine '%S' was never awaited", g->qualname) < 0)
-                qp__report_unraisable(ctx, obj);
+            qp__warn_unawaited_coro(ctx, obj, g);
             qp__gen_clear(ctx, g);
         } else {
             JSValue res = qp__gen_close(ctx, obj);
             if (JS_IsException(res)) {
                 if (JS_HasException(ctx))
-                    qp__report_unraisable(ctx, obj);
+                    qp__report_unraisable(ctx, "closing generator", obj);
             } else {
                 JS_FreeValue(ctx, res);
             }
@@ -1583,8 +1688,10 @@ static void qp_gen_finalizer(JSRuntime *rt, JSValue val)
     QPGen *g = JS_VALUE_GET_OBJ(val)->u.opaque;
     if (!g)
         return;
-    if (g->s)
+    if (g->s) {
+        g->s->py_gen = NULL;
         async_func_free(rt, g->s);
+    }
     JS_FreeValueRT(rt, g->func);
     JS_FreeValueRT(rt, g->name);
     JS_FreeValueRT(rt, g->qualname);
@@ -1681,7 +1788,7 @@ static const QPGetSetDef qp__coro_getsets[] = {
     { "cr_code", qp__g_code, NULL, 0, NULL },
     { "cr_suspended", qp__g_suspended, NULL, 0, NULL },
     { "cr_state", qp__g_state, NULL, 1, "state of the coroutine" },
-    { "cr_origin", qp__g_none, NULL, 0, NULL },
+    { "cr_origin", qp__g_origin, NULL, 0, NULL, QP_GETSET_MEMBER },
     { NULL }
 };
 
@@ -1742,7 +1849,7 @@ static const QPMethodDef qp__athrow_methods[] = {
 #define QP__GEN_FLAGS (QP_TPFLAGS_DISALLOW_INSTANTIATION | QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_HAS_DEL)
 
 static const QPTypeSpec qp__generator_spec = {
-    .name = "generator", .flags = QP__GEN_FLAGS, .base = -1, .exc_base = -1,
+    .name = "generator", .flags = QP__GEN_FLAGS | QP_TPFLAGS_WEAKREF, .base = -1, .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_GENERATOR,
     .slots = {
         .tp_repr = qp__gen_repr,
@@ -1754,7 +1861,7 @@ static const QPTypeSpec qp__generator_spec = {
 };
 
 static const QPTypeSpec qp__coroutine_spec = {
-    .name = "coroutine", .flags = QP__GEN_FLAGS, .base = -1, .exc_base = -1,
+    .name = "coroutine", .flags = QP__GEN_FLAGS | QP_TPFLAGS_WEAKREF, .base = -1, .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_COROUTINE,
     .slots = {
         .tp_repr = qp__gen_repr,
@@ -1764,7 +1871,7 @@ static const QPTypeSpec qp__coroutine_spec = {
 };
 
 static const QPTypeSpec qp__async_generator_spec = {
-    .name = "async_generator", .flags = QP__GEN_FLAGS, .base = -1, .exc_base = -1,
+    .name = "async_generator", .flags = QP__GEN_FLAGS | QP_TPFLAGS_WEAKREF, .base = -1, .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_ASYNC_GEN,
     .slots = {
         .tp_repr = qp__gen_repr,

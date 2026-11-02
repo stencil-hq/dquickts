@@ -39,14 +39,23 @@ typedef enum {
     QP_ERR_UNICODE_DECODE,  /* UnicodeDecodeError / SyntaxError for bad encodings as CPython does */
     QP_ERR_RECURSION,       /* RecursionError ("maximum recursion depth exceeded during compilation") */
     QP_ERR_OVERFLOW,        /* OverflowError */
+    QP_ERR_PENDING,         /* a Python exception is pending in the JSContext (raised while
+                               emitting a compile-time SyntaxWarning) */
 } qp_error_kind;
 
 typedef struct qp_error {
     qp_error_kind kind;
     char *msg;              /* malloc'd UTF-8, NULL if none */
-    int lineno, offset;     /* CPython SyntaxError semantics: offset is 1-based CHARACTER offset; 0 = unknown */
+    int lineno, offset;     /* CPython SyntaxError semantics: offset is 1-based CHARACTER offset; 0 = unknown
+                               unless end_lineno is set; negative = reported as is */
     int end_lineno, end_offset; /* 0 = unknown */
     char *text;             /* malloc'd UTF-8 source line, may be NULL */
+    /* SyntaxError._metadata of parser errors (_PyPegen_set_syntax_error_metadata):
+       (metadata_lineno, metadata_col_offset, source); source is a malloc'd
+       UTF-8 copy or NULL for None. */
+    int has_metadata;
+    int metadata_lineno, metadata_col_offset;
+    char *metadata_source;
 } qp_error;
 
 /* First error wins: qp_error_set does nothing if err->kind != QP_ERR_NONE.
@@ -70,6 +79,10 @@ static __maybe_unused int qp_arena_add_atom(qp_arena *a, JSAtom atom);    /* tak
 static __maybe_unused int qp_arena_add_value(qp_arena *a, JSValue v);     /* takes ownership; -1 + QP_ERR_MEMORY on OOM (value freed) */
 static __maybe_unused JSContext *qp_arena_ctx(qp_arena *a);
 static __maybe_unused qp_error *qp_arena_error(qp_arena *a);
+/* ast.parse(feature_version=(3, minor)): the grammar version qp_parse_string
+   accepts (CPython cf_feature_version; -1, the default: the current one) */
+static __maybe_unused void qp_arena_set_feature_version(qp_arena *a, int minor);
+static __maybe_unused int qp_arena_feature_version(qp_arena *a);
 #define PyArena qp_arena               /* internal-name aliases used by ported code */
 #define _PyArena_Malloc qp_arena_malloc
 
@@ -81,6 +94,9 @@ typedef enum {
     QP_CONST_COMPLEX, /* v: JS_TAG_FLOAT64 imaginary part (real part is always 0 in source) */
     QP_CONST_STR,     /* v: JSString (8/16-bit; may contain lone surrogates; never a rope) */
     QP_CONST_BYTES,   /* v: 8-bit JSString whose chars are the raw byte values 0..255 */
+    QP_CONST_OBJECT,  /* v: any other Python value (tuple, frozenset, complex with a real part,
+                         or an invalid type rejected by validation); only made by the _ast
+                         object converter (mod_ast.c), never by the parser */
 } qp_const_kind;
 typedef struct qp_const { qp_const_kind kind; JSValue v; } qp_const;
 /* Shared singletons, v = JS_UNDEFINED (tentative definitions; initialised in ast.c). */

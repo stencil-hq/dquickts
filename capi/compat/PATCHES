@@ -1,0 +1,63 @@
+# capi/compat patches against cpython v3.15.2 (tools/capi_sync.py --record).
+#
+# The copied Include/internal headers (COMPAT_COPIES of tools/capi_sync.py);
+# every other capi/compat file is a hand-written shim.
+
+# pycore_long.h: small ints are _PyQp_SmallInts (unit C); no _PyStackRef.
+
+--- a/pycore_long.h
++++ b/pycore_long.h
+@@ -56,7 +56,14 @@
+ 
+ PyAPI_FUNC(void) _PyLong_ExactDealloc(PyObject *self);
+ 
+-#define _PyLong_SMALL_INTS _Py_SINGLETON(small_ints)
++/* dquickts: the small ints are the static immortal ints of the C API
++   (python/capi_number.c), CPython's values of pycore_runtime_structs.h. */
++#ifndef _PY_NSMALLPOSINTS
++#  define _PY_NSMALLPOSINTS           1025
++#  define _PY_NSMALLNEGINTS           5
++#endif
++PyAPI_DATA(PyLongObject) _PyQp_SmallInts[_PY_NSMALLNEGINTS + _PY_NSMALLPOSINTS];
++#define _PyLong_SMALL_INTS _PyQp_SmallInts
+ 
+ // _PyLong_GetZero() and _PyLong_GetOne() must always be available
+ // _PyLong_FromUnsignedChar must always be available
+@@ -113,9 +120,8 @@
+ // Export for 'math' shared extension
+ PyAPI_DATA(PyObject*) _PyLong_Lshift(PyObject *, int64_t);
+ 
+-PyAPI_FUNC(_PyStackRef) _PyCompactLong_Add(PyLongObject *left, PyLongObject *right);
+-PyAPI_FUNC(_PyStackRef) _PyCompactLong_Multiply(PyLongObject *left, PyLongObject *right);
+-PyAPI_FUNC(_PyStackRef) _PyCompactLong_Subtract(PyLongObject *left, PyLongObject *right);
++/* dquickts: the _PyCompactLong_* interpreter helpers (_PyStackRef) are
++   not provided. */
+ 
+ // Export for 'binascii' shared extension.
+ PyAPI_DATA(unsigned char) _PyLong_DigitValue[256];
+
+# pycore_time.h: _PyTimeFraction defined here; no runtime-state init.
+--- a/pycore_time.h
++++ b/pycore_time.h
+@@ -57,7 +57,11 @@
+ #  error "this header requires Py_BUILD_CORE define"
+ #endif
+ 
+-#include "pycore_runtime_structs.h" // _PyTimeFraction
++/* dquickts: _PyTimeFraction from pycore_runtime_structs.h (not provided). */
++typedef struct {
++    PyTime_t numer;
++    PyTime_t denom;
++} _PyTimeFraction;
+ 
+ #ifdef __clang__
+ struct timeval;
+@@ -317,7 +321,7 @@
+ extern double _PyTimeFraction_Resolution(
+     const _PyTimeFraction *frac);
+ 
+-extern PyStatus _PyTime_Init(struct _Py_time_runtime_state *state);
++/* dquickts: _PyTime_Init (runtime state) is not provided. */
+ 
+ #ifdef __cplusplus
+ }

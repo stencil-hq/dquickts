@@ -967,17 +967,21 @@ parsenumber_raw(Parser *p, const char *s)
         }
         return qp_const_new(p->arena, QP_CONST_INT, val);
     }
-    if (radix == 10 && ndigits > QP_LONG_MAX_STR_DIGITS_THRESHOLD &&
-        ndigits > QP_LONG_DEFAULT_MAX_STR_DIGITS) {
+    /* the interpreter's sys.set_int_max_str_digits() limit (0: none), the
+       default one when the parser runs without an interpreter state */
+    int max_str_digits = ctx->py ? ctx->py->int_max_str_digits : QP_LONG_DEFAULT_MAX_STR_DIGITS;
+    if (radix == 10 && max_str_digits > 0 && ndigits > QP_LONG_MAX_STR_DIGITS_THRESHOLD &&
+        ndigits > (size_t)max_str_digits) {
         qp_error_clear(p->err);
         qp_error_set(p->err, QP_ERR_VALUE, 0, 0, 0, 0,
                      "Exceeds the limit (%d digits) for integer string conversion: "
                      "value has %lld digits; use sys.set_int_max_str_digits() "
                      "to increase the limit",
-                     QP_LONG_DEFAULT_MAX_STR_DIGITS, (long long)ndigits);
+                     max_str_digits, (long long)ndigits);
         return NULL;
     }
-    JSBigInt *r = js_bigint_from_string(ctx, digits, radix);
+    JSBigInt *r;
+    QP_BIG_CALL(ctx, r, js_bigint_from_string(ctx, digits, radix));
     if (r == NULL) {
         qp_pegen_js_error(p);
         return NULL;
@@ -1225,6 +1229,48 @@ qp_pegen_is_syntax_error(Parser *p)
            k == QP_ERR_INCOMPLETE;
 }
 
+/* SyntaxError._metadata: (last statement lineno, col_offset, source) */
+static void
+_PyPegen_set_syntax_error_metadata(Parser *p) {
+    qp_error *err = p->err;
+    const char *source = p->tok->str;
+
+    err->has_metadata = 1;
+    err->metadata_lineno = p->last_stmt_location.lineno;
+    err->metadata_col_offset = p->last_stmt_location.col_offset;
+    qp_sys_free(err->metadata_source);
+    err->metadata_source = NULL;
+    if (source) {
+        /* the_source = PyUnicode_Decode(source, strlen(source), tok->encoding)
+           (None if it fails).  tok->str holds the UTF-8 translation of the
+           source; decoding it with another declared encoding is only
+           modelled when that gives the same text (pure ASCII). */
+        size_t len = strlen(source);
+        const uint8_t *q = (const uint8_t *)source, *end = q + len;
+        const char *reason;
+        int ascii = 1;
+        uint32_t c;
+        while (q < end) {
+            int k = qp_utf8_decode1(q, end, &c, &reason);
+            if (k < 0) {
+                return;
+            }
+            if (c >= 0x80) {
+                ascii = 0;
+            }
+            q += k;
+        }
+        const char *enc = p->tok->encoding;
+        if (!ascii && enc != NULL && strcmp(enc, "utf-8") != 0) {
+            return;
+        }
+        err->metadata_source = qp_sys_malloc(len + 1);
+        if (err->metadata_source) {
+            memcpy(err->metadata_source, source, len + 1);
+        }
+    }
+}
+
 void *
 _PyPegen_run_parser(Parser *p)
 {
@@ -1254,9 +1300,10 @@ _PyPegen_run_parser(Parser *p)
         // point.
         _Pypegen_set_syntax_error(p, last_token);
 
-        // CPython attaches p->last_stmt_location and the source to the
-        // SyntaxError here (_PyPegen_set_syntax_error_metadata); qp_error
-        // carries no such metadata.
+        // Set the metadata in the exception from p->last_stmt_location
+        if (qp_pegen_is_syntax_error(p)) {
+            _PyPegen_set_syntax_error_metadata(p);
+        }
        return NULL;
     }
 
@@ -1270,7 +1317,7 @@ _PyPegen_run_parser(Parser *p)
 
 mod_ty
 _PyPegen_run_parser_from_string(const char *str, int start_rule, const char *filename,
-                                int cf_flags, PyArena *arena)
+                                JSValueConst module, int cf_flags, PyArena *arena)
 {
     qp_error *err = qp_arena_error(arena);
     int exec_input = start_rule == Py_file_input;
@@ -1280,7 +1327,7 @@ _PyPegen_run_parser_from_string(const char *str, int start_rule, const char *fil
     if (parser_flags & PyPARSE_IGNORE_COOKIE) {
         tok = _PyTokenizer_FromUTF8(str, exec_input, 0, err);
     } else {
-        tok = _PyTokenizer_FromString(str, exec_input, 0, err);
+        tok = _PyTokenizer_FromString(str, exec_input, 0, err, qp_arena_ctx(arena));
     }
     if (tok == NULL) {
         // Initialization errors are already converted by the tokenizer
@@ -1293,14 +1340,18 @@ _PyPegen_run_parser_from_string(const char *str, int start_rule, const char *fil
     }
     tok->barry_as_bdfl = parser_flags & PyPARSE_BARRY_AS_BDFL;
     tok->filename = filename;
-    tok->module = NULL;
+    tok->module = module;
+    tok->ctx = qp_arena_ctx(arena);
 
     // We need to clear up from here on
     mod_ty result = NULL;
 
-    // compile() and ast.parse() always parse with the current grammar
-    // (cf_feature_version defaults to PY_MINOR_VERSION).
-    int feature_version = 15;
+    // cf_feature_version: set by compile(..., PyCF_ONLY_AST, _feature_version=N),
+    // PY_MINOR_VERSION otherwise
+    int feature_version = qp_arena_feature_version(arena);
+    if (feature_version < 0) {
+        feature_version = 15;
+    }
     Parser *p = _PyPegen_Parser_New(tok, start_rule, parser_flags, feature_version,
                                     NULL, str, arena);
     if (p == NULL) {
@@ -1319,7 +1370,8 @@ error:
 /* Parser/peg_api.c */
 
 mod_ty qp_parse_string(JSContext *ctx, qp_arena *arena, const char *src, size_t len,
-                       const char *filename, int mode, int flags, qp_error *err)
+                       const char *filename, JSValueConst module, int mode, int flags,
+                       qp_error *err)
 {
     mod_ty result;
     char *str;
@@ -1335,7 +1387,7 @@ mod_ty qp_parse_string(JSContext *ctx, qp_arena *arena, const char *src, size_t 
     }
     memcpy(str, src, len);
     str[len] = '\0';
-    result = _PyPegen_run_parser_from_string(str, mode, filename, flags, arena);
+    result = _PyPegen_run_parser_from_string(str, mode, filename, module, flags, arena);
     js_free(ctx, str);
     if (result == NULL && err->kind == QP_ERR_NONE) {
         qp_error_set(err, QP_ERR_MEMORY, 0, 0, 0, 0, "%s", "");
@@ -4055,16 +4107,59 @@ _PyPegen_concatenate_strings(Parser *p, asdl_expr_seq *strings,
         col_offset, end_lineno, end_col_offset, arena);
 }
 
-/* CPython emits a SyntaxWarning for `from . lazy import x` here (outside
-   the error pass); warnings are not emitted (see pegen.h), so the only
-   observable effect is the absence of an error. */
 static int
 _warn_relative_import_of_lazy(Parser *p, asdl_seq *dots, expr_ty module)
 {
-    (void)p;
-    (void)dots;
-    (void)module;
-    return 0;
+    // Warn about `from . lazy import x`: the whitespace between the dots and
+    // the module name is insignificant, so this is parsed exactly like
+    // `from .lazy import x` (an import of the relative module "lazy"), but it
+    // is most likely a transposition of `lazy from . import x` (PEP 810).
+    if (p->call_invalid_rules) {
+        return 0;
+    }
+
+    // Only fire if there is whitespace between the last dot and the name,
+    // i.e. not for the common `from .lazy import x` spelling.
+    Token *last_dot = asdl_seq_GET_UNTYPED(dots, asdl_seq_LEN(dots) - 1);
+    if (
+        last_dot->end_lineno == module->lineno
+        && last_dot->end_col_offset == module->col_offset
+    ) {
+        return 0;
+    }
+
+    int count = _PyPegen_seq_count_dots(dots);
+    char *buf = PyMem_Malloc(count + 1);
+    if (buf == NULL) {
+        qp_pegen_no_memory(p);
+        return -1;
+    }
+    memset(buf, '.', count);
+    buf[count] = '\0';
+
+    DynBuf msg;
+    dbuf_init(&msg);
+    dbuf_printf(&msg,
+        "'from %s lazy import' is the same as 'from %slazy import'; "
+        "did you mean 'lazy from %s import'?",
+        buf, buf, buf);
+    PyMem_Free(buf);
+    if (dbuf_putc(&msg, '\0')) {
+        dbuf_free(&msg);
+        qp_pegen_no_memory(p);
+        return -1;
+    }
+
+    int res = qp_syntax_warn_err(p->ctx, p->err,
+                                 p->tok->filename,
+                                 p->tok->module,
+                                 (const char *)msg.buf,
+                                 module->lineno,
+                                 module->col_offset + 1,
+                                 module->end_lineno,
+                                 module->end_col_offset + 1);
+    dbuf_free(&msg);
+    return res;
 }
 
 stmt_ty
@@ -4128,14 +4223,17 @@ _PyPegen_register_stmts(Parser *p, asdl_stmt_seq* stmts) {
 /* _PyUnicode_DecodeUnicodeEscapeInternal2(s, size, NULL, NULL, ...): decode
    the "unicode_escape" codec input s[0:size] (strict errors).  Sets *res to
    the str value, or returns -1 with the UnicodeDecodeError set (positions
-   relative to s).  Invalid escapes are kept literally; their warning is not
-   emitted (see pegen.h). */
+   relative to s).  Invalid escapes are kept literally; the first one is
+   returned in *first_invalid_escape_ptr (NULL if none). */
 static int
-qp_decode_unicode_escape(Parser *p, const char *s, Py_ssize_t size, JSValue *res)
+qp_decode_unicode_escape(Parser *p, const char *s, Py_ssize_t size, JSValue *res,
+                         const char **first_invalid_escape_ptr)
 {
     const char *starts = s;
     const char *end;
     StringBuffer writer;
+
+    *first_invalid_escape_ptr = NULL;
 
     if (size == 0) {
         *res = JS_AtomToString(p->ctx, JS_ATOM_empty_string);
@@ -4208,6 +4306,12 @@ qp_decode_unicode_escape(Parser *p, const char *s, Py_ssize_t size, JSValue *res
                 ch = (ch<<3) + *s++ - '0';
                 if (s < end && '0' <= *s && *s <= '7') {
                     ch = (ch<<3) + *s++ - '0';
+                }
+            }
+            if (ch > 0377) {
+                if (*first_invalid_escape_ptr == NULL) {
+                    /* Back up 3 chars, since we've already incremented s. */
+                    *first_invalid_escape_ptr = s - 3;
                 }
             }
             WRITE_CHAR(ch);
@@ -4292,6 +4396,10 @@ qp_decode_unicode_escape(Parser *p, const char *s, Py_ssize_t size, JSValue *res
             goto error;
 
         default:
+            if (*first_invalid_escape_ptr == NULL) {
+                /* Back up one char, since we've already incremented s. */
+                *first_invalid_escape_ptr = s - 1;
+            }
             WRITE_CHAR('\\');
             WRITE_CHAR(c);
             continue;
@@ -4323,10 +4431,13 @@ qp_decode_unicode_escape(Parser *p, const char *s, Py_ssize_t size, JSValue *res
 
 /* _PyBytes_DecodeEscape2(s, len, NULL, ...): unescape a bytes literal body
    (strict errors).  Returns the bytes constant, or NULL with ValueError set.
-   Invalid escapes are kept literally (their warning is not emitted). */
+   Invalid escapes are kept literally; the first one is returned in
+   *first_invalid_escape_ptr (NULL if none). */
 static qp_const *
-qp_decode_bytes_escape(Parser *p, const char *s, Py_ssize_t len)
+qp_decode_bytes_escape(Parser *p, const char *s, Py_ssize_t len,
+                       const char **first_invalid_escape_ptr)
 {
+    *first_invalid_escape_ptr = NULL;
     char *buf = PyMem_Malloc((size_t)len + 1);
     if (buf == NULL) {
         return PyErr_NoMemory();
@@ -4369,6 +4480,12 @@ qp_decode_bytes_escape(Parser *p, const char *s, Py_ssize_t len)
                 if (s < end && '0' <= *s && *s <= '7')
                     c = (c<<3) + *s++ - '0';
             }
+            if (c > 0377) {
+                if (*first_invalid_escape_ptr == NULL) {
+                    /* Back up 3 chars, since we've already incremented s. */
+                    *first_invalid_escape_ptr = s - 3;
+                }
+            }
             *q++ = c;
             break;
         }
@@ -4391,6 +4508,10 @@ qp_decode_bytes_escape(Parser *p, const char *s, Py_ssize_t len)
             goto failed;
 
         default:
+            if (*first_invalid_escape_ptr == NULL) {
+                /* Back up one char, since we've already incremented s. */
+                *first_invalid_escape_ptr = s - 1;
+            }
             *q++ = '\\';
             s--;
         }
@@ -4411,9 +4532,110 @@ qp_decode_bytes_escape(Parser *p, const char *s, Py_ssize_t len)
 
 //// STRING HANDLING FUNCTIONS ////
 
-/* Invalid escape sequences produce a SyntaxWarning in CPython
-   (warn_invalid_escape_sequence); with no warnings machinery they are
-   accepted silently, which is what the default warning filters amount to. */
+static int
+warn_invalid_escape_sequence(Parser *p, const char* buffer, const char *first_invalid_escape, Token *t)
+{
+    if (p->call_invalid_rules) {
+        // Do not report warnings if we are in the second pass of the parser
+        // to avoid showing the warning twice.
+        return 0;
+    }
+    unsigned char c = (unsigned char)*first_invalid_escape;
+    if ((t->type == FSTRING_MIDDLE || t->type == FSTRING_END || t->type == TSTRING_MIDDLE || t->type == TSTRING_END)
+            && (c == '{' || c == '}')) {
+        // in this case the tokenizer has already emitted a warning,
+        // see Parser/tokenizer/helpers.c:warn_invalid_escape_sequence
+        return 0;
+    }
+
+    int octal = ('4' <= c && c <= '7');
+    char msg[200];
+    if (octal) {
+        snprintf(msg, sizeof(msg),
+                 "\"\\%.3s\" is an invalid octal escape sequence. "
+                 "Such sequences will not work in the future. "
+                 "Did you mean \"\\\\%.3s\"? A raw string is also an option.",
+                 first_invalid_escape, first_invalid_escape);
+    }
+    else {
+        snprintf(msg, sizeof(msg),
+                 "\"\\%c\" is an invalid escape sequence. "
+                 "Such sequences will not work in the future. "
+                 "Did you mean \"\\\\%c\"? A raw string is also an option.",
+                 c, c);
+    }
+    /* p->feature_version >= 12: SyntaxWarning (DeprecationWarning before) */
+
+    // Calculate the lineno and the col_offset of the invalid escape sequence
+    const char *start = buffer;
+    const char *end = first_invalid_escape;
+    int lineno = t->lineno;
+    int col_offset = t->col_offset;
+    while (start < end) {
+        if (*start == '\n') {
+            lineno++;
+            col_offset = 0;
+        }
+        else {
+            col_offset++;
+        }
+        start++;
+    }
+
+    // Count the number of quotes in the token
+    char first_quote = 0;
+    if (lineno == t->lineno) {
+        int quote_count = 0;
+        const char *tok = t->bytes;
+        for (Py_ssize_t i = 0; i < t->bytes_len; i++) {
+            if (tok[i] == '\'' || tok[i] == '\"') {
+                if (quote_count == 0) {
+                    first_quote = tok[i];
+                }
+                if (tok[i] == first_quote) {
+                    quote_count++;
+                }
+            } else {
+                break;
+            }
+        }
+
+        col_offset += quote_count;
+    }
+
+    int r = qp_syntax_warn(p->ctx, p->tok->filename, p->tok->module, lineno, msg);
+    if (r > 0) {
+        /* Replace the Syntax/DeprecationWarning exception with a SyntaxError
+           to get a more accurate error report */
+
+        /* This is needed, in order for the SyntaxError to point to the token t,
+           since _PyPegen_raise_error uses p->tokens[p->fill - 1] for the
+           error location, if p->known_err_token is not set. */
+        p->known_err_token = t;
+        if (octal) {
+            /* (the RAISE_* formatter has no precision: %.3s formatted here) */
+            snprintf(msg, sizeof(msg),
+                     "\"\\%.3s\" is an invalid octal escape sequence. "
+                     "Did you mean \"\\\\%.3s\"? A raw string is also an option.",
+                     first_invalid_escape, first_invalid_escape);
+            RAISE_ERROR_KNOWN_LOCATION(p, PyExc_SyntaxError, lineno, col_offset-1, lineno, col_offset+1,
+                "%s", msg);
+        }
+        else {
+            RAISE_ERROR_KNOWN_LOCATION(p, PyExc_SyntaxError, lineno, col_offset-1, lineno, col_offset+1,
+                "\"\\%c\" is an invalid escape sequence. "
+                "Did you mean \"\\\\%c\"? A raw string is also an option.",
+                c, c);
+        }
+        return -1;
+    }
+    if (r < 0) {
+        qp_error_clear(p->err);
+        qp_error_set(p->err, QP_ERR_PENDING, 0, 0, 0, 0, "%s", "");
+        return -1;
+    }
+    return 0;
+}
 
 static qp_const *
 decode_unicode_with_escapes(Parser *parser, const char *s, size_t len, Token *t)
@@ -4474,9 +4696,22 @@ decode_unicode_with_escapes(Parser *parser, const char *s, size_t len, Token *t)
     *p = '\0';
     len = (size_t)(p - buf);
 
-    if (qp_decode_unicode_escape(parser, buf, (Py_ssize_t)len, &v) < 0) {
+    const char *first_invalid_escape_ptr;
+    if (qp_decode_unicode_escape(parser, buf, (Py_ssize_t)len, &v,
+                                 &first_invalid_escape_ptr) < 0) {
         js_free_rt(parser->ctx->rt, buf);
         return NULL;
+    }
+
+    // HACK: later we can simply pass the line no, since we don't preserve the tokens
+    // when we are decoding the string but we preserve the line numbers.
+    if (first_invalid_escape_ptr != NULL && t != NULL) {
+        if (warn_invalid_escape_sequence(parser, buf, first_invalid_escape_ptr, t) < 0) {
+            /* first_invalid_escape_ptr points inside buf */
+            js_free_rt(parser->ctx->rt, buf);
+            JS_FreeValue(parser->ctx, v);
+            return NULL;
+        }
     }
     js_free_rt(parser->ctx->rt, buf);
     return qp_const_new(parser->arena, QP_CONST_STR, v);
@@ -4485,8 +4720,18 @@ decode_unicode_with_escapes(Parser *parser, const char *s, size_t len, Token *t)
 static qp_const *
 decode_bytes_with_escapes(Parser *p, const char *s, Py_ssize_t len, Token *t)
 {
-    (void)t;
-    return qp_decode_bytes_escape(p, s, len);
+    const char *first_invalid_escape_ptr;
+    qp_const *result = qp_decode_bytes_escape(p, s, len, &first_invalid_escape_ptr);
+    if (result == NULL) {
+        return NULL;
+    }
+
+    if (first_invalid_escape_ptr != NULL) {
+        if (warn_invalid_escape_sequence(p, s, first_invalid_escape_ptr, t) < 0) {
+            return NULL;
+        }
+    }
+    return result;
 }
 
 qp_const *

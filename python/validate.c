@@ -168,6 +168,9 @@ typedef struct qpv {
     JSContext *ctx;
     qp_error *err;
     int features;               /* future features | compile flags */
+    const char *filename;       /* SyntaxWarning location (c_filename) */
+    JSValueConst module;        /* SyntaxWarning module (c_module) */
+    int disable_warning;        /* c_disable_warning: inside FINALLY_END blocks */
     qpv_unit *u;
     JSAtom atom_debug;          /* "__debug__" */
     JSAtom atom_star;           /* "*" */
@@ -246,6 +249,240 @@ static int qpv_check_recursion(qpv *c)
         return -1;
     }
     return 0;
+}
+
+/* ---------------------------------------------------------------------- */
+/* SyntaxWarnings (codegen.c) */
+
+/* _PyCompile_Warn: 0, or -1 with the error set (SyntaxError when the
+   warning is raised as an error). */
+static int qpv_warn(qpv *c, _Py_SourceLocation loc, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+static int qpv_warn(qpv *c, _Py_SourceLocation loc, const char *fmt, ...)
+{
+    char msg[512];
+    va_list ap;
+
+    if (c->disable_warning)
+        return 0;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    return qp_syntax_warn_err(c->ctx, c->err, c->filename, c->module, msg,
+                              loc.lineno, loc.col_offset + 1,
+                              loc.end_lineno, loc.end_col_offset + 1);
+}
+
+/* tp_name of a Constant value */
+static const char *qpv_const_type_name(qpv *c, const qp_const *v)
+{
+    switch (v->kind) {
+    case QP_CONST_NONE: return "NoneType";
+    case QP_CONST_TRUE:
+    case QP_CONST_FALSE: return "bool";
+    case QP_CONST_ELLIPSIS: return "ellipsis";
+    case QP_CONST_INT: return "int";
+    case QP_CONST_FLOAT: return "float";
+    case QP_CONST_COMPLEX: return "complex";
+    case QP_CONST_STR: return "str";
+    case QP_CONST_BYTES: return "bytes";
+    default: {
+        QPType *t = qp_type_of(c->ctx, v->v);
+        return t && t->tp_name ? t->tp_name : "object";
+    }
+    }
+}
+
+/* infer_type: the tp_name of the type of `e` when known from its kind,
+   else NULL. */
+static const char *qpv_infer_type(qpv *c, expr_ty e)
+{
+    switch (e->kind) {
+    case Tuple_kind:
+        return "tuple";
+    case List_kind:
+    case ListComp_kind:
+        return "list";
+    case Dict_kind:
+    case DictComp_kind:
+        return "dict";
+    case Set_kind:
+    case SetComp_kind:
+        return "set";
+    case GeneratorExp_kind:
+        return "generator";
+    case Lambda_kind:
+        return "function";
+    case TemplateStr_kind:
+    case Interpolation_kind:
+        return "string.templatelib.Template";
+    case JoinedStr_kind:
+    case FormattedValue_kind:
+        return "str";
+    case Constant_kind:
+        return qpv_const_type_name(c, e->v.Constant.value);
+    default:
+        return NULL;
+    }
+}
+
+/* Return false if the expression is a constant value except named singletons.
+   Return true otherwise. */
+static BOOL qpv_check_is_arg(expr_ty e)
+{
+    if (e->kind == Tuple_kind) {
+        asdl_expr_seq *elts = e->v.Tuple.elts;
+        for (Py_ssize_t i = 0; i < asdl_seq_LEN(elts); i++) {
+            if (((expr_ty)asdl_seq_GET(elts, i))->kind != Constant_kind)
+                return TRUE;
+        }
+        return FALSE;
+    }
+    if (e->kind != Constant_kind)
+        return TRUE;
+    qp_const_kind k = e->v.Constant.value->kind;
+    return (k == QP_CONST_NONE
+         || k == QP_CONST_FALSE
+         || k == QP_CONST_TRUE
+         || k == QP_CONST_ELLIPSIS);
+}
+
+/* codegen_check_compare: check operands of identity checks ("is" and
+   "is not").  Emit a warning if any operand is a constant except named
+   singletons. */
+static int qpv_check_compare(qpv *c, expr_ty e)
+{
+    Py_ssize_t i, n;
+    BOOL left = qpv_check_is_arg(e->v.Compare.left);
+    expr_ty left_expr = e->v.Compare.left;
+    n = asdl_seq_LEN(e->v.Compare.ops);
+    for (i = 0; i < n; i++) {
+        cmpop_ty op = (cmpop_ty)asdl_seq_GET(e->v.Compare.ops, i);
+        expr_ty right_expr = (expr_ty)asdl_seq_GET(e->v.Compare.comparators, i);
+        BOOL right = qpv_check_is_arg(right_expr);
+        if (op == Is || op == IsNot) {
+            if (!right || !left) {
+                expr_ty literal = !left ? left_expr : right_expr;
+                return qpv_warn(c, QPV_LOC(e),
+                                op == Is
+                                ? "\"is\" with '%.200s' literal. Did you mean \"==\"?"
+                                : "\"is not\" with '%.200s' literal. Did you mean \"!=\"?",
+                                qpv_infer_type(c, literal));
+            }
+        }
+        left = right;
+        left_expr = right_expr;
+    }
+    return 0;
+}
+
+/* check_caller */
+static int qpv_check_caller(qpv *c, expr_ty e)
+{
+    switch (e->kind) {
+    case Constant_kind:
+    case Tuple_kind:
+    case List_kind:
+    case ListComp_kind:
+    case Dict_kind:
+    case DictComp_kind:
+    case Set_kind:
+    case SetComp_kind:
+    case GeneratorExp_kind:
+    case JoinedStr_kind:
+    case TemplateStr_kind:
+    case FormattedValue_kind:
+    case Interpolation_kind:
+        return qpv_warn(c, QPV_LOC(e), "'%.200s' object is not callable; "
+                                       "perhaps you missed a comma?",
+                        qpv_infer_type(c, e));
+    default:
+        return 0;
+    }
+}
+
+/* check_subscripter */
+static int qpv_check_subscripter(qpv *c, expr_ty e)
+{
+    switch (e->kind) {
+    case Constant_kind: {
+        const qp_const *v = e->v.Constant.value;
+        switch (v->kind) {
+        case QP_CONST_NONE:
+        case QP_CONST_ELLIPSIS:
+        case QP_CONST_TRUE:
+        case QP_CONST_FALSE:
+        case QP_CONST_INT:
+        case QP_CONST_FLOAT:
+        case QP_CONST_COMPLEX:
+            break;
+        case QP_CONST_OBJECT:
+            if (qp_long_check(c->ctx, v->v) || qp_float_check(c->ctx, v->v) ||
+                qp_complex_check(c->ctx, v->v) || qp_anyset_check(c->ctx, v->v))
+                break;
+            return 0;
+        default:
+            return 0;
+        }
+        break;
+    }
+    case Set_kind:
+    case SetComp_kind:
+    case GeneratorExp_kind:
+    case TemplateStr_kind:
+    case Interpolation_kind:
+    case Lambda_kind:
+        break;
+    default:
+        return 0;
+    }
+    return qpv_warn(c, QPV_LOC(e), "'%.200s' object is not subscriptable; "
+                                   "perhaps you missed a comma?",
+                    qpv_infer_type(c, e));
+}
+
+/* check_index */
+static int qpv_check_index(qpv *c, expr_ty e, expr_ty s)
+{
+    const char *index_type = qpv_infer_type(c, s);
+
+    if (index_type == NULL)
+        return 0;
+    if (s->kind == Constant_kind) {
+        /* PyType_FastSubclass(index_type, Py_TPFLAGS_LONG_SUBCLASS) or
+           PySlice_Type */
+        const qp_const *v = s->v.Constant.value;
+        if (v->kind == QP_CONST_INT || v->kind == QP_CONST_TRUE || v->kind == QP_CONST_FALSE)
+            return 0;
+        if (v->kind == QP_CONST_OBJECT &&
+            (qp_long_check(c->ctx, v->v) || !strcmp(index_type, "slice")))
+            return 0;
+    }
+
+    switch (e->kind) {
+    case Constant_kind: {
+        const qp_const *v = e->v.Constant.value;
+        if (v->kind == QP_CONST_STR || v->kind == QP_CONST_BYTES)
+            break;
+        if (v->kind == QP_CONST_OBJECT &&
+            (qp_str_check(c->ctx, v->v) || qp_bytes_check(c->ctx, v->v) ||
+             qp_tuple_check(c->ctx, v->v)))
+            break;
+        return 0;
+    }
+    case Tuple_kind:
+    case List_kind:
+    case ListComp_kind:
+    case JoinedStr_kind:
+    case FormattedValue_kind:
+        break;
+    default:
+        return 0;
+    }
+    return qpv_warn(c, QPV_LOC(e), "%.200s indices must be integers "
+                                   "or slices, not %.200s; "
+                                   "perhaps you missed a comma?",
+                    qpv_infer_type(c, e), index_type);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -471,6 +708,18 @@ static void qpv_val_from_const(const qp_const *k, qpv_val *out)
         qpv_val_init(out, QPV_V_STR);
         out->v = k->v;
         break;
+    case QP_CONST_OBJECT:
+        /* constant of an AST object: only an exact complex can reach
+           pattern checks (_PyAST_Validate rejects the other types) */
+        if (JS_VALUE_GET_TAG(k->v) == JS_TAG_OBJECT &&
+            JS_VALUE_GET_OBJ(k->v)->class_id == JS_CLASS_PY_COMPLEX) {
+            const QPComplex *z = JS_VALUE_GET_OBJ(k->v)->u.opaque;
+            qpv_val_init(out, QPV_V_COMPLEX);
+            out->re = z->real;
+            out->im = z->imag;
+            break;
+        }
+        /* fall through */
     case QP_CONST_BYTES:
     default:
         qpv_val_init(out, QPV_V_BYTES);
@@ -985,12 +1234,18 @@ static int qpv_push_fblock(qpv *c, _Py_SourceLocation loc, int type,
     f->type = type;
     f->loc = loc;
     f->finalbody = finalbody;
+    if (type == QPV_FB_FINALLY_END)
+        c->disable_warning++;
     return 0;
 }
 
+/* _PyCompile_PopFBlock */
 static void qpv_pop_fblock(qpv *c)
 {
-    c->u->nfblocks--;
+    qpv_unit *u = c->u;
+
+    if (u->fblock[--u->nfblocks].type == QPV_FB_FINALLY_END)
+        c->disable_warning--;
 }
 
 /* _PyCompile_AddDeferredAnnotation */
@@ -1105,17 +1360,49 @@ static int qpv_call_helper(qpv *c, asdl_expr_seq *args, asdl_keyword_seq *keywor
     return 0;
 }
 
-/* codegen_call.  maybe_optimize_method_call, can_optimize_super_call and
-   maybe_optimize_function_call visit the same sub-expressions in the same
-   order as the generic path (receiver, arguments, keyword values; an
-   optimized genexp argument is visited again by the fallback path, which
-   cannot raise a different first error), so only the generic order is
-   walked. */
+/* maybe_optimize_function_call: all/any/tuple/list/set called with a single
+   (non-async) generator expression get an inlined loop over it before the
+   fallback call, so the genexp is compiled twice. */
+static int qpv_optimizes_function_call(qpv *c, expr_ty e)
+{
+    static const char *const names[] = { "all", "any", "tuple", "list", "set" };
+    expr_ty func = e->v.Call.func;
+    char buf[ATOM_GET_STR_BUF_SIZE];
+    const char *name;
+    PySTEntryObject *entry;
+    size_t i;
+
+    if (!(func->kind == Name_kind &&
+          asdl_seq_LEN(e->v.Call.args) == 1 &&
+          asdl_seq_LEN(e->v.Call.keywords) == 0 &&
+          asdl_seq_GET(e->v.Call.args, 0)->kind == GeneratorExp_kind))
+        return 0;
+    entry = _PySymtable_Lookup(c->st, asdl_seq_GET(e->v.Call.args, 0));
+    if (!entry || entry->ste_coroutine)
+        return 0;
+    name = JS_AtomGetStr(c->ctx, buf, sizeof(buf), func->v.Name.id);
+    for (i = 0; i < countof(names); i++) {
+        if (!strcmp(name, names[i]))
+            return 1;
+    }
+    return 0;
+}
+
+/* codegen_call.  maybe_optimize_method_call and can_optimize_super_call
+   visit the same sub-expressions in the same order as the generic path
+   (receiver, arguments, keyword values), so only the generic order is
+   walked; check_caller cannot warn for the Attribute callee of an
+   optimized method call. */
 static int qpv_call(qpv *c, expr_ty e)
 {
     if (qpv_validate_keywords(c, e->v.Call.keywords) < 0)
         return -1;
+    if (qpv_check_caller(c, e->v.Call.func) < 0)
+        return -1;
     if (qpv_visit_expr(c, e->v.Call.func) < 0)
+        return -1;
+    if (qpv_optimizes_function_call(c, e) &&
+        qpv_visit_expr(c, asdl_seq_GET(e->v.Call.args, 0)) < 0)
         return -1;
     return qpv_call_helper(c, e->v.Call.args, e->v.Call.keywords);
 }
@@ -2332,13 +2619,26 @@ static int qpv_visit_stmt(qpv *c, stmt_ty s)
         if (asdl_seq_LEN(s->v.TryStar.finalbody))
             return qpv_try_finally(c, s, 1);
         return qpv_try_star_except(c, s);
-    case Assert_kind:
-        /* codegen_assert at optimization level 0 */
+    case Assert_kind: {
+        /* codegen_assert at optimization level 0.  Always emit a warning
+           if the test is a non-zero length tuple. */
+        expr_ty test = s->v.Assert.test;
+        if ((test->kind == Tuple_kind &&
+             asdl_seq_LEN(test->v.Tuple.elts) > 0) ||
+            (test->kind == Constant_kind &&
+             test->v.Constant.value->kind == QP_CONST_OBJECT &&
+             qp_tuple_check(c->ctx, test->v.Constant.value->v) &&
+             QP_TUPLE_SIZE(test->v.Constant.value->v) > 0)) {
+            if (qpv_warn(c, QPV_LOC(s), "assertion is always true, "
+                                        "perhaps remove parentheses?") < 0)
+                return -1;
+        }
         if (qpv_visit_expr(c, s->v.Assert.test) < 0)
             return -1;
         if (s->v.Assert.msg)
             return qpv_visit_expr(c, s->v.Assert.msg);
         return 0;
+    }
     case Import_kind:
         /* codegen_import: checked once per alias */
         for (i = 0; i < asdl_seq_LEN(s->v.Import.names); i++) {
@@ -2444,6 +2744,9 @@ static int qpv_visit_expr(qpv *c, expr_ty e)
     case Await_kind:
         return qpv_visit_expr(c, e->v.Await.value);
     case Compare_kind:
+        /* codegen_compare / codegen_jump_if */
+        if (qpv_check_compare(c, e) < 0)
+            return -1;
         if (qpv_visit_expr(c, e->v.Compare.left) < 0)
             return -1;
         return qpv_visit_exprs(c, e->v.Compare.comparators);
@@ -2483,6 +2786,12 @@ static int qpv_visit_expr(qpv *c, expr_ty e)
            arguments as compiling the super() call */
         return qpv_visit_expr(c, e->v.Attribute.value);
     case Subscript_kind:
+        /* codegen_subscript */
+        if (e->v.Subscript.ctx == Load) {
+            if (qpv_check_subscripter(c, e->v.Subscript.value) < 0 ||
+                qpv_check_index(c, e->v.Subscript.value, e->v.Subscript.slice) < 0)
+                return -1;
+        }
         if (qpv_visit_expr(c, e->v.Subscript.value) < 0)
             return -1;
         return qpv_visit_expr(c, e->v.Subscript.slice);
@@ -2522,7 +2831,8 @@ static int qpv_visit_expr(qpv *c, expr_ty e)
 /* ---------------------------------------------------------------------- */
 /* Entry point (compiler_codegen) */
 
-static int qp_validate(struct symtable *st, mod_ty mod, int flags, qp_error *err)
+static int qp_validate(struct symtable *st, mod_ty mod, int flags, const char *filename,
+                       JSValueConst module, qp_error *err)
 {
     qpv c;
     qpv_unit u;
@@ -2532,6 +2842,9 @@ static int qp_validate(struct symtable *st, mod_ty mod, int flags, qp_error *err
     c.ctx = st->st_ctx;
     c.err = err;
     c.features = flags;
+    c.filename = filename;
+    c.module = module;
+    c.disable_warning = 0;
     c.u = NULL;
     c.atom_debug = JS_NewAtom(c.ctx, "__debug__");
     c.atom_star = JS_NewAtom(c.ctx, "*");
@@ -2564,6 +2877,159 @@ static int qp_validate(struct symtable *st, mod_ty mod, int flags, qp_error *err
     JS_FreeAtom(c.ctx, c.atom_debug);
     JS_FreeAtom(c.ctx, c.atom_star);
     return ret < 0 ? -1 : 0;
+}
+
+/* ---------------------------------------------------------------------- */
+/* ast_preprocess.c: PEP 765 control flow in `finally` (enable_warnings) */
+
+/* ControlFlowInFinallyContext */
+typedef struct qpv_cf_ctx {
+    BOOL in_finally;
+    BOOL in_funcdef;
+    BOOL in_loop;
+} qpv_cf_ctx;
+
+typedef struct qpv_pp {
+    JSContext *ctx;
+    qp_error *err;
+    const char *filename;
+    JSValueConst module;
+    const qpv_cf_ctx *top;      /* get_cf_finally_top, NULL when empty */
+} qpv_pp;
+
+static int qpv_pp_stmts(qpv_pp *st, asdl_stmt_seq *stmts);
+
+/* push_cf_context / pop_cf_context around `stmts` */
+static int qpv_pp_stmts_in(qpv_pp *st, asdl_stmt_seq *stmts, BOOL finally, BOOL funcdef,
+                           BOOL loop)
+{
+    qpv_cf_ctx cf = { finally, funcdef, loop };
+    const qpv_cf_ctx *prev = st->top;
+    int ret;
+
+    st->top = &cf;
+    ret = qpv_pp_stmts(st, stmts);
+    st->top = prev;
+    return ret;
+}
+
+/* control_flow_in_finally_warning */
+static int qpv_pp_warning(qpv_pp *st, const char *kw, stmt_ty n)
+{
+    char msg[64];
+
+    snprintf(msg, sizeof(msg), "'%s' in a 'finally' block", kw);
+    return qp_syntax_warn_err(st->ctx, st->err, st->filename, st->module, msg,
+                              n->lineno, n->col_offset + 1,
+                              n->end_lineno, n->end_col_offset + 1);
+}
+
+static int qpv_pp_stmt(qpv_pp *st, stmt_ty s)
+{
+    Py_ssize_t i;
+
+    if (js_check_stack_overflow(st->ctx->rt, 0)) {
+        qp_error_set(st->err, QP_ERR_RECURSION, 0, 0, 0, 0, "%s",
+                     "maximum recursion depth exceeded during compilation");
+        return -1;
+    }
+    switch (s->kind) {
+    case FunctionDef_kind:
+        return qpv_pp_stmts_in(st, s->v.FunctionDef.body, FALSE, TRUE, FALSE);
+    case AsyncFunctionDef_kind:
+        return qpv_pp_stmts_in(st, s->v.AsyncFunctionDef.body, FALSE, TRUE, FALSE);
+    case ClassDef_kind:
+        return qpv_pp_stmts(st, s->v.ClassDef.body);
+    case Return_kind:
+        /* before_return */
+        if (st->top && st->top->in_finally && !st->top->in_funcdef)
+            return qpv_pp_warning(st, "return", s);
+        return 0;
+    case For_kind:
+        if (qpv_pp_stmts_in(st, s->v.For.body, FALSE, FALSE, TRUE) < 0)
+            return -1;
+        return qpv_pp_stmts(st, s->v.For.orelse);
+    case AsyncFor_kind:
+        if (qpv_pp_stmts_in(st, s->v.AsyncFor.body, FALSE, FALSE, TRUE) < 0)
+            return -1;
+        return qpv_pp_stmts(st, s->v.AsyncFor.orelse);
+    case While_kind:
+        if (qpv_pp_stmts_in(st, s->v.While.body, FALSE, FALSE, TRUE) < 0)
+            return -1;
+        return qpv_pp_stmts(st, s->v.While.orelse);
+    case If_kind:
+        if (qpv_pp_stmts(st, s->v.If.body) < 0)
+            return -1;
+        return qpv_pp_stmts(st, s->v.If.orelse);
+    case With_kind:
+        return qpv_pp_stmts(st, s->v.With.body);
+    case AsyncWith_kind:
+        return qpv_pp_stmts(st, s->v.AsyncWith.body);
+    case Try_kind:
+    case TryStar_kind: {
+        BOOL star = s->kind == TryStar_kind;
+        asdl_excepthandler_seq *handlers = star ? s->v.TryStar.handlers : s->v.Try.handlers;
+        if (qpv_pp_stmts(st, star ? s->v.TryStar.body : s->v.Try.body) < 0)
+            return -1;
+        for (i = 0; i < asdl_seq_LEN(handlers); i++) {
+            excepthandler_ty h = asdl_seq_GET(handlers, i);
+            if (qpv_pp_stmts(st, h->v.ExceptHandler.body) < 0)
+                return -1;
+        }
+        if (qpv_pp_stmts(st, star ? s->v.TryStar.orelse : s->v.Try.orelse) < 0)
+            return -1;
+        return qpv_pp_stmts_in(st, star ? s->v.TryStar.finalbody : s->v.Try.finalbody,
+                               TRUE, FALSE, FALSE);
+    }
+    case Match_kind:
+        for (i = 0; i < asdl_seq_LEN(s->v.Match.cases); i++) {
+            match_case_ty m = asdl_seq_GET(s->v.Match.cases, i);
+            if (qpv_pp_stmts(st, m->body) < 0)
+                return -1;
+        }
+        return 0;
+    case Break_kind:
+    case Continue_kind:
+        /* before_loop_exit */
+        if (st->top && st->top->in_finally && !st->top->in_loop)
+            return qpv_pp_warning(st, s->kind == Break_kind ? "break" : "continue", s);
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+static int qpv_pp_stmts(qpv_pp *st, asdl_stmt_seq *stmts)
+{
+    Py_ssize_t i;
+
+    for (i = 0; i < asdl_seq_LEN(stmts); i++) {
+        if (qpv_pp_stmt(st, asdl_seq_GET(stmts, i)) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+static int qp_preprocess_warnings(JSContext *ctx, mod_ty mod, const char *filename,
+                                  JSValueConst module, qp_error *err)
+{
+    qpv_pp st;
+
+    if (JS_IsUndefined(module))
+        return 0;
+    st.ctx = ctx;
+    st.err = err;
+    st.filename = filename;
+    st.module = module;
+    st.top = NULL;
+    switch (mod->kind) {
+    case Module_kind:
+        return qpv_pp_stmts(&st, mod->v.Module.body);
+    case Interactive_kind:
+        return qpv_pp_stmts(&st, mod->v.Interactive.body);
+    default:
+        return 0;
+    }
 }
 
 #undef QPV_WILDCARD_CHECK

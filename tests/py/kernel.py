@@ -20,6 +20,12 @@ Protocol (one JSON object per line):
   Python code and of subprocesses is captured alike.
 - ``reset`` answers ``{"ok": true}`` after replacing the namespace (and the
   event loop) with fresh ones; ``quit`` answers ``{"ok": true}`` and exits.
+- ``info`` answers ``{"version": sys.version, "executable": sys.executable,
+  "stdlib": [dir of os.py, its realpath]}``, the interpreter-specific strings
+  the harness normalises.
+
+At start the kernel hides third-party packages (``drop_site_packages``): the
+packages installed for each interpreter are host state, not runtime behaviour.
 
 The kernel machinery uses only portable stdlib modules (sys, os, io, json, ast,
 asyncio, contextlib, traceback, time, types); the prelude additionally imports
@@ -434,11 +440,49 @@ def _send(fd: int, obj: dict) -> None:
         data = data[os.write(fd, data):]
 
 
+def interpreter_info() -> dict:
+    """Host-specific strings the harness replaces with placeholders (see replay.py)."""
+    stdlib = os.path.dirname(os.path.abspath(os.__file__))
+    return {
+        "version": sys.version,
+        "executable": sys.executable,
+        "stdlib": [stdlib, os.path.realpath(stdlib)],
+    }
+
+
+SITE_DIR_NAMES = ("site-packages", "dist-packages")
+
+
+def drop_site_packages() -> None:
+    """Hide third-party packages: truncate ``sys.path`` at the first site dir.
+
+    Which packages are installed for an interpreter is a property of the
+    host, not of the runtime: the reference CPython sees everything
+    pip-installed into its site-packages, the IUT its own (empty) one.  Both
+    kernels therefore drop the site-packages entries (system and user) and
+    the ``.pth`` entries that ``site`` appended after them, and forget the
+    modules already imported from there.
+    """
+    for i, entry in enumerate(sys.path):
+        if os.path.basename(os.path.normpath(entry or ".")) in SITE_DIR_NAMES:
+            dropped = [os.path.abspath(p) for p in sys.path[i:] if p]
+            del sys.path[i:]
+            break
+    else:
+        return
+    for name, module in list(sys.modules.items()):
+        path = getattr(module, "__file__", None)
+        if isinstance(path, str) and any(path.startswith(d + os.sep) for d in dropped):
+            del sys.modules[name]
+    sys.path_importer_cache.clear()
+
+
 def main() -> None:
     """Serve requests from stdin until ``quit`` or EOF, then exit immediately."""
     # Cells must not import the harness modules that live next to this file.
     if sys.path and os.path.abspath(sys.path[0] or ".") == os.path.dirname(os.path.abspath(__file__)):
         del sys.path[0]
+    drop_site_packages()
     proto_out = os.dup(1)
     proto_in = os.fdopen(os.dup(0), "rb")
     null_fd = os.open(os.devnull, os.O_RDWR)
@@ -461,6 +505,8 @@ def main() -> None:
         elif op == "reset":
             kernel.reset()
             _send(proto_out, {"ok": True})
+        elif op == "info":
+            _send(proto_out, interpreter_info())
         elif op == "quit":
             _send(proto_out, {"ok": True})
             break

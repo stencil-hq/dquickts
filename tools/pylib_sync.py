@@ -1,23 +1,33 @@
 #!/usr/bin/env python3.15
-"""Sync the pinned pure-Python stdlib subset from cpython/Lib into pylib/.
+"""Sync the pinned pure-Python standard library from cpython/Lib into pylib/.
 
 pylib/ holds the CPython 3.15.2 standard-library modules that quickpy runs
-as Python source (everything else is provided natively by the VM).  The
-subset is described by pylib/MANIFEST.txt: one path per line, relative to
-CPython's Lib/ directory (``os.py`` for a module file, ``json/`` for a
+as Python source (everything else is provided natively by the VM or by
+CPython's C modules built over the C API layer).  It is the whole of Lib/
+except the entries listed in EXCLUDED below (the test suite, which L3 runs
+from cpython/Lib/test directly, and the Tk-based GUI packages).
+
+pylib/MANIFEST.txt describes the copied set: one path per line, relative
+to CPython's Lib/ directory (``os.py`` for a module file, ``json/`` for a
 package directory, copied recursively without ``test``/``tests``/
-``idle_test`` subdirectories, ``__pycache__`` and ``*.pyc``).  ``#`` starts a
-comment; the trailing comment sections of the generated manifest list the
-native (C) modules the closure needs.
+``idle_test`` subdirectories, ``__pycache__`` and ``*.pyc``).  ``#``
+starts a comment; the trailing comment sections of the generated manifest
+list the native (C) modules each pure module imports.
 
 Files are read from the git objects of the pinned tag, not from the work
-tree, so local edits or patches in cpython/ never leak into pylib/.
+tree, so local edits or patches in cpython/ never leak into pylib/.  The
+one exception is WHEEL_EDITS: members of the wheels bundled with ensurepip
+that quickpy has to adjust (see there); the wheel is rewritten with the
+edited members and its RECORD updated, and ``--check`` compares the
+members' contents.  pylib/site-packages/ (where pip installs into the
+default environment) is never touched.
 
 Usage:
   tools/pylib_sync.py                 sync pylib/ from pylib/MANIFEST.txt
   tools/pylib_sync.py --check         exit 1 if pylib/ differs from a sync
-  tools/pylib_sync.py --manifest      regenerate MANIFEST.txt from ROOTS
-                                      (static import closure), then sync
+  tools/pylib_sync.py --manifest      regenerate MANIFEST.txt (Lib/ minus
+                                      EXCLUDED, native-module sections from
+                                      a static import scan), then sync
   tools/pylib_sync.py --manifest --check
                                       also exit 1 if MANIFEST.txt is stale
 
@@ -27,10 +37,14 @@ ast module and sys.stdlib_module_names of the same version).
 
 import argparse
 import ast
+import base64
+import csv
 import hashlib
+import io
 import os
 import re
 import subprocess
+import zipfile
 import sys
 
 CPYTHON_TAG = "v3.15.2"
@@ -41,25 +55,81 @@ PYLIB_DIR = os.path.join(ROOT_DIR, "pylib")
 MANIFEST = "MANIFEST.txt"
 SOURCE = "SOURCE"
 KEEP = {MANIFEST, SOURCE}
+# Top-level pylib/ directories owned by the user (pip's default install
+# target, on sys.path after the stdlib): never listed as stale or removed.
+USER_DIRS = {"site-packages"}
 
 # Subdirectories never copied when a package directory is copied.
 EXCLUDED_DIRS = {"test", "tests", "idle_test", "__pycache__"}
 
-# Roots of the import closure written by --manifest.  Packages among them
-# are taken whole; every other package only contributes the modules that
-# are actually imported (plus the __init__.py of each parent).
-ROOTS = """
-json re collections pathlib subprocess os glob shutil time struct textwrap
-difflib ast tempfile hashlib sqlite3 datetime urllib concurrent.futures
-statistics random importlib math itertools shlex functools dataclasses enum
-typing copy operator heapq bisect fractions decimal string contextlib io
-pprint keyword unicodedata csv base64 binascii zlib types abc warnings
-traceback inspect dis linecache tokenize unittest doctest argparse logging
-weakref threading queue signal locale codecs encodings fnmatch posixpath
-genericpath stat errno numbers reprlib gettext selectors socket tarfile
-zipfile gzip bz2 lzma calendar email html http asyncio pdb site sysconfig
-platform uuid _pyio
-""".split()
+# Top-level Lib/ entries that are not copied (module or package names;
+# every other file and directory of Lib/ is).
+EXCLUDED = {
+    "test": "CPython's test suite; L3 runs it from cpython/Lib/test",
+    "idlelib": "IDLE (Tk GUI)",
+    "tkinter": "Tk GUI bindings",
+    "turtle": "Tk turtle graphics",
+    "turtledemo": "turtle demos",
+    "__phello__": "frozen-module test package",
+    "site-packages": "pip's install target (README.txt only)",
+}
+
+# Edits of members of wheels bundled under ensurepip/_bundled:
+# {wheel: {member: [(old, new), ...]}}; each `old` must occur exactly once.
+#
+# pip's vendored packaging.tags decides which wheels this interpreter can
+# install from sys.implementation.name.  quickpy is not "cpython", so
+# unmodified packaging only offers py3-none-* and quickpy315-* tags and no
+# binary wheel from PyPI matches.  quickpy loads CPython's stable ABI
+# (abi3, python/capi_dynload.c) and nothing version-specific, so the edits
+# make packaging treat "quickpy" as a cp interpreter (cp3XX-abi3-<platform>
+# for X <= 15, cp315-none-*, py3-none-*) whose own ABI list is empty, which
+# drops cp315-cp315-* wheels.  Wheels built from source against quickpy's own
+# headers (plan D5 Tier S: EXT_SUFFIX ".quickpy-315-<multiarch>.so", which
+# meson-python and setuptools tag quickpy315-quickpy_315_<multiarch>-<plat>)
+# come first in cpython_tags(), which both sys_tags() and pip's
+# compatibility_tags.get_supported() call.
+PIP_WHEEL = "ensurepip/_bundled/pip-26.2.2-py3-none-any.whl"
+WHEEL_EDITS = {
+    PIP_WHEEL: {
+        "pip/_vendor/packaging/tags.py": [
+            ('    "cpython": "cp",\n',
+             '    "cpython": "cp",\n'
+             '    # quickpy (dquickts) runs CPython\'s stable ABI; see _cpython_abis\n'
+             '    "quickpy": "cp",\n'),
+            ('    py_version = tuple(py_version)  # To allow for version comparison.\n'
+             '    abis = []\n',
+             '    py_version = tuple(py_version)  # To allow for version comparison.\n'
+             '    if sys.implementation.name == "quickpy":\n'
+             '        # quickpy loads stable-ABI (abi3) extension modules only, never\n'
+             '        # version-specific cpXY ones: cpython_tags() then offers the abi3\n'
+             '        # and "none" tags.\n'
+             '        return []\n'
+             '    abis = []\n'),
+            ('    interpreter = f"cp{_version_nodot(python_version[:2])}"\n',
+             '    interpreter = f"cp{_version_nodot(python_version[:2])}"\n'
+             '    if (sys.implementation.name == "quickpy"\n'
+             '            and tuple(python_version[:2]) == sys.version_info[:2]):\n'
+             '        # quickpy\'s own ABI (Tier S source builds against its headers,\n'
+             '        # EXT_SUFFIX ".quickpy-315-<multiarch>.so"), before the stable ABI\n'
+             '        platforms = list(platforms or platform_tags())\n'
+             '        tier_s = f"quickpy{_version_nodot(python_version[:2])}"\n'
+             '        for abi in _generic_abi():\n'
+             '            for platform_ in platforms:\n'
+             '                yield Tag(tier_s, abi, platform_)\n'),
+        ],
+        # uninstalling (also pip install --force-reinstall/--upgrade) asks
+        # importlib.util.cache_from_source for each .py file's __pycache__
+        # entry; quickpy writes no bytecode caches (sys.implementation.
+        # cache_tag is None), where cache_from_source raises
+        # NotImplementedError
+        "pip/_internal/req/req_uninstall.py": [
+            ('        if os.path.splitext(path)[1] == ".py":\n',
+             '        if (os.path.splitext(path)[1] == ".py"\n'
+             '                and sys.implementation.cache_tag is not None):\n'),
+        ],
+    },
+}
 
 # Exception names whose handler makes a `try:` body an optional import.
 IMPORT_GUARDS = {"ImportError", "ModuleNotFoundError", "Exception",
@@ -193,6 +263,59 @@ def parse_manifest(tree, text):
     return sorted(selected)
 
 
+def wheel_members(data):
+    """{member name: bytes} of a wheel (zip) given as bytes."""
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        return {info.filename: zf.read(info) for info in zf.infolist()}
+
+
+def edit_wheel(data, edits, name):
+    """The wheel `data` with WHEEL_EDITS applied and its RECORD updated."""
+    with zipfile.ZipFile(io.BytesIO(data)) as src:
+        infos = src.infolist()
+        members = {info.filename: src.read(info) for info in infos}
+    new = {}
+    for member, pairs in edits.items():
+        if member not in members:
+            die("%s: no member %s to edit" % (name, member))
+        text = members[member].decode("utf-8")
+        for old, repl in pairs:
+            if text.count(old) != 1:
+                die("%s: %s: edit anchor found %d times (expected once): %r"
+                    % (name, member, text.count(old), old))
+            text = text.replace(old, repl)
+        new[member] = text.encode("utf-8")
+    records = [m for m in members if m.endswith(".dist-info/RECORD")]
+    if len(records) != 1:
+        die("%s: expected one .dist-info/RECORD" % name)
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\n")
+    for row in csv.reader(io.StringIO(members[records[0]].decode("utf-8"))):
+        if row and row[0] in new:
+            digest = hashlib.sha256(new[row[0]]).digest()
+            row = [row[0], "sha256=" + base64.urlsafe_b64encode(digest)
+                   .rstrip(b"=").decode("ascii"), str(len(new[row[0]]))]
+        writer.writerow(row)
+    new[records[0]] = out.getvalue().encode("utf-8")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as dst:
+        for info in infos:
+            zi = zipfile.ZipInfo(info.filename, info.date_time)
+            zi.compress_type = info.compress_type
+            zi.external_attr = info.external_attr
+            zi.create_system = info.create_system
+            dst.writestr(zi, new.get(info.filename, members[info.filename]))
+    return buf.getvalue()
+
+
+def expected_data(tree, path):
+    """Content of pylib/<path> after a sync (WHEEL_EDITS applied)."""
+    data = tree.read(path)
+    if path in WHEEL_EDITS:
+        data = edit_wheel(data, WHEEL_EDITS[path], path)
+    return data
+
+
 def source_text(tree):
     return ("# Generated by tools/pylib_sync.py; do not edit.\n"
             "tag: %s\ncommit: %s\n" % (CPYTHON_TAG, tree.commit)).encode()
@@ -204,6 +327,10 @@ def existing_files():
     for dirpath, dirnames, filenames in os.walk(PYLIB_DIR):
         dirnames.sort()
         rel = os.path.relpath(dirpath, PYLIB_DIR)
+        # __pycache__/: bytecode caches qpy writes at import time
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        if rel == ".":
+            dirnames[:] = [d for d in dirnames if d not in USER_DIRS]
         for name in sorted(filenames):
             found.append(name if rel == "." else os.path.join(rel, name)
                          .replace(os.sep, "/"))
@@ -218,8 +345,19 @@ def plan(tree, selected):
         oid = tree.files[path]
         if os.path.isfile(dest) and not os.path.islink(dest):
             with open(dest, "rb") as f:
-                if blob_id(f.read(), len(oid)) == oid:
+                have = f.read()
+            if path in WHEEL_EDITS:
+                # the deflate output depends on the zlib version: compare
+                # the members
+                try:
+                    same = (wheel_members(have)
+                            == wheel_members(expected_data(tree, path)))
+                except zipfile.BadZipFile:
+                    same = False
+                if same:
                     continue
+            elif blob_id(have, len(oid)) == oid:
+                continue
         to_write.append(path)
     src = os.path.join(PYLIB_DIR, SOURCE)
     want = source_text(tree)
@@ -246,7 +384,7 @@ def sync(tree, selected, check):
         os.remove(os.path.join(PYLIB_DIR, p))
     for p in to_write:
         dest = os.path.join(PYLIB_DIR, p)
-        data = source_text(tree) if p == SOURCE else tree.read(p)
+        data = source_text(tree) if p == SOURCE else expected_data(tree, p)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         if os.path.lexists(dest) and not os.path.isfile(dest):
             die("pylib/%s exists and is not a regular file" % p)
@@ -257,6 +395,9 @@ def sync(tree, selected, check):
         os.replace(tmp, dest)
     # Drop directories emptied by removals.
     for dirpath, dirnames, filenames in os.walk(PYLIB_DIR, topdown=False):
+        rel = os.path.relpath(dirpath, PYLIB_DIR).replace(os.sep, "/")
+        if rel.split("/")[0] in USER_DIRS:
+            continue
         if dirpath != PYLIB_DIR and not os.listdir(dirpath):
             os.rmdir(dirpath)
     print("pylib_sync: %d file(s) written, %d removed, %d selected"
@@ -265,7 +406,7 @@ def sync(tree, selected, check):
 
 
 # ---------------------------------------------------------------------------
-# Import closure (--manifest)
+# Manifest generation (--manifest)
 
 
 class ModuleIndex:
@@ -287,9 +428,9 @@ class ModuleIndex:
                 pkg = False
             if not parts or not all(s.isidentifier() for s in parts):
                 continue
-            # CPython's test suite (Lib/test, pkg/tests, ...) is never copied,
-            # so it is not followed either.
-            if any(s in EXCLUDED_DIRS for s in parts):
+            # CPython's test suite (Lib/test, pkg/tests, ...) and EXCLUDED
+            # are never copied.
+            if parts[0] in EXCLUDED or any(s in EXCLUDED_DIRS for s in parts):
                 self.excluded.add(".".join(parts))
                 continue
             # A module is importable only if every parent is a package.
@@ -409,32 +550,35 @@ def posix_native_names():
     return names
 
 
-def compute_closure(tree):
-    """Return (idx, files, whole, natives, missing_sub, excluded) for ROOTS.
+def manifest_entries(tree):
+    """Top-level Lib/ entries minus EXCLUDED: `name.py` files, `dir/`s."""
+    entries = set()
+    for path in tree.files:
+        top = path.split("/", 1)[0]
+        name = top[:-3] if top.endswith(".py") else top
+        if name in EXCLUDED or top in EXCLUDED_DIRS or top.endswith(".pyc"):
+            continue
+        entries.add(top + "/" if "/" in path else top)
+    return sorted(entries, key=lambda e: e.rstrip("/"))
 
-    files: Lib-relative .py files of the closure; whole: root packages.
-    natives / missing_sub / excluded map a module name that is not part of
-    the closure (top-level non-Lib module / missing submodule of a Lib
-    package / module of CPython's test suite) to
-    {"importers": set, "required": bool}, where required means at least one
-    unguarded import of it exists.
+
+def scan_natives(tree, selected):
+    """Classify the imports of the copied modules that are not copied.
+
+    Returns (natives, missing_sub, excluded), each mapping a module name to
+    {"importers": set, "required": bool}: natives are top-level modules
+    that are not Python files in Lib/ (C extensions, builtins, frozen
+    aliases, third-party optional imports); missing_sub are submodules of
+    a copied package that do not exist; excluded are modules of EXCLUDED
+    and of CPython's test suite.  required means at least one unguarded
+    import of it exists.
     """
     idx = ModuleIndex(tree)
-    modules = set()
-    whole = set()       # packages taken whole (roots)
+    selected = set(selected)
     natives = {}
-    missing_sub = {}    # dotted name inside a pure package -> natives-like info
+    missing_sub = {}
+    excluded = {}
     aliases = set()     # names installed into sys.modules by scanned code
-    excluded = {}       # test-suite modules (never copied)
-    work = []
-
-    def add(name):
-        parts = name.split(".")
-        for i in range(1, len(parts) + 1):
-            n = ".".join(parts[:i])
-            if n not in modules:
-                modules.add(n)
-                work.append(n)
 
     def note(table, name, importer, guarded):
         info = table.setdefault(name, {"importers": set(), "required": False})
@@ -445,31 +589,23 @@ def compute_closure(tree):
     def resolve(name, importer, guarded):
         """Record an import of dotted `name`; return True if it is a module."""
         parts = name.split(".")
-        if parts[0] not in idx.path:
-            note(excluded if parts[0] in idx.excluded else natives,
-                 parts[0], importer, guarded)
-            return False
         for i in range(1, len(parts) + 1):
             n = ".".join(parts[:i])
             if n not in idx.path:
-                note(excluded if n in idx.excluded else missing_sub,
-                     n, importer, guarded)
+                if n in idx.excluded or parts[0] in EXCLUDED:
+                    table = excluded
+                else:
+                    table = natives if i == 1 else missing_sub
+                note(table, n, importer, guarded)
                 return False
-            add(n)
             if n not in idx.packages:
                 return True     # rest is an attribute / sys.modules alias
         return True
 
-    for root in ROOTS:
-        if root in idx.packages:
-            whole.add(root)
-            for sub in idx.submodules(root):
-                add(sub)
-        resolve(root, "<root>", False)
-
-    while work:
-        mod = work.pop()
+    for mod in sorted(idx.path):
         path = idx.path[mod]
+        if path not in selected:
+            continue
         is_pkg = mod in idx.packages
         imports, mod_aliases = scan_imports(tree.read(path), "Lib/" + path)
         aliases |= mod_aliases
@@ -484,42 +620,19 @@ def compute_closure(tree):
                     die("Lib/%s: relative import beyond top-level package" % path)
                 pkg_parts = pkg_parts[:len(pkg_parts) - (level - 1)]
                 base = ".".join(pkg_parts + ([base] if base else []))
-            if not resolve(base, mod, guarded) or base not in idx.packages:
-                continue
-            for n in names:
-                if n != "*" and base + "." + n in idx.path:
-                    add(base + "." + n)
+            resolve(base, mod, guarded)
 
-    files = {idx.path[m] for m in modules}
     for name in aliases:
         missing_sub.pop(name, None)
-    return idx, files, whole, natives, missing_sub, excluded
+    return natives, missing_sub, excluded
 
 
-def manifest_entries(tree, idx, files, whole):
-    """Collapse the closure into manifest paths: complete dirs or files."""
-    complete = set()
-    for pkg in idx.packages:
-        d = pkg.replace(".", "/")
-        if pkg in whole:
-            complete.add(d)
-            continue
-        if d.split("/")[-1] in EXCLUDED_DIRS:
-            continue
-        py = [p for p in tree.walk_dir(d) if p.endswith(".py")]
-        if py and all(p in files for p in py):
-            complete.add(d)
-    # Keep only the topmost complete directories (children are implied).
-    top = {d for d in complete
-           if not any(d.startswith(c + "/") for c in complete)}
-    entries = [d + "/" for d in top]
-    entries += [p for p in files if not any(p.startswith(d + "/") for d in top)]
-    return sorted(entries, key=lambda e: e.rstrip("/"))
-
-
-def render_manifest(tree, idx, files, whole, natives, missing_sub, excluded):
+def render_manifest(tree):
     if sys.version_info[:2] != (3, 15):
         die("--manifest needs the host CPython 3.15 (sys.stdlib_module_names)")
+    entries = manifest_entries(tree)
+    natives, missing_sub, excluded = scan_natives(
+        tree, parse_manifest(tree, "\n".join(entries)))
     stdlib = set(sys.stdlib_module_names)
     posix = posix_native_names()
 
@@ -543,37 +656,34 @@ def render_manifest(tree, idx, files, whole, natives, missing_sub, excluded):
     for name in sorted(missing_sub):
         info = missing_sub[name]
         absent.append(fmt(name, info, "" if not info["required"] else "unguarded"))
-    tests = [fmt(name, excluded[name]) for name in sorted(excluded)]
+    not_copied = [fmt(name, excluded[name]) for name in sorted(excluded)]
 
     lines = [
-        "# pylib/MANIFEST.txt -- pure-Python stdlib subset copied into pylib/",
-        "# from cpython/Lib at %s by tools/pylib_sync.py." % CPYTHON_TAG,
+        "# pylib/MANIFEST.txt -- pure-Python stdlib copied into pylib/ from",
+        "# cpython/Lib at %s by tools/pylib_sync.py." % CPYTHON_TAG,
         "#",
         "# One path per line relative to Lib/: `name.py` copies that file,",
         "# `dir/` copies the package recursively (without test/, tests/,",
         "# idle_test/, __pycache__/).  `#` starts a comment.",
         "#",
-        "# Generated by `tools/pylib_sync.py --manifest`: the transitive static",
-        "# import closure (module- and function-level imports) of the roots",
-        "# below; root packages are taken whole.  Edit ROOTS in the script",
+        "# Generated by `tools/pylib_sync.py --manifest`: every top-level entry",
+        "# of Lib/ except the ones below (EXCLUDED in the script); edit EXCLUDED",
         "# and regenerate rather than editing this list by hand.",
         "#",
-        "# roots:",
+        "# not copied:",
     ]
-    line = "#  "
-    for r in ROOTS:
-        if len(line) + len(r) + 1 > 76:
-            lines.append(line)
-            line = "#  "
-        line += " " + r
-    lines.append(line)
+    for name in sorted(EXCLUDED):
+        lines.append("#   %-16s %s" % (name, EXCLUDED[name]))
     lines.append("")
-    lines += manifest_entries(tree, idx, files, whole)
+    lines += entries
     lines += [
         "",
+        "# Native modules imported by the copied modules (static scan of",
+        "# module- and function-level imports; `name <- importers`).",
+        "#",
         "# provided natively:",
-        "# Modules imported by the closure that are not Python files in Lib",
-        "# (C extensions, builtins, frozen aliases); M3 must provide them.",
+        "# Imported unconditionally by at least one module (C extensions,",
+        "# builtins, frozen aliases); the importers need them to work.",
     ] + required + [
         "",
         "# provided natively, optional:",
@@ -587,13 +697,14 @@ def render_manifest(tree, idx, files, whole, natives, missing_sub, excluded):
         "# Not in CPython (third-party / other-implementation optional imports):",
     ] + absent + [
         "",
-        "# CPython test suite (not copied; imported only by test helpers):",
-    ] + tests
+        "# Not copied (EXCLUDED / CPython test suite; imported only by test",
+        "# helpers, demos or optional GUI features):",
+    ] + not_copied
     return "\n".join(lines) + "\n"
 
 
 def regen_manifest(tree, check):
-    text = render_manifest(tree, *compute_closure(tree))
+    text = render_manifest(tree)
     path = os.path.join(PYLIB_DIR, MANIFEST)
     old = None
     if os.path.isfile(path):
@@ -616,7 +727,7 @@ def main():
     ap.add_argument("--check", action="store_true",
                     help="do not write; exit 1 if pylib/ is out of date")
     ap.add_argument("--manifest", action="store_true",
-                    help="regenerate pylib/MANIFEST.txt from ROOTS first")
+                    help="regenerate pylib/MANIFEST.txt first")
     args = ap.parse_args()
 
     tree = CPythonTree()

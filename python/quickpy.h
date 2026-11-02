@@ -29,14 +29,17 @@ struct qp_error;
 
 #ifdef QUICKPY_INTERNAL
 /* ast.parse() semantics (compile() with PyCF_ONLY_AST): reject NUL bytes,
-   parse, then run the __future__ checks. src[len] must be '\0'.
+   parse, then run the __future__ checks. src[len] must be '\0'.  `module`
+   is the SyntaxWarning module (qp_parse_string).
    Returns 0 with *out set (valid until the arena is freed), or -1 with err set. */
 int qp_parse(JSContext *ctx, qp_arena *arena, const char *src, size_t len,
-             const char *filename, int mode, int flags, mod_ty *out, qp_error *err);
+             const char *filename, JSValueConst module, int mode, int flags, mod_ty *out,
+             qp_error *err);
 #endif
 
 /* compile() without code generation: parse, __future__ checks, symbol table
-   and compiler-detected SyntaxErrors. src[len] must be '\0'. All memory is
+   and compiler-detected SyntaxErrors (SyntaxWarnings are dropped).
+   src[len] must be '\0'. All memory is
    released before returning. Returns 0 if the source compiles, -1 with err
    set (unless err is NULL) otherwise. */
 int qp_check(JSContext *ctx, const char *src, size_t len, const char *filename,
@@ -58,5 +61,49 @@ int qp_dump_ast_json_batch(JSContext *ctx, FILE *in, FILE *out);
    flushing the standard streams fails, 130 for an unhandled
    KeyboardInterrupt).  Used by qpy and by `qjs file.py` / `qjs --python`. */
 int qp_main(int argc, char **argv);
+
+/* The base snapshot of qp_main (python/pythonrun.c, plan section 1): the
+   interpreter state after the part of the startup that does not depend on
+   the process, written at build time by qp_write_base_snapshot() (`qpy
+   --write-base-snapshot FILE DIR`: the base of the qpy of directory DIR,
+   plus the make dependencies of FILE in FILE.d; returns the exit status)
+   and embedded in qpy, which gives it to qp_set_base_snapshot() before
+   qp_main().  qp_main() starts from it when it applies (same build,
+   unchanged stdlib sources, a configuration that gives the same state),
+   normally otherwise.  'data' must stay valid. */
+int qp_write_base_snapshot(const char *path, const char *dir);
+void qp_set_base_snapshot(const uint8_t *data, size_t size);
+
+/* `qjs --drepl FILE --python` (python/pythonrun.c): qjs keeps the line
+   editor and runs each input in the session context `ctx`, whose runtime
+   it saves with JS_WriteSnapshot() as a delta of a new session.
+   qp_drepl_init() makes the state of a new session (sys.ps1/ps2, __main__,
+   the SIGINT handler); it only depends on the build, argv0 (its
+   executable) and the hash seed, so that the base of the deltas can be
+   rebuilt in another process (posix.environ is empty, the working
+   directory is not in the state).  qp_drepl_attach(), called after the
+   base of a new session is written and after a restore, checks that the
+   context is a Python session (-1 if not), gives it the signals and fills
+   posix.environ from the environment.  qp_drepl_environ(ctx, 0) empties
+   posix.environ before each save, qp_drepl_environ(ctx, 1) fills it
+   again after it: a session file never holds the environment.
+   qp_drepl_signals() installs the session's SIGINT handler for the run of
+   an input and returns the previous one.  qp_drepl_input_complete() is
+   codeop's decision (1 run it, 0 read more lines).  qp_drepl_exec() runs
+   one input (top-level await allowed) and returns 0, 1 if an exception was
+   reported, or 2 with *pstatus for SystemExit.  qp_drepl_prompt() is
+   str(sys.ps1) or str(sys.ps2) and qp_drepl_names() the completions of a
+   word (see pythonrun.c); both return strings freed with JS_FreeCString(),
+   or NULL. */
+int qp_drepl_init(JSContext *ctx, const char *argv0, uint32_t hash_seed);
+int qp_drepl_attach(JSContext *ctx);
+void qp_drepl_environ(JSContext *ctx, int fill);
+void (*qp_drepl_signals(JSContext *ctx))(int);
+void qp_drepl_set_stack(JSRuntime *rt);
+void qp_drepl_banner(char *buf, size_t size);
+const char *qp_drepl_prompt(JSContext *ctx, int more);
+int qp_drepl_input_complete(JSContext *ctx, const char *src, size_t len);
+int qp_drepl_exec(JSContext *ctx, const char *src, size_t len, int *pstatus);
+const char *qp_drepl_names(JSContext *ctx, const char *expr, const char *prefix);
 
 #endif /* QUICKPY_H */

@@ -17,9 +17,15 @@
  * pc -> location table, co_exceptiontable is empty (handlers are `catch`
  * opcodes).  replace() can change co_name, co_qualname, co_filename and
  * co_firstlineno (the facade keeps the overrides); changing any other
- * field would require recompiling and raises ValueError.  The code()
- * constructor is not provided: CPython bytecode cannot be run by this VM,
- * so type(code)(...) raises TypeError "cannot create 'code' instances".
+ * field would require recompiling and raises ValueError.
+ *
+ * The code() constructor (used by Cython's limited-API modules for the
+ * __code__ of their functions) builds an "explicit" code object: CPython
+ * bytecode cannot be run by this VM, so it reports exactly the fields it
+ * was given (QPCodeObject.fields) over a synthesized bytecode with the
+ * same calling convention, function kind and free variables, whose body
+ * raises SystemError when it runs.  replace() of an explicit code object
+ * calls the constructor again with the changed fields.
  */
 
 /* private helpers of funcobject.c */
@@ -33,6 +39,8 @@ typedef struct QPCodeObject {
     JSValue filename;
     int firstlineno;
     BOOL has_firstlineno;
+    uint32_t flags_add;         /* replace(co_flags=...) override: CO_ITERABLE_COROUTINE */
+    JSValue fields;             /* explicit code object: tuple of the 18 code() fields, else QP_NULL */
 } QPCodeObject;
 
 static void qp_code_finalizer(JSRuntime *rt, JSValue val)
@@ -45,6 +53,7 @@ static void qp_code_finalizer(JSRuntime *rt, JSValue val)
     JS_FreeValueRT(rt, c->name);
     JS_FreeValueRT(rt, c->qualname);
     JS_FreeValueRT(rt, c->filename);
+    JS_FreeValueRT(rt, c->fields);
     js_free_rt(rt, c);
 }
 
@@ -58,6 +67,7 @@ static void qp_code_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func
     JS_MarkValue(rt, c->name, mark_func);
     JS_MarkValue(rt, c->qualname, mark_func);
     JS_MarkValue(rt, c->filename, mark_func);
+    JS_MarkValue(rt, c->fields, mark_func);
 }
 
 static BOOL qp_co_check(JSValueConst v)
@@ -92,12 +102,16 @@ static JSValue qp_co_alloc(JSContext *ctx, JSValueConst bytecode, const QPCodeOb
         c->filename = JS_DupValue(ctx, from->filename);
         c->firstlineno = from->firstlineno;
         c->has_firstlineno = from->has_firstlineno;
+        c->flags_add = from->flags_add;
+        c->fields = JS_DupValue(ctx, from->fields);
     } else {
         c->name = QP_NULL;
         c->qualname = QP_NULL;
         c->filename = QP_NULL;
         c->firstlineno = 0;
         c->has_firstlineno = FALSE;
+        c->flags_add = 0;
+        c->fields = QP_NULL;
     }
     JS_VALUE_GET_OBJ(obj)->u.opaque = c;
     return obj;
@@ -109,6 +123,14 @@ static JSValue qp_code_new(JSContext *ctx, JSValueConst bytecode)
         !((JSFunctionBytecode *)JS_VALUE_GET_PTR(bytecode))->is_py)
         return qp_raise_system_error(ctx, "code object over non-Python bytecode");
     return qp_co_alloc(ctx, bytecode, NULL);
+}
+
+/* co_flags bits a code object adds to those of its bytecode
+   (types.coroutine: CO_ITERABLE_COROUTINE); 0 for other values */
+static uint32_t qp_code_extra_flags(JSValueConst code)
+{
+    QPCodeObject *c = qp_co_data(code);
+    return c ? c->flags_add : 0;
 }
 
 static struct JSFunctionBytecode *qp_code_bytecode(JSValueConst code_or_func)
@@ -126,6 +148,31 @@ static struct JSFunctionBytecode *qp_code_bytecode(JSValueConst code_or_func)
         p->u.func.function_bytecode->is_py)
         return p->u.func.function_bytecode;
     return NULL;
+}
+
+static void qp_code_mark_native_bc(JSFunctionBytecode *b)
+{
+    int i;
+
+    if (!b->is_py || !b->py_code || (b->py_code->co_flags & QP_CO_NATIVE))
+        return;
+    b->py_code->co_flags |= QP_CO_NATIVE;
+    for (i = 0; i < b->cpool_count; i++) {
+        if (JS_VALUE_GET_TAG(b->cpool[i]) == JS_TAG_FUNCTION_BYTECODE)
+            qp_code_mark_native_bc(JS_VALUE_GET_PTR(b->cpool[i]));
+    }
+}
+
+static void qp_code_mark_native(JSValueConst code_or_func)
+{
+    JSFunctionBytecode *b;
+
+    if (JS_VALUE_GET_TAG(code_or_func) == JS_TAG_FUNCTION_BYTECODE)
+        b = JS_VALUE_GET_PTR(code_or_func);
+    else
+        b = qp_code_bytecode(code_or_func);
+    if (b)
+        qp_code_mark_native_bc(b);
 }
 
 /* ---- field accessors ----------------------------------------------------- */
@@ -391,6 +438,101 @@ static int qp_co_insn_size(const uint8_t *buf, int pos)
     return short_opcode_info(op).size;
 }
 
+/* Byte offsets of the instruction starts of b (*pn of them); NULL with
+   *pn = 0 for empty bytecode or on allocation failure. */
+static uint32_t *qp_co_insn_starts(JSContext *ctx, JSFunctionBytecode *b, int *pn)
+{
+    const uint8_t *buf = b->byte_code_buf;
+    int pos, n = 0, len = b->byte_code_len;
+    uint32_t *starts;
+
+    *pn = 0;
+    for (pos = 0; pos < len; pos += qp_co_insn_size(buf, pos))
+        n++;
+    if (n == 0)
+        return NULL;
+    starts = js_malloc(ctx, sizeof(uint32_t) * n);
+    if (!starts)
+        return NULL;
+    n = 0;
+    for (pos = 0; pos < len; pos += qp_co_insn_size(buf, pos))
+        starts[n++] = pos;
+    *pn = n;
+    return starts;
+}
+
+/* Index of the instruction containing pc in starts[0..n) (n > 0). */
+static int qp_co_starts_index(const uint32_t *starts, int n, uint32_t pc)
+{
+    int lo = 0, hi = n - 1, found = 0;
+
+    while (lo <= hi) {
+        int mid = (lo + hi) >> 1;
+        if (starts[mid] <= pc) {
+            found = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return found;
+}
+
+static int qp_code_pc2lasti(JSFunctionBytecode *b, uint32_t pc)
+{
+    const uint8_t *buf = b->byte_code_buf;
+    int pos = 0, idx = 0, size;
+
+    if (pc >= (uint32_t)b->byte_code_len)
+        return -1;
+    for (;;) {
+        size = qp_co_insn_size(buf, pos);
+        if (pc < (uint32_t)(pos + size))
+            return 2 * idx;
+        pos += size;
+        idx++;
+    }
+}
+
+static int qp_code_lasti2pc(JSFunctionBytecode *b, int lasti)
+{
+    const uint8_t *buf = b->byte_code_buf;
+    int pos = 0, idx;
+
+    if (lasti < 0)
+        return -1;
+    for (idx = lasti / 2; idx > 0 && pos < b->byte_code_len; idx--)
+        pos += qp_co_insn_size(buf, pos);
+    return pos < b->byte_code_len ? pos : -1;
+}
+
+/* co_code: one 2-byte code unit per instruction (opcode, first operand
+   byte or py subop), matching the offsets of co_positions(), co_lines(),
+   f_lasti and tb_lasti. */
+static JSValue qp_co_code(JSContext *ctx, JSFunctionBytecode *b)
+{
+    const uint8_t *buf = b->byte_code_buf;
+    int pos, n = 0, len = b->byte_code_len;
+    uint8_t *out;
+    JSValue res;
+
+    for (pos = 0; pos < len; pos += qp_co_insn_size(buf, pos))
+        n++;
+    if (n == 0)
+        return qp_bytes_new(ctx, "", 0);
+    out = js_malloc(ctx, 2 * n);
+    if (!out)
+        return JS_EXCEPTION;
+    n = 0;
+    for (pos = 0; pos < len; pos += qp_co_insn_size(buf, pos)) {
+        out[n++] = buf[pos];
+        out[n++] = pos + 1 < len && qp_co_insn_size(buf, pos) > 1 ? buf[pos + 1] : 0;
+    }
+    res = qp_bytes_new(ctx, out, n);
+    js_free(ctx, out);
+    return res;
+}
+
 /* co_names: operands of the name subops, first-use order, no duplicates */
 static JSValue qp_co_names(JSContext *ctx, JSFunctionBytecode *b)
 {
@@ -460,27 +602,34 @@ static JSValue qp_co_consts(JSContext *ctx, JSFunctionBytecode *b)
     return t;
 }
 
-/* co_linetable: the pc -> location table as little-endian int32 records
-   (pc, lineno, end_lineno, col, end_col). */
+/* co_linetable: the offset -> location table as little-endian int32 records
+   (offset, lineno, end_lineno, col, end_col); offsets as in co_lines(). */
 static JSValue qp_co_linetable(JSContext *ctx, JSFunctionBytecode *b)
 {
     QPCodeInfo *ci = b->py_code;
     uint32_t i, n = ci ? ci->pcloc_count : 0;
+    uint32_t *starts;
+    int nstarts;
     uint8_t *buf;
     JSValue res;
 
     if (n == 0)
         return qp_bytes_new(ctx, "", 0);
+    starts = qp_co_insn_starts(ctx, b, &nstarts);
+    if (!starts)
+        return nstarts == 0 && b->byte_code_len == 0 ? qp_bytes_new(ctx, "", 0) : JS_EXCEPTION;
     buf = js_malloc(ctx, n * 20);
-    if (!buf)
+    if (!buf) {
+        js_free(ctx, starts);
         return JS_EXCEPTION;
+    }
     for (i = 0; i < n; i++) {
         QPLoc loc;
         int32_t rec[5];
         int k;
         if (qp_code_addr2loc(b, ci->pcloc[i].pc, &loc) < 0)
             loc.lineno = loc.end_lineno = loc.col = loc.end_col = -1;
-        rec[0] = (int32_t)ci->pcloc[i].pc;
+        rec[0] = 2 * qp_co_starts_index(starts, nstarts, ci->pcloc[i].pc);
         rec[1] = loc.lineno;
         rec[2] = loc.end_lineno;
         rec[3] = loc.col;
@@ -490,6 +639,7 @@ static JSValue qp_co_linetable(JSContext *ctx, JSFunctionBytecode *b)
     }
     res = qp_bytes_new(ctx, buf, n * 20);
     js_free(ctx, buf);
+    js_free(ctx, starts);
     return res;
 }
 
@@ -517,6 +667,40 @@ enum {
     QP_CA_CODE_ADAPTIVE,
 };
 
+/* code() fields, in argument order (QPCodeObject.fields) */
+enum {
+    QP_CF_ARGCOUNT, QP_CF_POSONLYARGCOUNT, QP_CF_KWONLYARGCOUNT, QP_CF_NLOCALS,
+    QP_CF_STACKSIZE, QP_CF_FLAGS, QP_CF_CODE, QP_CF_CONSTS, QP_CF_NAMES,
+    QP_CF_VARNAMES, QP_CF_FILENAME, QP_CF_NAME, QP_CF_QUALNAME, QP_CF_FIRSTLINENO,
+    QP_CF_LINETABLE, QP_CF_EXCEPTIONTABLE, QP_CF_FREEVARS, QP_CF_CELLVARS,
+    QP_CF__COUNT
+};
+
+/* field of a getter (QP_CA_*) */
+static int qp_co_field_index(int magic)
+{
+    switch (magic) {
+    case QP_CA_ARGCOUNT: return QP_CF_ARGCOUNT;
+    case QP_CA_POSONLYARGCOUNT: return QP_CF_POSONLYARGCOUNT;
+    case QP_CA_KWONLYARGCOUNT: return QP_CF_KWONLYARGCOUNT;
+    case QP_CA_STACKSIZE: return QP_CF_STACKSIZE;
+    case QP_CA_FLAGS: return QP_CF_FLAGS;
+    case QP_CA_NLOCALS: return QP_CF_NLOCALS;
+    case QP_CA_CONSTS: return QP_CF_CONSTS;
+    case QP_CA_NAMES: return QP_CF_NAMES;
+    case QP_CA_FILENAME: return QP_CF_FILENAME;
+    case QP_CA_NAME: return QP_CF_NAME;
+    case QP_CA_QUALNAME: return QP_CF_QUALNAME;
+    case QP_CA_FIRSTLINENO: return QP_CF_FIRSTLINENO;
+    case QP_CA_LINETABLE: return QP_CF_LINETABLE;
+    case QP_CA_EXCEPTIONTABLE: return QP_CF_EXCEPTIONTABLE;
+    case QP_CA_VARNAMES: return QP_CF_VARNAMES;
+    case QP_CA_CELLVARS: return QP_CF_CELLVARS;
+    case QP_CA_FREEVARS: return QP_CF_FREEVARS;
+    default: return QP_CF_CODE;   /* QP_CA_CODE, QP_CA_CODE_ADAPTIVE */
+    }
+}
+
 static JSValue qp_co_get(JSContext *ctx, JSValueConst self, int magic)
 {
     QPCodeObject *c = qp_co_data(self);
@@ -526,6 +710,8 @@ static JSValue qp_co_get(JSContext *ctx, JSValueConst self, int magic)
 
     if (!c)
         return qp_raise_type_error(ctx, "descriptor requires a 'code' object but received '%T'", self);
+    if (!QP_IS_NULL(c->fields))
+        return JS_DupValue(ctx, QP_TUPLE_ITEMS(c->fields)[qp_co_field_index(magic)]);
     b = JS_VALUE_GET_PTR(c->bytecode);
     ci = b->py_code;
     switch (magic) {
@@ -538,7 +724,7 @@ static JSValue qp_co_get(JSContext *ctx, JSValueConst self, int magic)
     case QP_CA_STACKSIZE:
         return JS_NewInt32(ctx, b->stack_size);
     case QP_CA_FLAGS:
-        return JS_NewInt32(ctx, (int32_t)ci->co_flags);
+        return JS_NewInt32(ctx, (int32_t)((ci->co_flags & ~QP_CO_NATIVE) | c->flags_add));
     case QP_CA_NLOCALS:
         n = qp_co_nlocals(ctx, b);
         if (n < 0)
@@ -567,7 +753,7 @@ static JSValue qp_co_get(JSContext *ctx, JSValueConst self, int magic)
     case QP_CA_FREEVARS:
         return qp_co_kind_tuple(ctx, b, QP_CO_FREEVARS);
     default:
-        return qp_bytes_new(ctx, b->byte_code_buf, b->byte_code_len);
+        return qp_co_code(ctx, b);
     }
 }
 
@@ -614,41 +800,52 @@ static JSValue qp_co_lines(JSContext *ctx, JSValueConst self, JSValueConst *args
     QPCodeInfo *ci = b->py_code;
     JSValue list, it;
     uint32_t i, n = ci->pcloc_count;
-    int v[3];
+    uint32_t *starts;
+    int nstarts, end, v[3];
 
     list = qp_list_new(ctx, 0);
     if (JS_IsException(list))
         return JS_EXCEPTION;
-    if (n == 0 && b->byte_code_len > 0) {
+    starts = qp_co_insn_starts(ctx, b, &nstarts);
+    if (!starts) {
+        if (b->byte_code_len > 0)
+            goto fail;
+        n = 0;
+    }
+    end = 2 * nstarts;
+    if (n == 0 && end > 0) {
         v[0] = 0;
-        v[1] = b->byte_code_len;
+        v[1] = end;
         v[2] = -1;
         if (qp_co_append_ints(ctx, list, 3, v) < 0)
             goto fail;
     }
     i = 0;
     while (i < n) {
-        v[0] = i == 0 ? 0 : (int)ci->pcloc[i].pc;
+        v[0] = i == 0 ? 0 : 2 * qp_co_starts_index(starts, nstarts, ci->pcloc[i].pc);
         v[2] = qp_co_pcloc_line(b, i);
         i++;
         while (i < n && qp_co_pcloc_line(b, i) == v[2])
             i++;
-        v[1] = i < n ? (int)ci->pcloc[i].pc : b->byte_code_len;
+        v[1] = i < n ? 2 * qp_co_starts_index(starts, nstarts, ci->pcloc[i].pc) : end;
         if (v[1] > v[0]) {
             /* start and end are never negative */
             if (qp_co_append_ints(ctx, list, 3, v) < 0)
                 goto fail;
         }
     }
+    js_free(ctx, starts);
     it = qp_iter(ctx, list);
     JS_FreeValue(ctx, list);
     return it;
  fail:
+    js_free(ctx, starts);
     JS_FreeValue(ctx, list);
     return JS_EXCEPTION;
 }
 
-/* co_positions(): one (lineno, end_lineno, col, end_col) per instruction */
+/* co_positions(): one (lineno, end_lineno, col, end_col) per instruction,
+   i.e. per 2-byte code unit of co_code */
 static JSValue qp_co_positions(JSContext *ctx, JSValueConst self, JSValueConst *args,
                                int nargs, JSValueConst kwnames, int magic)
 {
@@ -681,6 +878,294 @@ static JSValue qp_co_positions(JSContext *ctx, JSValueConst self, JSValueConst *
     return it;
 }
 
+/* ---- code() -------------------------------------------------------------- */
+
+/* the first Python bytecode in the constant pool of b, NULL if none */
+static JSFunctionBytecode *qp_co_first_nested(JSFunctionBytecode *b)
+{
+    int i;
+    for (i = 0; i < b->cpool_count; i++) {
+        if (JS_VALUE_GET_TAG(b->cpool[i]) == JS_TAG_FUNCTION_BYTECODE &&
+            ((JSFunctionBytecode *)JS_VALUE_GET_PTR(b->cpool[i]))->is_py)
+            return JS_VALUE_GET_PTR(b->cpool[i]);
+    }
+    return NULL;
+}
+
+/* name tuples (names, varnames, freevars, cellvars): str items only */
+static int qp_co_check_names(JSContext *ctx, JSValueConst t)
+{
+    Py_ssize_t i;
+    for (i = 0; i < QP_TUPLE_SIZE(t); i++) {
+        JSValueConst v = QP_TUPLE_ITEMS(t)[i];
+        if (!qp_str_check(ctx, v)) {
+            qp_raise_type_error(ctx, "name tuples must contain only strings, not '%T'", v);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Name i of a name tuple for the synthesized source: the name itself
+   (real) or `prefix`i. */
+static int qp_co_synth_name(JSContext *ctx, DynBuf *db, JSValueConst names, int i, BOOL real,
+                            char prefix)
+{
+    const char *s;
+    size_t len;
+
+    if (!real)
+        return dbuf_printf(db, "%c%d", prefix, i);
+    s = qp_str_utf8(ctx, QP_TUPLE_ITEMS(names)[i], &len);
+    if (!s)
+        return -1;
+    return dbuf_put(db, (const uint8_t *)s, len);
+}
+
+/* The bytecode of an explicit code object: a function with the
+   parameters of varnames in CPython's localsplus order (positional,
+   keyword-only, *args, **kwargs) and the free variables of an enclosing
+   function, whose body raises SystemError.  real: the given names (so that
+   keyword arguments bind), else generated ones (a0.., f0..).  Returns the
+   function bytecode, owned by *pbc (the compiled module); NULL with *pbc
+   JS_EXCEPTION on error, NULL with no exception pending when the real
+   names cannot be used (not identifiers, keywords, duplicates, shadowing
+   SystemError, ...). */
+static JSFunctionBytecode *qp_co_synth(JSContext *ctx, const int *iv, JSValueConst varnames,
+                                       JSValueConst freevars, BOOL real, JSValue *pbc)
+{
+    int argcount = iv[QP_CF_ARGCOUNT], flags = iv[QP_CF_FLAGS];
+    int nargs = argcount + iv[QP_CF_KWONLYARGCOUNT];
+    int total = nargs + ((flags & CO_VARARGS) != 0) + ((flags & CO_VARKEYWORDS) != 0);
+    int nfree = (int)QP_TUPLE_SIZE(freevars), i, r = 0;
+    JSFunctionBytecode *mb, *fb;
+    const char *indent = nfree ? "    " : "";
+    DynBuf db;
+    JSValue bc;
+
+    *pbc = JS_UNDEFINED;
+    if (real) {
+        /* the body refers to the builtin SystemError */
+        for (i = 0; i < total + nfree; i++) {
+            JSValueConst n = i < total ? QP_TUPLE_ITEMS(varnames)[i]
+                                       : QP_TUPLE_ITEMS(freevars)[i - total];
+            const char *s = qp_str_utf8(ctx, n, NULL);
+            if (!s) {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                return NULL;
+            }
+            if (!strcmp(s, "SystemError"))
+                return NULL;
+        }
+    }
+    js_dbuf_init(ctx, &db);
+    if (nfree) {
+        dbuf_putstr(&db, "def __qp_outer():\n    ");
+        for (i = 0; i < nfree; i++) {
+            r |= qp_co_synth_name(ctx, &db, freevars, i, real, 'f');
+            r |= dbuf_putstr(&db, " = ");
+        }
+        dbuf_putstr(&db, "None\n");
+    }
+    dbuf_printf(&db, "%s%sdef __qp_code(", indent,
+                (flags & (CO_COROUTINE | CO_ASYNC_GENERATOR)) ? "async " : "");
+    for (i = 0; i < argcount; i++) {
+        r |= qp_co_synth_name(ctx, &db, varnames, i, real, 'a');
+        dbuf_putstr(&db, i + 1 == iv[QP_CF_POSONLYARGCOUNT] ? ", /, " : ", ");
+    }
+    if (flags & CO_VARARGS) {
+        /* localsplus order: *args follows the keyword-only names */
+        dbuf_putc(&db, '*');
+        r |= qp_co_synth_name(ctx, &db, varnames, nargs, real, 'a');
+        dbuf_putstr(&db, ", ");
+    } else if (nargs > argcount) {
+        dbuf_putstr(&db, "*, ");
+    }
+    for (i = argcount; i < nargs; i++) {
+        r |= qp_co_synth_name(ctx, &db, varnames, i, real, 'a');
+        dbuf_putstr(&db, ", ");
+    }
+    if (flags & CO_VARKEYWORDS) {
+        dbuf_putstr(&db, "**");
+        r |= qp_co_synth_name(ctx, &db, varnames, total - 1, real, 'a');
+        dbuf_putstr(&db, ", ");
+    }
+    dbuf_printf(&db, "):\n%s    raise SystemError('code object created by code() cannot be "
+                "executed: CPython bytecode is not supported')\n", indent);
+    if (flags & (CO_GENERATOR | CO_ASYNC_GENERATOR))
+        dbuf_printf(&db, "%s    yield\n", indent);
+    for (i = 0; i < nfree; i++) {
+        dbuf_printf(&db, "%s    ", indent);
+        r |= qp_co_synth_name(ctx, &db, freevars, i, real, 'f');
+        dbuf_putc(&db, '\n');
+    }
+    if (r < 0 && real) {
+        /* a name without UTF-8 form */
+        dbuf_free(&db);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return NULL;
+    }
+    if (r || dbuf_putc(&db, '\0')) {
+        dbuf_free(&db);
+        if (!JS_HasException(ctx))
+            JS_ThrowOutOfMemory(ctx);
+        *pbc = JS_EXCEPTION;
+        return NULL;
+    }
+    bc = qp_compile_source(ctx, (const char *)db.buf, db.size - 1, "<code>", JS_UNDEFINED,
+                           257 /* Py_file_input */, 0, 0, NULL);
+    dbuf_free(&db);
+    if (JS_IsException(bc)) {
+        if (!real) {
+            *pbc = JS_EXCEPTION;
+            return NULL;
+        }
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return NULL;
+    }
+    mb = qp_co_first_nested(JS_VALUE_GET_PTR(bc));
+    fb = mb && nfree ? qp_co_first_nested(mb) : mb;
+    if (!fb || fb->closure_var_count != nfree) {
+        JS_FreeValue(ctx, bc);
+        return NULL;
+    }
+    *pbc = bc;
+    return fb;
+}
+
+/* code(argcount, posonlyargcount, kwonlyargcount, nlocals, stacksize, flags,
+        codestring, constants, names, varnames, filename, name, qualname,
+        firstlineno, linetable, exceptiontable, freevars=(), cellvars=())
+   from its QP_CF__COUNT arguments (QP_NULL: freevars / cellvars omitted).
+   Validation as code_new_impl + _PyCode_Validate. */
+static JSValue qp_co_from_fields(JSContext *ctx, JSValueConst *a)
+{
+    static const char *const neg_names[4] = {
+        "argcount", "posonlyargcount", "kwonlyargcount", "nlocals"
+    };
+    int iv[QP_CF_FIRSTLINENO + 1], i, total;
+    Py_ssize_t codelen;
+    JSValueConst varnames, freevars;
+    JSValue empty = JS_UNDEFINED, fields = JS_UNDEFINED, bc = JS_UNDEFINED, res = JS_EXCEPTION;
+    JSFunctionBytecode *fb;
+    QPCodeObject nc;
+
+    for (i = 0; i < QP_CF__COUNT; i++) {
+        JSValueConst v = a[i];
+        const char *want = NULL;
+        BOOL ok = TRUE;
+
+        switch (i) {
+        case QP_CF_ARGCOUNT: case QP_CF_POSONLYARGCOUNT: case QP_CF_KWONLYARGCOUNT:
+        case QP_CF_NLOCALS: case QP_CF_STACKSIZE: case QP_CF_FLAGS: case QP_CF_FIRSTLINENO:
+            if (qp_arg_int(ctx, v, &iv[i]) < 0)
+                return JS_EXCEPTION;
+            break;
+        case QP_CF_CODE: case QP_CF_LINETABLE: case QP_CF_EXCEPTIONTABLE:
+            want = "bytes";
+            ok = qp_bytes_check(ctx, v);
+            break;
+        case QP_CF_FILENAME: case QP_CF_NAME: case QP_CF_QUALNAME:
+            want = "str";
+            ok = qp_str_check(ctx, v);
+            break;
+        default:
+            if (QP_IS_NULL(v))
+                break;
+            want = "tuple";
+            ok = qp_tuple_check(ctx, v);
+            break;
+        }
+        if (!ok)
+            return qp_raise_type_error(ctx, "code() argument %d must be %s, not %T", i + 1,
+                                       want, v);
+    }
+    for (i = 0; i < 4; i++) {
+        if (iv[i] < 0)
+            return qp_raise_value_error(ctx, "code: %s must not be negative", neg_names[i]);
+    }
+    empty = qp_tuple_new(ctx, 0);
+    if (JS_IsException(empty))
+        return JS_EXCEPTION;
+    varnames = a[QP_CF_VARNAMES];
+    freevars = QP_IS_NULL(a[QP_CF_FREEVARS]) ? empty : a[QP_CF_FREEVARS];
+    if (qp_co_check_names(ctx, a[QP_CF_NAMES]) < 0 || qp_co_check_names(ctx, varnames) < 0 ||
+        qp_co_check_names(ctx, freevars) < 0 ||
+        (!QP_IS_NULL(a[QP_CF_CELLVARS]) && qp_co_check_names(ctx, a[QP_CF_CELLVARS]) < 0))
+        goto done;
+    if (iv[QP_CF_ARGCOUNT] < iv[QP_CF_POSONLYARGCOUNT] || iv[QP_CF_STACKSIZE] < 0 ||
+        iv[QP_CF_FLAGS] < 0) {
+        qp_raise_system_error(ctx, "bad argument to internal function");
+        goto done;
+    }
+    qp_bytes_data(a[QP_CF_CODE], &codelen);
+    if (codelen % 2) {
+        qp_raise_value_error(ctx, "code: co_code is malformed");
+        goto done;
+    }
+    total = iv[QP_CF_ARGCOUNT] + iv[QP_CF_KWONLYARGCOUNT] + ((iv[QP_CF_FLAGS] & CO_VARARGS) != 0) +
+        ((iv[QP_CF_FLAGS] & CO_VARKEYWORDS) != 0);
+    if (QP_TUPLE_SIZE(varnames) < total) {
+        qp_raise_value_error(ctx, "code: co_varnames is too small");
+        goto done;
+    }
+
+    /* the stored fields: co_nlocals is len(co_varnames) (CPython derives
+       it from the local kinds), omitted free/cell variables are () */
+    fields = qp_tuple_new(ctx, QP_CF__COUNT);
+    if (JS_IsException(fields))
+        goto done;
+    for (i = 0; i < QP_CF__COUNT; i++) {
+        JSValue v;
+        if (i == QP_CF_NLOCALS)
+            v = JS_NewInt32(ctx, (int32_t)QP_TUPLE_SIZE(varnames));
+        else if (i <= QP_CF_FLAGS || i == QP_CF_FIRSTLINENO)
+            v = JS_NewInt32(ctx, iv[i]);
+        else if (QP_IS_NULL(a[i]))
+            v = JS_DupValue(ctx, empty);
+        else
+            v = JS_DupValue(ctx, a[i]);
+        QP_TUPLE_ITEMS(fields)[i] = v;
+    }
+
+    fb = qp_co_synth(ctx, iv, varnames, freevars, TRUE, &bc);
+    if (!fb && !JS_IsException(bc))
+        fb = qp_co_synth(ctx, iv, varnames, freevars, FALSE, &bc);
+    if (!fb) {
+        if (!JS_IsException(bc))
+            qp_raise_system_error(ctx, "code(): cannot build the code object");
+        goto done;
+    }
+    memset(&nc, 0, sizeof(nc));
+    nc.name = QP_TUPLE_ITEMS(fields)[QP_CF_NAME];
+    nc.qualname = QP_TUPLE_ITEMS(fields)[QP_CF_QUALNAME];
+    nc.filename = QP_TUPLE_ITEMS(fields)[QP_CF_FILENAME];
+    nc.firstlineno = iv[QP_CF_FIRSTLINENO];
+    nc.has_firstlineno = TRUE;
+    nc.fields = fields;
+    res = qp_co_alloc(ctx, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, fb), &nc);
+ done:
+    JS_FreeValue(ctx, bc);
+    JS_FreeValue(ctx, fields);
+    JS_FreeValue(ctx, empty);
+    return res;
+}
+
+/* code.__new__ (positional-only: Argument Clinic signature of code_new) */
+static JSValue qp_co_new(JSContext *ctx, QPType *subtype, JSValueConst *args, size_t nargsf,
+                         JSValueConst kwnames)
+{
+    static const char *const kwlist[QP_CF__COUNT + 1] = {
+        "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", NULL
+    };
+    static const QPArgSpec spec = { "code", kwlist, QP_CF__COUNT - 2, QP_CF__COUNT, 0 };
+    JSValueConst a[QP_CF__COUNT];
+
+    if (qp_arg_parse(ctx, &spec, args, (int)qp_nargs(nargsf), kwnames, a) < 0)
+        return JS_EXCEPTION;
+    return qp_co_from_fields(ctx, a);
+}
+
 /* Compare a replace() argument with the current value of an unsupported
    field: 0 equal, -1 error (ValueError when different). */
 static int qp_co_replace_same(JSContext *ctx, JSValueConst self, int magic, JSValueConst v,
@@ -701,6 +1186,55 @@ static int qp_co_replace_same(JSContext *ctx, JSValueConst self, int magic, JSVa
         return -1;
     }
     return 0;
+}
+
+/* replace() argument type check (fields 7..17 of the replace() keyword
+   list): 0, -1 TypeError */
+static int qp_co_replace_check(JSContext *ctx, const char *const *kwlist, int i, JSValueConst v)
+{
+    const char *want;
+    BOOL ok;
+
+    if (i == 7 || i >= 16) {
+        want = "bytes";
+        ok = qp_bytes_check(ctx, v);
+    } else if (i <= 12) {
+        want = "tuple";
+        ok = qp_tuple_check(ctx, v);
+    } else {
+        want = "str";
+        ok = qp_str_check(ctx, v);
+    }
+    if (ok)
+        return 0;
+    qp_raise_type_error(ctx, "replace() argument '%s' must be %s, not %T", kwlist[i], want, v);
+    return -1;
+}
+
+/* replace() of an explicit code object: code() with the changed fields */
+static JSValue qp_co_replace_explicit(JSContext *ctx, QPCodeObject *c, const char *const *kwlist,
+                                      JSValueConst *a)
+{
+    /* code() field of each replace() keyword */
+    static const uint8_t field_of[18] = {
+        QP_CF_ARGCOUNT, QP_CF_POSONLYARGCOUNT, QP_CF_KWONLYARGCOUNT, QP_CF_NLOCALS,
+        QP_CF_STACKSIZE, QP_CF_FLAGS, QP_CF_FIRSTLINENO, QP_CF_CODE, QP_CF_CONSTS,
+        QP_CF_NAMES, QP_CF_VARNAMES, QP_CF_FREEVARS, QP_CF_CELLVARS, QP_CF_FILENAME,
+        QP_CF_NAME, QP_CF_QUALNAME, QP_CF_LINETABLE, QP_CF_EXCEPTIONTABLE
+    };
+    JSValueConst f[QP_CF__COUNT];
+    int i;
+
+    for (i = 0; i < QP_CF__COUNT; i++)
+        f[i] = QP_TUPLE_ITEMS(c->fields)[i];
+    for (i = 0; i < 18; i++) {
+        if (QP_IS_NULL(a[i]))
+            continue;
+        if (i >= 7 && qp_co_replace_check(ctx, kwlist, i, a[i]) < 0)
+            return JS_EXCEPTION;
+        f[field_of[i]] = a[i];
+    }
+    return qp_co_from_fields(ctx, f);
 }
 
 /* code.replace(*, co_argcount=..., ...) */
@@ -727,9 +1261,13 @@ static JSValue qp_co_replace(JSContext *ctx, JSValueConst self, JSValueConst *ar
     JSValueConst a[18];
     JSValue res;
     int i, iv;
+    uint32_t base_flags = ((JSFunctionBytecode *)JS_VALUE_GET_PTR(c->bytecode))->py_code->co_flags &
+        ~QP_CO_NATIVE;
 
     if (qp_arg_parse(ctx, &spec, args, nargs, kwnames, a) < 0)
         return JS_EXCEPTION;
+    if (!QP_IS_NULL(c->fields))
+        return qp_co_replace_explicit(ctx, c, kwlist, a);
     nc = *c;
     for (i = 0; i < 7; i++) {
         if (QP_IS_NULL(a[i]))
@@ -741,6 +1279,11 @@ static JSValue qp_co_replace(JSContext *ctx, JSValueConst self, JSValueConst *ar
         if (i == 6) {
             nc.firstlineno = iv;
             nc.has_firstlineno = TRUE;
+        } else if (i == 5 && (base_flags & CO_GENERATOR) &&
+                   ((uint32_t)iv & ~(uint32_t)CO_ITERABLE_COROUTINE) == base_flags) {
+            /* types.coroutine: a generator becomes awaitable; the flag only
+               changes how its generators are awaited, not the bytecode */
+            nc.flags_add = (uint32_t)iv & CO_ITERABLE_COROUTINE;
         } else {
             JSValue cur = qp_co_get(ctx, self, int_magic[i]);
             int same;
@@ -754,33 +1297,20 @@ static JSValue qp_co_replace(JSContext *ctx, JSValueConst self, JSValueConst *ar
     }
     for (i = 7; i < 18; i++) {
         JSValueConst v = a[i];
-        const char *want;
-        BOOL ok;
 
         if (QP_IS_NULL(v))
             continue;
-        if (i == 7 || i >= 16) {
-            want = "bytes";
-            ok = qp_bytes_check(ctx, v);
-        } else if (i <= 12) {
-            want = "tuple";
-            ok = qp_tuple_check(ctx, v);
-        } else {
-            want = "str";
-            ok = qp_str_check(ctx, v);
-        }
-        if (!ok)
-            return qp_raise_type_error(ctx, "replace() argument '%s' must be %s, not %T",
-                                       kwlist[i], want, v);
+        if (qp_co_replace_check(ctx, kwlist, i, v) < 0)
+            return JS_EXCEPTION;
         switch (i) {
         case 13:
-            nc.filename = v;
+            nc.filename = (JSValue)v;   /* borrowed: qp_co_alloc dups */
             break;
         case 14:
-            nc.name = v;
+            nc.name = (JSValue)v;
             break;
         case 15:
-            nc.qualname = v;
+            nc.qualname = (JSValue)v;
             break;
         default:
             if (qp_co_replace_same(ctx, self, obj_magic[i - 7], v, kwlist[i]) < 0)
@@ -972,20 +1502,21 @@ static Py_hash_t qp_co_hash(JSContext *ctx, JSValueConst self)
 }
 
 static const QPGetSetDef qp_co_getsets[] = {
-    { "co_argcount", qp_co_get, NULL, QP_CA_ARGCOUNT, NULL },
-    { "co_posonlyargcount", qp_co_get, NULL, QP_CA_POSONLYARGCOUNT, NULL },
-    { "co_kwonlyargcount", qp_co_get, NULL, QP_CA_KWONLYARGCOUNT, NULL },
-    { "co_stacksize", qp_co_get, NULL, QP_CA_STACKSIZE, NULL },
-    { "co_flags", qp_co_get, NULL, QP_CA_FLAGS, NULL },
-    { "co_nlocals", qp_co_get, NULL, QP_CA_NLOCALS, NULL },
-    { "co_consts", qp_co_get, NULL, QP_CA_CONSTS, NULL },
-    { "co_names", qp_co_get, NULL, QP_CA_NAMES, NULL },
-    { "co_filename", qp_co_get, NULL, QP_CA_FILENAME, NULL },
-    { "co_name", qp_co_get, NULL, QP_CA_NAME, NULL },
-    { "co_qualname", qp_co_get, NULL, QP_CA_QUALNAME, NULL },
-    { "co_firstlineno", qp_co_get, NULL, QP_CA_FIRSTLINENO, NULL },
-    { "co_linetable", qp_co_get, NULL, QP_CA_LINETABLE, NULL },
-    { "co_exceptiontable", qp_co_get, NULL, QP_CA_EXCEPTIONTABLE, NULL },
+    /* code_memberlist */
+    { "co_argcount", qp_co_get, NULL, QP_CA_ARGCOUNT, NULL, QP_GETSET_MEMBER },
+    { "co_posonlyargcount", qp_co_get, NULL, QP_CA_POSONLYARGCOUNT, NULL, QP_GETSET_MEMBER },
+    { "co_kwonlyargcount", qp_co_get, NULL, QP_CA_KWONLYARGCOUNT, NULL, QP_GETSET_MEMBER },
+    { "co_stacksize", qp_co_get, NULL, QP_CA_STACKSIZE, NULL, QP_GETSET_MEMBER },
+    { "co_flags", qp_co_get, NULL, QP_CA_FLAGS, NULL, QP_GETSET_MEMBER },
+    { "co_nlocals", qp_co_get, NULL, QP_CA_NLOCALS, NULL, QP_GETSET_MEMBER },
+    { "co_consts", qp_co_get, NULL, QP_CA_CONSTS, NULL, QP_GETSET_MEMBER },
+    { "co_names", qp_co_get, NULL, QP_CA_NAMES, NULL, QP_GETSET_MEMBER },
+    { "co_filename", qp_co_get, NULL, QP_CA_FILENAME, NULL, QP_GETSET_MEMBER },
+    { "co_name", qp_co_get, NULL, QP_CA_NAME, NULL, QP_GETSET_MEMBER },
+    { "co_qualname", qp_co_get, NULL, QP_CA_QUALNAME, NULL, QP_GETSET_MEMBER },
+    { "co_firstlineno", qp_co_get, NULL, QP_CA_FIRSTLINENO, NULL, QP_GETSET_MEMBER },
+    { "co_linetable", qp_co_get, NULL, QP_CA_LINETABLE, NULL, QP_GETSET_MEMBER },
+    { "co_exceptiontable", qp_co_get, NULL, QP_CA_EXCEPTIONTABLE, NULL, QP_GETSET_MEMBER },
     { "_co_code_adaptive", qp_co_get, NULL, QP_CA_CODE_ADAPTIVE, NULL },
     { "co_varnames", qp_co_get, NULL, QP_CA_VARNAMES, NULL },
     { "co_cellvars", qp_co_get, NULL, QP_CA_CELLVARS, NULL },
@@ -1016,11 +1547,12 @@ static const QPTypeSpec qp_co_code_spec = {
            "     flags, codestring, constants, names, varnames, filename, name,\n"
            "     qualname, firstlineno, linetable, exceptiontable, freevars=(),\n"
            "     cellvars=(), /)\n--\n\nCreate a code object.  Not for the faint of heart.",
-    .flags = QP_TPFLAGS_IMMUTABLETYPE,
+    .flags = QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_WEAKREF,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_CODE,
     .slots = {
+        .tp_new = qp_co_new,
         .tp_repr = qp_co_repr,
         .tp_hash = qp_co_hash,
         .tp_richcompare = qp_co_richcompare,
@@ -1028,3 +1560,209 @@ static const QPTypeSpec qp_co_code_spec = {
     .methods = qp_co_methods,
     .getsets = qp_co_getsets,
 };
+
+/* ------------------------------------------------------------------------ */
+/* Serialisation of the Python code metadata (JSFunctionBytecode.py_code)   */
+/* ------------------------------------------------------------------------ */
+
+/* Shared by the bytecode writer (JS_WriteObject with
+   JS_WRITE_OBJ_BYTECODE: marshal of code objects, .pyc files) and the
+   heap snapshots (qp_snap_write_code): a presence byte (bit 0: is_py,
+   bit 1: py_code present), then the QPCodeInfo fields; the inline caches
+   are restored empty (only their count is written). */
+static int qp_bc_write_code(BCWriterState *s, JSFunctionBytecode *b)
+{
+    QPCodeInfo *ci = b->py_code;
+    uint32_t i;
+
+    bc_put_u8(s, b->is_py | ((ci != NULL) << 1));
+    if (!ci)
+        return 0;
+    bc_put_leb128(s, ci->co_flags);
+    bc_put_leb128(s, ci->argcount);
+    bc_put_leb128(s, ci->posonlyargcount);
+    bc_put_leb128(s, ci->kwonlyargcount);
+    bc_put_sleb128(s, ci->firstlineno);
+    if (bc_put_atom(s, ci->qualname))
+        return -1;
+    bc_put_sleb128(s, ci->doc_cpool_idx);
+    bc_put_leb128(s, ci->loc_count);
+    for (i = 0; i < ci->loc_count; i++) {
+        bc_put_sleb128(s, ci->locs[i].lineno);
+        bc_put_sleb128(s, ci->locs[i].end_lineno);
+        bc_put_sleb128(s, ci->locs[i].col);
+        bc_put_sleb128(s, ci->locs[i].end_col);
+    }
+    bc_put_leb128(s, ci->pcloc_count);
+    for (i = 0; i < ci->pcloc_count; i++) {
+        bc_put_leb128(s, ci->pcloc[i].pc);
+        bc_put_leb128(s, ci->pcloc[i].loc);
+    }
+    bc_put_leb128(s, ci->ic_count);
+    return 0;
+}
+
+/* invalid input: the snapshot reader records the message, the bytecode
+   reader throws a SyntaxError like its other checks */
+static int qp_bc_read_invalid(BCReaderState *s, const char *what)
+{
+#ifdef QP_SNAPSHOT
+    if (s->is_snapshot)
+        return snap_error((SnapReader *)s, "invalid Python %s", what);
+#endif
+    if (!s->error_state)
+        JS_ThrowSyntaxError(s->ctx, "invalid Python %s", what);
+    return s->error_state = -1;
+}
+
+static int qp_bc_get_int(BCReaderState *s, int *pv)
+{
+    int32_t v;
+    if (bc_get_sleb128(s, &v))
+        return -1;
+    *pv = v;
+    return 0;
+}
+
+/* qp_bc_write_code's data; b->py_code is attached before it is filled
+   (freed with the bytecode on error) */
+static int qp_bc_read_code(BCReaderState *s, JSFunctionBytecode *b)
+{
+    JSContext *ctx = s->ctx;
+    QPCodeInfo *ci;
+    uint8_t bits;
+    uint32_t v, i, n;
+
+    if (bc_get_u8(s, &bits))
+        return -1;
+    b->is_py = bits & 1;
+    if (!(bits & 2))
+        return 0;
+    ci = qp_code_info_new(ctx);
+    if (!ci)
+        return -1;
+    b->py_code = ci;
+    if (bc_get_leb128(s, &ci->co_flags))
+        return -1;
+    if (bc_get_leb128(s, &v)) return -1;
+    ci->argcount = v;
+    if (bc_get_leb128(s, &v)) return -1;
+    ci->posonlyargcount = v;
+    if (bc_get_leb128(s, &v)) return -1;
+    ci->kwonlyargcount = v;
+    if (qp_bc_get_int(s, &ci->firstlineno) ||
+        bc_get_atom(s, &ci->qualname) ||
+        qp_bc_get_int(s, &ci->doc_cpool_idx) ||
+        bc_get_leb128(s, &n))
+        return -1;
+    if (n > s->buf_end - s->ptr)
+        return qp_bc_read_invalid(s, "location table");
+    if (n) {
+        ci->locs = js_malloc(ctx, sizeof(ci->locs[0]) * n);
+        if (!ci->locs)
+            return -1;
+        ci->loc_size = n;
+        for (i = 0; i < n; i++) {
+            QPLoc *l = &ci->locs[i];
+            if (qp_bc_get_int(s, &l->lineno) || qp_bc_get_int(s, &l->end_lineno) ||
+                qp_bc_get_int(s, &l->col) || qp_bc_get_int(s, &l->end_col))
+                return -1;
+            ci->loc_count = i + 1;
+        }
+    }
+    if (bc_get_leb128(s, &n))
+        return -1;
+    if (n > s->buf_end - s->ptr)
+        return qp_bc_read_invalid(s, "location map");
+    if (n) {
+        ci->pcloc = js_malloc(ctx, sizeof(ci->pcloc[0]) * n);
+        if (!ci->pcloc)
+            return -1;
+        for (i = 0; i < n; i++) {
+            if (bc_get_leb128(s, &ci->pcloc[i].pc) ||
+                bc_get_leb128(s, &ci->pcloc[i].loc))
+                return -1;
+            if (ci->pcloc[i].loc >= ci->loc_count)
+                return qp_bc_read_invalid(s, "location map");
+            ci->pcloc_count = i + 1;
+        }
+    }
+    if (bc_get_leb128(s, &v))
+        return -1;
+    if (v > UINT16_MAX)
+        return qp_bc_read_invalid(s, "inline cache count");
+    ci->ic_count = v;
+    /* inline caches restored empty, kinds from the bytecode */
+    return qp_code_info_setup_ic(ctx, b);
+}
+
+/* Bump when the meaning of the code the compiler emits changes without
+   a change of the opcode tables (part of qp_pyc_format_hash). */
+#define QP_PYC_FORMAT_VERSION 1
+
+static void qp_pyc_hash_bytes(uint64_t *h, const void *data, size_t len)
+{
+    const uint8_t *p = data;
+    size_t i;
+    for (i = 0; i < len; i++) {
+        *h ^= p[i];
+        *h *= 0x100000001b3ULL;
+    }
+}
+
+static void qp_pyc_hash_u32(uint64_t *h, uint32_t v)
+{
+    uint8_t b[4] = { v, v >> 8, v >> 16, v >> 24 };
+    qp_pyc_hash_bytes(h, b, 4);
+}
+
+/* Identity of the serialised code of this build (FNV-1a): bytecode
+   format, opcode and subop tables, predefined atoms and the build of the
+   compiler and the interpreter (quickjs.c with python/ is one unit, so
+   __DATE__/__TIME__ change with any of them).  Code objects written by
+   marshal carry it and the .pyc magic number is derived from it, so that
+   importlib never runs bytecode of another build. */
+static uint64_t qp_pyc_format_hash(void)
+{
+    static uint64_t hash;
+    uint64_t h;
+    int i;
+
+    if (hash)
+        return hash;
+    h = 0xcbf29ce484222325ULL;
+    qp_pyc_hash_bytes(&h, CONFIG_VERSION, strlen(CONFIG_VERSION));
+    qp_pyc_hash_bytes(&h, __DATE__ " " __TIME__, strlen(__DATE__ " " __TIME__));
+    qp_pyc_hash_u32(&h, QP_PYC_FORMAT_VERSION);
+    qp_pyc_hash_u32(&h, BC_VERSION);
+    qp_pyc_hash_u32(&h, JS_ATOM_END);
+    qp_pyc_hash_bytes(&h, js_atom_init, sizeof(js_atom_init));
+    qp_pyc_hash_u32(&h, countof(opcode_info));
+    for (i = 0; i < (int)countof(opcode_info); i++) {
+        const JSOpCode *oi = &opcode_info[i];
+        qp_pyc_hash_u32(&h, oi->size | (oi->n_pop << 8) | (oi->n_push << 16) |
+                        ((uint32_t)oi->fmt << 24));
+    }
+    qp_pyc_hash_u32(&h, QP_OP_COUNT);
+    for (i = 0; i < QP_OP_COUNT; i++) {
+        const QPSubopInfo *si = &qp_subop_info[i];
+        qp_pyc_hash_bytes(&h, si->name, strlen(si->name));
+        qp_pyc_hash_u32(&h, si->size | (si->n_pop << 8) | (si->n_push << 16) |
+                        ((uint32_t)si->fmt << 24));
+    }
+    if (!h)
+        h = 1;
+    hash = h;
+    return h;
+}
+
+/* importlib's MAGIC_NUMBER (_imp.pyc_magic_number_token): 2 bytes from
+   qp_pyc_format_hash(), then "\r\n" like CPython's.  The 16-bit number is
+   >= 0x8000, outside the range CPython 3 uses (3000-3999), so a CPython
+   .pyc is never taken for one of this interpreter. */
+static uint32_t qp_pyc_magic_number_token(void)
+{
+    uint64_t h = qp_pyc_format_hash();
+    uint32_t n = 0x8000 | (uint32_t)((h ^ (h >> 16) ^ (h >> 32) ^ (h >> 48)) & 0x7fff);
+    return n | ((uint32_t)'\r' << 16) | ((uint32_t)'\n' << 24);
+}

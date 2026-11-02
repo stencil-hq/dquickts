@@ -14,9 +14,11 @@
  *
  * Arithmetic works on "plain ints" (any int tag or a bool, borrowed): a
  * fast path on int64 values and a slow path on the QuickJS JSBigInt
- * helpers (js_bigint_add/mul/divrem/logic/shl/shr...).  QuickJS limits a
- * bigint to JS_BIGINT_MAX_SIZE limbs (1M bits); larger results raise
- * MemoryError, which is what CPython raises when it cannot allocate one.
+ * helpers (js_bigint_add/mul/divrem/logic/shl/shr...), called through
+ * QP_BIG_CALL: a Python int may have QP_LONG_MAX_LIMBS limbs (about 2^31
+ * bits, object.h) instead of the 1M bits of a JS BigInt; larger results
+ * raise MemoryError, which is what CPython raises when it cannot allocate
+ * one.
  *
  * This file also owns qp_init_numbers (int, bool, then float and complex
  * through qp_init_float / qp_init_complex of floatobject.c and
@@ -37,9 +39,9 @@ static int qp_init_complex(JSContext *ctx);
     "Exceeds the limit (%d digits) for integer string conversion; " \
     "use sys.set_int_max_str_digits() to increase the limit"
 
-/* Largest magnitude bit length a QuickJS bigint can hold (one bit is the
-   sign of the two's complement representation). */
-#define QP_LONG_MAX_BITS ((uint64_t)JS_BIGINT_MAX_SIZE * JS_LIMB_BITS - 1)
+/* Largest magnitude bit length of a Python int (one bit is the sign of the
+   two's complement representation). */
+#define QP_LONG_MAX_BITS ((uint64_t)QP_LONG_MAX_LIMBS * JS_LIMB_BITS - 1)
 
 #define QP_DBL_MANT_DIG 53
 #define QP_DBL_MAX_EXP 1024
@@ -119,14 +121,20 @@ static JSBigInt *qp_li_big(JSValueConst v, JSBigIntBuf *buf)
     }
 }
 
-/* A bigint helper returned NULL: keep uncatchable exceptions (interrupts),
-   turn the JS RangeError "BigInt is too large" / out of memory into
-   MemoryError. */
+/* A bigint helper returned NULL: turn its JS RangeError "BigInt is too
+   large" / InternalError "out of memory" into MemoryError; keep the
+   uncatchable exceptions and the exceptions raised at its interrupt polls
+   (signal handlers). */
 static JSValue qp_long_bigerr(JSContext *ctx)
 {
+    JSValue exc;
     if (ctx->rt->current_exception_is_uncatchable)
         return JS_EXCEPTION;
-    JS_FreeValue(ctx, JS_GetException(ctx));
+    exc = JS_GetException(ctx);
+    if (JS_VALUE_GET_TAG(exc) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_OBJ(exc)->class_id != JS_CLASS_ERROR)
+        return JS_Throw(ctx, exc);
+    JS_FreeValue(ctx, exc);
     return qp_raise_memory_error(ctx);
 }
 
@@ -334,36 +342,44 @@ static JSValue qp_li_add(JSContext *ctx, JSValueConst a, JSValueConst b)
 {
     int64_t x, y, r;
     JSBigIntBuf ba, bb;
+    JSBigInt *p;
     if (qp_li_small(a, &x) && qp_li_small(b, &y) && !__builtin_add_overflow(x, y, &r))
         return qp_long_from_int64(ctx, r);
-    return qp_long_from_big(ctx, js_bigint_add(ctx, qp_li_big(a, &ba), qp_li_big(b, &bb), 0));
+    QP_BIG_CALL(ctx, p, js_bigint_add(ctx, qp_li_big(a, &ba), qp_li_big(b, &bb), 0));
+    return qp_long_from_big(ctx, p);
 }
 
 static JSValue qp_li_sub(JSContext *ctx, JSValueConst a, JSValueConst b)
 {
     int64_t x, y, r;
     JSBigIntBuf ba, bb;
+    JSBigInt *p;
     if (qp_li_small(a, &x) && qp_li_small(b, &y) && !__builtin_sub_overflow(x, y, &r))
         return qp_long_from_int64(ctx, r);
-    return qp_long_from_big(ctx, js_bigint_add(ctx, qp_li_big(a, &ba), qp_li_big(b, &bb), 1));
+    QP_BIG_CALL(ctx, p, js_bigint_add(ctx, qp_li_big(a, &ba), qp_li_big(b, &bb), 1));
+    return qp_long_from_big(ctx, p);
 }
 
 static JSValue qp_li_mul(JSContext *ctx, JSValueConst a, JSValueConst b)
 {
     int64_t x, y, r;
     JSBigIntBuf ba, bb;
+    JSBigInt *p;
     if (qp_li_small(a, &x) && qp_li_small(b, &y) && !__builtin_mul_overflow(x, y, &r))
         return qp_long_from_int64(ctx, r);
-    return qp_long_from_big(ctx, js_bigint_mul(ctx, qp_li_big(a, &ba), qp_li_big(b, &bb)));
+    QP_BIG_CALL(ctx, p, js_bigint_mul(ctx, qp_li_big(a, &ba), qp_li_big(b, &bb)));
+    return qp_long_from_big(ctx, p);
 }
 
 static JSValue qp_li_neg(JSContext *ctx, JSValueConst a)
 {
     int64_t x;
     JSBigIntBuf ba;
+    JSBigInt *p;
     if (qp_li_small(a, &x) && x != INT64_MIN)
         return qp_long_from_int64(ctx, -x);
-    return qp_long_from_big(ctx, js_bigint_neg(ctx, qp_li_big(a, &ba)));
+    QP_BIG_CALL(ctx, p, js_bigint_neg(ctx, qp_li_big(a, &ba)));
+    return qp_long_from_big(ctx, p);
 }
 
 static JSValue qp_li_abs(JSContext *ctx, JSValueConst a)
@@ -377,9 +393,11 @@ static JSValue qp_li_invert(JSContext *ctx, JSValueConst a)
 {
     int64_t x;
     JSBigIntBuf ba;
+    JSBigInt *p;
     if (qp_li_small(a, &x))
         return qp_long_from_int64(ctx, ~x);
-    return qp_long_from_big(ctx, js_bigint_not(ctx, qp_li_big(a, &ba)));
+    QP_BIG_CALL(ctx, p, js_bigint_not(ctx, qp_li_big(a, &ba)));
+    return qp_long_from_big(ctx, p);
 }
 
 /* op = OP_and, OP_or or OP_xor */
@@ -387,6 +405,7 @@ static JSValue qp_li_logic(JSContext *ctx, JSValueConst a, JSValueConst b, OPCod
 {
     int64_t x, y;
     JSBigIntBuf ba, bb;
+    JSBigInt *p;
     if (qp_li_small(a, &x) && qp_li_small(b, &y)) {
         switch (op) {
         case OP_and: return qp_long_from_int64(ctx, x & y);
@@ -394,7 +413,8 @@ static JSValue qp_li_logic(JSContext *ctx, JSValueConst a, JSValueConst b, OPCod
         default:     return qp_long_from_int64(ctx, x ^ y);
         }
     }
-    return qp_long_from_big(ctx, js_bigint_logic(ctx, qp_li_big(a, &ba), qp_li_big(b, &bb), op));
+    QP_BIG_CALL(ctx, p, js_bigint_logic(ctx, qp_li_big(a, &ba), qp_li_big(b, &bb), op));
+    return qp_long_from_big(ctx, p);
 }
 
 /* Floor division and modulo (l_divmod).  pq / pr may be NULL. */
@@ -402,7 +422,7 @@ static int qp_li_divmod(JSContext *ctx, JSValueConst a, JSValueConst b, JSValue 
 {
     int64_t x, y;
     JSBigIntBuf ba, bb;
-    JSBigInt *A, *B;
+    JSBigInt *A, *B, *p;
     JSValue q = JS_UNDEFINED, r, t;
 
     if (qp_li_sign(b) == 0) {
@@ -432,11 +452,13 @@ static int qp_li_divmod(JSContext *ctx, JSValueConst a, JSValueConst b, JSValue 
     }
     A = qp_li_big(a, &ba);
     B = qp_li_big(b, &bb);
-    r = qp_long_from_big(ctx, js_bigint_divrem(ctx, A, B, TRUE));
+    QP_BIG_CALL(ctx, p, js_bigint_divrem(ctx, A, B, TRUE));
+    r = qp_long_from_big(ctx, p);
     if (JS_IsException(r))
         return -1;
     if (pq) {
-        q = qp_long_from_big(ctx, js_bigint_divrem(ctx, A, B, FALSE));
+        QP_BIG_CALL(ctx, p, js_bigint_divrem(ctx, A, B, FALSE));
+        q = qp_long_from_big(ctx, p);
         if (JS_IsException(q)) {
             JS_FreeValue(ctx, r);
             return -1;
@@ -484,6 +506,7 @@ static JSValue qp_li_lshift(JSContext *ctx, JSValueConst a, uint64_t n)
 {
     int64_t x;
     JSBigIntBuf ba;
+    JSBigInt *p;
     if (qp_li_sign(a) == 0)
         return JS_NewInt32(ctx, 0);
     if (qp_li_small(a, &x) && n < 63) {
@@ -493,7 +516,8 @@ static JSValue qp_li_lshift(JSContext *ctx, JSValueConst a, uint64_t n)
     }
     if (n > QP_LONG_MAX_BITS || qp_li_numbits(a) + n > QP_LONG_MAX_BITS)
         return qp_raise_memory_error(ctx);
-    return qp_long_from_big(ctx, js_bigint_shl(ctx, qp_li_big(a, &ba), (unsigned int)n));
+    QP_BIG_CALL(ctx, p, js_bigint_shl(ctx, qp_li_big(a, &ba), (unsigned int)n));
+    return qp_long_from_big(ctx, p);
 }
 
 /* a >> n (floor), n >= 0 */
@@ -509,7 +533,8 @@ static JSValue qp_li_rshift(JSContext *ctx, JSValueConst a, uint64_t n)
     p = JS_VALUE_GET_PTR(a);
     if (n >= (uint64_t)p->len * JS_LIMB_BITS)
         return JS_NewInt32(ctx, js_bigint_sign(p) ? -1 : 0);
-    return qp_long_from_big(ctx, js_bigint_shr(ctx, p, (unsigned int)n));
+    QP_BIG_CALL(ctx, p, js_bigint_shr(ctx, p, (unsigned int)n));
+    return qp_long_from_big(ctx, p);
 }
 
 /* TRUE if any of the low n bits of the non-negative plain int a is set. */
@@ -558,6 +583,23 @@ static JSValue qp_li_pow(JSContext *ctx, JSValueConst a, uint64_t e)
                 return qp_long_from_int64(ctx, r);
             if (__builtin_mul_overflow(bs, bs, &bs))
                 break;
+        }
+        /* (+-2**k) ** e = +-(1 << k*e): no multiplication */
+        {
+            uint64_t m = x < 0 ? -(uint64_t)x : (uint64_t)x;
+            if ((m & (m - 1)) == 0) {
+                int k = ctz64(m);
+                JSValue one = JS_NewInt32(ctx, 1);
+                if (e > QP_LONG_MAX_BITS / k)
+                    return qp_raise_memory_error(ctx);
+                result = qp_li_lshift(ctx, one, (uint64_t)k * e);
+                if (x < 0 && (e & 1) && !JS_IsException(result)) {
+                    t = qp_li_neg(ctx, result);
+                    JS_FreeValue(ctx, result);
+                    result = t;
+                }
+                return result;
+            }
         }
     }
     nb = qp_li_numbits(a);
@@ -1140,11 +1182,28 @@ static JSValue qp_long_from_digit_values(JSContext *ctx, const uint8_t *dv, size
     t = js_mallocz(ctx, nl * sizeof(js_limb_t));
     if (!t)
         return JS_EXCEPTION;
-    while (mult_max <= (js_limb_t)-1 / (js_limb_t)base) {
-        mult_max *= base;
-        k_max++;
+    if ((base & (base - 1)) == 0) {
+        /* binary base (long_from_binary_base): linear */
+        uint64_t bit_pos = 0;
+        for (i = n; i-- > 0;) {
+            size_t pos = bit_pos / JS_LIMB_BITS;
+            int sh = bit_pos % JS_LIMB_BITS;
+            t[pos] |= (js_limb_t)dv[i] << sh;
+            if (sh + bpd > JS_LIMB_BITS)
+                t[pos + 1] |= (js_limb_t)dv[i] >> (JS_LIMB_BITS - sh);
+            bit_pos += bpd;
+        }
+        used = nl;
+        while (used > 0 && t[used - 1] == 0)
+            used--;
+        i = n;
+    } else {
+        while (mult_max <= (js_limb_t)-1 / (js_limb_t)base) {
+            mult_max *= base;
+            k_max++;
+        }
+        i = 0;
     }
-    i = 0;
     while (i < n) {
         size_t m = n - i < (size_t)k_max ? n - i : (size_t)k_max, j;
         js_limb_t chunk = 0, mult = 1, carry;
@@ -1167,7 +1226,7 @@ static JSValue qp_long_from_digit_values(JSContext *ctx, const uint8_t *dv, size
     }
     if (t[used - 1] >> (JS_LIMB_BITS - 1))
         t[used++] = 0;  /* room for the sign bit */
-    r = js_bigint_new(ctx, used);
+    QP_BIG_CALL(ctx, r, js_bigint_new(ctx, used));
     if (!r) {
         js_free(ctx, t);
         return qp_long_bigerr(ctx);
@@ -1361,9 +1420,9 @@ static JSValue qp_long_from_byte_array(JSContext *ctx, const uint8_t *data, size
         return qp_long_from_int64(ctx, (int64_t)acc);
     }
     nl = (n + lb - 1) / lb + 1;
-    if (nl > JS_BIGINT_MAX_SIZE)
+    if (nl > QP_LONG_MAX_LIMBS)
         return qp_raise_memory_error(ctx);
-    r = js_bigint_new(ctx, (int)nl);
+    QP_BIG_CALL(ctx, r, js_bigint_new(ctx, (int)nl));
     if (!r)
         return qp_long_bigerr(ctx);
     memset(r->tab, 0, nl * lb);
@@ -1961,10 +2020,11 @@ static JSValue qp_long_meth_sizeof(JSContext *ctx, JSValueConst self, JSValueCon
                                    int nargs, JSValueConst kwnames, int magic)
 {
     uint64_t nd = (qp_li_numbits(qp_long_unwrap(self)) + QP_LONG_CPY_SHIFT - 1) / QP_LONG_CPY_SHIFT;
+    QPTypeLayout l;
     if (nd < 1)
         nd = 1;
-    /* offsetof(PyLongObject, long_value.ob_digit) + sizeof(digit) * ndigits */
-    return qp_long_from_uint64(ctx, 24 + 4 * nd);
+    qp_type_layout(ctx, qp_type_of(ctx, self), &l);
+    return qp_long_from_uint64(ctx, l.basicsize + l.itemsize * nd);
 }
 
 /* int.__round__(ndigits=None, /) */
@@ -2392,11 +2452,15 @@ static const QPTypeSpec qp_long_spec = {
            ">>> int('0b100', base=0)\n"
            "4",
     .flags = QP_TPFLAGS_BASETYPE | QP_TPFLAGS_LONG_SUBCLASS | QP_TPFLAGS_MATCH_SELF |
-             QP_TPFLAGS_IMMUTABLETYPE,
+             QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_PRIV_VARSIZE,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_BOXED,
     .nslots = 0,
+    /* offsetof(PyLongObject, long_value.ob_digit) (ob_refcnt, ob_type,
+       lv_tag) and sizeof(digit) (sys.int_info.sizeof_digit) */
+    .basicsize = 3 * sizeof(void *),
+    .itemsize = 4,
     .slots = {
         .tp_repr = qp_long_repr_slot,
         .tp_hash = qp_long_hash_slot,
@@ -2506,7 +2570,8 @@ static const QPTypeSpec qp_bool_spec = {
            "Returns True when the argument is true, False otherwise.\n"
            "The builtins True and False are the only two instances of the class bool.\n"
            "The class bool is a subclass of the class int, and cannot be subclassed.",
-    .flags = QP_TPFLAGS_LONG_SUBCLASS | QP_TPFLAGS_MATCH_SELF | QP_TPFLAGS_IMMUTABLETYPE,
+    .flags = QP_TPFLAGS_LONG_SUBCLASS | QP_TPFLAGS_MATCH_SELF | QP_TPFLAGS_IMMUTABLETYPE |
+             QP_TPFLAGS_PRIV_VARSIZE,
     .base = QP_T_int,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_BOXED,

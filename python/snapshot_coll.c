@@ -115,12 +115,206 @@ static inline Py_ssize_t qp_snap_coll_usable_fraction(uint8_t log2_size)
     return (((Py_ssize_t)1 << log2_size) << 1) / 3;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Address-independent tables                                                */
+/* ------------------------------------------------------------------------ */
+
+/* Depth limit of the recursion into tuples, frozensets and weakrefs. */
+#define QP_SNAP_COLL_KEY_DEPTH 8
+
+/* TRUE if the hash of 'key' does not depend on object addresses: exact str,
+   int, bool, float (not NaN), complex, bytes and None, and exact tuples and
+   frozensets of them.  Every other key (types, functions, instances...) may
+   have an identity hash. */
+static BOOL qp_snap_coll_hash_stable(JSContext *ctx, JSValueConst key, int depth)
+{
+    QPType *t;
+
+    if (depth > QP_SNAP_COLL_KEY_DEPTH)
+        return FALSE;
+    t = qp_type_of(ctx, key);
+    if (t == QP_TYPE(ctx, str) || t == QP_TYPE(ctx, int) ||
+        t == QP_TYPE(ctx, bool) || t == QP_TYPE(ctx, bytes) ||
+        t == QP_TYPE(ctx, NoneType))
+        return TRUE;
+    if (t == QP_TYPE(ctx, float) || t == QP_TYPE(ctx, complex)) {
+        /* the hash of a NaN is its identity hash */
+        Py_hash_t h = qp_hash(ctx, key);
+        if (h == -1) {
+            qp_tw_clear_exc(ctx);
+            return FALSE;
+        }
+        return h != (Py_hash_t)qp_hash_pointer((uintptr_t)qp_obj_addr(key));
+    }
+    if (t == QP_TYPE(ctx, tuple)) {
+        Py_ssize_t i, n = QP_TUPLE_SIZE(key);
+        for (i = 0; i < n; i++) {
+            if (!qp_snap_coll_hash_stable(ctx, QP_TUPLE_ITEMS(key)[i], depth + 1))
+                return FALSE;
+        }
+        return TRUE;
+    }
+    if (t == QP_TYPE(ctx, frozenset)) {
+        const qp_setcore *sc = &QP_SET(key)->core;
+        Py_ssize_t i;
+        for (i = 0; i <= sc->mask; i++) {
+            if (QP_SETENTRY_ACTIVE(&sc->table[i]) &&
+                !qp_snap_coll_hash_stable(ctx, sc->table[i].key, depth + 1))
+                return FALSE;
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static uint64_t qp_snap_coll_mix(uint64_t h, uint64_t v)
+{
+    h = (h ^ v) * 0x100000001b3ULL;
+    return h ^ (h >> 29);
+}
+
+static uint64_t qp_snap_coll_mix_bytes(uint64_t h, const char *s, size_t len)
+{
+    size_t i;
+    for (i = 0; i < len; i++)
+        h = (h ^ (uint8_t)s[i]) * 0x100000001b3ULL;
+    return qp_snap_coll_mix(h, len);
+}
+
+/* 'h' mixed with the text of 's' if it is a string */
+static uint64_t qp_snap_coll_mix_str(JSContext *ctx, uint64_t h, JSValueConst s)
+{
+    const char *str;
+    size_t len;
+
+    if (!JS_IsString(s))
+        return h;
+    str = JS_ToCStringLen(ctx, &len, s);
+    if (!str) {
+        qp_tw_clear_exc(ctx);
+        return h;
+    }
+    h = qp_snap_coll_mix_bytes(h, str, len);
+    JS_FreeCString(ctx, str);
+    return h;
+}
+
+static uint64_t qp_snap_coll_mix_atom(JSContext *ctx, uint64_t h, JSAtom a)
+{
+    JSValue s = JS_AtomToString(ctx, a);
+    if (JS_IsException(s)) {
+        qp_tw_clear_exc(ctx);
+        return h;
+    }
+    h = qp_snap_coll_mix_str(ctx, h, s);
+    JS_FreeValue(ctx, s);
+    return h;
+}
+
+/* 'h' mixed with the string value of 'name' in the dict 'd' */
+static uint64_t qp_snap_coll_mix_item(JSContext *ctx, uint64_t h,
+                                      JSValueConst d, JSAtom name)
+{
+    JSValue v;
+    int r;
+
+    if (!qp_dict_check(ctx, d))
+        return h;
+    r = qp_dict_get_item_atom(ctx, d, name, &v);
+    if (r < 0)
+        qp_tw_clear_exc(ctx);
+    if (r <= 0)
+        return h;
+    h = qp_snap_coll_mix_str(ctx, h, v);
+    JS_FreeValue(ctx, v);
+    return h;
+}
+
+/* The order of 'key' in a table written in address-independent form: the
+   same in every process for the same key (its names for types, modules,
+   builtin functions, the referent for weakrefs), unlike its identity
+   hash.  Unrelated keys may share it. Runs no Python code. */
+static uint64_t qp_snap_coll_order_key(JSContext *ctx, JSValueConst key, int depth)
+{
+    uint64_t h = 0xcbf29ce484222325ULL;
+    QPCFunctionObject *f;
+    QPWeakRec *rec;
+    QPType *t;
+
+    if (depth > QP_SNAP_COLL_KEY_DEPTH)
+        return h;
+    if (qp_snap_coll_hash_stable(ctx, key, 0)) {
+        Py_hash_t hv = qp_hash(ctx, key);
+        if (hv == -1)
+            qp_tw_clear_exc(ctx);
+        return qp_snap_coll_mix(h, (uint64_t)hv);
+    }
+    if (JS_VALUE_GET_TAG(key) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_OBJ(key)->class_id == JS_CLASS_PY_TYPE &&
+        (t = JS_VALUE_GET_OBJ(key)->u.opaque)) {
+        h = qp_snap_coll_mix(h, 1);
+        h = qp_snap_coll_mix_atom(ctx, h, t->name);
+        h = qp_snap_coll_mix_str(ctx, h, t->qualname);
+        if (t->tp_name)
+            h = qp_snap_coll_mix_bytes(h, t->tp_name, strlen(t->tp_name));
+        return qp_snap_coll_mix_item(ctx, h, t->dict, QP_ATOM(ctx, __module__));
+    }
+    if (qp_module_check(ctx, key)) {
+        h = qp_snap_coll_mix(h, 2);
+        return qp_snap_coll_mix_item(ctx, h, qp_module_get_dict(key),
+                                     QP_ATOM(ctx, __name__));
+    }
+    if ((f = qp_cfunction_payload(key)) != NULL) {
+        h = qp_snap_coll_mix(h, 3);
+        h = qp_snap_coll_mix_bytes(h, f->ml->name, strlen(f->ml->name));
+        if (!QP_IS_NULL(f->self))
+            h = qp_snap_coll_mix(h, qp_snap_coll_order_key(ctx, f->self, depth + 1));
+        return h;
+    }
+    if ((rec = qp_wr_rec(ctx, key)) != NULL) {
+        h = qp_snap_coll_mix(h, 4);
+        if (rec->target)
+            h = qp_snap_coll_mix(h, qp_snap_coll_order_key(ctx, JS_MKPTR(JS_TAG_OBJECT, rec->target),
+                                                           depth + 1));
+        return h;
+    }
+    if ((t = qp_type_of(ctx, key)) != NULL) {
+        if (t == QP_TYPE(ctx, tuple)) {
+            Py_ssize_t i, n = QP_TUPLE_SIZE(key);
+            h = qp_snap_coll_mix(h, 5);
+            for (i = 0; i < n; i++)
+                h = qp_snap_coll_mix(h, qp_snap_coll_order_key(ctx, QP_TUPLE_ITEMS(key)[i],
+                                                               depth + 1));
+            return h;
+        }
+        /* any other object: its type */
+        h = qp_snap_coll_mix(h, 6);
+        return qp_snap_coll_mix(h, qp_snap_coll_order_key(ctx, JS_MKPTR(JS_TAG_OBJECT, t->obj),
+                                                          depth + 1));
+    }
+    return h;
+}
+
+typedef struct {
+    uint64_t order;
+    Py_ssize_t index;
+} QPSnapCollOrder;
+
+static int qp_snap_coll_order_cmp(const void *a, const void *b)
+{
+    const QPSnapCollOrder *x = a, *y = b;
+    if (x->order != y->order)
+        return x->order < y->order ? -1 : 1;
+    return x->index < y->index ? -1 : x->index > y->index;
+}
+
 static int qp_snap_coll_write_dict(SnapWriter *w, JSObject *p)
 {
     QPDict *d = p->u.opaque;
     qp_dictkeys *keys;
     size_t i, size;
-    Py_ssize_t n;
+    Py_ssize_t n, k;
+    BOOL stable;
 
     qp_snap_coll_put_present(w, d);
     if (!d)
@@ -144,15 +338,43 @@ static int qp_snap_coll_write_dict(SnapWriter *w, JSObject *p)
     if (keys == QP_SNAP_COLL_EMPTY_KEYS)
         return 0;
     size = (size_t)1 << keys->log2_size;
-    for (i = 0; i < size; i++)
-        bc_put_sleb128(&w->bc, (int32_t)qp_dc_get_index(keys, i));
     n = keys->nentries;
+    /* the index table depends on the hashes: if one may depend on object
+       addresses, the active entries are indexed by the first slots, in
+       entry order, and the address-dependent hashes are written as -1, so
+       that the bytes are the same in every process (a reproducible base);
+       the restore rebuilds the index (qp_snap_coll_dict_rehash) */
+    stable = TRUE;
+    for (i = 0; i < (size_t)n && stable; i++) {
+        const qp_dictentry *ep = &keys->entries[i];
+        if (QP_DICTENTRY_ACTIVE(ep) && !keys->unicode &&
+            !qp_snap_coll_hash_stable(w->ctx, ep->key, 0))
+            stable = FALSE;
+    }
+    if (stable) {
+        for (i = 0; i < size; i++)
+            bc_put_sleb128(&w->bc, (int32_t)qp_dc_get_index(keys, i));
+    } else {
+        k = 0;
+        for (i = 0; i < (size_t)n; i++) {
+            if (QP_DICTENTRY_ACTIVE(&keys->entries[i])) {
+                bc_put_sleb128(&w->bc, (int32_t)i);
+                k++;
+            }
+        }
+        for (; k < (Py_ssize_t)size; k++)
+            bc_put_sleb128(&w->bc, QP_DKIX_EMPTY);
+    }
     for (i = 0; i < (size_t)n; i++) {
         const qp_dictentry *ep = &keys->entries[i];
+        Py_hash_t hash = ep->hash;
+        if (!stable && QP_DICTENTRY_ACTIVE(ep) &&
+            !qp_snap_coll_hash_stable(w->ctx, ep->key, 0))
+            hash = -1;
         /* deleted entries hold QP_NULL key and value */
         if (snap_put_value(w, ep->key) ||
             snap_put_value(w, ep->value) ||
-            qp_snap_put_i64(w, ep->hash))
+            qp_snap_put_i64(w, hash))
             return -1;
     }
     return 0;
@@ -359,6 +581,48 @@ enum {
     QP_SNAP_COLL_SLOT_ACTIVE = 2,
 };
 
+/* A set whose layout may depend on object addresses (see
+   qp_snap_coll_hash_stable), written so that the bytes are the same in
+   every process (a reproducible base): its active keys in the first slots,
+   in the order of qp_snap_coll_order_key(), with -1 hashes.  The restore
+   rebuilds the table (qp_snap_coll_set_rehash). */
+static int qp_snap_coll_write_set_ordered(SnapWriter *w, const qp_setcore *sc)
+{
+    QPSnapCollOrder *order;
+    Py_ssize_t i, k;
+    int ret = -1;
+
+    order = js_malloc(w->ctx, sizeof(order[0]) * max_int(sc->used, 1));
+    if (!order)
+        return -1;
+    k = 0;
+    for (i = 0; i <= sc->mask && k < sc->used; i++) {
+        if (QP_SETENTRY_ACTIVE(&sc->table[i])) {
+            order[k].order = qp_snap_coll_order_key(w->ctx, sc->table[i].key, 0);
+            order[k].index = i;
+            k++;
+        }
+    }
+    qsort(order, k, sizeof(order[0]), qp_snap_coll_order_cmp);
+    if (qp_snap_put_i64(w, sc->mask) ||
+        qp_snap_put_i64(w, k) ||
+        qp_snap_put_i64(w, k) ||
+        qp_snap_put_i64(w, 0))
+        goto done;
+    for (i = 0; i < k; i++) {
+        bc_put_u8(&w->bc, QP_SNAP_COLL_SLOT_ACTIVE);
+        if (snap_put_value(w, sc->table[order[i].index].key) ||
+            qp_snap_put_i64(w, -1))
+            goto done;
+    }
+    for (; i <= sc->mask; i++)
+        bc_put_u8(&w->bc, QP_SNAP_COLL_SLOT_UNUSED);
+    ret = 0;
+ done:
+    js_free(w->ctx, order);
+    return ret;
+}
+
 static int qp_snap_coll_write_set(SnapWriter *w, JSObject *p)
 {
     QPSet *s = p->u.opaque;
@@ -371,6 +635,11 @@ static int qp_snap_coll_write_set(SnapWriter *w, JSObject *p)
     sc = &s->core;
     if (sc->mask + 1 > QP_SNAP_COLL_SET_MAX_SIZE)
         return qp_snap_reject(w, p, "set table too large");
+    for (i = 0; i <= sc->mask; i++) {
+        if (QP_SETENTRY_ACTIVE(&sc->table[i]) &&
+            !qp_snap_coll_hash_stable(w->ctx, sc->table[i].key, 0))
+            return qp_snap_coll_write_set_ordered(w, sc);
+    }
     if (qp_snap_put_i64(w, sc->mask) ||
         qp_snap_put_i64(w, sc->fill) ||
         qp_snap_put_i64(w, sc->used) ||

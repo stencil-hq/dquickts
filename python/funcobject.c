@@ -902,9 +902,10 @@ static const QPGetSetDef qp_fo_func_getsets[] = {
     { "__qualname__", qp_fo_func_get, qp_fo_func_set, QP_FA_QUALNAME, NULL },
     { "__type_params__", qp_fo_func_get, qp_fo_func_set, QP_FA_TYPE_PARAMS,
       "Get the declared type parameters for a function." },
-    { "__closure__", qp_fo_func_get, NULL, QP_FA_CLOSURE, NULL },
-    { "__globals__", qp_fo_func_get, NULL, QP_FA_GLOBALS, NULL },
-    { "__builtins__", qp_fo_func_get, NULL, QP_FA_BUILTINS, NULL },
+    /* func_memberlist */
+    { "__closure__", qp_fo_func_get, NULL, QP_FA_CLOSURE, NULL, QP_GETSET_MEMBER },
+    { "__globals__", qp_fo_func_get, NULL, QP_FA_GLOBALS, NULL, QP_GETSET_MEMBER },
+    { "__builtins__", qp_fo_func_get, NULL, QP_FA_BUILTINS, NULL, QP_GETSET_MEMBER },
     { NULL }
 };
 
@@ -919,10 +920,11 @@ static const QPTypeSpec qp_fo_function_spec = {
            "  argdefs\n    a tuple that specifies the default argument values\n"
            "  closure\n    a tuple that supplies the bindings for free variables\n"
            "  kwdefaults\n    a dictionary that specifies the default keyword argument values",
-    .flags = QP_TPFLAGS_METHOD_DESCRIPTOR | QP_TPFLAGS_IMMUTABLETYPE,
+    .flags = QP_TPFLAGS_METHOD_DESCRIPTOR | QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_WEAKREF,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_BYTECODE_FUNCTION,
+    .generic_attr = QP_GENERIC_GETATTR | QP_GENERIC_SETATTR,
     .slots = {
         .tp_getattro = qp_fo_func_getattro,
         .tp_setattro = qp_fo_func_setattro,
@@ -1005,7 +1007,7 @@ static JSValue qp_fo_method_call(JSContext *ctx, JSValueConst callable, JSValueC
         JSValue *newargs = (JSValue *)args - 1;
         JSValue tmp = newargs[0];
         newargs[0] = m->self;
-        res = qp_vectorcall(ctx, m->func, newargs, nargs + 1, kwnames);
+        res = qp_vectorcall(ctx, m->func, (JSValueConst *)newargs, nargs + 1, kwnames);
         newargs[0] = tmp;
         return res;
     }
@@ -1019,7 +1021,7 @@ static JSValue qp_fo_method_call(JSContext *ctx, JSValueConst callable, JSValueC
     buf[1] = m->self;
     if (total)
         memcpy(buf + 2, args, sizeof(JSValue) * total);
-    res = qp_vectorcall(ctx, m->func, buf + 1,
+    res = qp_vectorcall(ctx, m->func, (JSValueConst *)(buf + 1),
                         (size_t)(nargs + 1) | QP_VECTORCALL_ARGUMENTS_OFFSET, kwnames);
     if (buf != small)
         js_free(ctx, buf);
@@ -1163,7 +1165,6 @@ static JSValue qp_fo_method_reduce(JSContext *ctx, JSValueConst self, JSValueCon
     JSAtom getattr_atom;
     const char *s;
     size_t len;
-    int r;
 
     funcname = qp_getattr(ctx, m->func, QP_ATOM(ctx, __name__));
     if (JS_IsException(funcname))
@@ -1222,12 +1223,10 @@ static JSValue qp_fo_method_reduce(JSContext *ctx, JSValueConst self, JSValueCon
         JS_FreeValue(ctx, funcname);
         return JS_EXCEPTION;
     }
-    r = qp_dict_get_item_atom(ctx, QP_STATE(ctx)->builtins_dict, getattr_atom, &getattr_fn);
+    getattr_fn = qp_eval_get_builtin(ctx, getattr_atom);
     JS_FreeAtom(ctx, getattr_atom);
-    if (r <= 0) {
+    if (JS_IsException(getattr_fn)) {
         JS_FreeValue(ctx, funcname);
-        if (r == 0)
-            qp_raise(ctx, QP_EXC(ctx, AttributeError), "module 'builtins' has no attribute 'getattr'");
         return JS_EXCEPTION;
     }
     items[0] = JS_DupValue(ctx, m->self);
@@ -1245,9 +1244,9 @@ static JSValue qp_fo_method_reduce(JSContext *ctx, JSValueConst self, JSValueCon
 
 static const QPGetSetDef qp_fo_method_getsets[] = {
     { "__func__", qp_fo_method_get, NULL, QP_MA_FUNC,
-      "the function (or other callable) implementing a method" },
+      "the function (or other callable) implementing a method", QP_GETSET_MEMBER },
     { "__self__", qp_fo_method_get, NULL, QP_MA_SELF,
-      "the instance to which a method is bound" },
+      "the instance to which a method is bound", QP_GETSET_MEMBER },
     { "__doc__", qp_fo_method_get, NULL, QP_MA_DOC, NULL },
     { NULL }
 };
@@ -1260,7 +1259,7 @@ static const QPMethodDef qp_fo_method_methods[] = {
 static const QPTypeSpec qp_fo_method_spec = {
     .name = "method",
     .doc = "method(function, instance, /)\n--\n\nCreate a bound instance method object.",
-    .flags = QP_TPFLAGS_IMMUTABLETYPE,
+    .flags = QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_WEAKREF,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_METHOD,

@@ -35,8 +35,7 @@ Usage:
   tools/capi_sync.py --record     rewrite PATCHES from the current capi/
                                   files (edit the files, then record)
 
-Not vendored: Modules/_decimal (needs libmpdec; decimal uses
-Lib/_pydecimal.py).  Stdlib only; deterministic output.
+Stdlib only; deterministic output.
 """
 
 import argparse
@@ -59,14 +58,14 @@ SOURCE = "SOURCE"
 # Directories searched for #include "..." (relative to Modules/), after the
 # directory of the including file: CPython's -I flags of the modules,
 # LIBHACL_FLAG_I and LIBEXPAT_CFLAGS.
-INCLUDE_DIRS = ["", "_hacl", "_hacl/include", "expat"]
+INCLUDE_DIRS = ["", "_hacl", "_hacl/include", "expat", "_decimal/libmpdec"]
 # Vendored in addition to the include closure (licences).
 EXTRA_MODULE_FILES = ["expat/COPYING"]
 # Include/internal/ headers copied into capi/compat/ (capi-design.md §3).
 COMPAT_COPIES = [
     "pycore_bitutils.h", "pycore_blocks_output_buffer.h",
     "pycore_hashtable.h", "pycore_intrinsics.h", "pycore_llist.h",
-    "pycore_lock.h", "pycore_long.h", "pycore_opcode_metadata.h",
+    "pycore_lock.h", "pycore_long.h", "pycore_mmap.h", "pycore_opcode_metadata.h",
     "pycore_opcode_utils.h",
     "pycore_parking_lot.h", "pycore_pyatomic_ft_wrappers.h",
     "pycore_pyhash.h", "pycore_pymath.h", "pycore_strhex.h",
@@ -152,7 +151,8 @@ def setup_sources():
     with open(SETUP, encoding="utf-8") as f:
         for lineno, line in enumerate(f, 1):
             line = line.split("#", 1)[0].split()
-            if not line:
+            # `*external* cond ...` and `NAME = flags` lines name no sources
+            if not line or line[0] == "*external*" or line[1:2] == ["="]:
                 continue
             for tok in line[1:]:
                 if tok.startswith(("@", "-", "$(")):
@@ -260,6 +260,11 @@ def parse_patches(path):
             if not rel.startswith(("a/", "b/")):
                 die("%s:%d: bad path %r" % (path, i + 1, rel))
             rel = rel[2:]
+            if first:
+                # the comment block right before the first diff (after the
+                # last blank line of the preamble) is that file's notes
+                while ps.preamble and ps.preamble[-1].startswith("#"):
+                    notes.insert(0, ps.preamble.pop())
             i += 2
             hunks = []
             while i < len(lines) and lines[i].startswith("@@"):

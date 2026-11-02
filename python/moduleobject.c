@@ -22,6 +22,12 @@
 typedef struct QPModule {
     JSValue dict;       /* md_dict (PY_DICT), owned */
     uint8_t builtin;    /* created by a builtin-module init (repr "(built-in)") */
+    uint32_t capi_seq;  /* D5: order in which the C API executed this C
+                           module (0: not a C module); snapshots re-run the
+                           C modules in that order (python/capi_snapshot.c) */
+    const char *capi_name; /* its inittab entry (static), with capi_seq */
+    const QPModuleDef *exec_def; /* created by _imp.create_builtin, its exec
+                                    hook not run yet (_imp.exec_builtin) */
 } QPModule;
 
 /* lazy_import objects (import.c) */
@@ -159,12 +165,15 @@ static int qp_module_add_functions(JSContext *ctx, JSValueConst module, const QP
     return ret;
 }
 
-/* PyModule_FromDefAndSpec + PyModule_ExecDef for a builtin module: new
-   module named def->name with __doc__, the def's functions bound to it and
-   the exec hook run.  sys and builtins exist from qp_init_builtins on and
-   are returned as they are (CPython's _imp.create_builtin also hands out
-   the existing objects for them). */
-static JSValue qp_module_from_def(JSContext *ctx, const QPModuleDef *def)
+/* PyModule_FromDefAndSpec for a builtin module: new module named def->name
+   with __doc__ and the def's functions bound to it; its exec hook is run
+   now if 'exec', else by qp_module_exec_pending() (CPython's two import
+   steps: _imp.create_builtin, then _imp.exec_builtin once the module is in
+   sys.modules, so that the imports its exec makes find it, as CPython's
+   multi-phase init does).  sys and builtins exist from qp_init_builtins on
+   and are returned as they are (CPython's _imp.create_builtin also hands
+   out the existing objects for them). */
+static JSValue qp_module_create_from_def(JSContext *ctx, const QPModuleDef *def, BOOL exec)
 {
     QPState *s = QP_STATE(ctx);
     JSValue name, doc, m;
@@ -193,12 +202,38 @@ static JSValue qp_module_from_def(JSContext *ctx, const QPModuleDef *def)
     }
     if (def->methods && qp_module_add_functions(ctx, m, def->methods) < 0)
         goto fail;
-    if (def->exec && def->exec(ctx, m) < 0)
-        goto fail;
+    if (def->exec) {
+        if (!exec)
+            qp_module_payload(m)->exec_def = def;
+        else if (def->exec(ctx, m) < 0)
+            goto fail;
+    }
     return m;
  fail:
     JS_FreeValue(ctx, m);
     return JS_EXCEPTION;
+}
+
+/* PyModule_FromDefAndSpec + PyModule_ExecDef: the module initialized */
+static JSValue qp_module_from_def(JSContext *ctx, const QPModuleDef *def)
+{
+    return qp_module_create_from_def(ctx, def, TRUE);
+}
+
+/* exec_builtin_or_dynamic: run the exec hook a module created by
+   qp_module_create_from_def(..., FALSE) still waits for (once: an import
+   of the module from its own exec finds it initializing in sys.modules
+   and does not run it again).  0, or -1 with an exception. */
+static int qp_module_exec_pending(JSContext *ctx, JSValueConst module)
+{
+    QPModule *m = qp_module_payload(module);
+    const QPModuleDef *def;
+
+    if (!m || !m->exec_def)
+        return 0;
+    def = m->exec_def;
+    m->exec_def = NULL;
+    return def->exec(ctx, module);
 }
 
 /* ---- spec helpers (shared with import.c) ------------------------------ */
@@ -548,17 +583,6 @@ static JSValue qp_module_getattro_impl(JSContext *ctx, JSValueConst obj, JSAtom 
 static JSValue qp_module_getattro(JSContext *ctx, JSValueConst obj, JSAtom name)
 {
     return qp_module_getattro_impl(ctx, obj, name, 0);
-}
-
-/* getattr(module, name) with AttributeError suppressed: 1/0/-1. */
-static int qp_module_getattr_opt(JSContext *ctx, JSValueConst obj, JSAtom name, JSValue *pres)
-{
-    *pres = qp_module_getattro_impl(ctx, obj, name, 1);
-    if (JS_IsException(*pres)) {
-        *pres = QP_NULL;
-        return -1;
-    }
-    return QP_IS_NULL(*pres) ? 0 : 1;
 }
 
 /* PyObject_GenericSetAttr with the module dict. */
@@ -969,7 +993,7 @@ static const QPMethodDef qp_module_methods[] = {
 static const QPGetSetDef qp_module_getsets[] = {
     { "__annotations__", qp_module_get_annotations, qp_module_set_annotations, 0, NULL },
     { "__annotate__", qp_module_get_annotate, qp_module_set_annotate, 0, NULL },
-    { "__dict__", qp_module_get_dict_attr, NULL, 0, NULL },
+    { "__dict__", qp_module_get_dict_attr, NULL, 0, NULL, QP_GETSET_MEMBER },
     { NULL }
 };
 
@@ -978,10 +1002,12 @@ static const QPTypeSpec qp_module_spec = {
     .doc = "module(name, doc=None)\n--\n\n"
            "Create a module object.\n\n"
            "The name must be a string; the optional doc argument can have any type.",
-    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_BASETYPE | QP_TPFLAGS_MANAGED_DICT,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_BASETYPE | QP_TPFLAGS_MANAGED_DICT |
+             QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_WEAKREF,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_MODULE,
+    .generic_attr = QP_GENERIC_SETATTR,
     .slots = {
         .tp_getattro = qp_module_getattro,
         .tp_setattro = qp_module_setattro,

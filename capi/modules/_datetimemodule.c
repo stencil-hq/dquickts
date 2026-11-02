@@ -7629,6 +7629,18 @@ _datetime_exec(PyObject *module)
     }
     /* We actually set the "current" module right before a successful return. */
 
+    /* dquickts: no interpreter init readies the static types
+       (pylifecycle.c pycore_init_types); the first exec does */
+    if (!PyType_HasFeature(&PyDateTime_DateType, Py_TPFLAGS_READY)) {
+        PyStatus status = _PyDateTime_InitTypes(interp);
+        if (_PyStatus_EXCEPTION(status)) {
+            if (!PyErr_Occurred()) {
+                PyErr_SetString(PyExc_SystemError, status.err_msg);
+            }
+            goto error;
+        }
+    }
+
     for (size_t i = 0; i < Py_ARRAY_LENGTH(capi_types); i++) {
         PyTypeObject *type = capi_types[i];
         const char *name = _PyType_Name(type);

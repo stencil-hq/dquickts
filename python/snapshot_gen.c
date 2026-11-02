@@ -111,6 +111,7 @@ static int qp_snap_gen_read_gen(SnapReader *r, JSObject *p)
     if (s) {
         js_rc(s)->ref_count++;
         g->s = s;
+        s->py_gen = p;
     }
     if (snap_get_value(r, &g->func) ||
         snap_get_value(r, &g->name) ||

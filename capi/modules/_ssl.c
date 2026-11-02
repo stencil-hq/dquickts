@@ -485,12 +485,28 @@ PyDoc_STRVAR(SSLEOFError_doc,
 static PyObject *
 SSLError_str(PyObject *op)
 {
-    PyOSErrorObject *self = (PyOSErrorObject*)op;
-    if (self->strerror != NULL && PyUnicode_Check(self->strerror)) {
-        return Py_NewRef(self->strerror);
+    /* dquickts: the PyOSErrorObject fields live on the JS exception object
+       (capi/modules/PATCHES): read them through the attribute protocol. */
+    PyObject *strerror = PyObject_GetAttrString(op, "strerror");
+    if (strerror == NULL) {
+        if (!PyErr_ExceptionMatches(PyExc_AttributeError)) {
+            return NULL;
+        }
+        PyErr_Clear();
     }
-    else
-        return PyObject_Str(self->args);
+    else if (PyUnicode_Check(strerror)) {
+        return strerror;
+    }
+    else {
+        Py_DECREF(strerror);
+    }
+    PyObject *args = PyException_GetArgs(op);
+    if (args == NULL) {
+        return NULL;
+    }
+    PyObject *res = PyObject_Str(args);
+    Py_DECREF(args);
+    return res;
 }
 
 static PyType_Slot sslerror_type_slots[] = {

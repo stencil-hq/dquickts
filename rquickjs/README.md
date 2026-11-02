@@ -27,6 +27,9 @@ Added:
   modules named `*.ts`, `*.mts`, `*.cts`); enums, namespaces and parameter properties compile to
   bytecode, `const enum` members are folded; standard or legacy decorators
   (`Runtime::set_decorators`), `using` declarations.
+- Python 3.15 (cargo feature `python`, off by default): the engine's embedded Python runtime is
+  compiled in, see [Python](#python).
+
 
 Removed (QuickJS-NG only): `Value::is_uncatchable_error` (see `Ctx::has_uncatchable_exception`).
 The bindings are generated from `quickjs.h` by `scripts/gen-bindings.sh`;
@@ -34,6 +37,66 @@ The bindings are generated from `quickjs.h` by `scripts/gen-bindings.sh`;
 
 **QuickJS** is a small and embeddable JavaScript engine. It supports the _ES2020_ specification including modules, asynchronous generators, proxies and BigInt.
 It optionally supports mathematical extensions such as big decimal floating point numbers (BigDecimal), big binary floating point numbers (BigFloat) and operator overloading.
+
+## Python
+
+With the `python` feature, `rquickjs-sys` compiles the engine's Python 3.15 runtime
+(`CONFIG_PYTHON`: `python/*.c`, included by `quickjs.c` as in the engine Makefile). Python and
+JavaScript share one heap and their values by identity (`list` = `Array`, `str` = `String`, `int`
+= number (int32) or `BigInt`, `float` = number, `None` = `undefined`, functions are functions,
+`dict` keys read as properties), so results convert with the ordinary `FromJs` / `IntoJs`:
+
+```rust
+use rquickjs::{context::{PythonEvalMode, PythonEvalOptions}, Context, Function, Object, Promise, Runtime};
+
+let rt = Runtime::new()?;
+let ctx = Context::full(&rt)?;
+ctx.with(|ctx| -> rquickjs::Result<()> {
+    let squares: Vec<i32> = ctx.eval_python("[x * x for x in range(4)]")?;
+
+    let mut exec = PythonEvalOptions::default();
+    exec.mode = PythonEvalMode::Exec;
+    ctx.eval_python_with_options::<(), _>("async def double(x):\n    return x * 2\n", exec)?;
+    let double: Function = ctx.eval_python("double")?;
+
+    // top-level await: a Promise, settled by the job queue
+    let mut tla = PythonEvalOptions::default();
+    tla.promise = true;
+    let promise: Promise = ctx.eval_python_with_options("await double(21)", tla)?;
+    assert_eq!(promise.finish::<i32>()?, 42);
+
+    let json: Object = ctx.python_import("json")?;
+    let dumps: Function = json.get("dumps")?;
+    assert_eq!(dumps.call::<_, String>((squares,))?, "[0, 1, 4, 9]");
+    Ok(())
+})?;
+```
+
+- `Ctx::init_python(PythonConfig)`: `sys.argv`, `sys.executable`, the Python home (the
+  standard library is `<home>/pylib`), `sys.path[0]`, a `PYTHONPATH`-style list, the hash
+  seed, `-O`, `-I` and the recursion limit. Optional: the first `eval_python` / `python_import`
+  initializes Python with the defaults, and a later configuration is ignored.
+- `Ctx::eval_python` evaluates an expression in the globals of `__main__`;
+  `Ctx::eval_python_with_options` takes `PythonEvalOptions` (mode exec / eval / single, the
+  filename, top-level `await` which returns a `Promise`).
+- `Ctx::python_import(name)`: `importlib.import_module`, the module object.
+- A Python exception is `Error::Exception`; `Ctx::catch()` returns the Python exception object
+  (its attributes are properties).
+- The standard library: `QPYHOME` at run time, else the `pylib` directory compiled in
+  (`QP_PYLIB_DIR`): the `pylib` of the QuickJS tree, or the directory named by
+  `RQUICKJS_PYLIB_DIR` when `rquickjs-sys` is built. Deploying elsewhere: set
+  `PythonConfig::home` (or `QPYHOME`) to a directory containing `pylib`.
+- Without a module loader (`Runtime::set_loader`), Python installs one which imports `.py`
+  specifiers of ES modules as Python modules.
+- C modules (64-bit Unix targets): the Python C API and CPython's self-contained C modules
+  (`_sre`, `_json`, `itertools`, `_collections`, `math`, `_decimal`, `_datetime`, the hash
+  modules, `pyexpat`, `_elementtree`, `_socket`, the CJK codecs, ...; `capi/Setup.qp`) are
+  compiled in with `python`. The modules that link a system library have a feature each,
+  off by default: `python-zlib`, `python-bz2`, `python-lzma`, `python-sqlite3`, `python-ssl`
+  (`_ssl`, `_hashlib`), `python-zstd`, `python-ctypes` (libffi), `python-readline` (GNU
+  readline or libedit) and `python-uuid` (libuuid; macOS uses libSystem without it). The
+  libraries are found with pkg-config, else linked by name. On macOS `_scproxy` links the
+  SystemConfiguration and CoreFoundation frameworks.
 
 ## Main features of QuickJS
 

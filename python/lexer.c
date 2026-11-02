@@ -306,7 +306,8 @@ _PyTokenizer_tok_new(qp_error *err)
     tok->encoding = NULL;
     tok->cont_line = 0;
     tok->filename = NULL;
-    tok->module = NULL;
+    tok->module = QP_NULL;
+    tok->ctx = NULL;
     tok->type_comments = 0;
     tok->interactive_underflow = IUNDERFLOW_NORMAL;
     tok->underflow = NULL;
@@ -474,6 +475,69 @@ _PyTokenizer_syntaxerror(struct tok_state *tok, const char *format, ...)
     return ret;
 }
 
+/* Tokenizer/helpers.c _PyTokenizer_warn_invalid_escape_sequence */
+static int
+_PyTokenizer_warn_invalid_escape_sequence(struct tok_state *tok, int first_invalid_escape_char)
+{
+    if (!tok->report_warnings || !tok->ctx) {
+        return 0;
+    }
+
+    char msg[160];
+    snprintf(msg, sizeof(msg),
+             "\"\\%c\" is an invalid escape sequence. "
+             "Such sequences will not work in the future. "
+             "Did you mean \"\\\\%c\"? A raw string is also an option.",
+             (char) first_invalid_escape_char,
+             (char) first_invalid_escape_char);
+
+    int r = qp_syntax_warn(tok->ctx, tok->filename, tok->module, tok->lineno, msg);
+    if (r > 0) {
+        /* Replace the SyntaxWarning exception with a SyntaxError
+           to get a more accurate error report */
+        return _PyTokenizer_syntaxerror(tok,
+            "\"\\%c\" is an invalid escape sequence. "
+            "Did you mean \"\\\\%c\"? A raw string is also an option.",
+            (char) first_invalid_escape_char,
+            (char) first_invalid_escape_char);
+    }
+    if (r < 0) {
+        qp_error_set(tok->err, QP_ERR_PENDING, 0, 0, 0, 0, "%s", "");
+        return -1;
+    }
+    return 0;
+}
+
+/* Tokenizer/helpers.c _PyTokenizer_parser_warn (category SyntaxWarning) */
+static int
+_PyTokenizer_parser_warn(struct tok_state *tok, const char *format, ...)
+{
+    if (!tok->report_warnings || !tok->ctx) {
+        return 0;
+    }
+
+    char msg[200];
+    va_list vargs;
+    va_start(vargs, format);
+    vsnprintf(msg, sizeof(msg), format, vargs);
+    va_end(vargs);
+
+    int r = qp_syntax_warn(tok->ctx, tok->filename, tok->module, tok->lineno, msg);
+    if (r == 0) {
+        return 0;
+    }
+    if (r > 0) {
+        /* Replace the SyntaxWarning exception with a SyntaxError
+           to get a more accurate error report */
+        _PyTokenizer_syntaxerror(tok, "%s", msg);
+    }
+    else {
+        qp_error_set(tok->err, QP_ERR_PENDING, 0, 0, 0, 0, "%s", "");
+    }
+    tok->done = E_ERROR;
+    return -1;
+}
+
 static int
 _PyTokenizer_syntaxerror_known_range(struct tok_state *tok,
                         int col_offset, int end_col_offset,
@@ -570,6 +634,65 @@ qp_lex_lookup_codec(const char *enc)
     return NULL;
 }
 
+/* translate_into_utf8 for an encoding the tokenizer does not implement
+   natively: PyUnicode_Decode through the codec registry (tok->ctx), then
+   UTF-8.  LookupError, ValueError (UnicodeDecodeError) and SyntaxError are
+   converted like _PyTokenizer_raise_init_error: SyntaxError(str(exc),
+   (filename, 0, -1, None)); any other exception is QP_ERR_PENDING. */
+static char *
+qp_lex_translate_with_codec(struct tok_state *tok, const char *str, size_t len,
+                            const char *enc)
+{
+    JSContext *ctx = tok->ctx;
+    JSValue u, exc, msg;
+    const char *utf8, *m;
+    size_t n;
+    char *out;
+
+    u = qp_str_decode(ctx, str, (Py_ssize_t)len, enc, "strict");
+    if (JS_IsException(u)) {
+        if (!(qp_exc_pending_matches(ctx, QP_EXC(ctx, LookupError)) ||
+              qp_exc_pending_matches(ctx, QP_EXC(ctx, SyntaxError)) ||
+              qp_exc_pending_matches(ctx, QP_EXC(ctx, ValueError)))) {
+            qp_error_set(tok->err, QP_ERR_PENDING, 0, 0, 0, 0, "%s", "");
+            return NULL;
+        }
+        exc = qp_exc_fetch(ctx);
+        msg = qp_str(ctx, exc);
+        JS_FreeValue(ctx, exc);
+        if (JS_IsException(msg)) {
+            qp_error_set(tok->err, QP_ERR_PENDING, 0, 0, 0, 0, "%s", "");
+            return NULL;
+        }
+        m = qp_str_utf8(ctx, msg, NULL);
+        if (m) {
+            qp_error_set(tok->err, QP_ERR_SYNTAX, 0, -1, 0, 0, "%s", m);
+            JS_FreeCString(ctx, m);
+        }
+        else {
+            qp_error_set(tok->err, QP_ERR_PENDING, 0, 0, 0, 0, "%s", "");
+        }
+        JS_FreeValue(ctx, msg);
+        return NULL;
+    }
+    utf8 = qp_str_utf8(ctx, u, &n);
+    if (!utf8) {
+        JS_FreeValue(ctx, u);
+        qp_error_set(tok->err, QP_ERR_PENDING, 0, 0, 0, 0, "%s", "");
+        return NULL;
+    }
+    out = qp_sys_malloc(n + 1);
+    if (out == NULL) {
+        qp_lex_nomem(tok->err);
+    }
+    else {
+        memcpy(out, utf8, n + 1);
+    }
+    JS_FreeCString(ctx, utf8);
+    JS_FreeValue(ctx, u);
+    return out;
+}
+
 /* PyUnicode_Decode(str, strlen(str), enc) followed by UTF-8 encoding.
    Returns a malloc'd UTF-8 string, or NULL with the error recorded already
    converted like _PyTokenizer_raise_init_error (SyntaxError, lineno 0,
@@ -582,6 +705,9 @@ _PyTokenizer_translate_into_utf8(struct tok_state *tok, const char* str, const c
     const char *codec = qp_lex_lookup_codec(enc);
     char *out;
 
+    if (codec == NULL && tok->ctx != NULL) {
+        return qp_lex_translate_with_codec(tok, str, len, enc);
+    }
     if (codec == NULL) {
         /* LookupError, converted like _PyTokenizer_raise_init_error:
            SyntaxError(str(exc), (filename, 0, -1, None)) */
@@ -1090,13 +1216,15 @@ decode_str(const char *input, int single, struct tok_state *tok, int preserve_cr
 
 /* Set up tokenizer for a byte string (BOM / coding cookie detection). */
 static struct tok_state *
-_PyTokenizer_FromString(const char *str, int exec_input, int preserve_crlf, qp_error *err)
+_PyTokenizer_FromString(const char *str, int exec_input, int preserve_crlf, qp_error *err,
+                        JSContext *ctx)
 {
     struct tok_state *tok = _PyTokenizer_tok_new(err);
     char *decoded;
 
     if (tok == NULL)
         return NULL;
+    tok->ctx = ctx;
     decoded = decode_str(str, exec_input, tok, preserve_crlf);
     if (decoded == NULL) {
         _PyTokenizer_Free(tok);
@@ -1369,8 +1497,8 @@ lookahead(struct tok_state *tok, const char *test)
 }
 
 /* Check what follows a numeric literal: a keyword that may legally follow a
-   number gets CPython's "invalid <kind> literal" SyntaxWarning (not emitted
-   here); any other identifier character is a SyntaxError. */
+   number gets the "invalid <kind> literal" SyntaxWarning; any other
+   identifier character is a SyntaxError. */
 static int
 verify_end_of_number(struct tok_state *tok, int c, const char *kind) {
     if (tok->tok_extra_tokens) {
@@ -1403,7 +1531,10 @@ verify_end_of_number(struct tok_state *tok, int c, const char *kind) {
     }
     if (r) {
         tok_backup(tok, c);
-        /* SyntaxWarning "invalid %s literal" dropped (no warnings machinery). */
+        if (_PyTokenizer_parser_warn(tok, "invalid %s literal", kind))
+        {
+            return 0;
+        }
         tok_nextc(tok);
     }
     else /* In future releases, only error will remain. */
@@ -2649,8 +2780,11 @@ f_string_middle:
             // brace. We have to restore and return the control back
             // to the loop for the next iteration.
             if (peek == '{' || peek == '}') {
-                /* Non-raw: SyntaxWarning "invalid escape sequence" dropped
-                   (no warnings machinery). */
+                if (!current_tok->raw) {
+                    if (_PyTokenizer_warn_invalid_escape_sequence(tok, peek)) {
+                        return MAKE_TOKEN(ERRORTOKEN);
+                    }
+                }
                 tok_backup(tok, peek);
                 continue;
             }

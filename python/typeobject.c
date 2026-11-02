@@ -19,9 +19,6 @@
 
 #include "typeobject_internal.h"
 
-/* Private type flag (above the CPython bit range). */
-#define QP_TPFLAGS_PRIV_VARSIZE ((uint64_t)1 << 41)  /* tp_itemsize != 0 (int, bytes, tuple, type) */
-
 #define QP_TEXT(t) ((QPTypeExt *)(t))
 
 /* ---- forward declarations (definitions below / in the private headers) */
@@ -318,22 +315,53 @@ static JSValue qp_type_module(JSContext *ctx, QPType *t)
 /* Allocation, finalization, subclass links                                  */
 /* ========================================================================= */
 
+static uint32_t qp_type_alloc_serial;
+
+#ifdef CONFIG_PYTHON_CAPI
+/* python/capi_snapshot.c: while a snapshot restores C modules, the type
+   object saved by reference under `key` (a placeholder, NULL if none) */
+static JSObject *qp_capi_snap_adopt_take(JSContext *ctx, const char *key);
+static BOOL qp_capi_snap_adopting(void);
+static const char *qp_capi_snap_adopt_module(void);
+#endif
+
 /* New empty type object of metatype `meta` (NULL: no prototype, used for
-   `type` itself).  Returns the QPType, the JSValue is QP_TYPE_VALUE. */
-static QPType *qp_type_alloc(JSContext *ctx, QPType *meta)
+   `type` itself).  Returns the QPType, the JSValue is QP_TYPE_VALUE.
+   `key` (C-API snapshot restore, may be NULL) names the type: a type
+   object of the snapshot saved under that key becomes the new type. */
+static QPType *qp_type_alloc_key(JSContext *ctx, QPType *meta, const char *key)
 {
     JSValue obj;
-    QPTypeExt *e;
+    QPTypeExt *e = NULL;
     QPType *t;
 
-    obj = JS_NewObjectProtoClass(ctx, meta ? QP_TYPE_VALUE(meta) : JS_NULL, JS_CLASS_PY_TYPE);
-    if (JS_IsException(obj))
-        return NULL;
-    e = js_mallocz(ctx, sizeof(*e));
-    if (!e) {
-        JS_FreeValue(ctx, obj);
-        return NULL;
+#ifdef CONFIG_PYTHON_CAPI
+    JSObject *p = key ? qp_capi_snap_adopt_take(ctx, key) : NULL;
+    if (p) {
+        /* the placeholder keeps its identity (and the QPType that
+           references to it allocated) */
+        obj = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
+        if (JS_SetPrototypeInternal(ctx, obj, meta ? QP_TYPE_VALUE(meta) : JS_NULL, FALSE) < 0) {
+            JS_FreeValue(ctx, obj);
+            return NULL;
+        }
+        if (p->u.opaque)
+            e = QP_TEXT((QPType *)p->u.opaque);
+    } else
+#endif
+    {
+        obj = JS_NewObjectProtoClass(ctx, meta ? QP_TYPE_VALUE(meta) : JS_NULL, JS_CLASS_PY_TYPE);
+        if (JS_IsException(obj))
+            return NULL;
     }
+    if (!e) {
+        e = js_mallocz(ctx, sizeof(*e));
+        if (!e) {
+            JS_FreeValue(ctx, obj);
+            return NULL;
+        }
+    }
+    e->alloc_serial = ++qp_type_alloc_serial;
     t = &e->t;
     t->obj = JS_VALUE_GET_OBJ(obj);
     t->ctx = ctx;
@@ -347,6 +375,11 @@ static QPType *qp_type_alloc(JSContext *ctx, QPType *meta)
     e->doc = QP_NULL;
     JS_VALUE_GET_OBJ(obj)->u.opaque = t;
     return t;
+}
+
+static QPType *qp_type_alloc(JSContext *ctx, QPType *meta)
+{
+    return qp_type_alloc_key(ctx, meta, NULL);
 }
 
 static int qp_type_add_subclass(JSContext *ctx, QPType *base, QPType *sub)
@@ -395,7 +428,34 @@ static void qp_type_unlink_bases(QPType *t)
     e->nbases_raw = 0;
 }
 
-static void qp_type_finalizer(JSRuntime *rt, JSValueConst val)
+/* A type held by QPState.types/exc_types (ExceptionGroup is a heap type)
+   is finalized while the state still references it only when the GC frees
+   a cycle that also holds the context (e.g. JS_FreeRuntime): the state's
+   reference is then part of the garbage, so drop the raw QPType pointer
+   instead of letting qp_state_free() read the freed payload.  The zombie
+   JSObject itself is released at the end of gc_free_cycles(). */
+static void qp_type_forget_in_states(JSRuntime *rt, QPType *t)
+{
+    struct list_head *el;
+    int i;
+
+    list_for_each(el, &rt->context_list) {
+        JSContext *ctx = list_entry(el, JSContext, link);
+        QPState *s = ctx->py;
+        if (!s)
+            continue;
+        for (i = 0; i < QP_T__COUNT; i++) {
+            if (s->types[i] == t)
+                s->types[i] = NULL;
+        }
+        for (i = 0; i < QP_EXC__COUNT; i++) {
+            if (s->exc_types[i] == t)
+                s->exc_types[i] = NULL;
+        }
+    }
+}
+
+static void qp_type_finalizer(JSRuntime *rt, JSValue val)
 {
     JSObject *p = JS_VALUE_GET_OBJ(val);
     QPType *t = (QPType *)p->u.opaque;
@@ -404,6 +464,7 @@ static void qp_type_finalizer(JSRuntime *rt, JSValueConst val)
 
     if (!t)
         return;
+    qp_type_forget_in_states(rt, t);
     e = QP_TEXT(t);
     qp_type_unlink_bases(t);
     /* subclasses that are still alive (same GC cycle) forget us */
@@ -701,7 +762,7 @@ again:
         qp_set_mro_error(ctx, to_merge, (int)(n + 1), remain);
         goto fail;
     }
-    res = qp_tuple_pack(ctx, nacc, acc);
+    res = qp_tuple_pack(ctx, nacc, (JSValueConst *)acc);
     js_free(ctx, to_merge);
     js_free(ctx, remain);
     js_free(ctx, acc);
@@ -718,8 +779,17 @@ fail:
 static QPType *qp_solid_base(JSContext *ctx, QPType *t)
 {
     QPType *base = t->base ? qp_solid_base(ctx, t->base) : QP_TYPE(ctx, object);
-    if (t->instance_class_id != base->instance_class_id || t->nslots != base->nslots)
+    if (t->instance_class_id != base->instance_class_id || t->nslots != base->nslots) {
+#ifdef CONFIG_PYTHON_CAPI
+        /* D5: a C type that adds no C fields to object (numpy.generic,
+           numpy.floating) keeps object's layout (CPython shape_differs), so
+           numpy.float64(numpy.floating, float) has float as its best base */
+        if (t->instance_class_id == JS_CLASS_PY_NATIVE && base == QP_TYPE(ctx, object) &&
+            t->nslots == base->nslots && qp_capi_native_same_layout(t, base))
+            return base;
+#endif
         return t;
+    }
 #ifdef CONFIG_PYTHON_CAPI
     /* D5 (CapiB) R4: a native type that adds C fields is a solid base */
     if (t->instance_class_id == JS_CLASS_PY_NATIVE && t->base &&
@@ -785,8 +855,10 @@ static int qp_mro_internal(JSContext *ctx, QPType *t)
     return 0;
 }
 
-/* find_best_base */
-static QPType *qp_best_base(JSContext *ctx, JSValueConst bases)
+/* find_best_base; check_basetype FALSE for PyType_Ready of a static type,
+   whose bases CPython's type_ready never checks for Py_TPFLAGS_BASETYPE
+   (numpy's numpy.character extends numpy.flexible, which lacks it). */
+static QPType *qp_best_base_ex(JSContext *ctx, JSValueConst bases, BOOL check_basetype)
 {
     Py_ssize_t i, n = QP_TUPLE_SIZE(bases);
     QPType *base = NULL, *winner = NULL;
@@ -797,7 +869,7 @@ static QPType *qp_best_base(JSContext *ctx, JSValueConst bases)
             qp_raise_type_error(ctx, "bases must be types; got '%T'", o);
             return NULL;
         }
-        if (!(bi->flags & QP_TPFLAGS_BASETYPE)) {
+        if (check_basetype && !(bi->flags & QP_TPFLAGS_BASETYPE)) {
             JSValue tn = qp_type_tp_name(ctx, bi);
             qp_raise_type_error(ctx, "type '%.100U' is not an acceptable base type", tn);
             JS_FreeValue(ctx, tn);
@@ -818,6 +890,11 @@ static QPType *qp_best_base(JSContext *ctx, JSValueConst bases)
         }
     }
     return base;
+}
+
+static QPType *qp_best_base(JSContext *ctx, JSValueConst bases)
+{
+    return qp_best_base_ex(ctx, bases, TRUE);
 }
 
 /* _PyType_CalculateMetaclass */
@@ -912,7 +989,8 @@ static int qp_type_fill_dict(JSContext *ctx, QPType *t, const QPTypeSpec *spec)
             return -1;
     }
     for (gs = spec->getsets; gs && gs->name; gs++) {
-        d = qp_descr_new_getset(ctx, t, gs);
+        d = (gs->flags & QP_GETSET_MEMBER) ? qp_descr_new_member_getset(ctx, t, gs) :
+            qp_descr_new_getset(ctx, t, gs);
         if (JS_IsException(d))
             return -1;
         a = JS_NewAtom(ctx, gs->name);
@@ -1223,10 +1301,18 @@ static JSValue qp_type_new_from_spec_bases(JSContext *ctx, QPType *meta, const Q
         qp_raise_system_error(ctx, "type '%s': bases must be a non-empty tuple", spec->name);
         return JS_EXCEPTION;
     }
-    base = qp_best_base(ctx, bases);
+    /* heap types had their bases checked by PyType_FromMetaclass */
+    base = qp_best_base_ex(ctx, bases, FALSE);
     if (!base)
         return JS_EXCEPTION;
-    t = qp_type_alloc(ctx, meta);
+#ifdef CONFIG_PYTHON_CAPI
+    if (qp_capi_snap_adopting()) {
+        char key[256];
+        snprintf(key, sizeof(key), "T:%s", spec->name);
+        t = qp_type_alloc_key(ctx, meta, key);
+    } else
+#endif
+        t = qp_type_alloc(ctx, meta);
     if (!t)
         return JS_EXCEPTION;
     v = QP_TYPE_VALUE(t);
@@ -1305,18 +1391,15 @@ static int qp_tw_is_identifier(JSContext *ctx, JSValueConst s)
 
 static int qp_tw_str_has_nul(JSContext *ctx, JSValueConst s)
 {
-    qp_strview v;
-    Py_ssize_t i;
-    int r = 0;
-    if (qp_str_view_acquire(ctx, s, &v) < 0)
+    /* PyUnicode_AsUTF8AndSize (UnicodeEncodeError for lone surrogates),
+       then the strlen() check */
+    size_t len;
+    const char *u = qp_str_utf8(ctx, s, &len);
+    int r;
+    if (!u)
         return -1;
-    for (i = 0; i < v.len; i++) {
-        if (QP_SL_READ(v.kind, v.data, i) == 0) {
-            r = 1;
-            break;
-        }
-    }
-    qp_str_view_release(ctx, &v);
+    r = strlen(u) != len;
+    JS_FreeCString(ctx, u);
     return r;
 }
 
@@ -1683,7 +1766,26 @@ static JSValue qp_type_new(JSContext *ctx, QPType *meta, JSValueConst name, JSVa
     }
 
     /* type_new_alloc */
-    t = qp_type_alloc(ctx, meta);
+#ifdef CONFIG_PYTHON_CAPI
+    if (qp_capi_snap_adopting() && qp_capi_snap_adopt_module()) {
+        /* class made by the exec of the C module being restored */
+        JSValue qn = QP_NULL;
+        const char *s = NULL;
+        char key[256];
+        if (qp_dict_get_item_atom(ctx, dict, QP_ATOM(ctx, __qualname__), &qn) < 0)
+            goto fail;
+        s = qp_str_utf8(ctx, qp_str_check(ctx, qn) ? qn : name, NULL);
+        if (!s) {
+            JS_FreeValue(ctx, qn);
+            goto fail;
+        }
+        snprintf(key, sizeof(key), "C:%s:%s", qp_capi_snap_adopt_module(), s);
+        JS_FreeCString(ctx, s);
+        JS_FreeValue(ctx, qn);
+        t = qp_type_alloc_key(ctx, meta, key);
+    } else
+#endif
+        t = qp_type_alloc(ctx, meta);
     if (!t)
         goto fail;
     tval = QP_TYPE_VALUE(t);
@@ -1749,6 +1851,22 @@ static JSValue qp_type_new(JSContext *ctx, QPType *meta, JSValueConst name, JSVa
             JS_FreeValue(ctx, t->qualname);
             t->qualname = qp_str_value(ctx, name);
         }
+    }
+    /* type_new_set_doc: a str __doc__ must be encodable to UTF-8 */
+    r = qp_dict_get_item_atom(ctx, t->dict, QP_ATOM(ctx, __doc__), &tmp);
+    if (r < 0)
+        goto fail;
+    if (r > 0) {
+        if (qp_str_check(ctx, tmp)) {
+            size_t len;
+            const char *u = qp_str_utf8(ctx, tmp, &len);
+            if (!u) {
+                JS_FreeValue(ctx, tmp);
+                goto fail;
+            }
+            JS_FreeCString(ctx, u);
+        }
+        JS_FreeValue(ctx, tmp);
     }
     /* special-case __new__, __init_subclass__, __class_getitem__ */
     if (qp_type_new_wrap(ctx, t->dict, QP_ATOM(ctx, __new__), 0) < 0 ||
@@ -1824,6 +1942,8 @@ static JSValue qp_type_new(JSContext *ctx, QPType *meta, JSValueConst name, JSVa
         goto fail;
     if (qp_type_new_init_subclass(ctx, t, kwds) < 0)
         goto fail;
+    /* still set when __slots__ declared no slot (e.g. __slots__ = ()) */
+    JS_FreeValue(ctx, slots);
     return tval;
 fail:
     JS_FreeValue(ctx, bases);
@@ -2017,6 +2137,20 @@ static int qp_mro_hierarchy(JSContext *ctx, QPType *t)
     return 0;
 }
 
+/* type_is_subtype_base_chain: reentrant __bases__ assignments (a custom
+   mro() assigning __bases__) update tp_base before the MRO, so a cycle
+   check through the MRO alone misses cycles of the tp_base chain. */
+static BOOL qp_type_base_chain_has(QPType *b, QPType *t)
+{
+    if (JS_IsUndefined(b->mro))
+        return FALSE;
+    for (; b; b = b->base) {
+        if (b == t)
+            return TRUE;
+    }
+    return FALSE;
+}
+
 static int qp_type_set_bases(JSContext *ctx, JSValueConst self, JSValueConst value, int magic)
 {
     QPType *t = qp_type_from_value(self), *new_base, *old_base;
@@ -2047,7 +2181,7 @@ static int qp_type_set_bases(JSContext *ctx, JSValueConst self, JSValueConst val
             qp_raise_type_error(ctx, "%U.__bases__ must be tuple of classes, not '%U'", tn, vn);
             goto err2;
         }
-        if (qp_type_is_subtype(b, t)) {
+        if (qp_type_is_subtype(b, t) || qp_type_base_chain_has(b, t)) {
             qp_raise_type_error(ctx, "a __bases__ item causes an inheritance cycle");
             return -1;
         }
@@ -2059,28 +2193,37 @@ static int qp_type_set_bases(JSContext *ctx, JSValueConst self, JSValueConst val
         return -1;
     old_bases = t->bases;
     old_base = t->base;
-    qp_type_unlink_bases(t);
     t->bases = JS_DupValue(ctx, value);
     t->base = new_base;
+    /* A custom mro() may assign __bases__ again (reentrance): the
+       subclass links and the rollback then belong to the inner
+       assignment, detected by t->bases no longer being `value`
+       (type_set_bases_unlocked). */
     if (qp_mro_hierarchy(ctx, t) < 0) {
         JSValue exc = qp_exc_fetch(ctx);
-        JS_FreeValue(ctx, t->bases);
-        t->bases = old_bases;
-        t->base = old_base;
-        for (i = 0; i < QP_TUPLE_SIZE(old_bases); i++)
-            qp_type_add_subclass(ctx, qp_type_from_value(QP_TUPLE_ITEMS(old_bases)[i]), t);
-        qp_mro_hierarchy(ctx, t);
+        if (JS_VALUE_GET_PTR(t->bases) == JS_VALUE_GET_PTR(value)) {
+            JS_FreeValue(ctx, t->bases);
+            t->bases = old_bases;
+            t->base = old_base;
+            if (qp_mro_hierarchy(ctx, t) < 0)
+                qp_tw_clear_exc(ctx);
+        } else {
+            JS_FreeValue(ctx, old_bases);
+        }
         qp_raise_object(ctx, exc);
         return -1;
     }
-    for (i = 0; i < n; i++) {
-        if (qp_type_add_subclass(ctx, qp_type_from_value(QP_TUPLE_ITEMS(value)[i]), t) < 0) {
-            JS_FreeValue(ctx, old_bases);
-            return -1;
+    if (JS_VALUE_GET_PTR(t->bases) == JS_VALUE_GET_PTR(value)) {
+        qp_type_unlink_bases(t);
+        for (i = 0; i < n; i++) {
+            if (qp_type_add_subclass(ctx, qp_type_from_value(QP_TUPLE_ITEMS(value)[i]), t) < 0) {
+                JS_FreeValue(ctx, old_bases);
+                return -1;
+            }
         }
+        qp_type_modified(ctx, t);
     }
     JS_FreeValue(ctx, old_bases);
-    qp_type_modified(ctx, t);
     return 0;
 err2:
     JS_FreeValue(ctx, tn);
@@ -2101,6 +2244,19 @@ static int qp_type_set_dict_attr(JSContext *ctx, JSValueConst self, JSValueConst
     if (!qp_check_set_special(ctx, t, value, magic ? "__doc__" : "__module__"))
         return -1;
     qp_type_modified(ctx, t);
+    if (!magic) {
+        /* type_set_module: the class moved, its __firstlineno__ is stale */
+        JSValue key = qp_str_from_atom(ctx, QP_ATOM(ctx, __firstlineno__)), old;
+        int r;
+        if (JS_IsException(key))
+            return -1;
+        r = qp_dict_pop(ctx, t->dict, key, &old);
+        JS_FreeValue(ctx, key);
+        if (r < 0)
+            return -1;
+        if (r > 0)
+            JS_FreeValue(ctx, old);
+    }
     return qp_dict_set_item_atom(ctx, t->dict, a, value);
 }
 
@@ -2162,14 +2318,15 @@ static JSValue qp_type_get_doc(JSContext *ctx, JSValueConst self, int magic)
     QPType *t = qp_type_from_value(self);
     JSValue res;
     QPDescrGetFunc *f;
+    const char *doc = (t->flags & QP_TPFLAGS_HEAPTYPE) ? NULL : qp_capi_type_doc(t);
     int r;
-    if (!(t->flags & QP_TPFLAGS_HEAPTYPE) && t->spec && t->spec->doc) {
+    if (doc) {
         JSValue sn = qp_type_short_name(ctx, t);
         const char *s = JS_IsException(sn) ? NULL : JS_ToCString(ctx, sn);
         JS_FreeValue(ctx, sn);
         if (!s)
             return JS_EXCEPTION;
-        res = qp_doc_from_internal(ctx, s, t->spec->doc);
+        res = qp_doc_from_internal(ctx, s, doc);
         JS_FreeCString(ctx, s);
         return res;
     }
@@ -2191,15 +2348,15 @@ static JSValue qp_type_get_text_signature(JSContext *ctx, JSValueConst self, int
 {
     QPType *t = qp_type_from_value(self);
     JSValue sn, res;
-    const char *s;
-    if ((t->flags & QP_TPFLAGS_HEAPTYPE) || !t->spec || !t->spec->doc)
+    const char *s, *doc = (t->flags & QP_TPFLAGS_HEAPTYPE) ? NULL : qp_capi_type_doc(t);
+    if (!doc)
         return JS_UNDEFINED;
     sn = qp_type_short_name(ctx, t);
     s = JS_IsException(sn) ? NULL : JS_ToCString(ctx, sn);
     JS_FreeValue(ctx, sn);
     if (!s)
         return JS_EXCEPTION;
-    res = qp_text_signature_from_internal(ctx, s, t->spec->doc);
+    res = qp_text_signature_from_internal(ctx, s, doc);
     JS_FreeCString(ctx, s);
     return res;
 }
@@ -2393,10 +2550,6 @@ static int qp_type_set_type_params(JSContext *ctx, JSValueConst self, JSValueCon
     QPType *t = qp_type_from_value(self);
     if (!qp_check_set_special(ctx, t, value, "__type_params__"))
         return -1;
-    if (!qp_tuple_check(ctx, value)) {
-        qp_raise_type_error(ctx, "__type_params__ must be set to a tuple, not %T", value);
-        return -1;
-    }
     qp_type_modified(ctx, t);
     return qp_dict_set_item_atom(ctx, t->dict, QP_ATOM(ctx, __type_params__), value);
 }
@@ -2411,6 +2564,54 @@ static JSValue qp_type_get_flags(JSContext *ctx, JSValueConst self, int magic)
 {
     QPType *t = qp_type_from_value(self);
     return qp_long_from_int64(ctx, (int64_t)(t->flags & 0xFFFFFFFFu));
+}
+
+static void qp_type_layout(JSContext *ctx, QPType *t, QPTypeLayout *l)
+{
+    QPType *b = t;
+    /* the layout of the nearest type with a known one (spec sizes, C-API
+       PyTypeObject, else object) plus one pointer per slot added below
+       it, as class statements do for __slots__ (type_new_descriptors) */
+    for (;;) {
+        if (b->spec && b->spec->basicsize) {
+            l->basicsize = b->spec->basicsize;
+            l->itemsize = b->spec->itemsize;
+            l->dictoffset = l->weaklistoffset = 0;
+            break;
+        }
+#ifdef CONFIG_PYTHON_CAPI
+        if (qp_capi_type_layout(ctx, b, l))
+            break;
+#endif
+        if (!b->base) {
+            l->basicsize = 2 * sizeof(void *);   /* sizeof(PyObject) */
+            l->itemsize = l->dictoffset = l->weaklistoffset = 0;
+            break;
+        }
+        b = b->base;
+    }
+    l->basicsize += (Py_ssize_t)sizeof(void *) * (t->nslots - b->nslots);
+    /* a dict / weakref list not at a known C offset is managed, as
+       type_new_descriptors adds them: tp_dictoffset -1,
+       tp_weaklistoffset MANAGED_WEAKREF_OFFSET */
+    if (!l->dictoffset && (t->flags & QP_TPFLAGS_MANAGED_DICT))
+        l->dictoffset = -1;
+    if (!l->weaklistoffset && (t->flags & QP_TPFLAGS_WEAKREF))
+        l->weaklistoffset = -4 * (Py_ssize_t)sizeof(void *);
+}
+
+static JSValue qp_type_get_layout(JSContext *ctx, JSValueConst self, int magic)
+{
+    QPTypeLayout l;
+    Py_ssize_t v;
+    qp_type_layout(ctx, qp_type_from_value(self), &l);
+    switch (magic) {
+    case 0: v = l.basicsize; break;
+    case 1: v = l.itemsize; break;
+    case 2: v = l.dictoffset; break;
+    default: v = l.weaklistoffset; break;
+    }
+    return qp_long_from_int64(ctx, v);
 }
 
 static const QPGetSetDef qp_type_getsets[] = {
@@ -2428,6 +2629,10 @@ static const QPGetSetDef qp_type_getsets[] = {
     { "__type_params__", qp_type_get_type_params, qp_type_set_type_params, 0, NULL },
     { "__base__", qp_type_get_base, NULL, 0, NULL },
     { "__flags__", qp_type_get_flags, NULL, 0, NULL },
+    { "__basicsize__", qp_type_get_layout, NULL, 0, NULL },
+    { "__itemsize__", qp_type_get_layout, NULL, 1, NULL },
+    { "__dictoffset__", qp_type_get_layout, NULL, 2, NULL },
+    { "__weakrefoffset__", qp_type_get_layout, NULL, 3, NULL },
     { NULL }
 };
 
@@ -3335,7 +3540,7 @@ static JSValue qp_object_init_subclass(JSContext *ctx, JSValueConst self, JSValu
 static JSValue qp_object_format_meth(JSContext *ctx, JSValueConst self, JSValueConst *args,
                                      int nargs, JSValueConst kwnames, int magic)
 {
-    JSValue spec = args[0];
+    JSValueConst spec = args[0];
     Py_ssize_t n;
     if (!qp_str_check(ctx, spec)) {
         JSValue tn = JS_IsUndefined(spec) ? qp_str_from_cstr(ctx, "None")
@@ -3537,16 +3742,8 @@ static const QPTypeSpec qp_notimpl_type_spec = {
     .methods = qp_notimpl_methods,
 };
 
-/* js.JsObject: Python view of foreign JS values (interop proper is M4;
-   in M2 the type exists so that type() of any JS value is defined). */
-static const QPTypeSpec qp_jsobject_spec = {
-    .name = "js.JsObject",
-    .doc = NULL,
-    .flags = QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_WEAKREF,
-    .base = -1,
-    .exc_base = -1,
-    .instance_class_id = JS_CLASS_OBJECT,
-};
+/* js.JsObject (Python view of foreign JS values): python/jsinterop.c,
+   qp_jsobject_type_spec(). */
 
 /* ========================================================================= */
 /* Init                                                                      */
@@ -3606,7 +3803,7 @@ static int qp_init_typeobject(JSContext *ctx)
         qp_type_ready(ctx, s->types[QP_T_super], &qp_super_spec) < 0 ||
         qp_type_ready(ctx, s->types[QP_T_NoneType], &qp_none_type_spec) < 0 ||
         qp_type_ready(ctx, s->types[QP_T_NotImplementedType], &qp_notimpl_type_spec) < 0 ||
-        qp_type_ready(ctx, s->types[QP_T_JsObject], &qp_jsobject_spec) < 0)
+        qp_type_ready(ctx, s->types[QP_T_JsObject], qp_jsobject_type_spec()) < 0)
         return -1;
     JS_FreeValue(ctx, s->not_implemented);
     s->not_implemented = qp_object_new_instance(ctx, s->types[QP_T_NotImplementedType],

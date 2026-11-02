@@ -112,8 +112,11 @@ static void qp_wr_holder_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark
         return;
     if (!QP_IS_NULL(rec->callback))
         JS_MarkValue(rt, rec->callback, mark_func);
-    if (!QP_IS_NULL(rec->pending_cb))
-        JS_MarkValue(rt, rec->pending_cb, mark_func);
+    /* not rec->pending_cb: a queued callback belongs to the pending queue
+       of the context (marked by qp_modstate_mark), not to the holder. The record outlives
+       a holder that dies while it is queued (qp_wr_holder_finalizer), so a
+       cycle collection freeing the holder must not free the callback the
+       drain still releases or calls. */
 }
 
 static const JSClassDef qp_wr_holder_class = {
@@ -460,7 +463,7 @@ static JSValue qp_wr_get_or_create(JSContext *ctx, QPType *type, JSValueConst ob
    static BOOL qp_weakref_check(JSContext *ctx, JSValueConst v);
        PyWeakref_Check (ref, subclasses, proxies)
    static JSValue qp_weakref_get(JSContext *ctx, JSValueConst ref);
-       referent (new ref) or None if dead; TypeError "expected a weakref"
+       referent of ref (new reference), None if dead
    static JSValue qp_weakref_get_first(JSContext *ctx, JSValueConst obj);
        head of obj's weakref list (subtype __weakref__ getter) or None
    static void qp_weakref_run_pending(JSContext *ctx);
@@ -975,7 +978,7 @@ static JSValue qp_wr_proxy_divmod(JSContext *ctx, JSValueConst x, JSValueConst y
         JS_FreeValue(ctx, v[0]);
         return v[1];
     }
-    res = qp_wr_call_builtin(ctx, "divmod", 2, v);
+    res = qp_wr_call_builtin(ctx, "divmod", 2, (JSValueConst *)v);
     JS_FreeValue(ctx, v[0]);
     JS_FreeValue(ctx, v[1]);
     return res;

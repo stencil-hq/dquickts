@@ -126,14 +126,24 @@ whose size is determined when the object is allocated.
 #  error "dquickts: the C API requires a 64-bit host"
 #endif
 
-/* dquickts ob_flags bits (CPython uses bits 0-3, see _Py_IMMORTAL_FLAGS):
+/* dquickts per-object flags.  They are not ob_flags bits: limited-API
+   extensions built for Python < 3.12 (cp37-abi3 wheels, ...) increment and
+   decrement ob_refcnt as a whole Py_ssize_t, so a bit above the 32-bit
+   count would keep their Py_DECREF from ever reaching 0 (and calling
+   _Py_Dealloc).  They live in the 16-bit flags word of the mirror head that
+   precedes every heap object (2 bytes at ob - 6, QPCapiHead in
+   python/capi.h); statically allocated objects (_Py_STATICALLY_ALLOCATED_FLAG
+   = bit 2 of ob_flags) have no head and none of these flags.
    _Py_QP_BOUND_FLAG: the object has a JS identity (a JS value shared with
      Python/JS code).  Py_REFCNT() then also counts the references the JS
      heap holds, so "uniquely referenced" fast paths stay correct.
    _Py_QP_LIVE_SIZE_FLAG: list/bytearray mirror; Py_SIZE()/Py_SET_SIZE()
      call _PyQp_GetLiveSize()/_PyQp_SetLiveSize(). */
-#define _Py_QP_BOUND_FLAG     (1 << 8)
-#define _Py_QP_LIVE_SIZE_FLAG (1 << 9)
+#define _Py_QP_BOUND_FLAG     0x1000
+#define _Py_QP_LIVE_SIZE_FLAG 0x2000
+#define _PyQp_HasFlag(ob, flag)                                              \
+    (!((ob)->ob_flags & (1 << 2) /* _Py_STATICALLY_ALLOCATED_FLAG */) &&    \
+     (((const uint16_t *)(ob))[-3] & (flag)) != 0)
 
 /* Nothing is actually declared to be a PyObject, but every pointer to
  * a Python object can be cast to a PyObject*.  This is inheritance built
@@ -255,7 +265,7 @@ PyTypeObject* _Py_TYPE_impl(PyObject *ob)
 
 /* dquickts (D5 mirror model): mirrors of mutable variable-size builtins
    (list, bytearray) whose length lives in the shared JS object set
-   _Py_QP_LIVE_SIZE_FLAG in ob_flags; their size is read and written
+   _Py_QP_LIVE_SIZE_FLAG; their size is read and written
    through these functions instead of the (stale) ob_size field. */
 PyAPI_FUNC(Py_ssize_t) _PyQp_GetLiveSize(PyObject *ob);
 PyAPI_FUNC(void) _PyQp_SetLiveSize(PyVarObject *ob, Py_ssize_t size);
@@ -266,7 +276,7 @@ _Py_SIZE_impl(PyObject *ob)
 {
     assert(Py_TYPE(ob) != &PyLong_Type);
     assert(Py_TYPE(ob) != &PyBool_Type);
-    if (ob->ob_flags & _Py_QP_LIVE_SIZE_FLAG) {
+    if (_PyQp_HasFlag(ob, _Py_QP_LIVE_SIZE_FLAG)) {
         return _PyQp_GetLiveSize(ob);
     }
     return  _PyVarObject_CAST(ob)->ob_size;
@@ -283,7 +293,7 @@ _Py_SET_SIZE_impl(PyVarObject *ob, Py_ssize_t size)
 {
     assert(Py_TYPE(_PyObject_CAST(ob)) != &PyLong_Type);
     assert(Py_TYPE(_PyObject_CAST(ob)) != &PyBool_Type);
-    if (ob->ob_base.ob_flags & _Py_QP_LIVE_SIZE_FLAG) {
+    if (_PyQp_HasFlag(&ob->ob_base, _Py_QP_LIVE_SIZE_FLAG)) {
         _PyQp_SetLiveSize(ob, size);
         return;
     }

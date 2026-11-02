@@ -18,9 +18,10 @@
  *    JS_ATOM_NULL on error.
  *  - Message formats of the RAISE_* helpers follow PyUnicode_FromFormat for
  *    %s %c %d %i %zd %%; %U and %R take a JSAtom (str() / repr() of it).
- *  - Python warnings (invalid escape sequences, "from . lazy import") are
- *    not emitted: there is no warnings machinery, and with the default
- *    filters they never turn into errors.
+ *  - SyntaxWarnings (invalid escape sequences, "from . lazy import") go
+ *    through qp_syntax_warn with p->tok->filename / p->tok->module; one
+ *    raised as an exception that is not a SyntaxWarning is reported as
+ *    QP_ERR_PENDING (the exception stays pending in p->ctx).
  *  - SyntaxError.metadata (_PyPegen_set_syntax_error_metadata) and the
  *    error text read back from the source file by filename
  *    (_PyErr_ProgramDecodedTextObject) have no qp_error equivalent; the text
@@ -52,10 +53,13 @@
 /* Parse a whole source string (compile()/ast.parse front half).
    mode: QP_INPUT_*; flags: QP_PF_*.  Without QP_PF_SOURCE_IS_UTF8 /
    QP_PF_IGNORE_COOKIE, src is bytes and the BOM / coding cookie decide the
-   encoding.  The source is parsed with feature_version 15.  `err` must be
-   the arena's error sink.  Returns NULL with err set on failure. */
+   encoding.  The source is parsed with feature_version 15.  `module` is the
+   module name SyntaxWarnings are reported for (QP_NULL = derived from
+   filename, JS_UNDEFINED = warnings dropped).  `err` must be the arena's
+   error sink.  Returns NULL with err set on failure. */
 static __maybe_unused mod_ty qp_parse_string(JSContext *ctx, qp_arena *arena, const char *src,
-                                             size_t len, const char *filename, int mode,
+                                             size_t len, const char *filename,
+                                             JSValueConst module, int mode,
                                              int flags, qp_error *err);
 
 #define PyPARSE_DONT_IMPLY_DEDENT       0x0002
@@ -423,7 +427,8 @@ static __maybe_unused qp_const *_PyPegen_decode_string(Parser *, int, const char
 static __maybe_unused Parser *_PyPegen_Parser_New(struct tok_state *, int, int, int, int *, const char*, PyArena *);
 static __maybe_unused void _PyPegen_Parser_Free(Parser *);
 static __maybe_unused void *_PyPegen_run_parser(Parser *);
-static __maybe_unused mod_ty _PyPegen_run_parser_from_string(const char *, int, const char *, int, PyArena *);
+static __maybe_unused mod_ty _PyPegen_run_parser_from_string(const char *, int, const char *,
+                                                             JSValueConst, int, PyArena *);
 static __maybe_unused asdl_stmt_seq *_PyPegen_interactive_exit(Parser *);
 
 // Generated function in parse.c - function definition in python.gram

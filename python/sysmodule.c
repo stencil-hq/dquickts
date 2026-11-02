@@ -14,11 +14,17 @@
  * qp_init_genericalias), builds the sys module and registers `sys` and
  * `builtins` in sys.modules.
  *
- * Gaps (outside M2): tracing/profiling (settrace, setprofile), switch
- * interval, remote debugging, lazy-import filters and other C-runtime
+ * settrace / setprofile are M6 (frameobject.c qp_trace_*); sys.monitoring
+ * is python/instrumentation.c (tool ids, callbacks and event sets are
+ * kept; events are not fired).
+ *
+ * Threads (M5): getswitchinterval/setswitchinterval drive the GIL of
+ * python/ceval.c; _current_frames/_current_exceptions read the saved
+ * state of the other threads.
+ *
+ * Gaps: remote debugging, lazy-import filters and other C-runtime
  * introspection hooks are absent (AttributeError, as on a CPython build
- * without the feature); sys.std* are simple text streams over fd 0/1/2
- * until M3's io replaces them (no `.buffer`).
+ * without the feature).
  */
 
 #include <float.h>
@@ -26,10 +32,13 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <dlfcn.h>
 
 /* ---- functions of other k files / units not declared in object.h -------- */
 static int qp_init_typevar(JSContext *ctx);                 /* typevarobject.c */
 static int qp_init_genericalias(JSContext *ctx);            /* genericaliasobject.c */
+static JSObject *qp_fr_sf_func(JSStackFrame *sf);             /* a: frameobject.c */
+static JSValue qp_frame_of(JSContext *ctx, JSStackFrame *sf);  /* a: frameobject.c */
 static int qp_unraisable_default_hook(JSContext *ctx, JSValueConst exc_type,
                                       JSValueConst exc_value, JSValueConst exc_tb,
                                       JSValueConst err_msg, JSValueConst obj); /* i: errors.c */
@@ -44,6 +53,9 @@ static JSValue qp_unraisable_hook_args_new(JSContext *ctx, JSValueConst exc_type
 #define QP_PY_VERSION       "3.15.2"
 #define QP_PY_HEXVERSION    0x030F02F0
 #define QP_PY_API_VERSION   1013
+/* sys.implementation.cache_tag: the .pyc files hold QuickJS bytecode
+   (python/mod_misc.c marshal), never mistaken for CPython's cpython-315 */
+#define QP_CACHE_TAG        "quickpy-315"
 #define QP_LONG_MAX_STR_DIGITS_THRESHOLD 640   /* _PY_LONG_MAX_STR_DIGITS_THRESHOLD */
 #define QP_LONG_DEFAULT_MAX_STR_DIGITS 4300    /* _PY_LONG_DEFAULT_MAX_STR_DIGITS */
 #define QP_IMMORTAL_REFCNT  3221225472LL       /* _Py_IMMORTAL_INITIAL_REFCNT (3 << 30) */
@@ -74,6 +86,36 @@ static JSValue qp_unraisable_hook_args_new(JSContext *ctx, JSValueConst exc_type
 #define QP_PLATFORM "wasi"
 #else
 #define QP_PLATFORM "unknown"
+#endif
+
+/* sys.implementation._multiarch (CPython's PLATFORM_TRIPLET), only defined
+   where CPython sets it. */
+#if defined(__APPLE__)
+#define QP_MULTIARCH "darwin"
+#elif defined(__linux__)
+#if defined(__x86_64__)
+#define QP_MULTIARCH "x86_64-linux-gnu"
+#elif defined(__aarch64__)
+#define QP_MULTIARCH "aarch64-linux-gnu"
+#elif defined(__i386__)
+#define QP_MULTIARCH "i386-linux-gnu"
+#elif defined(__arm__)
+#define QP_MULTIARCH "arm-linux-gnueabihf"
+#elif defined(__riscv)
+#define QP_MULTIARCH "riscv64-linux-gnu"
+#else
+#define QP_MULTIARCH "linux"
+#endif
+#endif
+
+/* SOABI of extension modules built from source against this interpreter's
+   C API headers (plan D5 Tier S, capi/include): sysconfig's SOABI and
+   EXT_SUFFIX ("." QP_SOABI ".so") and the first entry of
+   _imp.extension_suffixes(), as CPython's "cpython-315-<multiarch>". */
+#ifdef QP_MULTIARCH
+#define QP_SOABI "quickpy-315-" QP_MULTIARCH
+#else
+#define QP_SOABI "quickpy-315"
 #endif
 
 /* ========================================================================= */
@@ -563,6 +605,17 @@ static const QPMethodDef qp_namespace_methods[] = {
     { NULL }
 };
 
+static JSValue qp_namespace_get_dict(JSContext *ctx, JSValueConst self, int magic)
+{
+    return qp_object_get_dict(ctx, self);
+}
+
+/* namespace_members: __dict__ (T_OBJECT, READONLY) */
+static const QPGetSetDef qp_namespace_getsets[] = {
+    { "__dict__", qp_namespace_get_dict, NULL, 0, NULL, QP_GETSET_MEMBER },
+    { NULL }
+};
+
 static const QPTypeSpec qp_namespace_spec = {
     .name = "types.SimpleNamespace",
     .doc = "SimpleNamespace(mapping_or_iterable=(), /, **kwargs)\n--\n\n"
@@ -579,6 +632,7 @@ static const QPTypeSpec qp_namespace_spec = {
         .tp_new = qp_namespace_new,
     },
     .methods = qp_namespace_methods,
+    .getsets = qp_namespace_getsets,
 };
 
 /* SimpleNamespace from (name, value) C pairs: values consumed. */
@@ -1613,13 +1667,41 @@ static void qp_sys_format_unraisable(JSContext *ctx, const char *msg)
     JS_FreeValue(ctx, exc);
 }
 
-/* Call file.flush() if file is usable; -1 (exception pending) on failure. */
+/* CPython file_is_closed (pylifecycle.c): file.closed is true; errors are
+   cleared and mean "not closed" */
+static BOOL qp_sys_file_is_closed(JSContext *ctx, JSValueConst file)
+{
+    JSAtom name = JS_NewAtom(ctx, "closed");
+    JSValue v;
+    int r;
+
+    if (name == JS_ATOM_NULL) {
+        qp_err_clear(ctx);
+        return FALSE;
+    }
+    v = qp_getattr(ctx, file, name);
+    JS_FreeAtom(ctx, name);
+    if (JS_IsException(v)) {
+        qp_err_clear(ctx);
+        return FALSE;
+    }
+    r = qp_bool(ctx, v);
+    JS_FreeValue(ctx, v);
+    if (r < 0)
+        qp_err_clear(ctx);
+    return r > 0;
+}
+
+/* Call file.flush() if file is usable (not None, not closed); -1 (exception
+   pending) on failure. */
 static int qp_sys_flush_file(JSContext *ctx, JSValueConst file)
 {
     JSValue r;
     if (QP_IS_NULL(file) || JS_IsUndefined(file) || JS_IsNull(file))
         return 0;
     if (qp_is_stdprinter(ctx, file) && (qp_sp_flags(qp_sp_slots(ctx, file)) & QP_SPF_CLOSED))
+        return 0;
+    if (qp_sys_file_is_closed(ctx, file))
         return 0;
     r = qp_call_method(ctx, file, QP_ATOM(ctx, flush), NULL, 0, QP_NULL);
     if (JS_IsException(r))
@@ -1639,7 +1721,7 @@ static int qp_sys_flush_std_files(JSContext *ctx)
     int status = 0;
 
     if (qp_sys_flush_file(ctx, out) < 0) {
-        qp_sys_format_unraisable(ctx, "Exception ignored on flushing sys.stdout");
+        qp_sys_format_unraisable(ctx, "Exception ignored while flushing sys.stdout");
         status = -1;
     }
     if (!qp_is(orig_out, out) && qp_is_stdprinter(ctx, orig_out) &&
@@ -2090,15 +2172,153 @@ error:
     return JS_EXCEPTION;
 }
 
-/* getrefcount(object, /) */
+/* getrefcount(object, /): approximate.  Heap values (objects, str, big
+   ints, ...) report the QuickJS reference count of the value, which lives
+   in the malloc block header just before the payload (js_rc()); like
+   CPython it includes the reference held by the call's argument.  It counts
+   QuickJS references, not CPython ones: references held by shapes, atoms,
+   caches or C-extension mirrors are not CPython-equivalent, so only use it
+   for relative comparisons.  Unboxed values (small int, float, bool, None,
+   ...) have no count and report the immortal value like CPython's immortal
+   objects. */
 QP_SYS_FN(qp_sys_getrefcount)
 {
     JSValueConst o = args[0];
-    if (JS_VALUE_HAS_REF_COUNT(o)) {
-        JSRefCountHeader *h = JS_VALUE_GET_PTR(o);
-        return qp_long_from_int64(ctx, h->ref_count);
-    }
+    if (JS_VALUE_HAS_REF_COUNT(o))
+        return qp_long_from_int64(ctx, js_rc(JS_VALUE_GET_PTR(o))->ref_count +
+                                       qp_capi_c_refs(ctx, o));
     return qp_long_from_int64(ctx, QP_IMMORTAL_REFCNT);
+}
+
+/* ---- dlopen flags (CPython Python/import.c _PyImport_{Get,Set}DLOpenFlags);
+   used by python/capi_dynload.c ------------------------------------------ */
+
+/* getdlopenflags() */
+QP_SYS_FN(qp_sys_getdlopenflags)
+{
+    return JS_NewInt32(ctx, __atomic_load_n(&QP_STATE(ctx)->dlopenflags, __ATOMIC_RELAXED));
+}
+
+/* setdlopenflags(flags, /) */
+QP_SYS_FN(qp_sys_setdlopenflags)
+{
+    int flags;
+    if (qp_arg_int(ctx, args[0], &flags) < 0)
+        return JS_EXCEPTION;
+    __atomic_store_n(&QP_STATE(ctx)->dlopenflags, flags, __ATOMIC_RELAXED);
+    return JS_UNDEFINED;
+}
+
+/* ---- threads (python/ceval.c "Threads and the GIL") -------------------- */
+
+/* getswitchinterval() */
+QP_SYS_FN(qp_sys_getswitchinterval)
+{
+    return qp_float_new(ctx, 1e-6 * (double)__atomic_load_n(&qp_gil_interval_us,
+                                                           __ATOMIC_RELAXED));
+}
+
+/* setswitchinterval(interval, /) */
+QP_SYS_FN(qp_sys_setswitchinterval)
+{
+    double interval;
+    if (qp_arg_check_positional(ctx, "setswitchinterval", nargs, 1, 1) < 0 ||
+        qp_float_as_double(ctx, args[0], &interval) < 0)
+        return JS_EXCEPTION;
+    if (interval <= 0.0)
+        return qp_raise_value_error(ctx, "switch interval must be strictly positive");
+    __atomic_store_n(&qp_gil_interval_us, (unsigned long)(1e6 * interval), __ATOMIC_RELAXED);
+    return JS_UNDEFINED;
+}
+
+/* The top frame of a thread's frame chain that is a Python frame (NULL if
+   none): the running thread's or a saved one. */
+static JSStackFrame *qp_sys_thread_top_frame(JSContext *ctx, QPThreadState *ts)
+{
+    QPThreads *thr = ctx->rt->py_threads;
+    JSStackFrame *sf;
+    if (!thr || ts == thr->current)
+        return qp_py_frame_at(ctx, 0);
+    for (sf = ts->js.current_stack_frame; sf; sf = sf->prev_frame) {
+        if (qp_fr_sf_func(sf))
+            return sf;
+    }
+    return NULL;
+}
+
+/* _PyErr_GetTopmostException of a thread (borrowed, None if none).  The
+   bottom item of every chain is QPState.exc_info_base, which holds the
+   running thread's value: a saved thread's is in its state. */
+static JSValue qp_sys_thread_topmost_exc(JSContext *ctx, QPThreadState *ts)
+{
+    QPState *s = QP_STATE(ctx);
+    QPThreads *thr = ctx->rt->py_threads;
+    QPExcStackItem *it;
+    if (!thr || ts == thr->current) {
+        it = s->exc_info;
+        while ((JS_IsUndefined(it->exc_value) || QP_IS_NULL(it->exc_value)) && it->previous)
+            it = it->previous;
+        return QP_IS_NULL(it->exc_value) ? JS_UNDEFINED : it->exc_value;
+    }
+    for (it = ts->exc_info;; it = it->previous) {
+        JSValue v = it == &s->exc_info_base ? ts->exc_info_base.exc_value : it->exc_value;
+        if (!JS_IsUndefined(v) && !QP_IS_NULL(v))
+            return v;
+        if (it == &s->exc_info_base || !it->previous)
+            return JS_UNDEFINED;
+    }
+}
+
+/* _current_frames() / _current_exceptions() (magic 1):
+   _PyThread_CurrentFrames / _PyThread_CurrentExceptions */
+QP_SYS_FN(qp_sys_current_frames)
+{
+    QPThreads *thr = ctx->rt->py_threads;
+    struct list_head *el;
+    JSValue d = qp_dict_new(ctx);
+
+    if (JS_IsException(d))
+        return d;
+    for (el = thr ? thr->tstates.next : NULL; ; el = el->next) {
+        QPThreadState *ts = NULL;
+        uint64_t ident;
+        JSValue key, val;
+        int r;
+        if (thr) {
+            if (el == &thr->tstates)
+                break;
+            ts = list_entry(el, QPThreadState, link);
+            ident = ts->ident;
+        } else {
+            ident = (uint64_t)(uintptr_t)pthread_self();
+        }
+        if (magic) {
+            val = JS_DupValue(ctx, qp_sys_thread_topmost_exc(ctx, ts));
+        } else {
+            JSStackFrame *sf = qp_sys_thread_top_frame(ctx, ts);
+            val = sf ? JS_DupValue(ctx, qp_frame_of(ctx, sf)) : QP_NULL;
+        }
+        if (JS_IsException(val))
+            goto fail;
+        if (!QP_IS_NULL(val)) {
+            key = qp_long_from_uint64(ctx, ident);
+            if (JS_IsException(key)) {
+                JS_FreeValue(ctx, val);
+                goto fail;
+            }
+            r = qp_dict_set_item(ctx, d, key, val);
+            JS_FreeValue(ctx, key);
+            JS_FreeValue(ctx, val);
+            if (r < 0)
+                goto fail;
+        }
+        if (!thr)
+            break;
+    }
+    return d;
+ fail:
+    JS_FreeValue(ctx, d);
+    return JS_EXCEPTION;
 }
 
 /* _getframe(depth=0, /) */
@@ -2351,19 +2571,90 @@ QP_SYS_FN(qp_sys_set_asyncgen_hooks)
     return JS_UNDEFINED;
 }
 
-/* call_tracing(func, args, /) */
+/* set_coroutine_origin_tracking_depth(depth): per thread, like CPython */
+QP_SYS_FN(qp_sys_set_coroutine_origin_tracking_depth)
+{
+    static const char *const kwlist[] = { "depth", NULL };
+    static const QPArgSpec spec = { "set_coroutine_origin_tracking_depth", kwlist, 1, 1, 0 };
+    JSValueConst out[1];
+    int depth;
+
+    if (qp_arg_parse(ctx, &spec, args, nargs, kwnames, out) < 0)
+        return JS_EXCEPTION;
+    if (qp_arg_int(ctx, out[0], &depth) < 0)
+        return JS_EXCEPTION;
+    if (depth < 0)
+        return qp_raise_value_error(ctx, "depth must be >= 0");
+    QP_STATE(ctx)->coro_origin_depth = depth;
+    return JS_UNDEFINED;
+}
+
+/* get_coroutine_origin_tracking_depth() */
+QP_SYS_FN(qp_sys_get_coroutine_origin_tracking_depth)
+{
+    return JS_NewInt32(ctx, QP_STATE(ctx)->coro_origin_depth);
+}
+
+/* call_tracing(func, args, /): the call is traced even from a trace
+   function (_PyEval_CallTracing) */
 QP_SYS_FN(qp_sys_call_tracing)
 {
+    QPState *st = QP_STATE(ctx);
+    JSValue r;
+    int saved;
+
     if (qp_arg_check_positional(ctx, "call_tracing", nargs, 2, 2) < 0)
         return JS_EXCEPTION;
     if (!qp_tuple_check(ctx, args[1]))
         return qp_raise_type_error(ctx, "call_tracing() argument 2 must be tuple, not %T", args[1]);
-    return qp_call_tuple(ctx, args[0], args[1], QP_NULL);
+    saved = st->tracing;
+    st->tracing = 0;
+    r = qp_call_tuple(ctx, args[0], args[1], QP_NULL);
+    st->tracing = saved;
+    return r;
+}
+
+/* ---- M6: settrace / setprofile (frameobject.c qp_trace_*) --------------- */
+
+static int qp_sys_audit_event(JSContext *ctx, const char *event)
+{
+    JSValueConst a[1];
+    JSValue ev, r;
+
+    ev = qp_str_from_cstr(ctx, event);
+    if (JS_IsException(ev))
+        return -1;
+    a[0] = ev;
+    r = qp_sys_audit(ctx, JS_UNDEFINED, a, 1, QP_NULL, 0);
+    JS_FreeValue(ctx, ev);
+    if (JS_IsException(r))
+        return -1;
+    JS_FreeValue(ctx, r);
+    return 0;
+}
+
+/* settrace(function, /), setprofile(function, /) and the *allthreads
+   variants (one thread): magic = is_profile */
+QP_SYS_FN(qp_sys_settrace)
+{
+    if (qp_sys_audit_event(ctx, magic ? "sys.setprofile" : "sys.settrace") < 0 ||
+        qp_trace_set(ctx, magic, args[0]) < 0)
+        return JS_EXCEPTION;
+    return JS_UNDEFINED;
+}
+
+/* gettrace(), getprofile(): magic = is_profile */
+QP_SYS_FN(qp_sys_gettrace)
+{
+    QPState *st = QP_STATE(ctx);
+    JSValue f = magic ? st->profile_func : st->trace_func;
+
+    return JS_VALUE_GET_TAG(f) == JS_TAG_OBJECT ? JS_DupValue(ctx, f) : JS_UNDEFINED;
 }
 
 QP_SYS_FN(qp_sys_is_finalizing)
 {
-    return qp_bool_new(FALSE);
+    return qp_bool_new(QP_STATE(ctx)->finalizing);
 }
 
 QP_SYS_FN(qp_sys_is_gil_enabled)
@@ -2457,8 +2748,59 @@ static const QPMethodDef qp_sys_methods[] = {
       "getsizeof(object [, default]) -> int\n\nReturn the size of object in bytes." },
     { "_getframe", qp_sys_getframe, QP_METH_FASTCALL, 0,
       "_getframe($module, depth=0, /)\n--\n\nReturn a frame object from the call stack." },
+    { "_current_frames", qp_sys_current_frames, QP_METH_NOARGS, 0,
+      "_current_frames($module, /)\n--\n\n"
+      "Return a dict mapping each thread's thread id to its current stack frame.\n\n"
+      "This function should be used for specialized purposes only." },
+    { "_current_exceptions", qp_sys_current_frames, QP_METH_NOARGS, 1,
+      "_current_exceptions($module, /)\n--\n\n"
+      "Return a dict mapping each thread's identifier to its current raised exception.\n\n"
+      "This function should be used for specialized purposes only." },
+    { "getdlopenflags", qp_sys_getdlopenflags, QP_METH_NOARGS, 0,
+      "getdlopenflags($module, /)\n--\n\n"
+      "Return the current value of the flags that are used for dlopen calls.\n\n"
+      "The flag constants are defined in the os module." },
+    { "setdlopenflags", qp_sys_setdlopenflags, QP_METH_O, 0,
+      "setdlopenflags($module, flags, /)\n--\n\n"
+      "Set the flags used by the interpreter for dlopen calls.\n\n"
+      "This is used, for example, when the interpreter loads extension\n"
+      "modules. Among other things, this will enable a lazy resolving of\n"
+      "symbols when importing a module, if called as sys.setdlopenflags(0).\n"
+      "To share symbols across extension modules, call as\n"
+      "sys.setdlopenflags(os.RTLD_GLOBAL).  Symbolic names for the flag\n"
+      "modules can be found in the os module (RTLD_xxx constants, e.g.\n"
+      "os.RTLD_LAZY)." },
+    { "getswitchinterval", qp_sys_getswitchinterval, QP_METH_NOARGS, 0,
+      "getswitchinterval($module, /)\n--\n\n"
+      "Return the current thread switch interval; see sys.setswitchinterval()." },
+    { "setswitchinterval", qp_sys_setswitchinterval, QP_METH_FASTCALL, 0,
+      "setswitchinterval($module, interval, /)\n--\n\n"
+      "Set the ideal thread switching delay inside the Python interpreter.\n\n"
+      "The actual frequency of switching threads can be lower if the\n"
+      "interpreter executes long sequences of uninterruptible code\n"
+      "(this is implementation-specific and workload-dependent).\n\n"
+      "The parameter must represent the desired switching delay in seconds\n"
+      "A typical value is 0.005 (5 milliseconds)." },
     { "_getframemodulename", qp_sys_getframemodulename, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
       "_getframemodulename($module, /, depth=0)\n--\n\nReturn the name of the module for a calling frame." },
+    { "settrace", qp_sys_settrace, QP_METH_O, 0,
+      "settrace($module, function, /)\n--\n\nSet the global debug tracing function.\n\n"
+      "It will be called on each function call.  See the debugger chapter\nin the library manual." },
+    { "gettrace", qp_sys_gettrace, QP_METH_NOARGS, 0,
+      "gettrace($module, /)\n--\n\nReturn the global debug tracing function set with sys.settrace.\n\n"
+      "See the debugger chapter in the library manual." },
+    { "setprofile", qp_sys_settrace, QP_METH_O, 1,
+      "setprofile($module, function, /)\n--\n\nSet the profiling function.\n\n"
+      "It will be called on each function call and return.  See the profiler\nchapter in the library manual." },
+    { "getprofile", qp_sys_gettrace, QP_METH_NOARGS, 1,
+      "getprofile($module, /)\n--\n\nReturn the profiling function set with sys.setprofile.\n\n"
+      "See the profiler chapter in the library manual." },
+    { "_settraceallthreads", qp_sys_settrace, QP_METH_O, 0,
+      "_settraceallthreads($module, function, /)\n--\n\nSet the global debug tracing function in all running threads belonging to the current interpreter.\n\n"
+      "It will be called on each function call. See the debugger chapter\nin the library manual." },
+    { "_setprofileallthreads", qp_sys_settrace, QP_METH_O, 1,
+      "_setprofileallthreads($module, function, /)\n--\n\nSet the profiling function in all running threads belonging to the current interpreter.\n\n"
+      "It will be called on each function call and return.  See the profiler\nchapter in the library manual." },
     { "intern", qp_sys_intern, QP_METH_O, 0,
       "intern($module, string, /)\n--\n\n``Intern'' the given string." },
     { "_is_interned", qp_sys_is_interned, QP_METH_O, 0,
@@ -2471,6 +2813,17 @@ static const QPMethodDef qp_sys_methods[] = {
       "call_tracing($module, func, args, /)\n--\n\nCall func(*args), while tracing is enabled." },
     { "set_asyncgen_hooks", qp_sys_set_asyncgen_hooks, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
       "set_asyncgen_hooks([firstiter] [, finalizer])\n\nSet a finalizer for async generators objects." },
+    { "set_coroutine_origin_tracking_depth", qp_sys_set_coroutine_origin_tracking_depth,
+      QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "set_coroutine_origin_tracking_depth($module, /, depth)\n--\n\n"
+      "Enable or disable origin tracking for coroutine objects in this thread.\n\n"
+      "Coroutine objects will track 'depth' frames of traceback information\n"
+      "about where they came from, available in their cr_origin attribute.\n\n"
+      "Set a depth of 0 to disable." },
+    { "get_coroutine_origin_tracking_depth", qp_sys_get_coroutine_origin_tracking_depth,
+      QP_METH_NOARGS, 0,
+      "get_coroutine_origin_tracking_depth($module, /)\n--\n\n"
+      "Check status of origin tracking for coroutine objects in this thread." },
     { "get_asyncgen_hooks", qp_sys_get_asyncgen_hooks, QP_METH_NOARGS, 0,
       "get_asyncgen_hooks($module, /)\n--\n\nReturn the installed asynchronous generators hooks." },
     { "is_remote_debug_enabled", qp_sys_is_remote_debug_enabled, QP_METH_NOARGS, 0,
@@ -2741,7 +3094,7 @@ static JSValue qp_sys_make_impl_info(JSContext *ctx, JSValueConst version_info)
 {
     static const char *const names[] = {
         "name", "cache_tag", "version", "hexversion",
-#if defined(__APPLE__) || defined(__linux__)
+#ifdef QP_MULTIARCH
         "_multiarch",
 #endif
         "supports_isolated_interpreters",
@@ -2750,25 +3103,11 @@ static JSValue qp_sys_make_impl_info(JSContext *ctx, JSValueConst version_info)
     int i = 0;
 
     vals[i++] = qp_str_from_cstr(ctx, "quickpy");
-    vals[i++] = JS_UNDEFINED;     /* no bytecode cache: importlib writes no .pyc */
+    vals[i++] = qp_str_from_cstr(ctx, QP_CACHE_TAG); /* __pycache__/<name>.quickpy-315.pyc */
     vals[i++] = JS_DupValue(ctx, version_info);
     vals[i++] = JS_NewInt32(ctx, QP_PY_HEXVERSION);
-#if defined(__APPLE__)
-    vals[i++] = qp_str_from_cstr(ctx, "darwin");
-#elif defined(__linux__)
-#if defined(__x86_64__)
-    vals[i++] = qp_str_from_cstr(ctx, "x86_64-linux-gnu");
-#elif defined(__aarch64__)
-    vals[i++] = qp_str_from_cstr(ctx, "aarch64-linux-gnu");
-#elif defined(__i386__)
-    vals[i++] = qp_str_from_cstr(ctx, "i386-linux-gnu");
-#elif defined(__arm__)
-    vals[i++] = qp_str_from_cstr(ctx, "arm-linux-gnueabihf");
-#elif defined(__riscv)
-    vals[i++] = qp_str_from_cstr(ctx, "riscv64-linux-gnu");
-#else
-    vals[i++] = qp_str_from_cstr(ctx, "linux");
-#endif
+#ifdef QP_MULTIARCH
+    vals[i++] = qp_str_from_cstr(ctx, QP_MULTIARCH);
 #endif
     vals[i++] = qp_bool_new(FALSE); /* PEP 734 subinterpreters are not supported */
     return qp_namespace_from_pairs(ctx, i, names, vals);
@@ -3005,17 +3344,82 @@ fail:
     return JS_EXCEPTION;
 }
 
+/* sys._jit: there is no JIT compiler (CPython builds without
+   --enable-experimental-jit). */
+QP_SYS_FN(qp_sys_jit_false)
+{
+    return qp_bool_new(FALSE);
+}
+
+static const QPMethodDef qp_sys_jit_methods[] = {
+    { "is_available", qp_sys_jit_false, QP_METH_NOARGS, 0,
+      "is_available($module, /)\n--\n\nReturn True if the current Python executable supports JIT compilation, and False otherwise." },
+    { "is_enabled", qp_sys_jit_false, QP_METH_NOARGS, 0,
+      "is_enabled($module, /)\n--\n\nReturn True if JIT compilation is enabled for the current Python process (implies sys._jit.is_available()), and False otherwise." },
+    { "is_active", qp_sys_jit_false, QP_METH_NOARGS, 0,
+      "is_active($module, /)\n--\n\nReturn True if the topmost Python frame is currently executing JIT code (implies sys._jit.is_enabled()), and False otherwise." },
+    { NULL },
+};
+
+static const QPModuleDef qp_moddef_sys__jit = {
+    "sys._jit",
+    "Utilities for observing just-in-time compilation.\n\n"
+    "WARNING: This API is an implementation detail and may change between "
+    "Python releases.",
+    qp_sys_jit_methods,
+    NULL,
+};
+
+/* sys.monitoring (python/instrumentation.c) */
+static JSValue qp_monitoring_create(JSContext *ctx);
+
+/* The sys attributes that come from the configuration of the process:
+   executable, the command line, the -X/-W options, sys.flags (only when
+   'flags', the population sets it with the other struct sequences) and
+   the bytecode options.  Part of qp_sys_populate, and applied again to a
+   state restored from the base snapshot of qpy (pythonrun.c). */
+static int qp_sys_set_config_attrs(JSContext *ctx, JSValueConst d, BOOL flags)
+{
+    QPConfig *c = &QP_STATE(ctx)->config;
+    const char *exe = c->executable ? c->executable : "";
+    char exe_abs[PATH_MAX];
+    JSValue v;
+
+    if (exe[0] && exe[0] != '/' && strchr(exe, '/') && realpath(exe, exe_abs))
+        exe = exe_abs;
+    if (qp_sys_dict_set(ctx, d, "executable", qp_sys_fs_str(ctx, exe)) < 0 ||
+        qp_sys_dict_set(ctx, d, "_base_executable", qp_sys_fs_str(ctx, exe)) < 0 ||
+        qp_sys_dict_set(ctx, d, "pycache_prefix",
+                        c->pycache_prefix ? qp_sys_fs_str(ctx, c->pycache_prefix) : JS_UNDEFINED) < 0)
+        return -1;
+    if (flags && qp_sys_dict_set(ctx, d, "flags", qp_sys_make_flags(ctx)) < 0)
+        return -1;
+
+    /* command line */
+    if (c->argc > 0)
+        v = qp_sys_str_list(ctx, c->argc, c->argv);
+    else {
+        char empty[1] = "";
+        char *one[1] = { empty };
+        v = qp_sys_str_list(ctx, 1, one);
+    }
+    if (qp_sys_dict_set(ctx, d, "argv", v) < 0 ||
+        qp_sys_dict_set(ctx, d, "orig_argv", qp_sys_str_list(ctx, c->orig_argc, c->orig_argv)) < 0 ||
+        qp_sys_dict_set(ctx, d, "warnoptions", qp_sys_str_list(ctx, c->nwarnoptions, c->warnoptions)) < 0 ||
+        qp_sys_dict_set(ctx, d, "_xoptions", qp_sys_make_xoptions(ctx)) < 0 ||
+        qp_sys_dict_set(ctx, d, "dont_write_bytecode", qp_bool_new(c->dont_write_bytecode != 0)) < 0)
+        return -1;
+    return 0;
+}
+
 /* Fill the sys module dict (functions are already there: added from
    qp_moddef_sys.methods by qp_module_from_def). */
 static int qp_sys_populate(JSContext *ctx, JSValueConst d)
 {
     QPState *st = QP_STATE(ctx);
-    QPConfig *c = &st->config;
     QPSysPaths paths;
-    JSValue version_info, v;
+    JSValue version_info;
     uint16_t probe = 1;
-    const char *exe = c->executable ? c->executable : "";
-    char exe_abs[PATH_MAX];
 
     /* hooks and their originals */
 #define QP_SYS_ALIAS(dst, src)                                                 \
@@ -3068,21 +3472,25 @@ static int qp_sys_populate(JSContext *ctx, JSValueConst d)
         if (qp_sys_dict_set(ctx, d, "_git", qp_sys_new_str_tuple(ctx, 3, git)) < 0)
             return -1;
     }
+#ifdef __APPLE__
+    /* _PYTHONFRAMEWORK: empty for a non-framework build */
+    if (qp_sys_dict_set(ctx, d, "_framework", qp_str_from_cstr(ctx, "")) < 0)
+        return -1;
+#endif
+
+    if (qp_sys_dict_set(ctx, d, "_jit", qp_module_from_def(ctx, &qp_moddef_sys__jit)) < 0 ||
+        qp_sys_dict_set(ctx, d, "monitoring", qp_monitoring_create(ctx)) < 0)
+        return -1;
 
     /* paths */
     qp_sys_compute_paths(ctx, &paths);
-    if (exe[0] && exe[0] != '/' && strchr(exe, '/') && realpath(exe, exe_abs))
-        exe = exe_abs;
-    if (qp_sys_dict_set(ctx, d, "executable", qp_sys_fs_str(ctx, exe)) < 0 ||
-        qp_sys_dict_set(ctx, d, "_base_executable", qp_sys_fs_str(ctx, exe)) < 0 ||
-        qp_sys_dict_set(ctx, d, "prefix", qp_sys_fs_str(ctx, paths.prefix)) < 0 ||
+    if (qp_sys_dict_set(ctx, d, "prefix", qp_sys_fs_str(ctx, paths.prefix)) < 0 ||
         qp_sys_dict_set(ctx, d, "base_prefix", qp_sys_fs_str(ctx, paths.prefix)) < 0 ||
         qp_sys_dict_set(ctx, d, "exec_prefix", qp_sys_fs_str(ctx, paths.prefix)) < 0 ||
         qp_sys_dict_set(ctx, d, "base_exec_prefix", qp_sys_fs_str(ctx, paths.prefix)) < 0 ||
         qp_sys_dict_set(ctx, d, "platlibdir", qp_str_from_cstr(ctx, "lib")) < 0 ||
         qp_sys_dict_set(ctx, d, "_stdlib_dir",
                         paths.has_stdlib ? qp_sys_fs_str(ctx, paths.stdlib) : JS_UNDEFINED) < 0 ||
-        qp_sys_dict_set(ctx, d, "pycache_prefix", JS_UNDEFINED) < 0 ||
         qp_sys_dict_set(ctx, d, "path", qp_sys_make_path(ctx, &paths)) < 0 ||
         qp_sys_dict_set(ctx, d, "meta_path", qp_list_new(ctx, 0)) < 0 ||
         qp_sys_dict_set(ctx, d, "path_hooks", qp_list_new(ctx, 0)) < 0 ||
@@ -3090,21 +3498,7 @@ static int qp_sys_populate(JSContext *ctx, JSValueConst d)
         qp_sys_dict_set(ctx, d, "modules", JS_DupValue(ctx, st->modules)) < 0)
         return -1;
 
-    /* command line */
-    if (c->argc > 0)
-        v = qp_sys_str_list(ctx, c->argc, c->argv);
-    else {
-        char empty[1] = "";
-        char *one[1] = { empty };
-        v = qp_sys_str_list(ctx, 1, one);
-    }
-    if (qp_sys_dict_set(ctx, d, "argv", v) < 0 ||
-        qp_sys_dict_set(ctx, d, "orig_argv", qp_sys_str_list(ctx, c->orig_argc, c->orig_argv)) < 0 ||
-        qp_sys_dict_set(ctx, d, "warnoptions", qp_sys_str_list(ctx, c->nwarnoptions, c->warnoptions)) < 0 ||
-        qp_sys_dict_set(ctx, d, "_xoptions", qp_sys_make_xoptions(ctx)) < 0 ||
-        qp_sys_dict_set(ctx, d, "dont_write_bytecode", qp_bool_new(c->dont_write_bytecode != 0)) < 0)
-        return -1;
-    return 0;
+    return qp_sys_set_config_attrs(ctx, d, FALSE);
 }
 
 /* ========================================================================= */
@@ -3145,6 +3539,9 @@ static int qp_init_sys(JSContext *ctx)
         return -1;
     if (qp_init_genericalias(ctx) < 0 || qp_init_typevar(ctx) < 0)
         return -1;
+
+    /* CPython's interpreter default (pycore_runtime_init.h) */
+    st->dlopenflags = RTLD_NOW;
 
     if (JS_VALUE_GET_TAG(st->audit_hooks) != JS_TAG_OBJECT) {
         JSValue l = qp_list_new(ctx, 0);

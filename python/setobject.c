@@ -983,7 +983,7 @@ static JSValue qp_set_repr(JSContext *ctx, JSValueConst so)
 /* Iterator                                                                  */
 /* ------------------------------------------------------------------------ */
 
-static void qp_setiter_finalizer(JSRuntime *rt, JSValueConst val)
+static void qp_setiter_finalizer(JSRuntime *rt, JSValue val)
 {
     QPSetIter *si = JS_VALUE_GET_OBJ(val)->u.opaque;
     if (si) {
@@ -1096,12 +1096,9 @@ static JSValue qp_setiter_reduce(JSContext *ctx, JSValueConst self, JSValueConst
         JS_FreeValue(ctx, set);
     }
     /* _PyEval_GetBuiltin(&_Py_ID(iter)) */
-    r = qp_dict_get_item_atom(ctx, QP_STATE(ctx)->builtins_dict, QP_ATOM(ctx, iter),
-                              &iter_fn);
-    if (r <= 0) {
+    iter_fn = qp_eval_get_builtin(ctx, QP_ATOM(ctx, iter));
+    if (JS_IsException(iter_fn)) {
         JS_FreeValue(ctx, list);
-        if (r == 0)
-            return qp_raise(ctx, QP_EXC(ctx, AttributeError), "iter");
         return JS_EXCEPTION;
     }
     targs = qp_tuple_pack(ctx, 1, (JSValueConst *)&list);
@@ -1532,7 +1529,8 @@ static const QPMethodDef qp_setiter_methods[] = {
 static const QPTypeSpec qp_set_spec = {
     .name = "set",
     .doc = "set(iterable=(), /)\n--\n\nBuild an unordered collection of unique elements.",
-    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_BASETYPE | QP_TPFLAGS_MATCH_SELF,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_BASETYPE | QP_TPFLAGS_MATCH_SELF |
+             QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_WEAKREF,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_SET,
@@ -1566,7 +1564,8 @@ static const QPTypeSpec qp_frozenset_spec = {
     .name = "frozenset",
     .doc = "frozenset(iterable=(), /)\n--\n\n"
            "Build an immutable unordered collection of unique elements.",
-    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_BASETYPE | QP_TPFLAGS_MATCH_SELF,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_BASETYPE | QP_TPFLAGS_MATCH_SELF |
+             QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_WEAKREF,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_FROZENSET,
@@ -1593,7 +1592,7 @@ static const QPTypeSpec qp_frozenset_spec = {
 
 static const QPTypeSpec qp_setiter_spec = {
     .name = "set_iterator",
-    .flags = QP_TPFLAGS_DEFAULT,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_IMMUTABLETYPE,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_DICT_ITER,

@@ -321,7 +321,7 @@ extern PyTime_t _PyTimeFraction_Mul(
 extern double _PyTimeFraction_Resolution(
     const _PyTimeFraction *frac);
 
-extern PyStatus _PyTime_Init(struct _Py_time_runtime_state *state);
+/* dquickts: _PyTime_Init (runtime state) is not provided. */
 
 #ifdef __cplusplus
 }

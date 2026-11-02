@@ -60,6 +60,10 @@
 //!
 //! - `phf` enables using Perfect Hash Function for builtin modules lookup
 //!
+//! - `python` compiles the engine's Python 3.15 runtime in: `Ctx::init_python`,
+//! `Ctx::eval_python`, `Ctx::eval_python_with_options` and `Ctx::python_import` (Python values
+//! are JS values; see the Python section of the README).
+//!
 //! - `disable-assertions` compiles QuickJS with assertions stripped out.
 //!
 //! ## Extra types

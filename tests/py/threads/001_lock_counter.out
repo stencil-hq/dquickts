@@ -1,0 +1,3 @@
+24000 True True 0
+True False False True
+RuntimeError: release unlocked lock

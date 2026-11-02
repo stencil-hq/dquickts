@@ -484,7 +484,7 @@ static void qp_cd_add_note(JSContext *ctx, const char *what, const char *encodin
         goto error;
     }
     arg = note;
-    r = qp_call_method(ctx, exc, QP_ATOM(ctx, add_note), &arg, 1, QP_NULL);
+    r = qp_call_method(ctx, exc, QP_ATOM(ctx, add_note), (JSValueConst *)&arg, 1, QP_NULL);
     JS_FreeValue(ctx, note);
     if (JS_IsException(r))
         goto error;
@@ -733,6 +733,41 @@ static JSValue qp_codec_lookup_error(JSContext *ctx, const char *name)
     if (r == 0)
         return qp_raise(ctx, QP_EXC(ctx, LookupError), "unknown error handler name '%.400s'", name);
     return handler;
+}
+
+/* unicode_check_encoding_errors (Objects/unicodeobject.c): in development
+   mode (-X dev), check that encoding and errors name a codec and an error
+   handler even when they are not used.  Not before the `encodings` search
+   function is registered (CPython: before the filesystem codec is set) nor
+   during finalization.  0 or -1 (LookupError). */
+static int qp_codec_check_encoding_errors(JSContext *ctx, const char *encoding, const char *errors)
+{
+    QPState *st = QP_STATE(ctx);
+    QPModState *ms = st->mod_state;
+    JSValue h;
+
+    if (!encoding && !errors)
+        return 0;
+    if (!st->config.dev_mode || st->finalizing)
+        return 0;
+    if (!ms || QP_IS_NULL(ms->codec_search_path) || qp_list_size(ms->codec_search_path) == 0)
+        return 0;
+    if (encoding && strcmp(encoding, "utf-8") && strcmp(encoding, "utf8") &&
+        strcmp(encoding, "ascii")) {
+        h = qp_codec_lookup(ctx, encoding);
+        if (JS_IsException(h))
+            return -1;
+        JS_FreeValue(ctx, h);
+    }
+    if (errors && strcmp(errors, "strict") && strcmp(errors, "ignore") &&
+        strcmp(errors, "replace") && strcmp(errors, "surrogateescape") &&
+        strcmp(errors, "surrogatepass")) {
+        h = qp_codec_lookup_error(ctx, errors);
+        if (JS_IsException(h))
+            return -1;
+        JS_FreeValue(ctx, h);
+    }
+    return 0;
 }
 
 /* ========================================================================= */

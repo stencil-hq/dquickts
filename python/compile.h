@@ -106,9 +106,9 @@
  * are therefore the same as the plain ones.
  *
  * Warnings (_PyCompile_Warn: SyntaxWarning "is" with a literal, "'x' object
- * is not callable; perhaps you missed a comma?", ...) are not reported
- * (no warnings machinery in M2): qpc_warn() returns SUCCESS.  Port the
- * checks anyway when they also decide code shape; otherwise omit them.
+ * is not callable; perhaps you missed a comma?", ...) are emitted by
+ * qp_validate (validate.c), which runs before code generation; this unit
+ * does not port the warning-only checks.
  */
 #ifndef QP_COMPILE_H
 #define QP_COMPILE_H
@@ -311,6 +311,13 @@ typedef struct compiler_unit {
     jump_target_label u_ann_label, u_ann_body_label;
     int u_module_annotations_pending;
 
+    /* non-inlined comprehensions compiled in this unit: AST node -> cpool
+       index of their code.  A node compiled twice (the optimized and the
+       fallback paths of all()/any()/tuple()/list()/set() of a genexp)
+       reuses its code, as CPython's constant merging does. */
+    struct qpc_comp_code { void *key; int idx; } *u_comp_codes;
+    int u_n_comp_codes, u_comp_codes_size;
+
     struct compiler_unit *u_parent;
 } compiler_unit;
 
@@ -448,14 +455,12 @@ static int qpc_addop_name(compiler *c, location loc, int subop, JSAtom name, int
 
 /* Errors */
 static int qpc_error(compiler *c, location loc, const char *fmt, ...);  /* always returns ERROR */
-static int qpc_warn(compiler *c, location loc, const char *fmt, ...);   /* SUCCESS: warnings not reported */
 /* UTF-8 text of an atom for error messages (buf of QPC_ATOM_BUF bytes). */
 #define QPC_ATOM_BUF 128
 static const char *qpc_atom_str(compiler *c, char *buf, JSAtom atom);
 static BOOL qpc_atom_is(JSAtom a, JSAtom b) ;       /* a == b */
 
 /* Mangling (new atom references, JS_ATOM_NULL on error) */
-static JSAtom _PyCompile_Mangle(compiler *c, JSAtom name);
 static JSAtom _PyCompile_MaybeMangle(compiler *c, JSAtom name);
 
 /* Frame blocks */

@@ -13,11 +13,14 @@
  *    find_frozen() is None, init_frozen() is None, _frozen_module_names()
  *    is [], and get_frozen_object() / is_frozen_package() raise CPython's
  *    ImportError "No such frozen object named %R".
- *  - No dynamic loading (HAVE_DYNAMIC_LOADING undefined, until the C-API
- *    extension loader exists): create_dynamic/exec_dynamic are absent and
- *    extension_suffixes() is [], so importlib installs no
- *    ExtensionFileLoader (_bootstrap_external._get_supported_file_loaders
- *    tests hasattr(_imp, 'create_dynamic')).
+ *  - Dynamic loading exists only with the C API (CONFIG_PYTHON_CAPI,
+ *    python/capi_dynload.c) and only for the stable ABI: create_dynamic /
+ *    exec_dynamic load `*.abi3.so` / `*.abi3t.so`, which are all that
+ *    extension_suffixes() lists.  Without the C API (HAVE_DYNAMIC_LOADING
+ *    undefined) both are absent and extension_suffixes() is [], so
+ *    importlib installs no ExtensionFileLoader
+ *    (_bootstrap_external._get_supported_file_loaders tests
+ *    hasattr(_imp, 'create_dynamic')).
  *  - One interpreter, one thread (M5 brings threads): the import lock is a
  *    recursion counter in QPState; release_lock() without the lock raises
  *    CPython's RuntimeError.  The interpreter is the main interpreter, so
@@ -26,15 +29,14 @@
  *    qp_module_from_def, so exec_builtin() finds them initialized and
  *    returns 0 like CPython's exec_builtin_or_dynamic for an initialized
  *    module.
- *  - check_hash_based_pycs is 'never': QuickJS bytecode is not CPython
- *    .pyc, sys.implementation.cache_tag is None, so importlib never reads
- *    or writes bytecode caches.
+ *  - Bytecode caches hold QuickJS bytecode (marshal of code objects, see
+ *    python/mod_misc.c): pyc_magic_number_token is this build's own
+ *    (qp_pyc_magic_number_token, python/codeobject.c), never CPython's,
+ *    and sys.implementation.cache_tag is "quickpy-315", so importlib
+ *    reads and writes __pycache__/<name>.quickpy-315.pyc like CPython
+ *    does its own.  check_hash_based_pycs is --check-hash-based-pycs
+ *    ("default" unless given).
  */
-
-/* Include/internal/pycore_magic_number.h: PYC_MAGIC_NUMBER 3666 */
-#define QP_PYC_MAGIC_NUMBER 3666
-#define QP_PYC_MAGIC_NUMBER_TOKEN \
-    ((uint32_t)QP_PYC_MAGIC_NUMBER | ((uint32_t)'\r' << 16) | ((uint32_t)'\n' << 24))
 
 /* Argument Clinic "unicode" converter: "%s() argument[ N] must be str, not %T". */
 static int qp_imp_check_str(JSContext *ctx, const char *fname, const char *argname,
@@ -109,7 +111,7 @@ static JSValue qp_imp_lock_held(JSContext *ctx, JSValueConst self, JSValueConst 
 static JSValue qp_imp_acquire_lock(JSContext *ctx, JSValueConst self, JSValueConst *args,
                                    int nargs, JSValueConst kwnames, int magic)
 {
-    QP_STATE(ctx)->import_lock_level++;
+    qp_rmutex_lock(ctx, QP_RMUTEX_IMPORT);
     return JS_UNDEFINED;
 }
 
@@ -117,11 +119,8 @@ static JSValue qp_imp_acquire_lock(JSContext *ctx, JSValueConst self, JSValueCon
 static JSValue qp_imp_release_lock(JSContext *ctx, JSValueConst self, JSValueConst *args,
                                    int nargs, JSValueConst kwnames, int magic)
 {
-    QPState *s = QP_STATE(ctx);
-
-    if (s->import_lock_level <= 0)
+    if (qp_rmutex_unlock(ctx, QP_RMUTEX_IMPORT) < 0)
         return qp_raise_runtime_error(ctx, "not holding the import lock");
-    s->import_lock_level--;
     return JS_UNDEFINED;
 }
 
@@ -243,15 +242,20 @@ static JSValue qp_imp_create_builtin(JSContext *ctx, JSValueConst self, JSValueC
     /* "sys" and "builtins" are returned as they are (import_add_module of
        a core module); every other native module is multi-phase in CPython
        terms: a new module per call, sys.modules is left to the caller
-       (importlib._bootstrap._load_unlocked). */
-    return qp_module_from_def(ctx, def);
+       (importlib._bootstrap._load_unlocked), which then calls
+       exec_builtin() to run its exec hook */
+    return qp_module_create_from_def(ctx, def, FALSE);
 }
 
 /* extension_suffixes() */
 static JSValue qp_imp_extension_suffixes(JSContext *ctx, JSValueConst self, JSValueConst *args,
                                          int nargs, JSValueConst kwnames, int magic)
 {
+#ifdef CONFIG_PYTHON_CAPI
+    return qp_capi_imp_extension_suffixes(ctx);
+#else
     return qp_list_new(ctx, 0);
+#endif
 }
 
 /* init_frozen(name, /): PyImport_ImportFrozenModuleObject finds nothing. */
@@ -400,12 +404,14 @@ static JSValue qp_imp_override_multi_interp_extensions_check(JSContext *ctx, JSV
                                   "cannot be used in the main interpreter");
 }
 
-/* exec_builtin(mod, /) -> int: qp_module_from_def already ran the exec
-   hook, so the module is initialized (exec_builtin_or_dynamic returns 0
-   for non-modules and initialized modules alike). */
+/* exec_builtin(mod, /) -> int: exec_builtin_or_dynamic, the exec hook of a
+   module from create_builtin() (0 for non-modules and initialized modules
+   alike) */
 static JSValue qp_imp_exec_builtin(JSContext *ctx, JSValueConst self, JSValueConst *args,
                                    int nargs, JSValueConst kwnames, int magic)
 {
+    if (qp_module_exec_pending(ctx, args[0]) < 0)
+        return JS_EXCEPTION;
     return JS_NewInt32(ctx, 0);
 }
 
@@ -518,6 +524,14 @@ static const QPMethodDef qp_imp_methods[] = {
     { "create_builtin", qp_imp_create_builtin, QP_METH_O, 0,
       "create_builtin($module, spec, /)\n--\n\n"
       "Create an extension module." },
+#ifdef CONFIG_PYTHON_CAPI
+    { "create_dynamic", qp_capi_imp_create_dynamic, QP_METH_FASTCALL, 0,
+      "create_dynamic($module, spec, file=<unrepresentable>, /)\n--\n\n"
+      "Create an extension module." },
+    { "exec_dynamic", qp_capi_imp_exec_dynamic, QP_METH_O, 0,
+      "exec_dynamic($module, mod, /)\n--\n\n"
+      "Initialize an extension module." },
+#endif
     { "init_frozen", qp_imp_init_frozen, QP_METH_O, 0,
       "init_frozen($module, name, /)\n--\n\n"
       "Initializes a frozen module." },
@@ -566,7 +580,8 @@ static int qp_imp_exec(JSContext *ctx, JSValueConst module)
     JSAtom atom;
     int r;
 
-    v = qp_str_from_cstr(ctx, "never");
+    v = qp_str_from_cstr(ctx, QP_STATE(ctx)->config.check_hash_based_pycs ?
+                         QP_STATE(ctx)->config.check_hash_based_pycs : "default");
     if (JS_IsException(v))
         return -1;
     atom = JS_NewAtom(ctx, "check_hash_based_pycs");
@@ -579,7 +594,7 @@ static int qp_imp_exec(JSContext *ctx, JSValueConst module)
     if (atom == JS_ATOM_NULL)
         return -1;
     r = qp_dict_set_item_atom(ctx, d, atom,
-                              JS_NewInt32(ctx, (int32_t)QP_PYC_MAGIC_NUMBER_TOKEN));
+                              qp_long_from_int64(ctx, qp_pyc_magic_number_token()));
     JS_FreeAtom(ctx, atom);
     return r;
 }

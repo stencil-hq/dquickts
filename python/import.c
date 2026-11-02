@@ -303,10 +303,19 @@ static JSValue qp_import_module_level(JSContext *ctx, JSValueConst name, JSValue
    (BuiltinImporter.create_module/exec_module + _load_unlocked). */
 static JSValue qp_import_load_builtin(JSContext *ctx, const QPModuleDef *def, JSValueConst name)
 {
-    JSValue mod = qp_module_from_def(ctx, def);
+    JSValue mod = qp_module_create_from_def(ctx, def, FALSE);
     if (JS_IsException(mod))
         return mod;
     if (qp_dict_set_item(ctx, QP_STATE(ctx)->modules, name, mod) < 0) {
+        JS_FreeValue(ctx, mod);
+        return JS_EXCEPTION;
+    }
+    if (qp_module_exec_pending(ctx, mod) < 0) {
+        /* _load_unlocked: a failed module leaves sys.modules */
+        JSValue exc = qp_exc_fetch(ctx);
+        if (qp_dict_del_item(ctx, QP_STATE(ctx)->modules, name) < 0)
+            JS_FreeValue(ctx, qp_exc_fetch(ctx));
+        qp_raise_object(ctx, exc);
         JS_FreeValue(ctx, mod);
         return JS_EXCEPTION;
     }
@@ -411,23 +420,116 @@ static JSValue qp_import_find_and_load_unlocked(JSContext *ctx, JSValueConst nam
     return mod;
 }
 
+/* -X importtime (_IMPORT_TIME_HEADER) */
+static void qp_import_time_header(QPState *s)
+{
+    if (!s->import_time_header_done) {
+        fputs("import time: self [us] | cumulative | imported package\n", stderr);
+        s->import_time_header_done = 1;
+    }
+}
+
+/* get_importtime_name: the UTF-8 bytes of the name (backslashreplace),
+   freed with JS_FreeValue; the pending exception is kept */
+static JSValue qp_import_time_name(JSContext *ctx, JSValueConst name)
+{
+    JSValue exc = JS_HasException(ctx) ? JS_GetException(ctx) : JS_UNINITIALIZED;
+    JSValue b = qp_str_encode(ctx, name, "utf-8", "backslashreplace");
+
+    if (JS_IsException(b)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        b = JS_UNDEFINED;
+    }
+    if (!JS_IsUninitialized(exc))
+        JS_Throw(ctx, exc);
+    return b;
+}
+
+/* the bytes of qp_import_time_name(), "?" if it failed */
+static void qp_import_time_bytes(JSValueConst b, const char **pdata, Py_ssize_t *plen)
+{
+    const uint8_t *d = JS_IsUndefined(b) ? NULL : qp_bytes_data(b, plen);
+    if (!d) {
+        *pdata = "?";
+        *plen = 1;
+    } else {
+        *pdata = (const char *)d;
+    }
+}
+
+static int64_t qp_import_time_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+/* _PyTime_AsMicroseconds(ns, _PyTime_ROUND_CEILING) */
+static long qp_import_time_us(int64_t ns)
+{
+    return (long)(ns >= 0 ? (ns + 999) / 1000 : -((-ns) / 1000));
+}
+
+/* -X importtime=2: a module found in sys.modules */
+static void qp_import_time_cached(JSContext *ctx, JSValueConst name)
+{
+    QPState *s = QP_STATE(ctx);
+    const char *data;
+    Py_ssize_t len;
+    JSValue b;
+
+    qp_import_time_header(s);
+    b = qp_import_time_name(ctx, name);
+    qp_import_time_bytes(b, &data, &len);
+    fprintf(stderr, "import time: cached    | cached     | %*s%.*s\n",
+            s->import_time_level * 2, "", (int)len, data);
+    JS_FreeValue(ctx, b);
+}
+
 /* import_find_and_load: importlib._bootstrap._find_and_load(abs_name,
    __import__) when importlib is booted, else the builtin-only port. */
 static JSValue qp_import_find_and_load(JSContext *ctx, JSValueConst abs_name)
 {
     QPState *s = QP_STATE(ctx);
-    JSValue mod, args[2];
+    JSValue mod;
+    JSValueConst args[2];
     JSAtom fn;
     int rc;
 
     if (JS_IsObject(s->importlib)) {
+        int import_time = s->config.import_time;
+        int64_t t1 = 0, accumulated_copy = s->import_time_accumulated;
+
+        if (import_time) {
+            qp_import_time_header(s);
+            s->import_time_level++;
+            t1 = qp_import_time_now();
+            s->import_time_accumulated = 0;
+        }
         args[0] = abs_name;
         args[1] = JS_IsObject(s->import_func) ? s->import_func : JS_UNDEFINED;
         fn = JS_NewAtom(ctx, "_find_and_load");
         if (fn == JS_ATOM_NULL)
-            return JS_EXCEPTION;
-        mod = qp_call_method(ctx, s->importlib, fn, (JSValueConst *)args, 2, QP_NULL);
+            mod = JS_EXCEPTION;
+        else
+            mod = qp_call_method(ctx, s->importlib, fn, args, 2, QP_NULL);
         JS_FreeAtom(ctx, fn);
+        if (import_time) {
+            int64_t cum = qp_import_time_now() - t1;
+            const char *data;
+            Py_ssize_t len;
+            JSValue b;
+
+            s->import_time_level--;
+            b = qp_import_time_name(ctx, abs_name);
+            qp_import_time_bytes(b, &data, &len);
+            fprintf(stderr, "import time: %9ld | %10ld | %*s%.*s\n",
+                    qp_import_time_us(cum - s->import_time_accumulated),
+                    qp_import_time_us(cum),
+                    s->import_time_level * 2, "", (int)len, data);
+            JS_FreeValue(ctx, b);
+            s->import_time_accumulated = accumulated_copy + cum;
+        }
         return mod;
     }
     /* _find_and_load */
@@ -723,6 +825,10 @@ static JSValue qp_import_module_level(JSContext *ctx, JSValueConst name, JSValue
             mod = QP_NULL;
             goto error;
         }
+    } else if (QP_STATE(ctx)->config.import_time == 2) {
+        /* import_ensure_initialized: -X importtime=2 reports the modules
+           already loaded */
+        qp_import_time_cached(ctx, abs_name);
     }
 
     has_from = 0;
@@ -774,12 +880,11 @@ static JSValue qp_import_module_level(JSContext *ctx, JSValueConst name, JSValue
         if (rc > 0) {
             JS_FreeValue(ctx, path);
             if (JS_IsObject(QP_STATE(ctx)->importlib)) {
-                JSValue args[3] = { mod, fromlist, QP_STATE(ctx)->import_func };
+                JSValueConst args[3] = { mod, fromlist, QP_STATE(ctx)->import_func };
                 if (!JS_IsObject(args[2]))
                     args[2] = JS_UNDEFINED;
                 final_mod = qp_call_method(ctx, QP_STATE(ctx)->importlib,
-                                           QP_ATOM(ctx, _handle_fromlist),
-                                           (JSValueConst *)args, 3, QP_NULL);
+                                           QP_ATOM(ctx, _handle_fromlist), args, 3, QP_NULL);
             } else if (qp_import_handle_fromlist(ctx, mod, fromlist, 0) == 0) {
                 final_mod = JS_DupValue(ctx, mod);
             }
@@ -1141,8 +1246,9 @@ static void qp_lazy_import_add_exception_cause(JSContext *ctx, JSValueConst lz)
 /* lazy_import_resolve_impl / _PyImport_LoadLazyImportTstate */
 static JSValue qp_lazy_import_load(JSContext *ctx, JSValueConst lazy_import)
 {
-    JSValue root = lazy_import, first = QP_NULL, *rsl, fromlist = QP_NULL, globals, import_func = QP_NULL;
-    JSValue obj = JS_EXCEPTION, name, errmsg, from, item;
+    JSValueConst root = lazy_import, first = QP_NULL, globals, item;
+    JSValue *rsl, fromlist = QP_NULL, import_func = QP_NULL;
+    JSValue obj = JS_EXCEPTION, name, errmsg, from;
     int rc;
 
     while (qp_lazy_import_check(qp_lz_slots(root)[QP_LZ_FROM])) {
@@ -1374,7 +1480,7 @@ static const QPTypeSpec qp_lazy_import_spec = {
            "Instances of this object accessed from the global scope will be\n"
            "automatically imported based upon their name and then replaced with\n"
            "the imported value.",
-    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_DISALLOW_INSTANTIATION,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_DISALLOW_INSTANTIATION | QP_TPFLAGS_IMMUTABLETYPE,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_OBJECT,

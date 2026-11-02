@@ -32,7 +32,12 @@
  *   `__debug__` folding (codegen_nameop) and -OO docstring removal.
  *   Constant folding of `%`-formatting, constant tuples and match-pattern
  *   numbers is not done (same results at run time).
- * - SyntaxWarnings are not reported (no warnings machinery in M2).
+ * - SyntaxWarnings are emitted by qp_validate (validate.c), which walks the
+ *   AST in code generation order before this unit runs: _PyCompile_Warn,
+ *   infer_type, check_caller, check_subscripter, check_index,
+ *   codegen_check_compare and the codegen_assert warning live there, and the
+ *   ast_preprocess.c control-flow-in-finally warnings in
+ *   qp_preprocess_warnings.
  *
  * CPython functions without a same-named counterpart here:
  * - codegen_addop_* / ADDOP* (codegen.c), _PyCompile_AddConst,
@@ -59,7 +64,7 @@
  * - _PyCompile_LookupCellvar, dict_lookup_arg, _PyCompile_LookupArg:
  *   qpc_slot_find / qpc_freevar_index and the closure-variable binding in
  *   _PyCompile_EnterScope.
- * - _PyCompile_Error / _PyCompile_Warn: qpc_error / qpc_warn.
+ * - _PyCompile_Error: qpc_error (_PyCompile_Warn: see above).
  * - _PyCompile_FutureFeatures, _PyCompile_Symtable(Entry),
  *   _PyCompile_OptimizationLevel, _PyCompile_IsInteractiveTopLevel,
  *   _PyCompile_ScopeType, _PyCompile_Qualname, _PyCompile_Metadata,
@@ -209,12 +214,6 @@ static int qpc_error(compiler *c, location loc, const char *fmt, ...)
     qp_error_set(c->c_err, QP_ERR_SYNTAX, loc.lineno, loc.col_offset + 1,
                  loc.end_lineno, loc.end_col_offset + 1, "%s", buf);
     return ERROR;
-}
-
-static int qpc_warn(compiler *c, location loc, const char *fmt, ...)
-{
-    /* SyntaxWarnings are not reported in M2 (no warnings machinery). */
-    return SUCCESS;
 }
 
 /* Internal compiler error (CPython SystemError) */
@@ -526,6 +525,8 @@ static JSValue qpc_const_value(compiler *c, qp_const *k)
             return r;
         }
     }
+    case QP_CONST_OBJECT:
+        return JS_DupValue(ctx, k->v);
     }
     return JS_UNDEFINED;
 }
@@ -573,11 +574,6 @@ static int qpc_load_atom_tuple(compiler *c, location loc, const JSAtom *atoms, i
 /* ======================================================================== */
 /* Mangling, frame blocks, small compiler services                          */
 /* ======================================================================== */
-
-static JSAtom _PyCompile_Mangle(compiler *c, JSAtom name)
-{
-    return _Py_Mangle(c->u->u_private, name, c->ctx, c->c_err);
-}
 
 static JSAtom _PyCompile_MaybeMangle(compiler *c, JSAtom name)
 {
@@ -1024,6 +1020,7 @@ static void compiler_unit_free(compiler *c, compiler_unit *u)
         JS_FreeAtom(ctx, u->u_deferred_annotations[i].mangled);
     js_free(ctx, u->u_deferred_annotations);
     js_free(ctx, u->u_overrides);
+    js_free(ctx, u->u_comp_codes);
     js_free(ctx, u);
 }
 
@@ -3116,6 +3113,15 @@ static int codegen_comprehension(compiler *c, expr_ty e, int type,
 
     outermost = (comprehension_ty)asdl_seq_GET(generators, 0);
     IterStackPosition iter_state;
+    if (!is_inlined) {
+        compiler_unit *u = c->u;
+        for (int i = 0; i < u->u_n_comp_codes; i++) {
+            if (u->u_comp_codes[i].key == (void *)e) {
+                RETURN_IF_ERROR(qpc_op_u32(c, loc, OP_fclosure, u->u_comp_codes[i].idx));
+                goto make_call;
+            }
+        }
+    }
     if (is_inlined) {
         VISIT(c, expr, outermost->iter);
         ret = push_inlined_comprehension_state(c, loc, entry, &inline_state);
@@ -3182,7 +3188,16 @@ static int codegen_comprehension(compiler *c, expr_ty e, int type,
 
     loc = LOC(e);
     RETURN_IF_ERROR(codegen_make_closure(c, loc, fd, 0));
+    {
+        compiler_unit *u = c->u;
+        if (js_resize_array(c->ctx, (void **)&u->u_comp_codes, sizeof(u->u_comp_codes[0]),
+                            &u->u_comp_codes_size, u->u_n_comp_codes + 1))
+            return ERROR;
+        u->u_comp_codes[u->u_n_comp_codes].key = (void *)e;
+        u->u_comp_codes[u->u_n_comp_codes++].idx = fd->parent_cpool_idx;
+    }
 
+make_call:
     VISIT(c, expr, outermost->iter);
     if (type == COMP_GENEXP) {
         /* the genexp's GET_ITER / GET_AITER runs at creation time */
@@ -3379,6 +3394,12 @@ static int qpc_unparse_constant(StringBuffer *w, qp_const *c)
     case QP_CONST_BYTES: {
         JSString *p = JS_VALUE_GET_STRING(c->v);
         JSValue r = qp_bytes_repr(ctx, p->u.str8, p->len, 1);
+        if (JS_IsException(r))
+            return string_buffer_set_error(w);
+        return string_buffer_concat_value_free(w, r);
+    }
+    case QP_CONST_OBJECT: {
+        JSValue r = qp_repr(ctx, c->v);
         if (JS_IsException(r))
             return string_buffer_set_error(w);
         return string_buffer_concat_value_free(w, r);
@@ -4100,62 +4121,7 @@ static JSValue qpc_expr_as_unicode(JSContext *ctx, expr_ty e)
 
 /* ---- comparisons ------------------------------------------------------ */
 
-static bool
-is_const_tuple(asdl_expr_seq *elts)
-{
-    for (Py_ssize_t i = 0; i < asdl_seq_LEN(elts); i++) {
-        expr_ty e = (expr_ty)asdl_seq_GET(elts, i);
-        if (e->kind != Constant_kind) {
-            return false;
-        }
-    }
-    return true;
-}
-
-/* Return false if the expression is a constant value except named singletons.
-   Return true otherwise. */
-static bool
-check_is_arg(expr_ty e)
-{
-    if (e->kind == Tuple_kind) {
-        return !is_const_tuple(e->v.Tuple.elts);
-    }
-    if (e->kind != Constant_kind) {
-        return true;
-    }
-    qp_const_kind k = e->v.Constant.value->kind;
-    return (k == QP_CONST_NONE
-         || k == QP_CONST_FALSE
-         || k == QP_CONST_TRUE
-         || k == QP_CONST_ELLIPSIS);
-}
-
-/* Check operands of identity checks ("is" and "is not").
-   Emit a warning if any operand is a constant except named singletons.
-   Warnings are not reported (qpc_warn), so the literal's type name
-   (CPython infer_type) is not computed. */
-static int
-codegen_check_compare(compiler *c, expr_ty e)
-{
-    Py_ssize_t i, n;
-    bool left = check_is_arg(e->v.Compare.left);
-    n = asdl_seq_LEN(e->v.Compare.ops);
-    for (i = 0; i < n; i++) {
-        cmpop_ty op = (cmpop_ty)asdl_seq_GET(e->v.Compare.ops, i);
-        expr_ty right_expr = (expr_ty)asdl_seq_GET(e->v.Compare.comparators, i);
-        bool right = check_is_arg(right_expr);
-        if (op == Is || op == IsNot) {
-            if (!right || !left) {
-                const char *msg = (op == Is)
-                        ? "\"is\" with a literal. Did you mean \"==\"?"
-                        : "\"is not\" with a literal. Did you mean \"!=\"?";
-                return qpc_warn(c, LOC(e), "%s", msg);
-            }
-        }
-        left = right;
-    }
-    return SUCCESS;
-}
+/* (codegen_check_compare: SyntaxWarning only, emitted by qp_validate) */
 
 /* COMPARE_OP / IS_OP / CONTAINS_OP.  `to_bool` = CPython's oparg bit 4
    (set by the flowgraph when a TO_BOOL follows): only meaningful for rich
@@ -4264,7 +4230,6 @@ codegen_jump_if(compiler *c, location loc,
     case Compare_kind: {
         Py_ssize_t n = asdl_seq_LEN(e->v.Compare.ops) - 1;
         if (n > 0) {
-            RETURN_IF_ERROR(codegen_check_compare(c, e));
             NEW_JUMP_TARGET_LABEL(c, cleanup);
             VISIT(c, expr, e->v.Compare.left);
             for (Py_ssize_t i = 0; i < n; i++) {
@@ -4688,7 +4653,6 @@ codegen_compare(compiler *c, expr_ty e)
     location loc = LOC(e);
     Py_ssize_t i, n;
 
-    RETURN_IF_ERROR(codegen_check_compare(c, e));
     VISIT(c, expr, e->v.Compare.left);
     assert(asdl_seq_LEN(e->v.Compare.ops) > 0);
     n = asdl_seq_LEN(e->v.Compare.ops) - 1;
@@ -4723,9 +4687,8 @@ codegen_compare(compiler *c, expr_ty e)
     return SUCCESS;
 }
 
-/* infer_type, check_caller, check_subscripter, check_index: only emit
-   SyntaxWarnings (not reported, see qpc_warn) and never change the code:
-   omitted. */
+/* infer_type, check_caller, check_subscripter, check_index: SyntaxWarnings
+   only, emitted by qp_validate. */
 
 /* ---- calls ------------------------------------------------------------ */
 
@@ -5111,7 +5074,7 @@ codegen_call(compiler *c, expr_ty e)
         return SUCCESS;
     }
     NEW_JUMP_TARGET_LABEL(c, skip_normal_call);
-    /* check_caller: warning only, omitted */
+    /* check_caller: warning only, emitted by qp_validate */
     VISIT(c, expr, e->v.Call.func);
     RETURN_IF_ERROR(maybe_optimize_function_call(c, e, skip_normal_call));
     location loc = LOC(e->v.Call.func);
@@ -5621,7 +5584,7 @@ codegen_subscript(compiler *c, expr_ty e)
     location loc = LOC(e);
     expr_context_ty ctx = e->v.Subscript.ctx;
 
-    /* check_subscripter / check_index: warnings only, omitted */
+    /* check_subscripter / check_index: warnings only, emitted by qp_validate */
 
     VISIT(c, expr, e->v.Subscript.value);
     if (should_apply_two_element_slice_optimization(e->v.Subscript.slice) &&
@@ -6947,7 +6910,7 @@ codegen_from_import(compiler *c, stmt_ty s)
 static int
 codegen_assert(compiler *c, stmt_ty s)
 {
-    /* (CPython's "assertion is always true" SyntaxWarning is not reported) */
+    /* (the "assertion is always true" SyntaxWarning is emitted by qp_validate) */
     if (OPTIMIZATION_LEVEL(c)) {
         return SUCCESS;
     }
@@ -7072,8 +7035,8 @@ codegen_visit_stmt(compiler *c, stmt_ty s)
     }
     case Pass_kind:
     {
-        /* CPython's NOP is not emitted */
-        break;
+        /* CPython's NOP: the line of `pass` is reported by sys.settrace */
+        return qpc_op(c, LOC(s), OP_nop);
     }
     case Break_kind:
     {
@@ -7967,8 +7930,25 @@ qpc_pattern_const_equal(compiler *c, qp_const *a, qp_const *b)
 {
     JSValueConst ra, rb;
     double ia, ib;
-    int na = qpc_pattern_const_numeric(a, &ra, &ia);
-    int nb = qpc_pattern_const_numeric(b, &rb, &ib);
+    int na, nb;
+    if (a->kind == QP_CONST_OBJECT || b->kind == QP_CONST_OBJECT) {
+        /* constants of AST objects (e.g. a complex with a real part) */
+        JSValue va = qpc_const_value(c, a), vb;
+        int r;
+        if (JS_IsException(va))
+            return -1;
+        vb = qpc_const_value(c, b);
+        if (JS_IsException(vb)) {
+            JS_FreeValue(c->ctx, va);
+            return -1;
+        }
+        r = qp_richcompare_bool(c->ctx, va, vb, QP_CMP_EQ);
+        JS_FreeValue(c->ctx, va);
+        JS_FreeValue(c->ctx, vb);
+        return r;
+    }
+    na = qpc_pattern_const_numeric(a, &ra, &ia);
+    nb = qpc_pattern_const_numeric(b, &rb, &ib);
     if (na || nb) {
         if (!(na && nb) || ia != ib) {
             return 0;
@@ -8608,8 +8588,9 @@ static JSValue qp_compile(JSContext *ctx, mod_ty mod, struct symtable *st,
     return ret;
 }
 
-static JSValue qp_compile_ast(JSContext *ctx, mod_ty mod, const char *filename, int mode,
-                              int flags, int optimize, qp_arena *arena, qp_error *err)
+static JSValue qp_compile_ast(JSContext *ctx, mod_ty mod, const char *filename,
+                              JSValueConst module, int mode, int flags, int optimize,
+                              qp_arena *arena, qp_error *err)
 {
     _PyFutureFeatures future;
     struct symtable *st;
@@ -8621,10 +8602,13 @@ static JSValue qp_compile_ast(JSContext *ctx, mod_ty mod, const char *filename, 
         return JS_EXCEPTION;
     /* compiler_setup(): merge the __future__ features with the flags */
     future.ff_features |= flags;
+    /* _PyAST_Preprocess (enable_warnings = 1) */
+    if (qp_preprocess_warnings(ctx, mod, filename, module, err) < 0)
+        return JS_EXCEPTION;
     st = _PySymtable_Build(mod, filename, &future, arena, err);
     if (!st)
         return JS_EXCEPTION;
-    if (qp_validate(st, mod, future.ff_features, err) < 0) {
+    if (qp_validate(st, mod, future.ff_features, filename, module, err) < 0) {
         _PySymtable_Free(st);
         return JS_EXCEPTION;
     }
@@ -8637,8 +8621,8 @@ static JSValue qp_compile_ast(JSContext *ctx, mod_ty mod, const char *filename, 
    src[len] must be '\0'.  With err == NULL a compile error is raised as a
    Python exception (qp_raise_qp_error). */
 static JSValue qp_compile_source(JSContext *ctx, const char *src, size_t len,
-                                 const char *filename, int mode, int flags,
-                                 int optimize, qp_error *err)
+                                 const char *filename, JSValueConst module, int mode,
+                                 int flags, int optimize, qp_error *err)
 {
     qp_error local_err;
     qp_arena *arena;
@@ -8665,9 +8649,9 @@ static JSValue qp_compile_source(JSContext *ctx, const char *src, size_t len,
         qp_error_set(e, QP_ERR_MEMORY, 0, 0, 0, 0, "%s", "");
         goto done;
     }
-    mod = qp_parse_string(ctx, arena, src, len, filename, mode, flags, e);
+    mod = qp_parse_string(ctx, arena, src, len, filename, module, mode, flags, e);
     if (mod)
-        ret = qp_compile_ast(ctx, mod, filename, mode, flags, optimize, arena, e);
+        ret = qp_compile_ast(ctx, mod, filename, module, mode, flags, optimize, arena, e);
     qp_arena_free(arena);
  done:
     if (!err) {

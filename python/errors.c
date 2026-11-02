@@ -190,7 +190,7 @@ static JSValue qp_err_create_exception(JSContext *ctx, QPType *type, JSValueCons
     if (QP_IS_NONE_OR_NULL(value))
         exc = qp_exc_new(ctx, type, 0, NULL);
     else if (qp_tuple_check(ctx, value))
-        exc = qp_exc_new(ctx, type, (int)QP_TUPLE_SIZE(value), QP_TUPLE_ITEMS(value));
+        exc = qp_exc_new(ctx, type, (int)QP_TUPLE_SIZE(value), (JSValueConst *)QP_TUPLE_ITEMS(value));
     else
         exc = qp_exc_new(ctx, type, 1, &value);
     if (JS_IsException(exc))
@@ -314,13 +314,15 @@ static JSValue qp_raise_key_error(JSContext *ctx, JSValueConst key)
     return qp_raise_object(ctx, exc);
 }
 
-/* PyObject_GenericGetAttr / type_getattro / module_getattro messages, then
+/* PyObject_GenericGetAttr / type_getattro / module_getattro messages
+   (generic: always the PyObject_GenericGetAttr one), then
    set_attribute_error_context (name, obj). */
-static JSValue qp_raise_attribute_error(JSContext *ctx, JSValueConst obj, JSAtom name)
+static JSValue qp_raise_attribute_error_ex(JSContext *ctx, JSValueConst obj, JSAtom name,
+                                           BOOL generic)
 {
     char buf[QP_ERR_NAMEBUF];
     JSValue msg, name_str, res;
-    QPType *t = qp_type_from_value(obj);
+    QPType *t = generic ? NULL : qp_type_from_value(obj);
 
     name_str = qp_str_from_atom(ctx, name);
     if (JS_IsException(name_str))
@@ -328,7 +330,7 @@ static JSValue qp_raise_attribute_error(JSContext *ctx, JSValueConst obj, JSAtom
     if (t) {
         msg = qp_str_from_format(ctx, "type object '%.100s' has no attribute '%U'",
                                  qp_err_tp_name(ctx, t, buf, sizeof(buf)), name_str);
-    } else if (qp_module_check(ctx, obj)) {
+    } else if (!generic && qp_module_check(ctx, obj)) {
         JSValue modname = QP_NULL;
         JSValue d = qp_module_get_dict(obj);
         int r = 0;
@@ -351,6 +353,11 @@ static JSValue qp_raise_attribute_error(JSContext *ctx, JSValueConst obj, JSAtom
                                   QP_ATOM(ctx, name), name_str, QP_ATOM(ctx, obj), obj);
     JS_FreeValue(ctx, name_str);
     return res;
+}
+
+static JSValue qp_raise_attribute_error(JSContext *ctx, JSValueConst obj, JSAtom name)
+{
+    return qp_raise_attribute_error_ex(ctx, obj, name, FALSE);
 }
 
 /* NAME_ERROR_MSG + _PyEval_FormatExcCheckArg (sets NameError.name) */
@@ -472,7 +479,7 @@ static JSValue qp_exc_normalize(JSContext *ctx, JSValue thrown)
         msg = qp_str_from_cstr(ctx, "error return without exception set");
         if (JS_IsException(msg))
             goto fail;
-        exc = qp_exc_new(ctx, QP_EXC(ctx, SystemError), 1, &msg);
+        exc = qp_exc_new(ctx, QP_EXC(ctx, SystemError), 1, (JSValueConst *)&msg);
         JS_FreeValue(ctx, msg);
         if (JS_IsException(exc))
             goto fail;
@@ -490,7 +497,7 @@ static JSValue qp_exc_normalize(JSContext *ctx, JSValue thrown)
             msg = qp_str_from_cstr(ctx, "maximum recursion depth exceeded");
             if (JS_IsException(msg))
                 goto fail;
-            exc = qp_exc_new(ctx, QP_EXC(ctx, RecursionError), 1, &msg);
+            exc = qp_exc_new(ctx, QP_EXC(ctx, RecursionError), 1, (JSValueConst *)&msg);
             JS_FreeValue(ctx, msg);
             if (JS_IsException(exc))
                 goto fail;
@@ -513,7 +520,7 @@ static JSValue qp_exc_normalize(JSContext *ctx, JSValue thrown)
         if (JS_IsException(msg))
             goto fail;
     }
-    exc = qp_exc_new(ctx, QP_EXC(ctx, JsError), 1, &msg);
+    exc = qp_exc_new(ctx, QP_EXC(ctx, JsError), 1, (JSValueConst *)&msg);
     JS_FreeValue(ctx, msg);
     if (JS_IsException(exc))
         goto fail;
@@ -1004,6 +1011,159 @@ static int qp_warn(JSContext *ctx, QPType *category, int stacklevel, const char 
     return ret;
 }
 
+/* Universal-newline line reader of err_programtext: 1 line read, 0 EOF. */
+static int qp_err_fgets_univ(FILE *fp, char *buf, size_t size, size_t *plen)
+{
+    size_t n = 0;
+    int c;
+
+    while (n + 1 < size) {
+        c = getc(fp);
+        if (c == EOF)
+            break;
+        if (c == '\r') {
+            c = getc(fp);
+            if (c != '\n' && c != EOF)
+                ungetc(c, fp);
+            c = '\n';
+        }
+        buf[n++] = (char)c;
+        if (c == '\n')
+            break;
+    }
+    buf[n] = '\0';
+    *plen = n;
+    return n > 0;
+}
+
+/* Source encoding of the coding cookie in the first two lines (PEP 263),
+   default UTF-8 (_PyTokenizer_FindEncodingFilename).  `enc` receives a
+   NUL-terminated name. */
+static void qp_err_find_encoding(FILE *fp, char *enc, size_t size)
+{
+    char line[1000];
+    size_t len;
+    int i;
+
+    snprintf(enc, size, "utf-8");
+    for (i = 0; i < 2; i++) {
+        const char *p, *q;
+        if (!qp_err_fgets_univ(fp, line, sizeof(line), &len))
+            break;
+        p = line;
+        if (i == 0 && len >= 3 && !memcmp(p, "\xef\xbb\xbf", 3))
+            p += 3;
+        while (*p == ' ' || *p == '\t' || *p == '\f')
+            p++;
+        if (*p != '#') {
+            if (*p == '\n' || *p == '\0')
+                continue;   /* blank line: the cookie may be on line 2 */
+            break;
+        }
+        q = strstr(p, "coding");
+        if (q && (q[6] == ':' || q[6] == '=')) {
+            size_t k = 0;
+            q += 7;
+            while (*q == ' ' || *q == '\t')
+                q++;
+            while (k + 1 < size && (isalnum((unsigned char)*q) || *q == '-' || *q == '_' ||
+                                    *q == '.'))
+                enc[k++] = *q++;
+            if (k > 0) {
+                enc[k] = '\0';
+                return;
+            }
+        }
+    }
+}
+
+/* PyErr_ProgramTextObject (err_programtext): line `lineno` of the file
+   named `filename` decoded with its source encoding ("replace" errors), or
+   QP_NULL (no exception pending) if it cannot be read. */
+static JSValue qp_err_program_text(JSContext *ctx, const char *filename, int lineno)
+{
+    char linebuf[1000], encoding[64];
+    size_t line_size = 0;
+    const char *line;
+    JSValue res;
+    FILE *fp;
+    int i;
+
+    if (filename == NULL || lineno <= 0)
+        return QP_NULL;
+    fp = fopen(filename, "r");
+    if (fp == NULL)
+        return QP_NULL;
+    qp_err_find_encoding(fp, encoding, sizeof(encoding));
+    rewind(fp);
+    for (i = 0; i < lineno; ) {
+        if (!qp_err_fgets_univ(fp, linebuf, sizeof(linebuf), &line_size)) {
+            fclose(fp);     /* error or EOF */
+            return QP_NULL;
+        }
+        /* a line longer than the buffer continues in the next read */
+        if (i + 1 < lineno && line_size == sizeof(linebuf) - 1 &&
+            linebuf[sizeof(linebuf) - 2] != '\n')
+            continue;
+        i++;
+    }
+    fclose(fp);
+    line = linebuf;
+    if (lineno == 1 && line_size >= 3 && memcmp(line, "\xef\xbb\xbf", 3) == 0) {
+        line += 3;
+        line_size -= 3;
+    }
+    res = qp_str_decode(ctx, line, (Py_ssize_t)line_size, encoding, "replace");
+    if (JS_IsException(res)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return QP_NULL;
+    }
+    return res;
+}
+
+static int qp_syntax_warn(JSContext *ctx, const char *filename, JSValueConst module,
+                          int lineno, const char *msg)
+{
+    JSValue text, fname;
+    int ret;
+
+    if (JS_IsUndefined(module))
+        return 0;
+    text = qp_str_from_cstr(ctx, msg);
+    if (JS_IsException(text))
+        return -1;
+    fname = qp_str_from_cstr(ctx, filename ? filename : "<string>");
+    if (JS_IsException(fname)) {
+        JS_FreeValue(ctx, text);
+        return -1;
+    }
+    ret = qp_warnings_warn_explicit(ctx, QP_EXC(ctx, SyntaxWarning), text, fname, lineno,
+                                    module, QP_NULL, QP_NULL);
+    JS_FreeValue(ctx, text);
+    JS_FreeValue(ctx, fname);
+    if (ret >= 0)
+        return 0;
+    if (qp_exc_pending_matches(ctx, QP_EXC(ctx, SyntaxWarning))) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return 1;
+    }
+    return -1;
+}
+
+static int qp_syntax_warn_err(JSContext *ctx, qp_error *err, const char *filename,
+                              JSValueConst module, const char *msg, int lineno, int offset,
+                              int end_lineno, int end_offset)
+{
+    int r = qp_syntax_warn(ctx, filename, module, lineno, msg);
+    if (r == 0)
+        return 0;
+    if (r > 0)
+        qp_error_set(err, QP_ERR_SYNTAX, lineno, offset, end_lineno, end_offset, "%s", msg);
+    else
+        qp_error_set(err, QP_ERR_PENDING, 0, 0, 0, 0, "%s", "");
+    return -1;
+}
+
 /* ========================================================================= */
 /* Name suggestions (Python/suggestions.c)                                    */
 /* ========================================================================= */
@@ -1100,7 +1260,7 @@ static JSValue qp_calculate_suggestions(JSContext *ctx, JSValueConst dir_list, J
 
     if (qp_tuple_check(ctx, dir_list)) {
         n = QP_TUPLE_SIZE(dir_list);
-        items = QP_TUPLE_ITEMS(dir_list);
+        items = (JSValueConst *)QP_TUPLE_ITEMS(dir_list);
     } else {
         JSValue *li = qp_list_items(dir_list, &n);
         if (!li) {
@@ -1108,9 +1268,9 @@ static JSValue qp_calculate_suggestions(JSContext *ctx, JSValueConst dir_list, J
             if (JS_IsException(tmp_list))
                 return tmp_list;
             n = QP_TUPLE_SIZE(tmp_list);
-            items = QP_TUPLE_ITEMS(tmp_list);
+            items = (JSValueConst *)QP_TUPLE_ITEMS(tmp_list);
         } else {
-            items = li;
+            items = (JSValueConst *)li;
         }
     }
     if (n >= QP_SUGG_MAX_CANDIDATE_ITEMS) {
@@ -1162,6 +1322,36 @@ static JSValue qp_calculate_suggestions(JSContext *ctx, JSValueConst dir_list, J
     JS_FreeValue(ctx, suggestion);
     return JS_EXCEPTION;
 }
+
+/* Modules/_suggestions.c: _generate_suggestions(candidates, item, /) */
+static JSValue qp_suggestions_generate(JSContext *ctx, JSValueConst self, JSValueConst *args,
+                                       int nargs, JSValueConst kwnames, int magic)
+{
+    JSValue r;
+
+    if (nargs != 2)
+        return qp_raise_type_error(ctx, "_generate_suggestions expected 2 arguments, got %d",
+                                   nargs);
+    if (!qp_list_check(ctx, args[0]))
+        return qp_raise_type_error(ctx, "_generate_suggestions() argument 1 must be list, "
+                                   "not %T", args[0]);
+    if (!qp_str_check(ctx, args[1]))
+        return qp_raise_type_error(ctx, "_generate_suggestions() argument 2 must be str, "
+                                   "not %T", args[1]);
+    r = qp_calculate_suggestions(ctx, args[0], args[1]);
+    return QP_IS_NULL(r) ? JS_UNDEFINED : r;
+}
+
+static const QPMethodDef qp_suggestions_methods[] = {
+    { "_generate_suggestions", qp_suggestions_generate, QP_METH_FASTCALL, 0,
+      "_generate_suggestions($module, candidates, item, /)\n--\n\n"
+      "Returns the candidate in candidates that's closest to item" },
+    { NULL, NULL, 0, 0, NULL },
+};
+
+static const QPModuleDef qp_moddef__suggestions = {
+    "_suggestions", "A module for generating suggestions for typos", qp_suggestions_methods, NULL,
+};
 
 /* ========================================================================= */
 /* Uncaught exceptions (Python/pythonrun.c)                                   */

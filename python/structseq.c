@@ -7,18 +7,41 @@
  * n_sequence_fields) are stored as integer-indexed JS own properties of
  * the instance object, which Python attribute lookup never sees.  Named
  * fields are exposed by read-only properties on the type.  The descriptor
- * pointer is kept as a JS (not Python) property of the type object.
+ * is kept as a JS (not Python) property of the type object: the index of
+ * a descriptor of the native modules in qp_ss_registry (python/config.c),
+ * which depends on neither the load address nor the layout of the
+ * executable, so that the type is the same in a snapshot read by another
+ * process or another link of the same sources (the base snapshot of qpy);
+ * for the other descriptors (C extensions), their offset from
+ * qp_ss_anchor, which does not change with the load address.
  */
 
 static JSValue qp_tup_alloc(JSContext *ctx, QPType *type, Py_ssize_t n);
 
 #define QP_STRUCTSEQ_DESC_PROP "\x01qp_structseq_desc"
+#define QP_STRUCTSEQ_DESC_ID_PROP "\x01qp_structseq_desc_id"
+
+/* python/config.c: index of a descriptor of the native modules (-1 if
+   not one of them) and back */
+static int qp_ss_registry_index(const QPStructSeqDesc *desc);
+static const QPStructSeqDesc *qp_ss_registry_get(int index);
+
+/* the other descriptors are static data of the same executable */
+static const char qp_ss_anchor = 0;
 
 static const QPStructSeqDesc *qp_ss_desc_of_type(JSContext *ctx, QPType *t)
 {
     for (; t; t = t->base) {
         JSValue tv = JS_MKPTR(JS_TAG_OBJECT, t->obj);
-        JSValue v = JS_GetPropertyStr(ctx, tv, QP_STRUCTSEQ_DESC_PROP);
+        JSValue v = JS_GetPropertyStr(ctx, tv, QP_STRUCTSEQ_DESC_ID_PROP);
+        if (JS_IsException(v)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        } else if (JS_VALUE_GET_TAG(v) == JS_TAG_INT) {
+            const QPStructSeqDesc *d = qp_ss_registry_get(JS_VALUE_GET_INT(v));
+            if (d)
+                return d;
+        }
+        v = JS_GetPropertyStr(ctx, tv, QP_STRUCTSEQ_DESC_PROP);
         if (JS_IsException(v)) {
             JS_FreeValue(ctx, JS_GetException(ctx));
             continue;
@@ -27,7 +50,7 @@ static const QPStructSeqDesc *qp_ss_desc_of_type(JSContext *ctx, QPType *t)
             double d;
             JS_ToFloat64(ctx, &d, v);
             if (d != 0)
-                return (const QPStructSeqDesc *)(uintptr_t)d;
+                return (const QPStructSeqDesc *)(&qp_ss_anchor + (intptr_t)d);
         }
         JS_FreeValue(ctx, v);
     }
@@ -275,7 +298,7 @@ static JSValue qp_ss_reduce(JSContext *ctx, JSValueConst self, JSValueConst *arg
         return JS_EXCEPTION;
     qp_ss_counts(d, &n_fields, &n_unnamed);
     nvis = (int)QP_TUPLE_SIZE(self);
-    tup = qp_tuple_pack(ctx, nvis, QP_TUPLE_ITEMS(self));
+    tup = qp_tuple_pack(ctx, nvis, (JSValueConst *)QP_TUPLE_ITEMS(self));
     if (JS_IsException(tup))
         return tup;
     dict = qp_dict_new(ctx);
@@ -451,7 +474,7 @@ static JSValue qp_structseq_new_type(JSContext *ctx, const QPStructSeqDesc *desc
         argv[1] = JS_UNDEFINED;
         argv[2] = JS_UNDEFINED;
         argv[3] = desc->field_docs && desc->field_docs[i] ? qp_str_from_cstr(ctx, desc->field_docs[i]) : JS_UNDEFINED;
-        prop = qp_vectorcall(ctx, JS_MKPTR(JS_TAG_OBJECT, QP_TYPE(ctx, property)->obj), argv, 4, QP_NULL);
+        prop = qp_vectorcall(ctx, JS_MKPTR(JS_TAG_OBJECT, QP_TYPE(ctx, property)->obj), (JSValueConst *)argv, 4, QP_NULL);
         JS_FreeValue(ctx, fget);
         JS_FreeValue(ctx, argv[3]);
         if (JS_IsException(prop))
@@ -463,7 +486,7 @@ static JSValue qp_structseq_new_type(JSContext *ctx, const QPStructSeqDesc *desc
     if (JS_IsException(name))
         goto done;
     base = JS_MKPTR(JS_TAG_OBJECT, QP_TYPE(ctx, tuple)->obj);
-    bases = qp_tuple_pack(ctx, 1, &base);
+    bases = qp_tuple_pack(ctx, 1, (JSValueConst *)&base);
     if (JS_IsException(bases)) {
         JS_FreeValue(ctx, name);
         goto done;
@@ -474,9 +497,15 @@ static JSValue qp_structseq_new_type(JSContext *ctx, const QPStructSeqDesc *desc
     if (JS_IsException(type))
         goto done;
     t = qp_type_from_value(type);
-    if (JS_DefinePropertyValueStr(ctx, type, QP_STRUCTSEQ_DESC_PROP,
-                                  JS_NewFloat64(ctx, (double)(uintptr_t)desc), 0) < 0)
-        goto fail;
+    {
+        int idx = qp_ss_registry_index(desc);
+        if (idx >= 0 ?
+            JS_DefinePropertyValueStr(ctx, type, QP_STRUCTSEQ_DESC_ID_PROP, JS_NewInt32(ctx, idx), 0) < 0 :
+            JS_DefinePropertyValueStr(ctx, type, QP_STRUCTSEQ_DESC_PROP,
+                                      JS_NewFloat64(ctx, (double)((const char *)desc - &qp_ss_anchor)),
+                                      0) < 0)
+            goto fail;
+    }
     {
         JSValue nw = qp_cfunction_new(ctx, &qp_ss_new_def, type, JS_UNDEFINED), sm;
         JSAtom at;

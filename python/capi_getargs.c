@@ -1448,13 +1448,12 @@ qp_capi_convertsimple(PyObject *arg, const char **p_format, va_list *p_va, int f
 static Py_ssize_t
 qp_capi_convertbuffer(PyObject *arg, const void **p, const char **errmsg)
 {
-    PyBufferProcs *pb = Py_TYPE(arg)->tp_as_buffer;
     Py_ssize_t count;
     Py_buffer view;
 
     *errmsg = NULL;
     *p = NULL;
-    if (pb != NULL && pb->bf_releasebuffer != NULL) {
+    if (qp_capi_buffer_needs_release(arg)) {
         *errmsg = "read-only bytes-like object";
         return -1;
     }
@@ -1767,6 +1766,37 @@ PyArg_ValidateKeywordArguments(PyObject *kwargs)
 static PyObject *
 qp_capi_new_kwtuple(const char * const *keywords, int total, int pos);
 
+/* qp: CPython's parsers fetch a keyword value with PyDict_GetItemRef, drop
+   the reference and keep using the pointer (the "O" result, the
+   _PyArg_UnpackKeywords buffer), relying on the kwargs dict to keep it
+   alive.  A dict mirror only keeps a value's mirror alive through a pin, so
+   the lookup goes through the pinning borrowed API.  1 / 0 / -1. */
+static int
+qp_capi_kwdict_get(PyObject *kwargs, PyObject *key, PyObject **result)
+{
+    PyObject *v = PyDict_GetItemWithError(kwargs, key);
+    if (v == NULL) {
+        *result = NULL;
+        return PyErr_Occurred() ? -1 : 0;
+    }
+    *result = Py_NewRef(v);
+    return 1;
+}
+
+static int
+qp_capi_kwdict_get_str(PyObject *kwargs, const char *key, PyObject **result)
+{
+    PyObject *k = PyUnicode_FromString(key);
+    int r;
+    if (k == NULL) {
+        *result = NULL;
+        return -1;
+    }
+    r = qp_capi_kwdict_get(kwargs, k, result);
+    Py_DECREF(k);
+    return r;
+}
+
 static PyObject*
 qp_capi_find_keyword_str(PyObject *kwnames, PyObject *const *kwstack, const char *key)
 {
@@ -1942,7 +1972,7 @@ qp_capi_vgetargskeywords_impl(PyObject *const *args, Py_ssize_t nargs,
             }
             else if (nkwargs && i >= pos) {
                 if (kwargs != NULL) {
-                    if (PyDict_GetItemStringRef(kwargs, kwlist[i], &current_arg) < 0) {
+                    if (qp_capi_kwdict_get_str(kwargs, kwlist[i], &current_arg) < 0) {
                         return qp_capi_cleanreturn(0, &freelist);
                     }
                 }
@@ -2499,7 +2529,7 @@ qp_capi_vgetargskeywordsfast_impl(PyObject *const *args, Py_ssize_t nargs,
         else if (nkwargs && i >= pos) {
             keyword = PyTuple_GET_ITEM(kwtuple, i - pos);
             if (kwargs != NULL) {
-                if (PyDict_GetItemRef(kwargs, keyword, &current_arg) < 0) {
+                if (qp_capi_kwdict_get(kwargs, keyword, &current_arg) < 0) {
                     return qp_capi_cleanreturn(0, &freelist);
                 }
             }
@@ -2733,7 +2763,7 @@ _PyArg_UnpackKeywords(PyObject *const *args, Py_ssize_t nargs,
         if (nkwargs) {
             keyword = PyTuple_GET_ITEM(kwtuple, i - posonly);
             if (kwargs != NULL) {
-                if (PyDict_GetItemRef(kwargs, keyword, &current_arg) < 0) {
+                if (qp_capi_kwdict_get(kwargs, keyword, &current_arg) < 0) {
                     return NULL;
                 }
             }

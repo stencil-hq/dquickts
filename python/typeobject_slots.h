@@ -1434,6 +1434,10 @@ static const QPSlotDef *qp_update_one_slot(JSContext *ctx, QPType *t, const QPSl
     int use_generic = 0, offset = p->offset;
     void **ptr = qp_slotptr(t, offset);
 
+    /* process data: a state restored from a snapshot (the base of qpy)
+       never ran qp_init_types_phase1 in this process */
+    qp_slotdefs_init();
+
     do {
         JSValue descr = qp_find_name_in_mro(ctx, t, QP_STATE(ctx)->atoms[p->atom_id]);
         QPDescr *d;
@@ -1582,8 +1586,14 @@ static int qp_add_operators(JSContext *ctx, QPType *t)
         ptr = qp_slotptr(t, p->offset);
         if (!*ptr)
             continue;
-        /* ignore when the slot has been inherited */
-        if (!(t->flags & QP_TPFLAGS_HEAPTYPE) && t->base) {
+        if (t->spec &&
+            (((t->spec->generic_attr & QP_GENERIC_GETATTR) &&
+              ptr == (void **)&t->slots.tp_getattro) ||
+             ((t->spec->generic_attr & QP_GENERIC_SETATTR) &&
+              ptr == (void **)&t->slots.tp_setattro)))
+            continue;
+        /* ignore when the slot has been inherited (static builtins only) */
+        if (!(t->flags & (QP_TPFLAGS_HEAPTYPE | QP_TPFLAGS_PRIV_CAPI)) && t->base) {
             void **bptr = qp_slotptr(t->base, p->offset);
             if (*bptr == *ptr) {
                 if (ptr == (void **)&t->slots.tp_hash) {

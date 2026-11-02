@@ -69,6 +69,7 @@ typedef struct QPModState {
     JSValue sig_default_int_handler;    /* _signal.default_int_handler */
     JSValue sig_dfl, sig_ign;           /* Handlers sentinels: int 0 / int 1 objects */
     JSValue sig_itimer_error;           /* _signal.ItimerError */
+    JSValue sig_siginfo_type;           /* _signal.struct_siginfo (sigwaitinfo platforms), QP_NULL otherwise */
     int sig_wakeup_fd;                  /* -1 = none */
     int sig_wakeup_warn_on_full_buffer;
 
@@ -117,6 +118,20 @@ typedef struct QPModState {
     JSValue codec_error_registry;       /* dict name -> handler */
     JSValue codec_builtin_handlers[8];  /* strict, ignore, replace, xmlcharrefreplace, backslashreplace, namereplace, surrogatepass, surrogateescape function objects */
     JSValue codec_encoding_map_type;    /* EncodingMap type object */
+
+    /* _ast (mod_ast.c; CPython interp->ast): tuple of the node classes and
+       operator singletons, QP_NULL until first used */
+    JSValue ast_state;
+
+    /* sys.monitoring (instrumentation.c; CPython interp->monitoring_*) */
+    JSValue mon_tool_names[6];          /* str, QP_NULL = tool id free */
+    JSValue mon_callbacks;              /* dict (tool_id << 8 | event_id) -> callable */
+    JSValue mon_local_events;           /* dict (code, tool_id) -> event set */
+    uint32_t mon_events[6];             /* global event set per tool */
+
+    /* asynchronous exception type raised at the next poll (CPython
+       tstate->async_exc, _PY_ASYNC_EXCEPTION_BIT), QP_NULL = none */
+    JSValue async_exc;
 } QPModState;
 
 /* State of ctx, created on first use; NULL with MemoryError pending. */
@@ -140,6 +155,7 @@ static QPModState *qp_modstate(JSContext *ctx)
     ms->sig_dfl = QP_NULL;
     ms->sig_ign = QP_NULL;
     ms->sig_itimer_error = QP_NULL;
+    ms->sig_siginfo_type = QP_NULL;
     ms->sig_wakeup_fd = -1;
     ms->sig_wakeup_warn_on_full_buffer = 1;
     ms->gc_enabled = 1;
@@ -166,6 +182,12 @@ static QPModState *qp_modstate(JSContext *ctx)
     for (i = 0; i < 8; i++)
         ms->codec_builtin_handlers[i] = QP_NULL;
     ms->codec_encoding_map_type = QP_NULL;
+    ms->ast_state = QP_NULL;
+    for (i = 0; i < (int)countof(ms->mon_tool_names); i++)
+        ms->mon_tool_names[i] = QP_NULL;
+    ms->mon_callbacks = QP_NULL;
+    ms->mon_local_events = QP_NULL;
+    ms->async_exc = QP_NULL;
     s->mod_state = ms;
     return ms;
 }
@@ -179,10 +201,16 @@ static void qp_modstate_mark_value(JSRuntime *rt, JSValueConst v, JS_MarkFunc *m
 static void qp_modstate_mark(JSRuntime *rt, QPState *s, JS_MarkFunc *mark_func)
 {
     QPModState *ms = s->mod_state;
+    QPWeakRec *r;
     int i;
 
     if (!ms)
         return;
+    /* the callbacks waiting in the queue belong to the context: a context
+       that dies before they run (no Python code ran after their referents
+       died) must not be kept alive by them */
+    for (r = ms->wr_pending_head; r; r = r->pending_next)
+        qp_modstate_mark_value(rt, r->pending_cb, mark_func);
     qp_modstate_mark_value(rt, ms->atexit_callbacks, mark_func);
     for (i = 0; i < QP_NSIG; i++)
         qp_modstate_mark_value(rt, ms->sig_handlers[i], mark_func);
@@ -190,6 +218,7 @@ static void qp_modstate_mark(JSRuntime *rt, QPState *s, JS_MarkFunc *mark_func)
     qp_modstate_mark_value(rt, ms->sig_dfl, mark_func);
     qp_modstate_mark_value(rt, ms->sig_ign, mark_func);
     qp_modstate_mark_value(rt, ms->sig_itimer_error, mark_func);
+    qp_modstate_mark_value(rt, ms->sig_siginfo_type, mark_func);
     qp_modstate_mark_value(rt, ms->gc_callbacks, mark_func);
     qp_modstate_mark_value(rt, ms->gc_garbage, mark_func);
     qp_modstate_mark_value(rt, ms->warn_filters, mark_func);
@@ -210,6 +239,12 @@ static void qp_modstate_mark(JSRuntime *rt, QPState *s, JS_MarkFunc *mark_func)
     for (i = 0; i < 8; i++)
         qp_modstate_mark_value(rt, ms->codec_builtin_handlers[i], mark_func);
     qp_modstate_mark_value(rt, ms->codec_encoding_map_type, mark_func);
+    qp_modstate_mark_value(rt, ms->ast_state, mark_func);
+    for (i = 0; i < (int)countof(ms->mon_tool_names); i++)
+        qp_modstate_mark_value(rt, ms->mon_tool_names[i], mark_func);
+    qp_modstate_mark_value(rt, ms->mon_callbacks, mark_func);
+    qp_modstate_mark_value(rt, ms->mon_local_events, mark_func);
+    qp_modstate_mark_value(rt, ms->async_exc, mark_func);
 }
 
 static void qp_modstate_free_value(JSContext *ctx, JSValue *pv)
@@ -260,6 +295,12 @@ static void qp_modstate_free(JSContext *ctx)
             if (!QP_IS_NULL(r->pending_cb))
                 JS_FreeValue(ctx, r->pending_cb);
             js_free_rt(ctx->rt, r);
+        } else if (!QP_IS_NULL(r->pending_cb)) {
+            /* the callback will not run: released with the queue (the
+               state marked it) */
+            JSValue cb = r->pending_cb;
+            r->pending_cb = QP_NULL;
+            JS_FreeValue(ctx, cb);
         }
     }
     ms->wr_pending_head = ms->wr_pending_tail = NULL;
@@ -271,6 +312,7 @@ static void qp_modstate_free(JSContext *ctx)
     qp_modstate_free_value(ctx, &ms->sig_dfl);
     qp_modstate_free_value(ctx, &ms->sig_ign);
     qp_modstate_free_value(ctx, &ms->sig_itimer_error);
+    qp_modstate_free_value(ctx, &ms->sig_siginfo_type);
     qp_modstate_free_value(ctx, &ms->gc_callbacks);
     qp_modstate_free_value(ctx, &ms->gc_garbage);
     qp_modstate_free_value(ctx, &ms->warn_filters);
@@ -291,6 +333,12 @@ static void qp_modstate_free(JSContext *ctx)
     for (i = 0; i < 8; i++)
         qp_modstate_free_value(ctx, &ms->codec_builtin_handlers[i]);
     qp_modstate_free_value(ctx, &ms->codec_encoding_map_type);
+    qp_modstate_free_value(ctx, &ms->ast_state);
+    for (i = 0; i < countof(ms->mon_tool_names); i++)
+        qp_modstate_free_value(ctx, &ms->mon_tool_names[i]);
+    qp_modstate_free_value(ctx, &ms->mon_callbacks);
+    qp_modstate_free_value(ctx, &ms->mon_local_events);
+    qp_modstate_free_value(ctx, &ms->async_exc);
     s->mod_state = NULL;
     js_free(ctx, ms);
 }

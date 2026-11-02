@@ -1504,7 +1504,7 @@ static const QPTypeSpec qp_list_spec = {
            "If no argument is given, the constructor creates a new empty list.\n"
            "The argument must be an iterable if specified.",
     .flags = QP_TPFLAGS_BASETYPE | QP_TPFLAGS_LIST_SUBCLASS |
-             QP_TPFLAGS_MATCH_SELF | QP_TPFLAGS_SEQUENCE,
+             QP_TPFLAGS_MATCH_SELF | QP_TPFLAGS_SEQUENCE | QP_TPFLAGS_IMMUTABLETYPE,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_ARRAY,

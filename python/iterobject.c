@@ -161,44 +161,6 @@ static int qp_seq_as_ssize_strict(JSContext *ctx, JSValueConst v, Py_ssize_t *ou
     return ret;
 }
 
-/* PyLong_AsLong (no __index__). */
-static int qp_seq_as_long_strict(JSContext *ctx, JSValueConst v, int64_t *out)
-{
-    JSValue iv;
-    int ret;
-    if (JS_VALUE_GET_TAG(v) == JS_TAG_INT) {
-        *out = JS_VALUE_GET_INT(v);
-        return 0;
-    }
-    if (!qp_long_check(ctx, v)) {
-        qp_raise_type_error(ctx, "an integer is required");
-        return -1;
-    }
-    iv = qp_long_value(ctx, v);
-    if (JS_IsException(iv))
-        return -1;
-    ret = qp_long_as_int64(ctx, iv, out);
-    JS_FreeValue(ctx, iv);
-    return ret;
-}
-
-/* _PyEval_GetBuiltin: builtins[name] or AttributeError(name). */
-static JSValue qp_seq_get_builtin(JSContext *ctx, JSAtom name)
-{
-    JSValue v, s;
-    int r = qp_dict_get_item_atom(ctx, QP_STATE(ctx)->builtins_dict, name, &v);
-    if (r < 0)
-        return JS_EXCEPTION;
-    if (r > 0)
-        return v;
-    s = qp_str_from_atom(ctx, name);
-    if (JS_IsException(s))
-        return s;
-    qp_raise_value(ctx, QP_EXC(ctx, AttributeError), s);
-    JS_FreeValue(ctx, s);
-    return JS_EXCEPTION;
-}
-
 /* Clear the pending exception if it is an IndexError or StopIteration
    (or only StopIteration when index_error is FALSE); TRUE if cleared. */
 static BOOL qp_seq_clear_stop(JSContext *ctx, BOOL index_error)
@@ -321,7 +283,7 @@ static JSValue qp_iter_reduce_empty(JSContext *ctx, JSValue empty)
     JSValue res;
     if (JS_IsException(empty))
         return empty;
-    res = qp_iter_reduce_value(ctx, qp_seq_get_builtin(ctx, QP_ATOM(ctx, iter)), empty, FALSE, 0);
+    res = qp_iter_reduce_value(ctx, qp_eval_get_builtin(ctx, QP_ATOM(ctx, iter)), empty, FALSE, 0);
     JS_FreeValue(ctx, empty);
     return res;
 }
@@ -404,7 +366,7 @@ static JSValue qp_seqiter_m_reduce(JSContext *ctx, JSValueConst self, JSValueCon
                                    int nargs, JSValueConst kwnames, int magic)
 {
     QPIterObj *it = qp_iterobj(self);
-    JSValue iter = qp_seq_get_builtin(ctx, QP_ATOM(ctx, iter));
+    JSValue iter = qp_eval_get_builtin(ctx, QP_ATOM(ctx, iter));
     if (JS_IsException(iter))
         return iter;
     if (!QP_IS_NULL(it->seq))
@@ -490,7 +452,7 @@ static JSValue qp_calliter_m_reduce(JSContext *ctx, JSValueConst self, JSValueCo
                                     int nargs, JSValueConst kwnames, int magic)
 {
     QPIterObj *it = qp_iterobj(self);
-    JSValue iter = qp_seq_get_builtin(ctx, QP_ATOM(ctx, iter));
+    JSValue iter = qp_eval_get_builtin(ctx, QP_ATOM(ctx, iter));
     JSValue items[2], targs;
     JSValueConst pair[2];
 
@@ -607,10 +569,10 @@ static JSValue qp_listiter_m_reduce(JSContext *ctx, JSValueConst self, JSValueCo
         atom = JS_NewAtom(ctx, "reversed");
         if (atom == JS_ATOM_NULL)
             return JS_EXCEPTION;
-        callable = qp_seq_get_builtin(ctx, atom);
+        callable = qp_eval_get_builtin(ctx, atom);
         JS_FreeAtom(ctx, atom);
     } else {
-        callable = qp_seq_get_builtin(ctx, QP_ATOM(ctx, iter));
+        callable = qp_eval_get_builtin(ctx, QP_ATOM(ctx, iter));
     }
     if (JS_IsException(callable))
         return callable;
@@ -736,7 +698,7 @@ static JSValue qp_seqidx_m_reduce(JSContext *ctx, JSValueConst self, JSValueCons
     QPIterObj *it = qp_iterobj(self);
     JSValue iter;
     if (!QP_IS_NULL(it->seq)) {
-        iter = qp_seq_get_builtin(ctx, QP_ATOM(ctx, iter));
+        iter = qp_eval_get_builtin(ctx, QP_ATOM(ctx, iter));
         return qp_iter_reduce_value(ctx, iter, it->seq, TRUE, it->index);
     }
     return qp_iter_reduce_empty(ctx, magic ? qp_str_from_cstr(ctx, "") : qp_tuple_new(ctx, 0));
@@ -885,7 +847,7 @@ static JSValue qp_rangeiter_reduce_tuple(JSContext *ctx, JSValue range)
     JSValue items[3], iter;
     if (JS_IsException(range))
         return range;
-    iter = qp_seq_get_builtin(ctx, QP_ATOM(ctx, iter));
+    iter = qp_eval_get_builtin(ctx, QP_ATOM(ctx, iter));
     if (JS_IsException(iter)) {
         JS_FreeValue(ctx, range);
         return iter;
@@ -928,7 +890,15 @@ static JSValue qp_rangeiter_m_setstate(JSContext *ctx, JSValueConst self, JSValu
 {
     QPIterObj *it = qp_iterobj(self);
     int64_t index;
-    if (qp_seq_as_long_strict(ctx, args[0], &index) < 0)
+    JSValue iv;
+    int r;
+    /* PyLong_AsLong: honours __index__ */
+    iv = qp_index(ctx, args[0]);
+    if (JS_IsException(iv))
+        return JS_EXCEPTION;
+    r = qp_long_as_int64(ctx, iv, &index);
+    JS_FreeValue(ctx, iv);
+    if (r < 0)
         return JS_EXCEPTION;
     /* silently clip the index value */
     if (index < 0)

@@ -57,6 +57,8 @@ L3_ERRORS = PY_DIR / "cpython_errors.txt"
 CPYTHON_TEST_DIR = REPO_ROOT / "cpython" / "Lib" / "test"
 BUILD_DIR = REPO_ROOT / "build" / "testpy"
 TESTROOT = BUILD_DIR / "testroot"
+# test-only C extension modules (_testlimitedcapi): `make capi-testmods`
+CAPI_TESTMODS_DIR = BUILD_DIR / "capi-testmods"
 L3_RESULTS = BUILD_DIR / "l3-results.json"
 
 GOLDEN_GROUPS = ("syntax", "types", "objects", "stdlib")
@@ -609,7 +611,8 @@ def run_l3_module(impl: list[str], module: str, set_name: str,
         workdir = Path(tmp)
         results = workdir / "results.jsonl"
         env = child_env({
-            "PYTHONPATH": os.pathsep.join([str(SUPPORT_DIR), str(TESTROOT)]),
+            "PYTHONPATH": os.pathsep.join([str(SUPPORT_DIR), str(TESTROOT),
+                                           str(CAPI_TESTMODS_DIR)]),
             "TESTPY_RESULTS": str(results),
             "TESTPY_EXCLUDE": ",".join(excluded),
         })
@@ -662,6 +665,9 @@ def cmd_l3(args: argparse.Namespace) -> int:
     if not modules:
         raise HarnessError("no L3 modules selected")
     ensure_testroot()
+    if not any(CAPI_TESTMODS_DIR.glob("_testlimitedcapi.*")):
+        print(f"note: no _testlimitedcapi in {CAPI_TESTMODS_DIR} (make capi-testmods): "
+              "test_bytes and the other modules that need it are skipped")
 
     runs: list[ModuleRun] = []
     jobs = run_parallel(

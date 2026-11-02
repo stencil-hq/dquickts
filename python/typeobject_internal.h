@@ -41,6 +41,10 @@ typedef struct QPTypeExt {
     QPType **bases_raw;
     int nbases_raw;
     JSValue doc;                /* builtin types: cached __doc__ str or QP_NULL */
+    uint32_t alloc_serial;      /* qp_type_alloc order in the process */
+    uint8_t capi_class;         /* D5: class made by the exec of a C module and
+                                   stored in its namespace (snapshots save it by
+                                   reference, python/capi_snapshot.c) */
 } QPTypeExt;
 
 /* New str: CPython tp_name, used by "'%.100s' object ..." messages
@@ -73,11 +77,6 @@ static JSValue qp_descr_new_wrapper(JSContext *ctx, QPType *t, const QPSlotDef *
 static JSValue qp_descr_new_classmethod(JSContext *ctx, QPType *t, const QPMethodDef *ml);
 /* QPDescr payload of a PY_DESCR object, NULL if v is not one. */
 static QPDescr *qp_descr_get(JSValueConst v);
-/* Type of a descriptor object: QP_DESCR_* kind or -1. */
-static int qp_descr_kind(JSValueConst v);
-/* Callable of a classmethod/staticmethod object (borrowed), QP_NULL if not
-   one. */
-static JSValue qp_funcwrap_callable(JSValueConst v);
 
 /* Doc helpers (CPython _PyType_GetDocFromInternalDoc /
    _PyType_GetTextSignatureFromInternalDoc): `name` is the object name the

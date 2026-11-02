@@ -44,7 +44,7 @@ PyTuple_SET_ITEM(PyObject *op, Py_ssize_t index, PyObject *value) {
     PyTupleObject *tuple = _PyTuple_CAST(op);
     assert(0 <= index);
     assert(index < Py_SIZE(tuple));
-    if (_PyObject_CAST(tuple)->ob_flags & _Py_QP_BOUND_FLAG) {
+    if (_PyQp_HasFlag(_PyObject_CAST(tuple), _Py_QP_BOUND_FLAG)) {
         _PyQp_TupleSetItem(op, index, value);
         return;
     }

@@ -224,6 +224,7 @@ static void qp_error_clear(qp_error *err)
 {
     qp_sys_free(err->msg);
     qp_sys_free(err->text);
+    qp_sys_free(err->metadata_source);
     memset(err, 0, sizeof(*err));
 }
 

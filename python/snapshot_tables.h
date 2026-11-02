@@ -7,9 +7,12 @@
  *
  * GENERATED: regenerate after adding such a table (a missing table only
  * makes JS_WriteSnapshot() fail with "unregistered native code pointer"):
- * for each python/<unit>.c included by quickpy.c, in include order, every
+ * for each python/<unit>.c included by quickpy.c, in include order (not
+ * the capi_*.c units of CONFIG_PYTHON_CAPI: C-extension state is saved by
+ * python/capi_snapshot.c), and
+ * each local header it includes (recursively, first inclusion only), every
  * line matching
- *   ^static const (QPMethodDef|QPGetSetDef|QPMemberDef|QPTypeSpec|QPModuleDef) NAME([...])? =
+ *   ^static const (QPMethodDef|QPGetSetDef|QPMemberDef|QPTypeSpec|QPModuleDef) NAME([...])?( __maybe_unused)? =
  * (not inside a macro definition) or ^(QP_ITER_SPEC|QP_DICTITER_SPEC)(NAME,
  * gives A(Type, NAME) for arrays and S(Type, NAME) for single objects,
  * grouped by type in the order QPTypeSpec, QPModuleDef, QPMethodDef,
@@ -72,7 +75,7 @@
     S(QPTypeSpec, qp_object_spec) /* typeobject.c */ \
     S(QPTypeSpec, qp_none_type_spec) /* typeobject.c */ \
     S(QPTypeSpec, qp_notimpl_type_spec) /* typeobject.c */ \
-    S(QPTypeSpec, qp_jsobject_spec) /* typeobject.c */ \
+    S(QPTypeSpec, qp_super_spec) /* typeobject_attr.h */ \
     S(QPTypeSpec, qp_builtin_function_or_method_spec) /* descrobject.c */ \
     S(QPTypeSpec, qp_method_descriptor_spec) /* descrobject.c */ \
     S(QPTypeSpec, qp_classmethod_descriptor_spec) /* descrobject.c */ \
@@ -115,6 +118,8 @@
     S(QPTypeSpec, qp_union_spec) /* genericaliasobject.c */ \
     S(QPTypeSpec, qp_module_spec) /* moduleobject.c */ \
     S(QPTypeSpec, qp_lazy_import_spec) /* import.c */ \
+    S(QPTypeSpec, qp_jsi_awaiter_spec) /* jsinterop.c */ \
+    S(QPTypeSpec, qp_jsobject_spec) /* jsinterop.c */ \
     S(QPTypeSpec, qp_context_spec) /* mod_misc.c */ \
     S(QPTypeSpec, qp_ctxvar_spec) /* mod_misc.c */ \
     S(QPTypeSpec, qp_ctxtok_spec) /* mod_misc.c */ \
@@ -130,16 +135,24 @@
     S(QPTypeSpec, qp_si_spec) /* mod_posix.c */ \
     S(QPTypeSpec, qp_poll_spec) /* mod_select.c */ \
     S(QPTypeSpec, qp_cd_emap_spec) /* mod_codecs.c */ \
+    S(QPTypeSpec, qpast_ast_spec) /* mod_ast.c */ \
+    S(QPTypeSpec, qp_tokiter_spec) /* mod_tokenize.c */ \
+    S(QPTypeSpec, qp_ste_spec) /* mod_symtable.c */ \
+    S(QPTypeSpec, qp_tic_sicm_spec) /* mod_testinternalcapi.c */ \
+    S(QPModuleDef, qp_moddef__suggestions) /* errors.c */ \
     S(QPModuleDef, qp_moddef_builtins) /* bltinmodule.c */ \
+    S(QPModuleDef, qp_moddef_sys__jit) /* sysmodule.c */ \
     S(QPModuleDef, qp_moddef_sys) /* sysmodule.c */ \
     S(QPModuleDef, qp_moddef__typing) /* typevarobject.c */ \
     S(QPModuleDef, qp_moddef__string) /* import.c */ \
+    S(QPModuleDef, qp_moddef_js) /* jsinterop.c */ \
     S(QPModuleDef, qp_moddef_gc) /* mod_misc.c */ \
     S(QPModuleDef, qp_moddef_atexit) /* mod_misc.c */ \
     S(QPModuleDef, qp_moddef__contextvars) /* mod_misc.c */ \
     S(QPModuleDef, qp_moddef__warnings) /* mod_misc.c */ \
     S(QPModuleDef, qp_moddef__signal) /* mod_misc.c */ \
     S(QPModuleDef, qp_moddef_marshal) /* mod_misc.c */ \
+    S(QPModuleDef, qp_moddef_sys_monitoring) /* instrumentation.c */ \
     S(QPModuleDef, qp_moddef__weakref) /* mod_weakref.c */ \
     S(QPModuleDef, qp_moddef__thread) /* mod_thread.c */ \
     S(QPModuleDef, qp_moddef_time) /* mod_time.c */ \
@@ -152,6 +165,12 @@
     S(QPModuleDef, qp_moddef__locale) /* mod_locale.c */ \
     S(QPModuleDef, qp_moddef__io) /* mod_io.c */ \
     S(QPModuleDef, qp_moddef__imp) /* mod_imp.c */ \
+    S(QPModuleDef, qp_moddef__ast) /* mod_ast.c */ \
+    S(QPModuleDef, qp_moddef__tokenize) /* mod_tokenize.c */ \
+    S(QPModuleDef, qp_moddef__symtable) /* mod_symtable.c */ \
+    S(QPModuleDef, qp_moddef__types) /* mod_types.c */ \
+    S(QPModuleDef, qp_moddef__sysconfigdata) /* mod_types.c */ \
+    S(QPModuleDef, qp_moddef__testinternalcapi) /* mod_testinternalcapi.c */ \
     A(QPMethodDef, qp_fo_method_methods) /* funcobject.c */ \
     A(QPMethodDef, qp_co_methods) /* codeobject.c */ \
     A(QPMethodDef, qp_fr_methods) /* frameobject.c */ \
@@ -159,6 +178,7 @@
     A(QPMethodDef, qp_float_methods) /* floatobject.c */ \
     A(QPMethodDef, qp_complex_methods) /* complexobject.c */ \
     A(QPMethodDef, qp_str_methods) /* unicodeobject.c */ \
+    A(QPMethodDef, qp_string_module_methods) /* unicode_format.c */ \
     A(QPMethodDef, qpt_interpolation_methods) /* templateobject.c */ \
     A(QPMethodDef, qpt_template_methods) /* templateobject.c */ \
     A(QPMethodDef, qp_tuple_methods) /* tupleobject.c */ \
@@ -192,6 +212,7 @@
     A(QPMethodDef, qp_type_methods) /* typeobject.c */ \
     A(QPMethodDef, qp_object_methods) /* typeobject.c */ \
     A(QPMethodDef, qp_notimpl_methods) /* typeobject.c */ \
+    S(QPMethodDef, qp_tp_new_methoddef) /* typeobject_slots.h */ \
     A(QPMethodDef, qp_cfunction_methods) /* descrobject.c */ \
     A(QPMethodDef, qp_descr_methods) /* descrobject.c */ \
     A(QPMethodDef, qp_property_methods) /* descrobject.c */ \
@@ -201,6 +222,7 @@
     A(QPMethodDef, qp_exc_importerror_methods) /* exceptions.c */ \
     A(QPMethodDef, qp_exc_oserror_methods) /* exceptions.c */ \
     A(QPMethodDef, qp_exc_attributeerror_methods) /* exceptions.c */ \
+    A(QPMethodDef, qp_suggestions_methods) /* errors.c */ \
     A(QPMethodDef, qp_tb_methods) /* traceback.c */ \
     A(QPMethodDef, qp__gen_methods) /* genobject.c */ \
     A(QPMethodDef, qp__coro_methods) /* genobject.c */ \
@@ -219,6 +241,7 @@
     A(QPMethodDef, qp_namespace_methods) /* sysmodule.c */ \
     A(QPMethodDef, qp_sp_methods) /* sysmodule.c */ \
     A(QPMethodDef, qp_sys_methods) /* sysmodule.c */ \
+    A(QPMethodDef, qp_sys_jit_methods) /* sysmodule.c */ \
     A(QPMethodDef, qp_nodefault_methods) /* typevarobject.c */ \
     A(QPMethodDef, qp_typevar_methods) /* typevarobject.c */ \
     A(QPMethodDef, qp_paramspecargs_methods) /* typevarobject.c */ \
@@ -236,6 +259,8 @@
     A(QPMethodDef, qp_ss_methods) /* structseq.c */ \
     A(QPMethodDef, qp_module_methods) /* moduleobject.c */ \
     A(QPMethodDef, qp_lazy_import_methods) /* import.c */ \
+    A(QPMethodDef, qp_jsobj_methods) /* jsinterop.c */ \
+    A(QPMethodDef, qp_jsmod_methods) /* jsinterop.c */ \
     A(QPMethodDef, qp_gc_methods) /* mod_misc.c */ \
     A(QPMethodDef, qp_atexit_methods) /* mod_misc.c */ \
     A(QPMethodDef, qp_context_methods) /* mod_misc.c */ \
@@ -245,6 +270,7 @@
     A(QPMethodDef, qp_warnings_methods) /* mod_misc.c */ \
     A(QPMethodDef, qp_signal_methods) /* mod_misc.c */ \
     A(QPMethodDef, qp_marshal_methods) /* mod_misc.c */ \
+    A(QPMethodDef, qp_mon_methods) /* instrumentation.c */ \
     A(QPMethodDef, qp_wr_ref_methods) /* mod_weakref.c */ \
     A(QPMethodDef, qp_wr_proxy_methods) /* mod_weakref.c */ \
     A(QPMethodDef, qp_wr_module_methods) /* mod_weakref.c */ \
@@ -266,8 +292,14 @@
     A(QPMethodDef, qp_codecs_methods) /* mod_codecs.c */ \
     A(QPMethodDef, qp_locale_methods) /* mod_locale.c */ \
     S(QPMethodDef, qp_iom_read_file_def) /* mod_io.c */ \
+    S(QPMethodDef, qp_iom_mark_native_def) /* mod_io.c */ \
     A(QPMethodDef, qp_io_methods) /* mod_io.c */ \
     A(QPMethodDef, qp_imp_methods) /* mod_imp.c */ \
+    A(QPMethodDef, qpast_ast_methods) /* mod_ast.c */ \
+    A(QPMethodDef, qpast_module_methods) /* mod_ast.c */ \
+    A(QPMethodDef, qp_symtable_methods) /* mod_symtable.c */ \
+    A(QPMethodDef, qp_tic_sicm_methods) /* mod_testinternalcapi.c */ \
+    A(QPMethodDef, qp_tic_methods) /* mod_testinternalcapi.c */ \
     A(QPGetSetDef, qp_fo_func_getsets) /* funcobject.c */ \
     A(QPGetSetDef, qp_fo_method_getsets) /* funcobject.c */ \
     A(QPGetSetDef, qp_fo_cell_getsets) /* funcobject.c */ \
@@ -283,6 +315,8 @@
     A(QPGetSetDef, qp_memoryview_getsets) /* memoryobject.c */ \
     A(QPGetSetDef, qp_type_getsets) /* typeobject.c */ \
     A(QPGetSetDef, qp_object_getsets) /* typeobject.c */ \
+    A(QPGetSetDef, qp_subtype_getsets) /* typeobject_attr.h */ \
+    A(QPGetSetDef, qp_super_getsets) /* typeobject_attr.h */ \
     A(QPGetSetDef, qp_cfunction_getsets) /* descrobject.c */ \
     A(QPGetSetDef, qp_methoddescr_getsets) /* descrobject.c */ \
     A(QPGetSetDef, qp_attrdescr_getsets) /* descrobject.c */ \
@@ -303,6 +337,7 @@
     A(QPGetSetDef, qp__gen_getsets) /* genobject.c */ \
     A(QPGetSetDef, qp__coro_getsets) /* genobject.c */ \
     A(QPGetSetDef, qp__agen_getsets) /* genobject.c */ \
+    A(QPGetSetDef, qp_namespace_getsets) /* sysmodule.c */ \
     A(QPGetSetDef, qp_sp_getsets) /* sysmodule.c */ \
     A(QPGetSetDef, qp_typevar_getsets) /* typevarobject.c */ \
     A(QPGetSetDef, qp_paramspec_getsets) /* typevarobject.c */ \
@@ -315,6 +350,7 @@
     A(QPGetSetDef, qp_wr_ref_getsets) /* mod_weakref.c */ \
     A(QPGetSetDef, qp_thread_handle_getsets) /* mod_thread.c */ \
     A(QPGetSetDef, qp_thread_local_getsets) /* mod_thread.c */ \
+    A(QPGetSetDef, qpast_ast_getsets) /* mod_ast.c */ \
     A(QPMemberDef, qpt_interpolation_members) /* templateobject.c */ \
     A(QPMemberDef, qpt_template_members) /* templateobject.c */ \
     A(QPMemberDef, qp_sentinel_members) /* bltinmodule.c */ \
@@ -325,6 +361,21 @@
     A(QPMemberDef, qp_ga_members) /* genericaliasobject.c */ \
     A(QPMemberDef, qp_union_members) /* genericaliasobject.c */ \
     A(QPMemberDef, qp_ctxvar_members) /* mod_misc.c */ \
-    A(QPMemberDef, qp_de_members) /* mod_posix.c */
+    A(QPMemberDef, qp_de_members) /* mod_posix.c */ \
+    A(QPMemberDef, qp_ste_members) /* mod_symtable.c */
+
+/* Host-specific tables, outside the generated list: the kqueue objects of
+   mod_select.c exist on macOS/BSD only (QP_HAVE_KQUEUE).  Expanded after
+   QP_SNAP_TABLES. */
+#ifdef QP_HAVE_KQUEUE
+#define QP_SNAP_TABLES_HOST(A, S) \
+    S(QPTypeSpec, qp_kevent_spec) /* mod_select.c */ \
+    S(QPTypeSpec, qp_kqueue_spec) /* mod_select.c */ \
+    A(QPMethodDef, qp_kq_methods) /* mod_select.c */ \
+    A(QPGetSetDef, qp_kev_getsets) /* mod_select.c */ \
+    A(QPGetSetDef, qp_kq_getsets) /* mod_select.c */
+#else
+#define QP_SNAP_TABLES_HOST(A, S)
+#endif
 
 #endif /* QP_SNAPSHOT_TABLES_H */

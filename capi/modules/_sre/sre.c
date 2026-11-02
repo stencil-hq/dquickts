@@ -3032,14 +3032,18 @@ expand_template(TemplateObject *self, MatchObject *match)
     PyObject *buffer[10];
     PyObject **out = buffer;
     PyObject *list = NULL;
+    /* dquickts: list items are not a C array; collect into a heap array
+       and build the list from it (capi/modules/PATCHES). */
+    PyObject **heap = NULL;
     if (self->chunks > (int)Py_ARRAY_LENGTH(buffer) ||
         !PyUnicode_Check(self->literal))
     {
-        list = PyList_New(self->chunks);
-        if (!list) {
+        heap = PyMem_New(PyObject *, self->chunks);
+        if (!heap) {
+            PyErr_NoMemory();
             return NULL;
         }
-        out = &PyList_GET_ITEM(list, 0);
+        out = heap;
     }
 
     out[count++] = Py_NewRef(self->literal);
@@ -3068,19 +3072,23 @@ expand_template(TemplateObject *self, MatchObject *match)
         result = _PyUnicode_JoinArray(&_Py_STR(empty), out, count);
     }
     else {
-        Py_SET_SIZE(list, count);
+        list = PyList_New(count);
+        if (!list) {
+            goto cleanup;
+        }
+        for (Py_ssize_t i = 0; i < count; i++) {
+            PyList_SET_ITEM(list, i, out[i]);
+        }
+        count = 0;  /* the list owns the items */
         result = PyBytes_Join((PyObject *)&_Py_SINGLETON(bytes_empty), list);
     }
 
 cleanup:
-    if (list) {
-        Py_DECREF(list);
+    Py_XDECREF(list);
+    for (Py_ssize_t i = 0; i < count; i++) {
+        Py_DECREF(out[i]);
     }
-    else {
-        for (Py_ssize_t i = 0; i < count; i++) {
-            Py_DECREF(out[i]);
-        }
-    }
+    PyMem_Free(heap);
     return result;
 }
 

@@ -79,7 +79,8 @@
 #define WITH_DOC_STRINGS 1
 #define HAVE_SSIZE_T 1
 #define HAVE_LONG_LONG 1
-#define HAVE_THREAD_LOCAL 1
+/* no HAVE_THREAD_LOCAL: pyport.h defines it for Py_BUILD_CORE only, as
+   CPython does (gh-142163: extensions such as numpy test it themselves) */
 #define HAVE_STD_ATOMIC 1
 #define HAVE_BUILTIN_ATOMIC 1
 #define HAVE_COMPUTED_GOTOS 1
@@ -88,12 +89,29 @@
 #define _Py_HAVE_STRERROR_R 1
 #define STDC_HEADERS 1
 #define RETSIGTYPE void
+/* _decimal: the context is a context variable (configure's default
+   --with-decimal-contextvar) */
+#define WITH_DECIMAL_CONTEXTVAR 1
+/* Cython-generated code (plan D5 Tier S, M7): Cython's CPython mode reaches
+   into internals this runtime does not have (PyListObject.ob_item,
+   tstate->current_exception, the exception's traceback field, the frame
+   struct of internal/pycore_frame.h), unconditionally for
+   CYTHON_COMPILING_IN_CPYTHON.  Its limited-API mode uses public functions
+   only, so it is selected for every Cython module built against these
+   headers, as PyPy and GraalPy get their own Cython modes. */
+#ifndef CYTHON_LIMITED_API
+#  define CYTHON_LIMITED_API 1
+#endif
 /* PyObject_Malloc is the runtime's allocator (python/capi_object.c); the
    pymalloc/mimalloc options of CPython do not apply.  WITH_PYMALLOC,
    WITH_MIMALLOC, WITH_DTRACE, Py_DEBUG, Py_REF_DEBUG, Py_TRACE_REFS,
    Py_STATS and Py_GIL_DISABLED are never defined. */
 
 /* ---- headers and functions present on every supported host -------------- */
+/* configure's ANSI C checks, still tested by third-party extensions
+   (Pillow's ImPlatform.h) */
+#define HAVE_PROTOTYPES 1
+#define STDC_HEADERS 1
 #define HAVE_ALLOCA_H 1
 #define HAVE_DIRENT_H 1
 #define HAVE_DLFCN_H 1
@@ -104,6 +122,7 @@
 #define HAVE_NETDB_H 1
 #define HAVE_NETINET_IN_H 1
 #define HAVE_NETINET_TCP_H 1
+#define HAVE_NET_ETHERNET_H 1          /* socket: ETHERTYPE_* */
 #define HAVE_ARPA_INET_H 1
 #define HAVE_NET_IF_H 1
 #define HAVE_POLL_H 1
@@ -165,6 +184,7 @@
 #define HAVE_GETPEERNAME 1
 #define HAVE_GETPID 1
 #define HAVE_GETPROTOBYNAME 1
+#define HAVE_GETRUSAGE 1               /* resource.getrusage */
 #define HAVE_GETSERVBYNAME 1
 #define HAVE_GETSERVBYPORT 1
 #define HAVE_GETSOCKNAME 1
@@ -179,12 +199,14 @@
 #define HAVE_LOCALTIME_R 1
 #define HAVE_LOG1P 1
 #define HAVE_LOG2 1
+#define HAVE_MADVISE 1                 /* mmap.madvise */
 #define HAVE_MKTIME 1
 #define HAVE_NANOSLEEP 1
 #define HAVE_POLL 1
 #define HAVE_RECVFROM 1
 #define HAVE_SENDTO 1
 #define HAVE_SETSOCKOPT 1
+#define HAVE_SETHOSTNAME 1             /* socket.sethostname */
 #define HAVE_SHUTDOWN 1
 #define HAVE_SIGACTION 1
 #define HAVE_SNPRINTF 1
@@ -204,11 +226,67 @@
 #define HAVE_WCSXFRM 1
 #define HAVE_WMEMCMP 1
 #define ENABLE_IPV6 1
+/* fcntl, grp, pwd, readline, _multiprocessing, _posixshmem, _uuid */
+#define HAVE_FLOCK 1
+#define HAVE_GETGRGID_R 1
+#define HAVE_GETGRNAM_R 1
+#define HAVE_GETPWENT 1
+#define HAVE_GETPWNAM_R 1
+#define HAVE_GETPWUID_R 1
+#define HAVE_STRUCT_PASSWD_PW_GECOS 1
+#define HAVE_STRUCT_PASSWD_PW_PASSWD 1
+#define HAVE_SETLOCALE 1
+#define HAVE_SIGWAIT 1
+#define HAVE_SEM_OPEN 1
+#define HAVE_SEM_UNLINK 1
+#define HAVE_SHM_OPEN 1
+#define HAVE_SHM_UNLINK 1
+#define HAVE_UUID_UUID_H 1
+/* readline: the functions of the library chosen by the Makefile (GNU
+   readline, or libedit with WITH_EDITLINE: the set of macOS's libedit) */
+#ifdef WITH_EDITLINE
+#  define Py_RL_STARTUP_HOOK_TAKES_ARGS 1
+#  define HAVE_RL_COMPLETION_APPEND_CHARACTER 1
+#  define HAVE_RL_COMPLETION_DISPLAY_MATCHES_HOOK 1
+#  define HAVE_RL_COMPLETION_MATCHES 1
+#  define HAVE_RL_PRE_INPUT_HOOK 1
+#else
+#  define HAVE_RL_APPEND_HISTORY 1
+#  define HAVE_RL_CATCH_SIGNAL 1
+#  define HAVE_RL_COMPDISP_FUNC_T 1
+#  define HAVE_RL_COMPLETION_APPEND_CHARACTER 1
+#  define HAVE_RL_COMPLETION_DISPLAY_MATCHES_HOOK 1
+#  define HAVE_RL_COMPLETION_MATCHES 1
+#  define HAVE_RL_COMPLETION_SUPPRESS_APPEND 1
+#  define HAVE_RL_PRE_INPUT_HOOK 1
+#  define HAVE_RL_RESIZE_TERMINAL 1
+#endif
+
+/* ---- HACL* SIMD (_blake2): capi/Setup.qp compiles the SIMD128/SIMD256
+   objects (with -msse4.2 / -mavx2) on x86_64 only; blake2module.c picks them
+   at run time from CPUID.  Other hosts use the portable code. */
+#if defined(__x86_64__)
+#  define _Py_HACL_CAN_COMPILE_VEC128 1
+#  define _Py_HACL_CAN_COMPILE_VEC256 1
+#endif
+
+/* ---- libffi and the dynamic loader (_ctypes; built only when pkg-config
+   finds libffi, capi/Setup.qp @ffi).  libffi >= 3.3 on the 64-bit hosts:
+   ffi_prep_cif_var, ffi_prep_closure_loc, ffi_closure_alloc and the C99
+   complex types (configure's compile/run checks). */
+#define HAVE_FFI_PREP_CIF_VAR 1
+#define HAVE_FFI_PREP_CLOSURE_LOC 1
+#define HAVE_FFI_CLOSURE_ALLOC 1
+#define _Py_FFI_SUPPORT_C_COMPLEX 1
+#define HAVE_DECL_RTLD_GLOBAL 1
+#define HAVE_DECL_RTLD_LOCAL 1
 
 /* ---- host specific -------------------------------------------------------- */
 #if defined(__APPLE__)
 #  define HAVE_SOCKADDR_SA_LEN 1
 #  define HAVE_SYS_EVENT_H 1
+#  define HAVE_SYS_KERN_CONTROL_H 1    /* socket: SYSPROTO_CONTROL */
+#  define HAVE_SYS_SYS_DOMAIN_H 1
 #  define HAVE_KQUEUE 1
 #  define HAVE_SYS_SYSCTL_H 1
 #  define HAVE_SYSCTLBYNAME 1
@@ -219,6 +297,9 @@
 #  define HAVE_SYS_RANDOM_H 1
 #  define HAVE_STRLCPY 1
 #  define WITH_DYLD 1
+/* sem_getvalue() is not implemented, sem_timedwait() is missing */
+#  define HAVE_BROKEN_SEM_GETVALUE 1
+#  define HAVE_DYLD_SHARED_CACHE_CONTAINS_PATH 1
 #elif defined(__linux__)
 #  define HAVE_LINUX_NETLINK_H 1
 #  define HAVE_LINUX_CAN_H 1
@@ -237,6 +318,13 @@
 #  define HAVE_NETPACKET_PACKET_H 1
 #  define HAVE_SOCKADDR_ALG 1
 #  define HAVE_LINUX_VM_SOCKETS_H 1
+#  define HAVE_LINUX_FS_H 1
+#  define HAVE_SEM_TIMEDWAIT 1
+#  define HAVE_SIGTIMEDWAIT 1
+#  define HAVE_SIGWAITINFO 1
+/* _uuid with libuuid */
+#  define HAVE_UUID_GENERATE_TIME_SAFE 1
+#  define HAVE_DL_ITERATE_PHDR 1
 #endif
 
 #endif /* Py_PYCONFIG_H */

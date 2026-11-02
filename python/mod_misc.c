@@ -82,7 +82,8 @@ static BOOL qp_misc_callable(JSContext *ctx, JSValueConst v)
  * edges (plus the items of lists, tuples, dicts and sets, which include
  * untracked values such as ints and strs, as CPython's tp_traverse does),
  * looking through internal objects (function data, closure variables,
- * weakref holders) to the Python objects behind them.  DEBUG_SAVEALL
+ * weakref holders, generator frames, whose locals are visited even while
+ * they run) to the Python objects behind them.  DEBUG_SAVEALL
  * cannot keep cycles alive (QuickJS frees them inside JS_RunGC), so
  * gc.garbage stays empty; the cycle collector never refuses to free a
  * cycle (cycles with __del__ are freed without calling it, m2-design §6),
@@ -196,6 +197,7 @@ typedef struct QPGcHdrVec {
     JSGCObjectHeader **v;
     int n, size;
     BOOL oom;
+    BOOL self_ref;              /* v[0] reached again: the object refers to itself */
 } QPGcHdrVec;
 
 static QPGcHdrVec *qp_gc_cur_vec;
@@ -208,8 +210,11 @@ static void qp_gc_mark_collect(JSRuntime *rt, JSGCObjectHeader *gp)
     if (vec->oom)
         return;
     for (i = 0; i < vec->n; i++) {
-        if (vec->v[i] == gp)
+        if (vec->v[i] == gp) {
+            if (i == 0)
+                vec->self_ref = TRUE;
             return;
+        }
     }
     if (vec->n == vec->size) {
         int ns = vec->size ? vec->size * 2 : 32;
@@ -273,12 +278,32 @@ static int qp_gc_visit_items(JSContext *ctx, JSValueConst obj, QPGcVisitFunc *fn
     return r;
 }
 
+/* The locals of a running generator frame, which mark_children skips (a
+   running frame cannot be part of a removable cycle); CPython's
+   gen_traverse visits them in every state. */
+static void qp_gc_mark_running_locals(JSRuntime *rt, JSAsyncFunctionState *s)
+{
+    JSStackFrame *sf = &s->frame;
+    JSFunctionBytecode *b;
+    int i;
+
+    if (s->is_completed || sf->cur_sp || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+        return;
+    b = JS_VALUE_GET_OBJ(sf->cur_func)->u.func.function_bytecode;
+    if (!b)
+        return;
+    for (i = 0; i < sf->arg_count; i++)
+        JS_MarkValue(rt, sf->arg_buf[i], qp_gc_mark_collect);
+    for (i = 0; i < b->var_count; i++)
+        JS_MarkValue(rt, sf->var_buf[i], qp_gc_mark_collect);
+}
+
 /* Call fn for every object obj refers to (CPython tp_traverse).  0, 1
    (stopped) or -1. */
 static int qp_gc_foreach_referent(JSContext *ctx, JSValueConst obj, QPGcVisitFunc *fn, void *opaque)
 {
     JSRuntime *rt = ctx->rt;
-    QPGcHdrVec vec = { NULL, 0, 0, FALSE }, *saved;
+    QPGcHdrVec vec = { NULL, 0, 0, FALSE, FALSE }, *saved;
     BOOL handled;
     int i, r;
 
@@ -301,7 +326,15 @@ static int qp_gc_foreach_referent(JSContext *ctx, JSValueConst obj, QPGcVisitFun
             continue;
         if (vec.n > 100000)
             break;
+        if (type == JS_GC_OBJ_TYPE_VAR_REF) {
+            /* a cell refers to its value (an open var ref of a heap
+               frame marks the whole frame) */
+            JS_MarkValue(rt, *((JSVarRef *)gp)->pvalue, qp_gc_mark_collect);
+            continue;
+        }
         mark_children(rt, gp, qp_gc_mark_collect);
+        if (type == JS_GC_OBJ_TYPE_ASYNC_FUNCTION)
+            qp_gc_mark_running_locals(rt, (JSAsyncFunctionState *)gp);
     }
     qp_gc_cur_vec = saved;
     if (vec.oom) {
@@ -317,6 +350,8 @@ static int qp_gc_foreach_referent(JSContext *ctx, JSValueConst obj, QPGcVisitFun
         if ((t->flags & QP_TPFLAGS_HEAPTYPE) && JS_VALUE_GET_OBJ(obj)->class_id != JS_CLASS_PY_TYPE)
             r = fn(ctx, QP_TYPE_VALUE(t), opaque);
     }
+    if (vec.self_ref && r == 0)
+        r = fn(ctx, obj, opaque);
     for (i = 1; i < vec.n && r == 0; i++) {
         JSGCObjectHeader *gp = vec.v[i];
         JSValue v;
@@ -489,6 +524,21 @@ static Py_ssize_t qp_gc_collect_main(JSContext *ctx, QPModState *ms, int generat
     qp_gc_invoke_callbacks(ctx, ms, "stop", generation, collected, 0, before, duration);
     ms->gc_collecting = 0;
     return (Py_ssize_t)collected;
+}
+
+/* PyGC_Collect() of Py_FinalizeEx: when the collector is enabled, a full
+   collection (with gc.callbacks) before the modules are destroyed, so
+   that the garbage is finalized while they still work */
+static void qp_gc_collect_at_exit(JSContext *ctx)
+{
+    QPModState *ms = qp_gc_state(ctx);
+
+    if (!ms) {
+        qp_tw_clear_exc(ctx);
+        return;
+    }
+    if (ms->gc_enabled)
+        qp_gc_collect_main(ctx, ms, QP_GC_NUM_GENERATIONS - 1);
 }
 
 static JSValue qp_gc_enable(JSContext *ctx, JSValueConst self, JSValueConst *args,
@@ -1431,13 +1481,16 @@ static JSValue qp_ctxvar_new_ms(JSContext *ctx, QPModState *ms, JSValueConst nam
     slots[QP_CTXVAR_SLOT_NAME] = JS_DupValue(ctx, name);
     slots[QP_CTXVAR_SLOT_DEFAULT] = QP_IS_NULL(dflt) ? QP_NULL : JS_DupValue(ctx, dflt);
 
-    /* contextvar_generate_hash: hash(name) XOR Py_HashPointer(self) */
+    /* contextvar_generate_hash: hash(name) XOR Py_HashPointer(self), with
+       a unique number instead of the address, so that the hash (stored,
+       see the HAMT of the contexts) is the same in every process for the
+       same program: a heap snapshot base is reproducible */
     name_hash = qp_hash(ctx, name);
     if (name_hash == -1) {
         JS_FreeValue(ctx, obj);
         return JS_EXCEPTION;
     }
-    h = (Py_hash_t)qp_hash_pointer((uintptr_t)JS_VALUE_GET_PTR(obj)) ^ name_hash;
+    h = (Py_hash_t)qp_hash_pointer((uintptr_t)(++QP_STATE(ctx)->next_dict_uid << 4)) ^ name_hash;
     if (h == -1)
         h = -2;
     slots[QP_CTXVAR_SLOT_HASH_LO] = JS_NewInt32(ctx, (int32_t)(uint32_t)(uint64_t)h);
@@ -2227,10 +2280,10 @@ static const QPModuleDef qp_moddef__contextvars = {
  * `_defaultaction` and `_warnings_context` ARE those objects, and the C code
  * re-reads the Python `warnings` module attributes like get_warnings_attr().
  *
- * Locking: CPython uses a recursive mutex.  Until real OS threads exist
- * (M5) there is a single thread, so the lock is a recursion counter
- * (warn_lock_count): acquiring always succeeds, releasing an unheld lock
- * raises RuntimeError like _PyRecursiveMutex_TryUnlock failing.
+ * Locking: CPython's recursive mutex is the interpreter recursive mutex
+ * QP_RMUTEX_WARNINGS (python/ceval.c): warn_lock_count is its level, the
+ * owning thread is kept by the GIL code; releasing a lock the thread does
+ * not hold raises RuntimeError like _PyRecursiveMutex_TryUnlock failing.
  *
  * Finalization: CPython skips importing `warnings` once the interpreter is
  * finalizing; this runtime has no finalizing phase in which Python code may
@@ -2290,20 +2343,6 @@ static JSValue qp_warnings_call_method1(JSContext *ctx, JSValueConst obj, const 
         return m;
     r = QP_IS_NULL(arg) ? qp_call0(ctx, m) : qp_call1(ctx, m, arg);
     JS_FreeValue(ctx, m);
-    return r;
-}
-
-/* PyDict_GetItemRef with a C-string key. */
-static int qp_warnings_dict_get(JSContext *ctx, JSValueConst d, const char *name, JSValue *pv)
-{
-    JSAtom a = JS_NewAtom(ctx, name);
-    int r;
-    if (a == JS_ATOM_NULL) {
-        *pv = QP_NULL;
-        return -1;
-    }
-    r = qp_dict_get_item_atom(ctx, d, a, pv);
-    JS_FreeAtom(ctx, a);
     return r;
 }
 
@@ -2421,17 +2460,18 @@ static QPModState *qp_warnings_state(JSContext *ctx)
     return ms;
 }
 
-static void qp_warnings_lock(QPModState *ms)
+/* the lock is the recursive mutex QP_RMUTEX_WARNINGS of python/ceval.c
+   (level: ms->warn_lock_count) */
+static void qp_warnings_lock(JSContext *ctx, QPModState *ms)
 {
-    ms->warn_lock_count++;
+    (void)ms;
+    qp_rmutex_lock(ctx, QP_RMUTEX_WARNINGS);
 }
 
-static int qp_warnings_unlock(QPModState *ms)
+static int qp_warnings_unlock(JSContext *ctx, QPModState *ms)
 {
-    if (ms->warn_lock_count <= 0)
-        return -1;
-    ms->warn_lock_count--;
-    return 0;
+    (void)ms;
+    return qp_rmutex_unlock(ctx, QP_RMUTEX_WARNINGS);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -3348,7 +3388,7 @@ static int qp_warnings_setup_context(JSContext *ctx, Py_ssize_t stack_level,
 }
 
 /* get_category: borrowed type value or JS_EXCEPTION. */
-static JSValue qp_warnings_get_category(JSContext *ctx, JSValueConst message,
+static JSValueConst qp_warnings_get_category(JSContext *ctx, JSValueConst message,
                                         JSValueConst category)
 {
     QPType *t;
@@ -3383,10 +3423,10 @@ static int qp_warnings_do_warn(JSContext *ctx, JSValueConst message, JSValueCons
     if (qp_warnings_setup_context(ctx, stack_level, skip_file_prefixes, &filename, &lineno,
                                   &module, &registry) < 0)
         return -1;
-    qp_warnings_lock(ms);
+    qp_warnings_lock(ctx, ms);
     res = qp_warnings_do_warn_explicit(ctx, ms, category, message, filename, lineno, module,
                                        registry, QP_NULL, source);
-    qp_warnings_unlock(ms);
+    qp_warnings_unlock(ctx, ms);
     JS_FreeValue(ctx, filename);
     JS_FreeValue(ctx, registry);
     JS_FreeValue(ctx, module);
@@ -3513,10 +3553,10 @@ static int qp_warnings_warn_explicit(JSContext *ctx, QPType *category, JSValueCo
         return -1;
     if (!category)
         category = QP_EXC(ctx, RuntimeWarning);
-    qp_warnings_lock(ms);
+    qp_warnings_lock(ctx, ms);
     res = qp_warnings_do_warn_explicit(ctx, ms, QP_TYPE_VALUE(category), message, filename,
                                        lineno, module, registry, QP_NULL, source);
-    qp_warnings_unlock(ms);
+    qp_warnings_unlock(ctx, ms);
     return res;
 }
 
@@ -3613,10 +3653,10 @@ static JSValue qp_warnings_m_warn_explicit(JSContext *ctx, JSValueConst self, JS
             return JS_EXCEPTION;
     }
 
-    qp_warnings_lock(ms);
+    qp_warnings_lock(ctx, ms);
     res = qp_warnings_do_warn_explicit(ctx, ms, a[1], a[0], a[2], lineno, a[4], registry,
                                        source_line, sourceobj);
-    qp_warnings_unlock(ms);
+    qp_warnings_unlock(ctx, ms);
     JS_FreeValue(ctx, source_line);
     if (res < 0)
         return JS_EXCEPTION;
@@ -3643,7 +3683,7 @@ static JSValue qp_warnings_m_acquire_lock(JSContext *ctx, JSValueConst self, JSV
     QPModState *ms = qp_warnings_state(ctx);
     if (!ms)
         return JS_EXCEPTION;
-    qp_warnings_lock(ms);
+    qp_warnings_lock(ctx, ms);
     return JS_UNDEFINED;
 }
 
@@ -3653,7 +3693,7 @@ static JSValue qp_warnings_m_release_lock(JSContext *ctx, JSValueConst self, JSV
     QPModState *ms = qp_warnings_state(ctx);
     if (!ms)
         return JS_EXCEPTION;
-    if (qp_warnings_unlock(ms) < 0)
+    if (qp_warnings_unlock(ctx, ms) < 0)
         return qp_raise_runtime_error(ctx, "cannot release un-acquired lock");
     return JS_UNDEFINED;
 }
@@ -3740,10 +3780,13 @@ static const QPModuleDef qp_moddef__warnings = {
  * Python handlers like _PyErr_CheckSignalsTstate and then the queued
  * weakref callbacks.
  *
- * Threads: until real OS threads exist (M5) the only thread is the main
- * thread of the main interpreter, so CPython's "signal only works in main
- * thread of the main interpreter" / "set_wakeup_fd only works in main
- * thread of the main interpreter" checks always pass and are not coded.
+ * Threads: the Python handlers run in the main thread only (the thread
+ * that ran Python code when the first thread was started, see
+ * qp_thread_is_main_rt()); signal.signal() and set_wakeup_fd() raise
+ * CPython's "only works in main thread of the main interpreter"
+ * ValueError in other threads.  A signal arriving while another thread
+ * holds the GIL makes that thread poll; the main thread runs the handlers
+ * once it gets the GIL back (qp_gil_acquire() makes it poll at once).
  * sys.audit hooks are not available to native modules, so the
  * "signal.pthread_kill" audit event is not raised.
  */
@@ -3784,7 +3827,6 @@ static volatile sig_atomic_t qp_signal_wakeup_warn = 1;
 static volatile sig_atomic_t qp_signal_wakeup_errno;
 static JSContext *volatile qp_signal_main_ctx;
 #ifdef QP_SIGNAL_HAVE_SIGWAITINFO
-static QPType *qp_signal_siginfo_type;   /* kept alive by the module dict */
 #endif
 
 static void qp_signal_request_poll(void)
@@ -3895,6 +3937,9 @@ static int qp_signal_check_signals(JSContext *ctx)
 
     if (!qp_signal_is_tripped)
         return 0;
+    /* _Py_ThreadCanHandleSignals: only the main thread runs the handlers */
+    if (!qp_thread_is_main_rt(ctx->rt))
+        return 0;
     qp_signal_is_tripped = 0;
     err = qp_signal_wakeup_errno;
     if (err) {
@@ -3936,7 +3981,7 @@ static int qp_signal_check_signals(JSContext *ctx)
         func = JS_DupValue(ctx, func);
         args[0] = JS_NewInt32(ctx, i);
         args[1] = frame;
-        result = qp_vectorcall(ctx, func, args, 2, QP_NULL);
+        result = qp_vectorcall(ctx, func, (JSValueConst *)args, 2, QP_NULL);
         JS_FreeValue(ctx, func);
         JS_FreeValue(ctx, frame);
         if (JS_IsException(result)) {
@@ -3949,15 +3994,46 @@ static int qp_signal_check_signals(JSContext *ctx)
     return 0;
 }
 
-/* _Py_HandlePending: Python signal handlers, then weakref callbacks */
+/* _Py_HandlePending: Python signal handlers, then __del__ of the objects
+   freed since the last poll and weakref callbacks */
 static int qp_signal_check(JSContext *ctx)
 {
-    if (qp_signal_is_tripped && ctx == qp_signal_main_ctx) {
+    QPModState *ms = QP_STATE(ctx)->mod_state;
+
+    if (ms && !QP_IS_NULL(ms->async_exc)) {
+        /* _PY_ASYNC_EXCEPTION_BIT: raise the pending asynchronous exception */
+        JSValue exc = ms->async_exc;
+        ms->async_exc = QP_NULL;
+        qp_raise_value(ctx, qp_type_from_value(exc), JS_UNDEFINED);
+        JS_FreeValue(ctx, exc);
+        return -1;
+    }
+    if (qp_signal_is_tripped && ctx == qp_signal_main_ctx &&
+        qp_thread_is_main_rt(ctx->rt)) {
         if (qp_signal_check_signals(ctx) < 0)
             return -1;
     }
+#ifdef CONFIG_PYTHON_CAPI
+    /* PyThreadState_SetAsyncExc (python/capi_stable.c) */
+    if (qp_capi_async_exc_check(ctx) < 0)
+        return -1;
+#endif
+    /* objects freed since the last poll: __del__, then weakref callbacks */
+    qp_run_pending_finalizers(ctx);
     qp_weakref_run_pending(ctx);
     return 0;
+}
+
+/* _PySignal_AfterFork: signals that arrived just before os.fork() are
+   handled by the parent only */
+static void qp_signal_after_fork_child(void)
+{
+    int i;
+    if (!qp_signal_is_tripped)
+        return;
+    for (i = 1; i < QP_NSIG; i++)
+        qp_signal_tripped[i] = 0;
+    qp_signal_is_tripped = 0;
 }
 
 /* PyErr_SetInterruptEx (+ the ValueError of _thread.interrupt_main) */
@@ -3980,6 +4056,54 @@ static int qp_signal_trip(JSContext *ctx, int signum)
         qp_signal_trip_c(signum);
     }
     return 0;
+}
+
+/* qjs --drepl FILE --python: make ctx (the session) the context that
+   handles the signals and give SIGINT the C handler that its Python-level
+   handler needs (the line editor of qjs owns SIGINT between the inputs).
+   Returns the previous C handler. */
+static void (*qp_signal_attach(JSContext *ctx))(int)
+{
+    QPModState *ms = QP_STATE(ctx)->mod_state;
+    void (*handler)(int) = SIG_DFL;
+    JSValueConst h;
+
+    qp_signal_main_ctx = ctx;
+    if (ms && !QP_IS_NULL(h = ms->sig_handlers[SIGINT])) {
+        if (qp_signal_compare_handler(h, ms->sig_ign))
+            handler = SIG_IGN;
+        else if (!qp_signal_compare_handler(h, ms->sig_dfl) && qp_signal_callable(ctx, h))
+            handler = qp_signal_handler;
+    }
+    return qp_signal_setsig(SIGINT, handler);
+}
+
+/* ctx goes away (qp_state_free): the signal handlers no longer poll it */
+static void qp_signal_forget_ctx(JSContext *ctx)
+{
+    if (qp_signal_main_ctx == ctx)
+        qp_signal_main_ctx = NULL;
+}
+
+/* qpy started from its base snapshot (pythonrun.c): the signal state was
+   recorded in a process where no signal was ignored, so the signals this
+   process inherited ignored ('ignored[signum]') are recorded ignored and
+   stay ignored, SIGINT included, as signal_get_set_handlers() and the
+   SIGINT installation of a normal start do.  The C handler of SIGINT
+   (qp_snap_state_apply installed it) is then SIG_IGN again. */
+static void qp_signal_apply_inherited(JSContext *ctx, const uint8_t *ignored, int nsig)
+{
+    QPModState *ms = QP_STATE(ctx)->mod_state;
+    int signum;
+
+    if (!ms || QP_IS_NULL(ms->sig_ign))
+        return;
+    for (signum = 1; signum < QP_NSIG && signum < nsig; signum++) {
+        if (!ignored[signum] || qp_signal_compare_handler(ms->sig_handlers[signum], ms->sig_ign))
+            continue;
+        qp_signal_set_handler(ctx, ms, signum, JS_DupValue(ctx, ms->sig_ign));
+        qp_signal_setsig(signum, SIG_IGN);
+    }
 }
 
 /* ---- argument helpers ---- */
@@ -4175,6 +4299,9 @@ static JSValue qp_signal_signal(JSContext *ctx, JSValueConst self, JSValueConst 
     ms = qp_modstate(ctx);
     if (!ms)
         return JS_EXCEPTION;
+    if (!qp_thread_is_main_rt(ctx->rt))
+        return qp_raise_value_error(ctx, "signal only works in main thread "
+                                    "of the main interpreter");
     if (signalnum < 1 || signalnum >= QP_NSIG)
         return qp_raise_value_error(ctx, "signal number out of range");
     if (qp_signal_callable(ctx, handler)) {
@@ -4271,6 +4398,9 @@ static JSValue qp_signal_set_wakeup_fd(JSContext *ctx, JSValueConst self, JSValu
     }
     if (qp_arg_int(ctx, a[0], &fd) < 0)
         return JS_EXCEPTION;
+    if (!qp_thread_is_main_rt(ctx->rt))
+        return qp_raise_value_error(ctx, "set_wakeup_fd only works in main thread "
+                                    "of the main interpreter");
     if (fd != -1) {
         struct stat st;
         int flags;
@@ -4343,7 +4473,7 @@ static JSValue qp_signal_raise_itimer_error(JSContext *ctx, int err)
         return JS_EXCEPTION;
     a[0] = eno;
     a[1] = msg;
-    exc = qp_exc_new(ctx, t, 2, a);
+    exc = qp_exc_new(ctx, t, 2, (JSValueConst *)a);
     JS_FreeValue(ctx, msg);
     if (JS_IsException(exc))
         return JS_EXCEPTION;
@@ -4466,7 +4596,16 @@ static JSValue qp_signal_fill_siginfo(JSContext *ctx, siginfo_t *si)
             return JS_EXCEPTION;
         }
     }
-    return qp_structseq_new(ctx, qp_signal_siginfo_type, items);
+    {
+        QPModState *ms = QP_STATE(ctx)->mod_state;
+        QPType *t = ms ? qp_type_from_value(ms->sig_siginfo_type) : NULL;
+        if (!t) {
+            for (i = 0; i < 7; i++)
+                JS_FreeValue(ctx, items[i]);
+            return qp_raise_system_error(ctx, "signal.struct_siginfo is not initialized");
+        }
+        return qp_structseq_new(ctx, t, items);
+    }
 }
 
 static JSValue qp_signal_sigwaitinfo(JSContext *ctx, JSValueConst self, JSValueConst *args,
@@ -4912,7 +5051,8 @@ static int qp_signal_exec(JSContext *ctx, JSValueConst module)
     v = qp_structseq_new_type(ctx, &qp_signal_siginfo_desc);
     if (JS_IsException(v))
         return -1;
-    qp_signal_siginfo_type = qp_type_from_value(v);
+    qp_modstate_free_value(ctx, &ms->sig_siginfo_type);
+    ms->sig_siginfo_type = JS_DupValue(ctx, v);
     if (qp_signal_add(ctx, module, "struct_siginfo", v) < 0)
         return -1;
 #endif
@@ -4999,13 +5139,17 @@ static const QPModuleDef qp_moddef__signal = {
  *  - "Interned" strings are atom strings plus the empty string and the
  *    1-character latin-1 strings (statically interned in CPython).
  *    Interned strings read back are made atoms.
- *  - Code objects: the bytecode/pyc serialisation of code objects arrives
- *    with the C API / pyc support; until then dumps() of a code object
- *    raises ValueError("unmarshallable object") (or "marshalling code
- *    objects is disallowed" with allow_code=False, as CPython checks that
- *    first) and loads() of TYPE_CODE raises ValueError("bad marshal data
- *    (unknown type code)") (or "unmarshalling code objects is disallowed"
- *    with allow_code=False).
+ *  - Code objects (TYPE_CODE) hold QuickJS bytecode, not CPython's code
+ *    fields: the format hash of the build (qp_pyc_format_hash, two longs),
+ *    the size and bytes of JS_WriteObject(bytecode, JS_WRITE_OBJ_BYTECODE)
+ *    (the Python metadata and constants included, see
+ *    qp_bc_write_code / qp_bc_write_pyobj), then a byte telling whether
+ *    the replace() overrides of the code object follow (name, qualname and
+ *    filename objects, None if not overridden, then the firstlineno
+ *    override flag and value and the added co_flags as longs).  loads()
+ *    of code written by another build raises ValueError("bad marshal data
+ *    (code object of another build)"); .pyc files of another build are
+ *    rejected before by their magic number (_imp.pyc_magic_number_token).
  *  - sys.audit events (marshal.dumps/loads/load) are not raised: there is
  *    no C-level audit entry point in the core yet.
  *  - load() passes a bytearray (instead of a memoryview over the internal
@@ -5082,6 +5226,7 @@ typedef struct qp_marshal_WFILE {
 } qp_marshal_WFILE;
 
 static void qp_marshal_w_object(JSValueConst v, qp_marshal_WFILE *p);
+static void qp_marshal_w_code(JSValueConst v, int flag, qp_marshal_WFILE *p);
 
 static uint64_t qp_marshal_idkey(JSValueConst v)
 {
@@ -5733,10 +5878,7 @@ static void qp_marshal_w_complex_object(JSValueConst v, int flag, qp_marshal_WFI
             p->error = QP_MARSHAL_WFERR_CODE_NOT_ALLOWED;
             return;
         }
-        /* Code object serialisation arrives with the C API / pyc support
-           (see the file header). */
-        QP_MARSHAL_W_TYPE(QP_MARSHAL_TYPE_UNKNOWN, p);
-        p->error = QP_MARSHAL_WFERR_UNMARSHALLABLE;
+        qp_marshal_w_code(v, flag, p);
     }
     else if (qp_slice_check(v)) {
         JSValue start, stop, step;
@@ -5785,6 +5927,44 @@ static void qp_marshal_w_complex_object(JSValueConst v, int flag, qp_marshal_WFI
         JS_FreeValue(ctx, JS_GetException(ctx));
         QP_MARSHAL_W_TYPE(QP_MARSHAL_TYPE_UNKNOWN, p);
         p->error = QP_MARSHAL_WFERR_UNMARSHALLABLE;
+    }
+}
+
+/* TYPE_CODE payload (see the file header) */
+static void qp_marshal_w_code(JSValueConst v, int flag, qp_marshal_WFILE *p)
+{
+    JSContext *ctx = p->ctx;
+    QPCodeObject *c = qp_co_data(v);
+    uint64_t h = qp_pyc_format_hash();
+    uint8_t *buf;
+    size_t len;
+    BOOL overrides;
+
+    if (!c) {
+        p->error = QP_MARSHAL_WFERR_UNMARSHALLABLE;
+        return;
+    }
+    buf = JS_WriteObject(ctx, &len, c->bytecode, JS_WRITE_OBJ_BYTECODE);
+    if (!buf) {
+        p->error = QP_MARSHAL_WFERR_UNMARSHALLABLE;
+        return;
+    }
+    QP_MARSHAL_W_TYPE(QP_MARSHAL_TYPE_CODE, p);
+    qp_marshal_w_long((long)(int32_t)(uint32_t)h, p);
+    qp_marshal_w_long((long)(int32_t)(uint32_t)(h >> 32), p);
+    if (qp_marshal_w_size((Py_ssize_t)len, p) == 0)
+        qp_marshal_w_string(buf, len, p);
+    js_free(ctx, buf);
+    overrides = !QP_IS_NULL(c->name) || !QP_IS_NULL(c->qualname) ||
+        !QP_IS_NULL(c->filename) || c->has_firstlineno || c->flags_add;
+    qp_marshal_w_byte(overrides, p);
+    if (overrides) {
+        qp_marshal_w_object(QP_IS_NULL(c->name) ? JS_UNDEFINED : c->name, p);
+        qp_marshal_w_object(QP_IS_NULL(c->qualname) ? JS_UNDEFINED : c->qualname, p);
+        qp_marshal_w_object(QP_IS_NULL(c->filename) ? JS_UNDEFINED : c->filename, p);
+        qp_marshal_w_long(c->has_firstlineno, p);
+        qp_marshal_w_long(c->firstlineno, p);
+        qp_marshal_w_long((long)(int32_t)c->flags_add, p);
     }
 }
 
@@ -6038,9 +6218,9 @@ static JSValue qp_marshal_r_pylong(qp_marshal_RFILE *p)
     neg = n < 0;
     size = neg ? -n : n;
     nl = ((size_t)size * QP_MARSHAL_SHIFT) / JS_LIMB_BITS + 2;
-    if (nl > JS_BIGINT_MAX_SIZE)
+    if (nl > QP_LONG_MAX_LIMBS)
         return qp_raise_memory_error(ctx);
-    r = js_bigint_new(ctx, (int)nl);
+    QP_BIG_CALL(ctx, r, js_bigint_new(ctx, (int)nl));
     if (!r) {
         JS_FreeValue(ctx, JS_GetException(ctx));
         return qp_raise_memory_error(ctx);
@@ -6182,6 +6362,7 @@ static JSValue qp_marshal_r_ref(JSValue o, int flag, qp_marshal_RFILE *p)
 }
 
 static JSValue qp_marshal_r_object(qp_marshal_RFILE *p);
+static JSValue qp_marshal_r_code(qp_marshal_RFILE *p);
 
 /* r_object for a container element: QP_NULL (TYPE_NULL) becomes
    TypeError "NULL object in marshal data for <what>". */
@@ -6573,14 +6754,23 @@ static JSValue qp_marshal_r_object(qp_marshal_RFILE *p)
             retval = v;
         }
         break;
-    case QP_MARSHAL_TYPE_CODE:
+    case QP_MARSHAL_TYPE_CODE: {
+        Py_ssize_t cidx;
         if (!p->allow_code) {
             retval = qp_raise_value_error(ctx, "unmarshalling code objects is disallowed");
             break;
         }
-        /* Code objects arrive with the C API / pyc support (file header). */
-        retval = qp_raise_value_error(ctx, "bad marshal data (unknown type code)");
+        cidx = qp_marshal_r_ref_reserve(flag, p);
+        if (cidx < 0) {
+            retval = JS_EXCEPTION;
+            break;
+        }
+        v = qp_marshal_r_code(p);
+        if (!JS_IsException(v))
+            v = qp_marshal_r_ref_insert(v, cidx, flag, p);
+        retval = v;
         break;
+    }
     case QP_MARSHAL_TYPE_REF:
         n = qp_marshal_r_long(p, &err);
         if (err || n < 0 || n >= p->nrefs) {
@@ -6634,6 +6824,95 @@ static JSValue qp_marshal_r_object(qp_marshal_RFILE *p)
 #undef QP_MARSHAL_R_REF
     p->depth--;
     return retval;
+}
+
+/* TYPE_CODE payload (see the file header) */
+static JSValue qp_marshal_r_code(qp_marshal_RFILE *p)
+{
+    JSContext *ctx = p->ctx;
+    uint64_t h = qp_pyc_format_hash();
+    JSValue bc, code, ov[3] = { JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED };
+    const uint8_t *data;
+    long lo, hi, n, has_first, first, flags_add;
+    int err = 0, overrides, i;
+    QPCodeObject *c;
+
+    lo = qp_marshal_r_long(p, &err);
+    if (!err)
+        hi = qp_marshal_r_long(p, &err);
+    if (!err)
+        n = qp_marshal_r_long(p, &err);
+    if (err)
+        return JS_EXCEPTION;
+    if ((uint32_t)lo != (uint32_t)h || (uint32_t)hi != (uint32_t)(h >> 32))
+        return qp_raise_value_error(ctx, "bad marshal data (code object of another build)");
+    if (n < 0)
+        return qp_raise_value_error(ctx, "bad marshal data (code size out of range)");
+    data = qp_marshal_r_string(n, p);
+    if (!data)
+        return JS_EXCEPTION;
+    bc = JS_ReadObject(ctx, data, (size_t)n, JS_READ_OBJ_BYTECODE);
+    if (JS_IsException(bc)) {
+        JSValue exc = JS_GetException(ctx);
+        JS_FreeValue(ctx, exc);
+        return qp_raise_value_error(ctx, "bad marshal data (invalid code object)");
+    }
+    if (JS_VALUE_GET_TAG(bc) != JS_TAG_FUNCTION_BYTECODE ||
+        !((JSFunctionBytecode *)JS_VALUE_GET_PTR(bc))->is_py) {
+        JS_FreeValue(ctx, bc);
+        return qp_raise_value_error(ctx, "bad marshal data (invalid code object)");
+    }
+    code = qp_code_new(ctx, bc);
+    JS_FreeValue(ctx, bc);
+    if (JS_IsException(code))
+        return code;
+    overrides = qp_marshal_r_byte(p);
+    if (overrides < 0) {
+        JS_FreeValue(ctx, code);
+        return JS_EXCEPTION;
+    }
+    if (!overrides)
+        return code;
+    for (i = 0; i < 3; i++) {
+        ov[i] = qp_marshal_r_item(p, "code");
+        if (JS_IsException(ov[i]))
+            goto fail;
+        if (!JS_IsUndefined(ov[i]) && !qp_str_check(ctx, ov[i])) {
+            qp_raise_value_error(ctx, "bad marshal data (invalid code object)");
+            goto fail;
+        }
+    }
+    has_first = qp_marshal_r_long(p, &err);
+    if (!err)
+        first = qp_marshal_r_long(p, &err);
+    if (!err)
+        flags_add = qp_marshal_r_long(p, &err);
+    if (err)
+        goto fail;
+    c = qp_co_data(code);
+    if (!JS_IsUndefined(ov[0])) {
+        c->name = ov[0];
+        ov[0] = JS_UNDEFINED;
+    }
+    if (!JS_IsUndefined(ov[1])) {
+        c->qualname = ov[1];
+        ov[1] = JS_UNDEFINED;
+    }
+    if (!JS_IsUndefined(ov[2])) {
+        c->filename = ov[2];
+        ov[2] = JS_UNDEFINED;
+    }
+    c->has_firstlineno = has_first != 0;
+    c->firstlineno = (int)first;
+    c->flags_add = (uint32_t)flags_add;
+    return code;
+ fail:
+    for (i = 0; i < 3; i++) {
+        if (!JS_IsException(ov[i]))
+            JS_FreeValue(ctx, ov[i]);
+    }
+    JS_FreeValue(ctx, code);
+    return JS_EXCEPTION;
 }
 
 /* read_object */
@@ -6773,6 +7052,58 @@ static JSValue qp_marshal_loads(JSContext *ctx, JSValueConst self, JSValueConst 
     qp_marshal_rfile_free(&rf);
     qp_buffer_release(ctx, &view);
     return result;
+}
+
+/* Python constants in the constant pool of bytecode written by
+   JS_WriteObject(JS_WRITE_OBJ_BYTECODE) (tuples, frozensets, bytes,
+   complex, slices, Ellipsis...): BC_TAG_PY_OBJECT, the size and the
+   marshal data of the value. */
+static int qp_bc_write_pyobj(BCWriterState *s, JSValueConst obj)
+{
+    JSContext *ctx = s->ctx;
+    qp_marshal_WFILE wf;
+    int error = qp_marshal_write_buf(ctx, obj, QP_MARSHAL_VERSION, 1, &wf);
+
+    if (error != QP_MARSHAL_WFERR_OK) {
+        js_free(ctx, wf.buf);
+        qp_marshal_w_clear_refs(&wf);
+        if (!JS_HasException(ctx))
+            JS_ThrowTypeError(ctx, "unsupported Python constant");
+        return -1;
+    }
+    bc_put_u8(s, BC_TAG_PY_OBJECT);
+    bc_put_leb128(s, (uint32_t)wf.len);
+    dbuf_put(&s->dbuf, wf.buf, wf.len);
+    js_free(ctx, wf.buf);
+    return 0;
+}
+
+static JSValue qp_bc_read_pyobj(BCReaderState *s)
+{
+    qp_marshal_RFILE rf;
+    JSValue v;
+    uint32_t len;
+
+    if (bc_get_leb128(s, &len))
+        return JS_EXCEPTION;
+    if (len > (uint32_t)(s->buf_end - s->ptr)) {
+        bc_read_error_end(s);
+        return JS_EXCEPTION;
+    }
+    memset(&rf, 0, sizeof(rf));
+    rf.ctx = s->ctx;
+    rf.allow_code = 1;
+    rf.readable = QP_NULL;
+    rf.ptr = s->ptr;
+    rf.end = s->ptr + len;
+    v = qp_marshal_read_object(&rf);
+    qp_marshal_rfile_free(&rf);
+    if (!JS_IsException(v) && rf.ptr != rf.end) {
+        JS_FreeValue(s->ctx, v);
+        v = JS_ThrowSyntaxError(s->ctx, "invalid Python constant");
+    }
+    s->ptr += len;
+    return v;
 }
 
 static const QPMethodDef qp_marshal_methods[] = {

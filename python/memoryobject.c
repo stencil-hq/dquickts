@@ -86,13 +86,35 @@ static void qp_mv_init_len(QPMemoryView *mv)
     mv->len = len * mv->itemsize;
 }
 
-static void qp_mv_set_format(QPMemoryView *mv, const char *fmt)
+static void qp_mv_free_format(JSRuntime *rt, QPMemoryView *mv)
 {
-    size_t n = strlen(fmt);
-    if (n >= QP_MV_FMT_MAX)
-        n = QP_MV_FMT_MAX - 1;
-    memcpy(mv->format, fmt, n);
-    mv->format[n] = '\0';
+    if (mv->format && mv->format != mv->format_inline)
+        js_free_rt(rt, (char *)mv->format);
+    mv->format = NULL;
+}
+
+/* Owned copy of fmt as the format of a heap memoryview.  -1 on OOM
+   (exception set, previous format kept). */
+static int qp_mv_set_format(JSContext *ctx, QPMemoryView *mv, const char *fmt)
+{
+    size_t n = strlen(fmt) + 1;
+    char *p = mv->format_inline;
+    if (n > sizeof(mv->format_inline) || fmt == mv->format_inline) {
+        p = js_malloc(ctx, n);
+        if (!p)
+            return -1;
+    }
+    memcpy(p, fmt, n);
+    qp_mv_free_format(ctx->rt, mv);
+    mv->format = p;
+    return 0;
+}
+
+/* Format of a stack descriptor: borrowed from the exporter, which outlives
+   the descriptor. */
+static void qp_mv_borrow_format(QPMemoryView *mv, const char *fmt)
+{
+    mv->format = fmt;
 }
 
 /* Fill a temporary descriptor for a JS typed array / DataView. */
@@ -107,7 +129,7 @@ static void qp_mv_from_typed_array(JSValueConst obj, QPMemoryView *tmp)
                          &tmp->itemsize, &fmt);
     if (!tmp->buf)
         tmp->buf = (uint8_t *)qp_bytes_empty_data;
-    qp_mv_set_format(tmp, fmt);
+    qp_mv_borrow_format(tmp, fmt);
     tmp->ndim = 1;
     qp_mv_set_dims_inline(tmp);
     tmp->shape[0] = tmp->len / tmp->itemsize;
@@ -235,12 +257,33 @@ static JSValue qp_mv_alloc(JSContext *ctx, JSValue mbuf, int ndim, QPMemoryView 
     return obj;
 }
 
+#ifdef CONFIG_PYTHON_CAPI
+/* python/capi_bytes.c: ndim, shape and strides (NULL: C-contiguous) of a
+   buffer exported by a C extension (ndarrays, ctypes arrays and scalars,
+   ...), -1 for other exporters */
+static int qp_capi_buffer_shape(JSContext *ctx, const QPBuffer *view, const Py_ssize_t **pshape,
+                                const Py_ssize_t **pstrides, Py_ssize_t *pitemsize);
+#endif
+
 /* mbuf_add_view(mbuf, NULL): view of the whole master buffer */
 static JSValue qp_mv_from_mbuf(JSContext *ctx, JSValue mbuf)
 {
     QPMemoryView *mv;
     QPBuffer *m = &QP_MBUF_OBJ(mbuf)->master;
-    JSValue obj = qp_mv_alloc(ctx, mbuf, 1, &mv);
+    const Py_ssize_t *cshape = NULL, *cstrides = NULL;
+    int ndim = 1, i;
+    Py_ssize_t sd, citemsize = 0;
+    JSValue obj;
+#ifdef CONFIG_PYTHON_CAPI
+    i = qp_capi_buffer_shape(ctx, m, &cshape, &cstrides, &citemsize);
+    if (i >= 0) {
+        ndim = i;
+    } else {
+        cshape = NULL;
+        cstrides = NULL;
+    }
+#endif
+    obj = qp_mv_alloc(ctx, mbuf, ndim, &mv);
     if (JS_IsException(obj))
         return obj;
     m = &QP_MBUF_OBJ(mv->mbuf)->master;
@@ -248,10 +291,25 @@ static JSValue qp_mv_from_mbuf(JSContext *ctx, JSValue mbuf)
     mv->len = m->len;
     mv->itemsize = m->itemsize > 0 ? m->itemsize : 1;
     mv->readonly = m->readonly;
-    qp_mv_set_format(mv, m->format ? m->format : "B");
-    mv->ndim = 1;
-    mv->shape[0] = mv->len / mv->itemsize;
-    mv->strides[0] = mv->itemsize;
+    if (qp_mv_set_format(ctx, mv, m->format ? m->format : "B") < 0) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+    if (cshape || ndim != 1) {
+        /* the exporter's strides, or C-contiguous ones of its shape */
+        mv->itemsize = citemsize;
+        mv->ndim = ndim;
+        sd = mv->itemsize;
+        for (i = ndim - 1; i >= 0; i--) {
+            mv->shape[i] = cshape[i];
+            mv->strides[i] = cstrides ? cstrides[i] : sd;
+            sd *= cshape[i];
+        }
+    } else {
+        mv->ndim = 1;
+        mv->shape[0] = mv->len / mv->itemsize;
+        mv->strides[0] = mv->itemsize;
+    }
     qp_mv_init_flags(mv);
     return obj;
 }
@@ -283,7 +341,10 @@ static JSValue qp_mv_copy_view(JSContext *ctx, JSValueConst self, QPMemoryView *
     mv->len = src->len;
     mv->itemsize = src->itemsize;
     mv->readonly = src->readonly;
-    memcpy(mv->format, src->format, sizeof(mv->format));
+    if (qp_mv_set_format(ctx, mv, src->format) < 0) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
     mv->ndim = ndim;
     if (ndim == src->ndim) {
         for (i = 0; i < ndim; i++) {
@@ -320,7 +381,7 @@ static JSValue qp_memoryview_from_object(JSContext *ctx, JSValueConst v, int fla
         return qp_mv_copy_view(ctx, v, src, src->ndim, &mv);
     }
     if (qp_buffer_check(ctx, v)) {
-        mbuf = qp_mbuf_new(ctx, v, flags);
+        mbuf = qp_mbuf_new(ctx, v, flags | QP_BUF_STRIDED);
         if (JS_IsException(mbuf))
             return mbuf;
         return qp_mv_from_mbuf(ctx, mbuf);
@@ -356,6 +417,7 @@ static void qp_memoryview_finalize(JSRuntime *rt, QPMemoryView *mv)
     JS_FreeValueRT(rt, mv->mbuf);
     if (mv->shape && mv->shape != &mv->dims1[0])
         js_free_rt(rt, mv->shape);
+    qp_mv_free_format(rt, mv);
     js_free_rt(rt, mv);
 }
 
@@ -970,7 +1032,7 @@ static void qp_mv_from_qpbuffer(const QPBuffer *b, QPMemoryView *d)
     d->len = b->len;
     d->itemsize = b->itemsize > 0 ? b->itemsize : 1;
     d->readonly = b->readonly;
-    qp_mv_set_format(d, b->format ? b->format : "B");
+    qp_mv_borrow_format(d, b->format ? b->format : "B");
     d->ndim = 1;
     qp_mv_set_dims_inline(d);
     d->shape[0] = d->len / d->itemsize;
@@ -1383,7 +1445,7 @@ static JSValue qp_mv_cast(JSContext *ctx, JSValueConst self, JSValueConst *args,
     JSValueConst shape;
     JSValue r, ascii, fmtstr, shapeseq = JS_UNDEFINED;
     const char *destfmt, *srcfmt;
-    char fmtbuf[QP_MV_FMT_MAX];
+    char fmtbuf[QP_MV_FMT_INLINE];  /* native formats are at most "@x" */
     Py_ssize_t fmtlen;
     const uint8_t *fd;
 
@@ -1431,7 +1493,7 @@ static JSValue qp_mv_cast(JSContext *ctx, JSValueConst self, JSValueConst *args,
         return ascii;
     }
     fd = qp_bytes_data(ascii, &fmtlen);
-    if (fmtlen >= QP_MV_FMT_MAX || memchr(fd, 0, fmtlen))
+    if (fmtlen >= (Py_ssize_t)sizeof(fmtbuf) || memchr(fd, 0, fmtlen))
         fmtlen = -1;
     else {
         memcpy(fmtbuf, fd, fmtlen);
@@ -1459,7 +1521,8 @@ static JSValue qp_mv_cast(JSContext *ctx, JSValueConst self, JSValueConst *args,
         qp_raise_type_error(ctx, "memoryview: length is not a multiple of itemsize");
         goto error;
     }
-    qp_mv_set_format(mv, fmtbuf);
+    if (qp_mv_set_format(ctx, mv, fmtbuf) < 0)
+        goto error;
     mv->itemsize = itemsize;
     mv->ndim = 1;
     mv->shape[0] = mv->len / mv->itemsize;
@@ -1854,7 +1917,7 @@ static const QPMethodDef qp_memoryview_methods[] = {
 static const QPTypeSpec qp_memoryview_spec = {
     .name = "memoryview",
     .doc = "memoryview(object)\n--\n\nCreate a new memoryview object which references the given object.",
-    .flags = QP_TPFLAGS_SEQUENCE | QP_TPFLAGS_IMMUTABLETYPE,
+    .flags = QP_TPFLAGS_SEQUENCE | QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_WEAKREF,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_BYTEARRAY,

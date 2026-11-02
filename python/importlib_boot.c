@@ -15,8 +15,10 @@
  *    prefix = its parent directory;
  *  - else stdlib = <directory of the real executable>/pylib, prefix = that
  *    directory.
- * exec_prefix, base_prefix and base_exec_prefix equal prefix (site.py
- * switches prefix/exec_prefix for a venv); platlibdir is "lib".
+ * exec_prefix, base_prefix and base_exec_prefix equal prefix, except in a
+ * virtual environment (pyvenv.cfg next to sys.executable or in its parent
+ * directory): prefix and exec_prefix are then the venv directory and
+ * _base_executable the real interpreter; platlibdir is "lib".
  * sys.path = PYTHONPATH entries (made absolute), stdlib,
  * stdlib/site-packages; the launcher inserts sys.path[0] afterwards.
  *
@@ -32,9 +34,11 @@
  * _bootstrap_external._fix_up_module (their source file), since no frozen
  * importer can describe them (_imp.is_frozen is always False).
  *
- * Bytecode caches: sys.implementation.cache_tag is None (sysmodule.c) so
- * importlib never reads or writes .pyc files, and sys.dont_write_bytecode
- * is set to True: QuickJS bytecode is not CPython bytecode.
+ * Bytecode caches: sys.implementation.cache_tag is "quickpy-315"
+ * (sysmodule.c) and marshal serialises code objects as QuickJS bytecode
+ * (mod_misc.c), so importlib's SourceLoader reads and writes
+ * __pycache__/<name>.quickpy-315.pyc like CPython; sys.dont_write_bytecode
+ * is -B / PYTHONDONTWRITEBYTECODE.
  */
 
 #include <errno.h>
@@ -50,6 +54,7 @@
 
 /* python/mod_io.c: init_sys_streams + init_set_builtins_open. */
 static int qp_io_install_stdio(JSContext *ctx);
+static void qp_boot_ignore_signals(void);
 
 typedef struct QPBootPaths {
     char *prefix;       /* js_malloc'd, absolute */
@@ -156,9 +161,10 @@ static char *qp_boot_abspath(JSContext *ctx, const char *path, size_t len)
     return r;
 }
 
+#ifndef QP_PYLIB_DIR
 /* Directory of the real executable (realpath of sys.executable, else the
    OS's record of the running image), js_malloc'd; NULL without error if
-   unknown. */
+   unknown.  Not used when the stdlib directory is compiled in. */
 static char *qp_boot_executable_dir(JSContext *ctx)
 {
     const char *exe = QP_STATE(ctx)->config.executable;
@@ -187,6 +193,7 @@ static char *qp_boot_executable_dir(JSContext *ctx)
         *slash = '\0';
     return qp_boot_strdup(ctx, real, strlen(real));
 }
+#endif
 
 static BOOL qp_boot_isfile(const char *path)
 {
@@ -209,7 +216,9 @@ static int qp_boot_compute_paths(JSContext *ctx, QPBootPaths *p)
     char *landmark;
 
     p->prefix = p->stdlib = NULL;
-    if (!cfg->ignore_environment && !cfg->isolated)
+    if (cfg->home && cfg->home[0])
+        home = cfg->home;   /* embedder setting (JS_InitPython) wins */
+    else if (!cfg->ignore_environment && !cfg->isolated)
         home = getenv("QPYHOME");
     if (home && home[0]) {
         p->prefix = qp_boot_abspath(ctx, home, strlen(home));
@@ -336,17 +345,68 @@ static JSValue qp_boot_make_sys_path(JSContext *ctx, const QPBootPaths *p)
     return JS_EXCEPTION;
 }
 
-/* The sys attributes computed by getpath (interpreter_update_config). */
+/* getpath's virtual environment detection: the directory holding
+   pyvenv.cfg next to sys.executable (bin/) or one level up, js_malloc'd;
+   NULL without error when the executable is not in a venv. */
+static char *qp_boot_venv_prefix(JSContext *ctx)
+{
+    const char *exe = QP_STATE(ctx)->config.executable;
+    char *dir, *cfg, *slash;
+    int i;
+
+    if (!exe || exe[0] != '/')
+        return NULL;
+    slash = strrchr(exe, '/');
+    dir = qp_boot_strdup(ctx, exe, slash == exe ? 1 : (size_t)(slash - exe));
+    for (i = 0; dir && i < 2; i++) {
+        cfg = qp_boot_join(ctx, dir, "pyvenv.cfg");
+        if (!cfg)
+            break;
+        if (qp_boot_isfile(cfg)) {
+            js_free(ctx, cfg);
+            return dir;
+        }
+        js_free(ctx, cfg);
+        slash = strrchr(dir, '/');
+        if (!slash || slash == dir)
+            break;
+        *slash = '\0';
+    }
+    js_free(ctx, dir);
+    return NULL;
+}
+
+/* The sys attributes computed by getpath (interpreter_update_config).  In
+   a virtual environment prefix/exec_prefix are the venv directory (site
+   adds its site-packages) and _base_executable is the real interpreter;
+   base_prefix stays the installation. */
 static int qp_boot_init_sys(JSContext *ctx, const QPBootPaths *p)
 {
-    if (qp_boot_sys_set(ctx, "prefix", qp_boot_fs_str(ctx, p->prefix)) < 0 ||
-        qp_boot_sys_set(ctx, "base_prefix", qp_boot_fs_str(ctx, p->prefix)) < 0 ||
-        qp_boot_sys_set(ctx, "exec_prefix", qp_boot_fs_str(ctx, p->prefix)) < 0 ||
+    char *venv = qp_boot_venv_prefix(ctx);
+    const char *prefix = venv ? venv : p->prefix;
+    int r;
+
+    if (venv) {
+        const char *exe = QP_STATE(ctx)->config.executable;
+        char real[PATH_MAX];
+        if (realpath(exe, real) &&
+            qp_boot_sys_set(ctx, "_base_executable", qp_boot_fs_str(ctx, real)) < 0) {
+            js_free(ctx, venv);
+            return -1;
+        }
+    }
+    r = qp_boot_sys_set(ctx, "prefix", qp_boot_fs_str(ctx, prefix)) < 0 ||
+        qp_boot_sys_set(ctx, "exec_prefix", qp_boot_fs_str(ctx, prefix)) < 0;
+    js_free(ctx, venv);
+    if (r)
+        return -1;
+    if (qp_boot_sys_set(ctx, "base_prefix", qp_boot_fs_str(ctx, p->prefix)) < 0 ||
         qp_boot_sys_set(ctx, "base_exec_prefix", qp_boot_fs_str(ctx, p->prefix)) < 0 ||
         qp_boot_sys_set(ctx, "platlibdir", qp_str_from_cstr(ctx, "lib")) < 0 ||
         qp_boot_sys_set(ctx, "_stdlib_dir", qp_boot_fs_str(ctx, p->stdlib)) < 0 ||
         qp_boot_sys_set(ctx, "path", qp_boot_make_sys_path(ctx, p)) < 0 ||
-        qp_boot_sys_set(ctx, "dont_write_bytecode", qp_bool_new(TRUE)) < 0)
+        qp_boot_sys_set(ctx, "dont_write_bytecode",
+                        qp_bool_new(QP_STATE(ctx)->config.dont_write_bytecode != 0)) < 0)
         return -1;
     return 0;
 }
@@ -426,7 +486,7 @@ static JSValue qp_boot_exec_source(JSContext *ctx, const QPBootPaths *p, const c
         goto fail_name;
     if (qp_dict_set_item(ctx, st->modules, name, mod) < 0)
         goto fail_mod;
-    bc = qp_compile_source(ctx, src, len, co_filename, QP_INPUT_FILE, 0, 0, NULL);
+    bc = qp_compile_source(ctx, src, len, co_filename, JS_UNDEFINED, QP_INPUT_FILE, 0, 0, NULL);
     js_free(ctx, src);
     src = NULL;
     if (JS_IsException(bc))
@@ -497,7 +557,7 @@ static int qp_boot_fix_up_module(JSContext *ctx, const QPBootPaths *p, JSValueCo
     args[2] = qp_boot_fs_str(ctx, path);
     js_free(ctx, path);
     if (!JS_IsException(args[1]) && !JS_IsException(args[2])) {
-        r = qp_boot_call_method(ctx, external, "_fix_up_module", 3, args);
+        r = qp_boot_call_method(ctx, external, "_fix_up_module", 3, (JSValueConst *)args);
         if (!JS_IsException(r)) {
             JS_FreeValue(ctx, r);
             ret = 0;
@@ -574,7 +634,33 @@ static int qp_boot_import(JSContext *ctx, const char *name)
     return 0;
 }
 
-static int qp_importlib_boot(JSContext *ctx)
+/* stdlib location and the sys attributes of getpath (also re-applied to a
+   state restored from the base snapshot, qp_importlib_boot_paths) */
+static int qp_boot_paths(JSContext *ctx, QPBootPaths *paths)
+{
+    if (qp_boot_compute_paths(ctx, paths) < 0)
+        return -1;
+    if (qp_boot_init_sys(ctx, paths) < 0) {
+        qp_boot_paths_free(ctx, paths);
+        return -1;
+    }
+    return 0;
+}
+
+static int qp_importlib_boot_paths(JSContext *ctx)
+{
+    QPBootPaths paths;
+
+    if (qp_boot_paths(ctx, &paths) < 0)
+        return -1;
+    qp_boot_paths_free(ctx, &paths);
+    return 0;
+}
+
+/* The part of the boot that does not depend on the process (the content
+   of the base snapshot, see qp_write_base_snapshot): importlib, the
+   zipimport hook, encodings and _signal. */
+static int qp_importlib_boot_core(JSContext *ctx)
 {
     QPState *st = QP_STATE(ctx);
     int verbose = st->config.verbose;
@@ -583,10 +669,8 @@ static int qp_importlib_boot(JSContext *ctx)
     JSValue args[2];
     int ret = -1;
 
-    if (qp_boot_compute_paths(ctx, &paths) < 0)
+    if (qp_boot_paths(ctx, &paths) < 0)
         return -1;
-    if (qp_boot_init_sys(ctx, &paths) < 0)
-        goto done;
 
     /* init_importlib */
     if (verbose)
@@ -612,7 +696,7 @@ static int qp_importlib_boot(JSContext *ctx)
     }
     args[0] = st->sys_module;
     args[1] = imp;
-    r = qp_boot_call_method(ctx, bootstrap, "_install", 2, args);
+    r = qp_boot_call_method(ctx, bootstrap, "_install", 2, (JSValueConst *)args);
     if (JS_IsException(r))
         goto done;
     JS_FreeValue(ctx, r);
@@ -627,6 +711,12 @@ static int qp_importlib_boot(JSContext *ctx)
     if (JS_IsException(r))
         goto done;
     JS_FreeValue(ctx, r);
+#ifdef CONFIG_PYTHON_CAPI
+    /* version-specific CPython extension files raise a clear ImportError
+       (python/capi_dynload.c) */
+    if (qp_capi_install_ext_reject(ctx) < 0)
+        goto done;
+#endif
     if (qp_boot_fix_up_module(ctx, &paths, external, bootstrap, "_frozen_importlib",
                               "importlib/_bootstrap.py") < 0 ||
         qp_boot_fix_up_module(ctx, &paths, external, external, "_frozen_importlib_external",
@@ -640,6 +730,21 @@ static int qp_importlib_boot(JSContext *ctx)
         goto done;
 
     /* _PySignal_Init -> signal_install_handlers */
+    qp_boot_ignore_signals();
+    if (qp_boot_import(ctx, "_signal") < 0)
+        goto done;
+    ret = 0;
+ done:
+    JS_FreeValue(ctx, bootstrap);
+    JS_FreeValue(ctx, external);
+    JS_FreeValue(ctx, imp);
+    qp_boot_paths_free(ctx, &paths);
+    return ret;
+}
+
+/* signal_install_handlers: the signals Python ignores */
+static void qp_boot_ignore_signals(void)
+{
 #ifdef SIGPIPE
     signal(SIGPIPE, SIG_IGN);
 #endif
@@ -649,21 +754,34 @@ static int qp_importlib_boot(JSContext *ctx)
 #ifdef SIGXFSZ
     signal(SIGXFSZ, SIG_IGN);
 #endif
-    if (qp_boot_import(ctx, "_signal") < 0)
-        goto done;
+}
+
+/* The part of the boot that depends on the process: the standard
+   streams, the warnings options and site. */
+static int qp_importlib_boot_process(JSContext *ctx)
+{
+    QPState *st = QP_STATE(ctx);
 
     /* init_sys_streams + init_set_builtins_open */
     if (qp_io_install_stdio(ctx) < 0)
-        goto done;
+        return -1;
+
+    /* init_interp_main: initialize warnings (apply sys.warnoptions) */
+    if (st->config.nwarnoptions > 0 && qp_boot_import(ctx, "warnings") < 0) {
+        int kbint;
+        fprintf(stderr, "'import warnings' failed; traceback:\n");
+        qp_err_print_uncaught(ctx, &kbint);
+    }
 
     /* init_import_site */
     if (!st->config.no_site && qp_boot_import(ctx, "site") < 0)
-        goto done;
-    ret = 0;
- done:
-    JS_FreeValue(ctx, bootstrap);
-    JS_FreeValue(ctx, external);
-    JS_FreeValue(ctx, imp);
-    qp_boot_paths_free(ctx, &paths);
-    return ret;
+        return -1;
+    return 0;
+}
+
+static int qp_importlib_boot(JSContext *ctx)
+{
+    if (qp_importlib_boot_core(ctx) < 0)
+        return -1;
+    return qp_importlib_boot_process(ctx);
 }

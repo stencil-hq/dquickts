@@ -12,9 +12,11 @@
  *
  * Static C data referenced by these payloads (QPMethodDef / QPGetSetDef
  * entries, wrapped slot functions) goes through the native registry
- * (snap_put_native).  Method definitions that are not part of a registered
- * table (e.g. defined at run time by a C extension) make the write fail
- * with a TypeError.  The slotdefs entry of a wrapper descriptor is written
+ * (qp_snap_put_def: u8 0 + native).  Definitions of C extensions (C API
+ * registry) are written as (owner, attribute name), u8 1: the reader
+ * takes the definition of that attribute once the owning C module ran
+ * again (python/capi_snapshot.c); other unregistered definitions make the
+ * write fail with a TypeError.  The slotdefs entry of a wrapper descriptor is written
  * as its index in qp_slotdefs (the build signature pins the table), which
  * lets the reader validate it before the descriptor dereferences it.
  */
@@ -28,7 +30,7 @@ static int qp_snap_descr_write_cfunction(SnapWriter *w, JSObject *p)
     bc_put_u8(&w->bc, f != NULL);
     if (!f)
         return 0;
-    if (snap_put_native(w, f->ml) ||
+    if (qp_snap_put_def(w, f->ml, QP_SNAP_DEF_METHOD) ||
         snap_put_value(w, f->self) ||
         snap_put_value(w, f->module))
         return -1;
@@ -39,7 +41,7 @@ static int qp_snap_descr_read_cfunction(SnapReader *r, JSObject *p)
 {
     QPCFunctionObject *f;
     uint8_t present;
-    void *ml;
+    BOOL is_ref;
 
     if (bc_get_u8(&r->bc, &present))
         return -1;
@@ -52,11 +54,10 @@ static int qp_snap_descr_read_cfunction(SnapReader *r, JSObject *p)
     f->module = QP_NULL;
     p->u.opaque = f;
     snap_payload_ready(r);
-    if (snap_get_native(r, &ml))
+    if (qp_snap_get_def(r, (const void **)&f->ml, QP_SNAP_DEF_METHOD, &is_ref))
         return -1;
-    if (!ml)
+    if (!f->ml && !is_ref)
         return snap_error(r, "invalid builtin function definition");
-    f->ml = ml;
     if (snap_get_value(r, &f->self) ||
         snap_get_value(r, &f->module))
         return -1;
@@ -80,17 +81,23 @@ static int qp_snap_descr_write_descr(SnapWriter *w, JSObject *p)
     switch (d->kind) {
     case QP_DESCR_METHOD:
     case QP_DESCR_CLASSMETHOD:
-        return snap_put_native(w, d->u.method);
+        return qp_snap_put_def(w, d->u.method, QP_SNAP_DEF_METHOD);
     case QP_DESCR_GETSET:
-        return snap_put_native(w, d->u.getset);
+        return qp_snap_put_def(w, d->u.getset, QP_SNAP_DEF_GETSET);
     case QP_DESCR_MEMBER:
         /* The private atom is the key of the hidden property holding the
            slot value in instances of non-PY_OBJECT classes: the atom table
            of the snapshot keeps its identity, so those properties stay
-           reachable through the restored descriptor. */
+           reachable through the restored descriptor.  A PyMemberDef-backed
+           member of a C-extension type has an accessor definition. */
         bc_put_leb128(&w->bc, d->u.member.slot);
         bc_put_u8(&w->bc, d->u.member.flags);
-        return bc_put_atom(&w->bc, d->u.member.private_atom);
+        if (bc_put_atom(&w->bc, d->u.member.private_atom))
+            return -1;
+        bc_put_u8(&w->bc, d->u.member.getset != NULL);
+        if (!d->u.member.getset)
+            return 0;
+        return qp_snap_put_def(w, d->u.member.getset, QP_SNAP_DEF_GETSET);
     case QP_DESCR_WRAPPER:
     case QP_DESCR_METHOD_WRAPPER:
         /* a method-wrapper copies the slot and wrapped function of its
@@ -99,7 +106,7 @@ static int qp_snap_descr_write_descr(SnapWriter *w, JSObject *p)
             d->u.wrapper.slot >= qp_slotdefs + QP_NSLOTDEFS)
             return qp_snap_reject(w, p, "slot wrapper outside the slot table");
         bc_put_u16(&w->bc, (uint16_t)(d->u.wrapper.slot - qp_slotdefs));
-        return snap_put_native(w, d->u.wrapper.wrapped);
+        return qp_snap_put_def(w, d->u.wrapper.wrapped, QP_SNAP_DEF_WRAPPED);
     default:
         return qp_snap_reject(w, p, "unknown descriptor kind");
     }
@@ -108,10 +115,10 @@ static int qp_snap_descr_write_descr(SnapWriter *w, JSObject *p)
 static int qp_snap_descr_read_descr(SnapReader *r, JSObject *p)
 {
     QPDescr *d;
-    uint8_t present, kind, flags;
+    uint8_t present, kind, flags, has_getset;
     uint16_t slot_index;
     uint32_t slot;
-    void *ptr;
+    BOOL is_ref;
 
     if (bc_get_u8(&r->bc, &present))
         return -1;
@@ -139,18 +146,16 @@ static int qp_snap_descr_read_descr(SnapReader *r, JSObject *p)
     switch (kind) {
     case QP_DESCR_METHOD:
     case QP_DESCR_CLASSMETHOD:
-        if (snap_get_native(r, &ptr))
+        if (qp_snap_get_def(r, (const void **)&d->u.method, QP_SNAP_DEF_METHOD, &is_ref))
             return -1;
-        if (!ptr)
+        if (!d->u.method && !is_ref)
             return snap_error(r, "invalid method descriptor");
-        d->u.method = ptr;
         break;
     case QP_DESCR_GETSET:
-        if (snap_get_native(r, &ptr))
+        if (qp_snap_get_def(r, (const void **)&d->u.getset, QP_SNAP_DEF_GETSET, &is_ref))
             return -1;
-        if (!ptr)
+        if (!d->u.getset && !is_ref)
             return snap_error(r, "invalid getset descriptor");
-        d->u.getset = ptr;
         break;
     case QP_DESCR_MEMBER:
         if (bc_get_leb128(&r->bc, &slot) ||
@@ -160,8 +165,16 @@ static int qp_snap_descr_read_descr(SnapReader *r, JSObject *p)
             return snap_error(r, "invalid member descriptor slot");
         d->u.member.slot = slot;
         d->u.member.flags = flags;
-        if (bc_get_atom(&r->bc, &d->u.member.private_atom))
+        if (bc_get_atom(&r->bc, &d->u.member.private_atom) ||
+            bc_get_u8(&r->bc, &has_getset))
             return -1;
+        if (has_getset) {
+            if (qp_snap_get_def(r, (const void **)&d->u.member.getset, QP_SNAP_DEF_GETSET,
+                                &is_ref))
+                return -1;
+            if (!d->u.member.getset && !is_ref)
+                return snap_error(r, "invalid member descriptor");
+        }
         break;
     case QP_DESCR_WRAPPER:
     case QP_DESCR_METHOD_WRAPPER:
@@ -170,9 +183,9 @@ static int qp_snap_descr_read_descr(SnapReader *r, JSObject *p)
         if (slot_index >= QP_NSLOTDEFS)
             return snap_error(r, "invalid wrapper descriptor slot");
         d->u.wrapper.slot = &qp_slotdefs[slot_index];
-        if (snap_get_native(r, &ptr))
+        if (qp_snap_get_def(r, (const void **)&d->u.wrapper.wrapped, QP_SNAP_DEF_WRAPPED,
+                            &is_ref))
             return -1;
-        d->u.wrapper.wrapped = ptr;
         break;
     }
     return 0;

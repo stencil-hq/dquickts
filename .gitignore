@@ -42,3 +42,6 @@ tests/test_qjsc_modules.c
 /build/
 /qpy
 /fuzz_py_compile
+__pycache__/
+/qpy-asan
+/qpy-nobase

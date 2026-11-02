@@ -1,0 +1,3 @@
+[('ValueError', 'boom', 'Exception ignored in thread started by <Boom>')]
+True
+ZeroDivisionError: division by zero

@@ -46,6 +46,7 @@ static JSValue qp_codec_encode_text(JSContext *ctx, JSValueConst s, const char *
                                     const char *errors);
 static JSValue qp_codec_decode_text(JSContext *ctx, JSValueConst obj, const char *encoding,
                                     const char *errors);
+static int qp_codec_check_encoding_errors(JSContext *ctx, const char *encoding, const char *errors);
 static void qp_str_state_free(JSContext *ctx);
 
 #define QP_MAX_UNICODE 0x10FFFF
@@ -1742,9 +1743,9 @@ QP_STR_METH(qp_str_m_join)
     }
     if (qp_tuple_check_exact(ctx, seq)) {
         n = QP_TUPLE_SIZE(seq);
-        items = QP_TUPLE_ITEMS(seq);
+        items = (JSValueConst *)QP_TUPLE_ITEMS(seq);
     } else {
-        items = qp_list_items(seq, &n);
+        items = (JSValueConst *)qp_list_items(seq, &n);
         if (!items) {
             JSValue t = qp_list_as_tuple(ctx, seq);
             JS_FreeValue(ctx, seq);
@@ -1752,7 +1753,7 @@ QP_STR_METH(qp_str_m_join)
                 return JS_EXCEPTION;
             seq = t;
             n = QP_TUPLE_SIZE(seq);
-            items = QP_TUPLE_ITEMS(seq);
+            items = (JSValueConst *)QP_TUPLE_ITEMS(seq);
         }
     }
     for (i = 0; i < n; i++) {
@@ -2560,6 +2561,8 @@ static JSValue qp_str_encode(JSContext *ctx, JSValueConst s, const char *encodin
     JSValue res;
     int codec, eh;
 
+    if (qp_codec_check_encoding_errors(ctx, encoding, errors) < 0)
+        return JS_EXCEPTION;
     codec = encoding ? qp_str_codec_lookup(encoding) : QP_ENC_UTF8;
     eh = qp_error_handler_builtin(errors);
     if (codec < 0 || eh < 0) {
@@ -2886,6 +2889,8 @@ static JSValue qp_str_decode(JSContext *ctx, const char *data, Py_ssize_t len,
     QPDecoder d;
     int codec, eh, r;
 
+    if (qp_codec_check_encoding_errors(ctx, encoding, errors) < 0)
+        return JS_EXCEPTION;
     if (len == 0)
         return qp_str_empty(ctx);
     codec = encoding ? qp_str_codec_lookup(encoding) : QP_ENC_UTF8;

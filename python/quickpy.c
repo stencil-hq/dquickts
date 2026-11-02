@@ -88,11 +88,14 @@
 #include "structseq.c"
 #include "moduleobject.c"
 #include "import.c"
+#include "importlib_boot.h"
 #include "pythonrun.c"
+#include "jsinterop.c"
 
 /* native modules: inittab entries live in config.c */
 #include "modstate.h"
 #include "mod_misc.c"
+#include "instrumentation.c"
 #include "mod_weakref.c"
 #include "mod_thread.c"
 #include "mod_time.c"
@@ -105,13 +108,37 @@
 #include "mod_locale.c"
 #include "mod_io.c"
 #include "mod_imp.c"
-/* Boot is activated by including importlib_boot.h before pythonrun.c
-   (QP_IMPORTLIB_BOOT); enabled once the M2 core passes L0. */
-#include "importlib_boot.h"
+#include "mod_ast.c"
+#include "mod_tokenize.c"
+#include "mod_symtable.c"
+#include "mod_types.c"
+#include "mod_testinternalcapi.c"
 #include "importlib_boot.c"
 #include "config.c"
 /* heap snapshot hooks of quickjs-snapshot.c (M4Snapshot); after config.c */
 #include "snapshot.c"
+
+#ifdef CONFIG_PYTHON_CAPI
+/* Python C API (plan D5, capi-design.md §4): exported Py* symbols. */
+#include "capi.h"
+#include "capi_mirror.c"
+#include "capi_object.c"
+#include "capi_type.c"
+#include "capi_module.c"
+#include "capi_number.c"
+#include "capi_abstract.c"
+#include "capi_unicode.c"
+#include "capi_bytes.c"
+#include "capi_tuple.c"
+#include "capi_dict.c"
+#include "capi_errors.c"
+#include "capi_getargs.c"
+#include "capi_runtime.c"
+#include "capi_tracemalloc.c"   /* tracemalloc: traces of the runtime's allocations */
+#include "capi_stable.c"
+#include "capi_dynload.c"
+#include "capi_snapshot.c"   /* heap snapshots of C-extension state */
+#endif
 
 /* _Py_SourceAsString(): compile() rejects sources with embedded NUL bytes
    before parsing. */
@@ -133,7 +160,8 @@ static void qpy_set_memory_error(qp_error *err)
 }
 
 int qp_parse(JSContext *ctx, qp_arena *arena, const char *src, size_t len,
-             const char *filename, int mode, int flags, mod_ty *out, qp_error *err)
+             const char *filename, JSValueConst module, int mode, int flags, mod_ty *out,
+             qp_error *err)
 {
     _PyFutureFeatures future;
     mod_ty mod;
@@ -141,7 +169,7 @@ int qp_parse(JSContext *ctx, qp_arena *arena, const char *src, size_t len,
     *out = NULL;
     if (qpy_check_null_bytes(src, len, err) < 0)
         return -1;
-    mod = qp_parse_string(ctx, arena, src, len, filename, mode, flags, err);
+    mod = qp_parse_string(ctx, arena, src, len, filename, module, mode, flags, err);
     if (!mod)
         return -1;
     /* _Py_CompileString -> _PyCompile_AstPreprocess runs the __future__
@@ -178,13 +206,14 @@ int qp_check(JSContext *ctx, const char *src, size_t len, const char *filename,
         qpy_set_memory_error(err);
         goto done;
     }
-    mod = qp_parse_string(ctx, arena, src, len, filename, mode, flags, err);
+    /* syntax check only: SyntaxWarnings are dropped (module None) */
+    mod = qp_parse_string(ctx, arena, src, len, filename, JS_UNDEFINED, mode, flags, err);
     if (mod && _PyFuture_FromAST(mod, filename, &future, arena, err)) {
         /* compiler_setup(): merge the __future__ features with the flags */
         future.ff_features |= flags;
         st = _PySymtable_Build(mod, filename, &future, arena, err);
         if (st) {
-            ret = qp_validate(st, mod, future.ff_features, err);
+            ret = qp_validate(st, mod, future.ff_features, filename, JS_UNDEFINED, err);
             _PySymtable_Free(st);
         }
     }
@@ -570,7 +599,7 @@ static void qpy_handle_request(JSContext *ctx, const char *line, size_t len, Dyn
             qpy_put_qp_error(resp, id, &err);
             goto done;
         }
-        if (qp_parse(ctx, arena, src, src_len, s, mode, flags, &mod, &err) < 0) {
+        if (qp_parse(ctx, arena, src, src_len, s, JS_UNDEFINED, mode, flags, &mod, &err) < 0) {
             qpy_put_qp_error(resp, id, &err);
         } else {
             start = resp->size;

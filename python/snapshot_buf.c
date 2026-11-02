@@ -26,7 +26,10 @@
  *                i64 written, i64 start, i64 end, QP_EXC_NFIELDS x value f[i]
  *   traceback    value next, func, frame, self_hint, locals,
  *                sleb lasti, sleb lineno
- *   module       value dict, u8 builtin
+ *   module       value dict, u8 builtin; a module executed by the C API
+ *                starts with 2 instead of 1, then leb its execution order
+ *                and its inittab entry (python/capi_snapshot.c executes
+ *                it again on read)
  *
  * Buffer pointers are never written.  QPBuffer.buf / len / readonly /
  * itemsize / format of a managed buffer are re-derived from its restored
@@ -215,7 +218,7 @@ static int qp_snap_buf_write_mv(SnapWriter *w, JSObject *p, QPMemoryView *mv)
     qp_snap_put_i64(w, mv->itemsize);
     bc_put_u8(&w->bc, mv->readonly != 0);
     bc_put_leb128(&w->bc, mv->ndim);
-    snap_put_bytes(&w->bc, mv->format, strnlen(mv->format, QP_MV_FMT_MAX));
+    snap_put_bytes(&w->bc, mv->format, strlen(mv->format));
     for (i = 0; i < mv->ndim; i++) {
         qp_snap_put_i64(w, mv->shape[i]);
         qp_snap_put_i64(w, mv->strides[i]);
@@ -336,6 +339,7 @@ static int qp_snap_buf_read_mv(SnapReader *r, JSObject *p)
     QPMemoryView *mv;
     uint8_t released, readonly;
     uint32_t ndim, fmtlen;
+    char *fmt;
     int64_t v;
     int i;
 
@@ -362,12 +366,24 @@ static int qp_snap_buf_read_mv(SnapReader *r, JSObject *p)
     if (bc_get_u8(&r->bc, &readonly) || bc_get_leb128(&r->bc, &ndim) ||
         bc_get_leb128(&r->bc, &fmtlen))
         return -1;
-    if (released > 1 || readonly > 1 || ndim > QP_MV_MAX_NDIM || fmtlen >= QP_MV_FMT_MAX ||
+    if (released > 1 || readonly > 1 || ndim > QP_MV_MAX_NDIM ||
+        (size_t)fmtlen > (size_t)(r->bc.buf_end - r->bc.ptr) ||
         mv->len < 0 || mv->itemsize < 1)
         return snap_error(r, "invalid memoryview");
     mv->readonly = readonly;
-    if (bc_get_buf(&r->bc, (uint8_t *)mv->format, fmtlen))
+    fmt = mv->format_inline;
+    if (fmtlen >= sizeof(mv->format_inline)) {
+        fmt = js_malloc(r->ctx, (size_t)fmtlen + 1);
+        if (!fmt)
+            return -1;
+    }
+    fmt[0] = '\0';
+    mv->format = fmt;   /* owned: freed by the finalizer */
+    if (bc_get_buf(&r->bc, (uint8_t *)fmt, fmtlen))
         return -1;
+    fmt[fmtlen] = '\0';
+    if (strlen(fmt) != fmtlen)
+        return snap_error(r, "invalid memoryview");
     if (ndim > 1) {
         mv->shape = js_malloc(r->ctx, sizeof(Py_ssize_t) * 2 * ndim);
         if (!mv->shape) {
@@ -641,9 +657,22 @@ static int qp_snap_buf_write_module(SnapWriter *w, JSObject *p)
 {
     QPModule *m = p->u.opaque;
 
-    bc_put_u8(&w->bc, m != NULL);
-    if (!m)
+    if (!m) {
+        bc_put_u8(&w->bc, 0);
         return 0;
+    }
+    if (m->exec_def)
+        return qp_snap_reject(w, p, "builtin module created but not executed");
+#ifdef CONFIG_PYTHON_CAPI
+    if (m->capi_seq) {
+        bc_put_u8(&w->bc, 2);
+        if (qp_capi_snap_module_write(w, m))
+            return -1;
+    } else
+#endif
+    {
+        bc_put_u8(&w->bc, 1);
+    }
     if (snap_put_value(w, m->dict))
         return -1;
     bc_put_u8(&w->bc, m->builtin);
@@ -657,11 +686,19 @@ static int qp_snap_buf_read_module(SnapReader *r, JSObject *p)
 
     if (bc_get_u8(&r->bc, &present))
         return -1;
-    if (present > 1)
+    if (present > 2)
         return snap_error(r, "invalid module payload");
     if (!present) {
         snap_payload_ready(r);
         return 0;
+    }
+    if (present == 2) {
+#ifdef CONFIG_PYTHON_CAPI
+        if (qp_capi_snap_module_read(r, p))
+            return -1;
+#else
+        return snap_error(r, "C extension module without the C API");
+#endif
     }
     m = js_mallocz(r->ctx, sizeof(*m));
     if (!m)

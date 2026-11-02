@@ -36,10 +36,21 @@
  * (__hash__).  Caches (method cache, inline caches, str cache, hash caches)
  * are restored empty.
  *
+ * C-extension state (D5, python/capi_snapshot.c): C modules are saved as
+ * module objects and executed again on read, C types and the classes a C
+ * module makes are saved by reference (the re-executed module re-creates
+ * them into the saved type objects), C functions and descriptors keep
+ * their objects with a reference (owner, name) to their C definition, and
+ * C-extension instances are saved as their __reduce_ex__() value
+ * (records, written instead of the object, read into a JS_CLASS_PY_NATIVE
+ * placeholder that becomes the reconstructed object).
+ *
  * Host state is rejected (TypeError "snapshot: cannot save Python object
- * ..."): OS threads, directory streams, poll objects, file objects on
- * descriptors other than the standard streams, sockets, processes,
- * C-extension companions (JS_CLASS_PY_NATIVE), running Python code.
+  * ...): OS threads other than the main thread (what names the main thread
+ * is bound to the main thread of the reader, qp_snap_thread_bound),
+ * directory streams, poll and kqueue objects, file
+ * objects on descriptors other than the standard streams, sockets, processes,
+ * C-extension objects that cannot be pickled, running Python code.
  * Process-level state that Python keeps in the heap is re-applied on read:
  * signal handlers (sigaction) and a disabled gc.
  *
@@ -178,7 +189,103 @@ typedef struct QPSnapRead {
     QPSnapDefer *early, *late;
     int early_count, early_size;
     int late_count, late_size;
+    struct QPCapiSnapRead *capi; /* C-extension state (capi_snapshot.c) */
+    JSObject **thread_bound;    /* _thread objects bound to the main thread */
+    int thread_bound_count, thread_bound_size;
+    BOOL thread_rebound;        /* the main _ThreadHandle was rebound: */
+    uint64_t thread_old_ident;  /* the ident of the writer's main thread */
 } QPSnapRead;
+
+/* ---- C-extension state (python/capi_snapshot.c, included later) -------- */
+
+/* kinds of C definitions referenced by functions and descriptors */
+enum {
+    QP_SNAP_DEF_METHOD,         /* const QPMethodDef * */
+    QP_SNAP_DEF_GETSET,         /* const QPGetSetDef * */
+    QP_SNAP_DEF_WRAPPED,        /* wrapped C slot function */
+};
+
+#ifdef CONFIG_PYTHON_CAPI
+static int qp_capi_snap_add_natives(JSRuntime *rt, SnapNatives *n);
+static int qp_capi_snap_write_record(SnapWriter *w, JSObject *p);
+static int qp_capi_snap_read_record(SnapReader *r, JSObject *p);
+static int qp_capi_snap_write_type_ref(SnapWriter *w, JSObject *p);
+static int qp_capi_snap_read_type_ref(SnapReader *r, JSObject *p);
+static int qp_capi_snap_put_def(SnapWriter *w, const void *def, int kind);
+static BOOL qp_capi_snap_is_capi_def(SnapWriter *w, const void *def, int kind);
+static int qp_capi_snap_type_skip_sub(SnapWriter *w, QPType *sub);
+static int qp_capi_snap_get_def(SnapReader *r, const void **pdef, int kind);
+struct QPModule;
+static int qp_capi_snap_module_write(SnapWriter *w, struct QPModule *m);
+static int qp_capi_snap_module_read(SnapReader *r, JSObject *p);
+static int qp_capi_snap_finish(SnapReader *r, JSContext *ctx);
+static void qp_capi_snap_writer_free(SnapWriter *w);
+static void qp_capi_snap_reader_free(SnapReader *r);
+#endif
+
+/* Reference to static C data or code of a function/descriptor payload:
+   u8 0 + native index, or (C API) u8 1 + C definition reference. */
+static int qp_snap_put_def(SnapWriter *w, const void *def, int kind)
+{
+#ifdef CONFIG_PYTHON_CAPI
+    if (def && !snap_map_find(&w->natives.map, def) && qp_capi_snap_is_capi_def(w, def, kind)) {
+        bc_put_u8(&w->bc, 1);
+        return qp_capi_snap_put_def(w, def, kind);
+    }
+#endif
+    bc_put_u8(&w->bc, 0);
+    return snap_put_native(w, def);
+}
+
+/* *pdef: the definition, or NULL until the C modules are restored (C
+   definition reference); *pref tells which. */
+static int qp_snap_get_def(SnapReader *r, const void **pdef, int kind, BOOL *pref)
+{
+    uint8_t tag;
+    void *ptr;
+
+    *pref = FALSE;
+    if (bc_get_u8(&r->bc, &tag))
+        return -1;
+    if (tag == 0) {
+        if (snap_get_native(r, &ptr))
+            return -1;
+        *pdef = ptr;
+        return 0;
+    }
+#ifdef CONFIG_PYTHON_CAPI
+    if (tag == 1) {
+        *pref = TRUE;
+        *pdef = NULL;
+        return qp_capi_snap_get_def(r, pdef, kind);
+    }
+#endif
+    return snap_error(r, "invalid C definition reference");
+}
+
+/* snap_write_object() hook: C-extension objects are written as records
+   (1 = not one).  A cell keeps its form in every snapshot of a series. */
+static int qp_snap_write_record(SnapWriter *w, JSObject *p)
+{
+    int ret = 1;
+#ifdef CONFIG_PYTHON_CAPI
+    ret = qp_capi_snap_write_record(w, p);
+#endif
+    if (ret == 1 && w->cur_idx < w->base_cell_count &&
+        snap_writer_cell(w, w->cur_idx)->py_record) {
+        JS_ThrowTypeError(w->ctx, "snapshot: a C extension object of the base snapshot "
+                          "changed its class; write a full snapshot");
+        return -1;
+    }
+    return ret;
+}
+
+static void qp_snap_writer_free(SnapWriter *w)
+{
+#ifdef CONFIG_PYTHON_CAPI
+    qp_capi_snap_writer_free(w);
+#endif
+}
 
 static QPSnapRead *qp_snap_read_state_get(SnapReader *r)
 {
@@ -230,8 +337,12 @@ static void qp_snap_reader_free(SnapReader *r)
     QPSnapRead *s = r->py;
     if (!s)
         return;
+#ifdef CONFIG_PYTHON_CAPI
+    qp_capi_snap_reader_free(r);
+#endif
     js_free_rt(r->rt, s->early);
     js_free_rt(r->rt, s->late);
+    js_free_rt(r->rt, s->thread_bound);
     js_free_rt(r->rt, s);
     r->py = NULL;
 }
@@ -310,6 +421,7 @@ static int qp_snap_add_natives(JSRuntime *rt, SnapNatives *n)
     if (qp_snap_add_entries(rt, n, #T, #x, &(x), 1, sizeof(x)))              \
         return -1;
     QP_SNAP_TABLES(QP_SNAP_A, QP_SNAP_S)
+    QP_SNAP_TABLES_HOST(QP_SNAP_A, QP_SNAP_S)
 #undef QP_SNAP_A
 #undef QP_SNAP_S
 
@@ -327,6 +439,7 @@ static int qp_snap_add_natives(JSRuntime *rt, SnapNatives *n)
         qp_snap_add_spec_slots(rt, n, (const QPTypeSpec *)&(x)))             \
         return -1;
     QP_SNAP_TABLES(QP_SNAP_A, QP_SNAP_S)
+    QP_SNAP_TABLES_HOST(QP_SNAP_A, QP_SNAP_S)
 #undef QP_SNAP_A
 #undef QP_SNAP_S
 
@@ -343,6 +456,10 @@ static int qp_snap_add_natives(JSRuntime *rt, SnapNatives *n)
         if (snap_natives_push(rt, n, qp_snap_extra_natives[i]))
             return -1;
     }
+#ifdef CONFIG_PYTHON_CAPI
+    if (qp_capi_snap_add_natives(rt, n))
+        return -1;
+#endif
     return 0;
 }
 
@@ -380,6 +497,14 @@ static int qp_snap_write_type(SnapWriter *w, JSObject *p)
         bc_put_u8(&w->bc, 0);
         return 0;
     }
+#ifdef CONFIG_PYTHON_CAPI
+    {
+        /* u8 2 + key: type made by C, saved by reference */
+        int ret = qp_capi_snap_write_type_ref(w, p);
+        if (ret <= 0)
+            return ret;
+    }
+#endif
     e = QP_TEXT(t);
     if (t->flags & QP_TPFLAGS_READYING)
         return qp_snap_reject(w, p, "type is being created");
@@ -412,11 +537,42 @@ static int qp_snap_write_type(SnapWriter *w, JSObject *p)
         if (qp_snap_put_type(w, e->bases_raw[i]))
             return -1;
     }
+#ifdef CONFIG_PYTHON_CAPI
+    {
+        /* types saved by reference link themselves again when their C
+           module runs (and an older copy from a failed module exec is
+           not saved) */
+        uint8_t skip_buf[64], *skip = skip_buf;
+        int n = 0, ret = 0;
+        if (t->subclass_count > (int)sizeof(skip_buf)) {
+            skip = js_malloc(w->ctx, t->subclass_count);
+            if (!skip)
+                return -1;
+        }
+        for (i = 0; i < t->subclass_count && ret >= 0; i++) {
+            ret = qp_capi_snap_type_skip_sub(w, t->subclasses[i]);
+            skip[i] = ret > 0;
+            n += ret == 0;
+        }
+        if (ret >= 0) {
+            bc_put_leb128(&w->bc, n);
+            for (i = 0; i < t->subclass_count && ret >= 0; i++) {
+                if (!skip[i] && qp_snap_put_type(w, t->subclasses[i]))
+                    ret = -1;
+            }
+        }
+        if (skip != skip_buf)
+            js_free(w->ctx, skip);
+        if (ret < 0)
+            return -1;
+    }
+#else
     bc_put_leb128(&w->bc, t->subclass_count);
     for (i = 0; i < t->subclass_count; i++) {
         if (qp_snap_put_type(w, t->subclasses[i]))
             return -1;
     }
+#endif
     memcpy(fn, &t->slots, sizeof(fn));
     for (i = 0; i < (int)QP_SNAP_NSLOTFN; i++) {
         if (snap_put_native(w, fn[i]))
@@ -442,6 +598,12 @@ static int qp_snap_read_type(SnapReader *r, JSObject *p)
         snap_payload_ready(r);
         return 0;
     }
+#ifdef CONFIG_PYTHON_CAPI
+    if (present == 2)
+        return qp_capi_snap_read_type_ref(r, p);
+#endif
+    if (present != 1)
+        return snap_error(r, "invalid Python type payload");
     t = qp_snap_type_ensure(r, p);
     if (!t)
         return -1;
@@ -532,8 +694,46 @@ static const struct {
 } qp_snap_host_specs[] = {
     { &qp_si_spec, "directory stream (os.scandir iterator)" },     /* DIR* in a slot */
     { &qp_poll_spec, "poll object on file descriptors" },
-    { &qp_thread_handle_spec, "operating system thread" },
+#ifdef QP_HAVE_KQUEUE
+    { &qp_kqueue_spec, "kqueue object (file descriptor)" },
+#endif
+    { &qp_tokiter_spec, "tokenizer state (_tokenize.TokenizerIter)" },
 };
+
+/* _thread objects that name an OS thread by its ident (_ThreadHandle of a
+   started thread, RLock held by a thread).  The main thread is the one
+   thread a restored runtime has again (the main thread of the reading
+   process): what is bound to it is saved by reference and bound to the
+   new main thread on read (qp_snap_thread_rebind).  Locks and RLocks
+   that no thread holds and the handles of threads not started or done
+   are plain values; a handle of another live thread is host state.
+   Returns 1 (bound to the main thread), 0 (a value) or -1 with *preason. */
+static int qp_snap_thread_bound(JSContext *ctx, JSObject *p, QPType *t, const char **preason)
+{
+    JSValue obj = JS_MKPTR(JS_TAG_OBJECT, p);
+    QPInstance *in = p->u.opaque;
+    QPType *b;
+    int state;
+
+    if (!in || in->nslots < 2)
+        return 0;
+    for (b = t; b; b = b->base) {
+        if (b->spec == &qp_thread_handle_spec) {
+            state = qp_thread_slot_int(obj, 1);
+            if (state != QP_TH_STARTING && state != QP_TH_RUNNING)
+                return 0;
+            if (state == QP_TH_RUNNING &&
+                qp_thread_slot_u64(ctx, obj, 0) == qp_thread_main_ident(ctx))
+                return 1;
+            *preason = "operating system thread (only the main thread is restored)";
+            return -1;
+        }
+        if (b->spec == &qp_thread_rlock_spec)
+            return qp_thread_slot_int(obj, 1) > 0 &&
+                qp_thread_slot_u64(ctx, obj, 0) == qp_thread_main_ident(ctx);
+    }
+    return 0;
+}
 
 /* Python classes (any module spelling) whose instances own a file
    descriptor, a socket or a child process.  FileIO objects on the standard
@@ -649,6 +849,11 @@ static const char *qp_snap_host_reason(JSContext *ctx, JSObject *p, QPType *t)
                         ((JS_VALUE_GET_INT(fd) >= 0 && JS_VALUE_GET_INT(fd) <= 2) ||
                          JS_VALUE_GET_INT(fd) < 0 /* closed */))
                         return NULL;
+                    /* closed (_pyio.FileIO.close() keeps _fd; IOBase.close()
+                       sets the private __closed) */
+                    if (JS_VALUE_GET_TAG(fd = qp_snap_peek_attr(ctx, p, "_IOBase__closed")) ==
+                        JS_TAG_BOOL && JS_VALUE_GET_BOOL(fd))
+                        return NULL;
                 }
                 return qp_snap_host_classes[i].reason;
             }
@@ -662,10 +867,13 @@ static int qp_snap_write_instance(SnapWriter *w, JSObject *p)
     JSObject *proto = p->shape->proto;
     QPInstance *in = p->u.opaque;
     uint32_t i;
+    int bound = 0;
 
     if (proto && proto->class_id == JS_CLASS_PY_TYPE && proto->u.opaque) {
         QPType *t = proto->u.opaque;
         const char *reason = qp_snap_host_reason(t->ctx, p, t);
+        if (!reason)
+            bound = qp_snap_thread_bound(t->ctx, p, t, &reason);
         if (reason)
             return qp_snap_reject(w, p, reason);
     }
@@ -673,7 +881,8 @@ static int qp_snap_write_instance(SnapWriter *w, JSObject *p)
         bc_put_u8(&w->bc, 0);
         return 0;
     }
-    bc_put_u8(&w->bc, 1);
+    /* 1: slots, 2: slots of an object bound to the main thread */
+    bc_put_u8(&w->bc, bound ? 2 : 1);
     bc_put_leb128(&w->bc, in->nslots);
     for (i = 0; i < in->nslots; i++) {
         if (snap_put_value(w, in->slots[i]))
@@ -694,10 +903,23 @@ static int qp_snap_read_instance(SnapReader *r, JSObject *p)
         snap_payload_ready(r);
         return 0;
     }
+    if (present > 2)
+        return snap_error(r, "invalid Python instance payload");
     if (snap_get_leb(r, &n))
         return -1;
-    if (n > r->bc.buf_end - r->bc.ptr)
+    if (n > r->bc.buf_end - r->bc.ptr || (present == 2 && n < 2))
         return snap_error(r, "invalid Python instance slot count");
+    if (present == 2) {
+        QPSnapRead *s = qp_snap_read_state_get(r);
+        if (!s)
+            return -1;
+        if (snap_resize(r->rt, (void **)&s->thread_bound, sizeof(*s->thread_bound),
+                        &s->thread_bound_size, s->thread_bound_count + 1)) {
+            JS_ThrowOutOfMemory(r->ctx);
+            return -1;
+        }
+        s->thread_bound[s->thread_bound_count++] = p;
+    }
     in = js_malloc(r->ctx, sizeof(*in) + sizeof(in->slots[0]) * n);
     if (!in)
         return -1;
@@ -863,7 +1085,11 @@ static int qp_snap_read_payload(SnapReader *r, JSObject *p)
         snap_payload_ready(r);
         return snap_get_value(r, &p->u.object_data);
     case JS_CLASS_PY_NATIVE:
+#ifdef CONFIG_PYTHON_CAPI
+        return qp_capi_snap_read_record(r, p);
+#else
         return snap_error(r, "unsupported Python C extension object");
+#endif
     default:
         break;
     }
@@ -880,107 +1106,16 @@ static int qp_snap_read_payload(SnapReader *r, JSObject *p)
 /* Code metadata (JSFunctionBytecode.py_code)                                */
 /* ========================================================================= */
 
+/* python/codeobject.c qp_bc_write_code / qp_bc_read_code (the format the
+   bytecode writer uses for marshal and .pyc files too) */
 static int qp_snap_write_code(SnapWriter *w, JSFunctionBytecode *b)
 {
-    QPCodeInfo *ci = b->py_code;
-    uint32_t i;
-
-    bc_put_u8(&w->bc, b->is_py | ((ci != NULL) << 1));
-    if (!ci)
-        return 0;
-    bc_put_leb128(&w->bc, ci->co_flags);
-    bc_put_leb128(&w->bc, ci->argcount);
-    bc_put_leb128(&w->bc, ci->posonlyargcount);
-    bc_put_leb128(&w->bc, ci->kwonlyargcount);
-    bc_put_sleb128(&w->bc, ci->firstlineno);
-    if (bc_put_atom(&w->bc, ci->qualname))
-        return -1;
-    bc_put_sleb128(&w->bc, ci->doc_cpool_idx);
-    bc_put_leb128(&w->bc, ci->loc_count);
-    for (i = 0; i < ci->loc_count; i++) {
-        bc_put_sleb128(&w->bc, ci->locs[i].lineno);
-        bc_put_sleb128(&w->bc, ci->locs[i].end_lineno);
-        bc_put_sleb128(&w->bc, ci->locs[i].col);
-        bc_put_sleb128(&w->bc, ci->locs[i].end_col);
-    }
-    bc_put_leb128(&w->bc, ci->pcloc_count);
-    for (i = 0; i < ci->pcloc_count; i++) {
-        bc_put_leb128(&w->bc, ci->pcloc[i].pc);
-        bc_put_leb128(&w->bc, ci->pcloc[i].loc);
-    }
-    /* inline caches: only their count (restored empty) */
-    bc_put_leb128(&w->bc, ci->ic_count);
-    return 0;
+    return qp_bc_write_code(&w->bc, b);
 }
 
 static int qp_snap_read_code(SnapReader *r, JSFunctionBytecode *b)
 {
-    JSContext *ctx = r->ctx;
-    QPCodeInfo *ci;
-    uint8_t bits;
-    uint32_t v, i, n;
-
-    if (bc_get_u8(&r->bc, &bits))
-        return -1;
-    b->is_py = bits & 1;
-    if (!(bits & 2))
-        return 0;
-    ci = qp_code_info_new(ctx);
-    if (!ci)
-        return -1;
-    b->py_code = ci; /* freed with the bytecode on error */
-    if (bc_get_leb128(&r->bc, &ci->co_flags))
-        return -1;
-    if (bc_get_leb128(&r->bc, &v)) return -1;
-    ci->argcount = v;
-    if (bc_get_leb128(&r->bc, &v)) return -1;
-    ci->posonlyargcount = v;
-    if (bc_get_leb128(&r->bc, &v)) return -1;
-    ci->kwonlyargcount = v;
-    if (qp_snap_get_int(r, &ci->firstlineno) ||
-        bc_get_atom(&r->bc, &ci->qualname) ||
-        qp_snap_get_int(r, &ci->doc_cpool_idx) ||
-        snap_get_leb(r, &n))
-        return -1;
-    if (n > r->bc.buf_end - r->bc.ptr)
-        return snap_error(r, "invalid Python location table");
-    if (n) {
-        ci->locs = js_malloc(ctx, sizeof(ci->locs[0]) * n);
-        if (!ci->locs)
-            return -1;
-        ci->loc_size = n;
-        for (i = 0; i < n; i++) {
-            QPLoc *l = &ci->locs[i];
-            if (qp_snap_get_int(r, &l->lineno) || qp_snap_get_int(r, &l->end_lineno) ||
-                qp_snap_get_int(r, &l->col) || qp_snap_get_int(r, &l->end_col))
-                return -1;
-            ci->loc_count = i + 1;
-        }
-    }
-    if (snap_get_leb(r, &n))
-        return -1;
-    if (n > r->bc.buf_end - r->bc.ptr)
-        return snap_error(r, "invalid Python location map");
-    if (n) {
-        ci->pcloc = js_malloc(ctx, sizeof(ci->pcloc[0]) * n);
-        if (!ci->pcloc)
-            return -1;
-        for (i = 0; i < n; i++) {
-            if (bc_get_leb128(&r->bc, &ci->pcloc[i].pc) ||
-                bc_get_leb128(&r->bc, &ci->pcloc[i].loc))
-                return -1;
-            if (ci->pcloc[i].loc >= ci->loc_count)
-                return snap_error(r, "invalid Python location map");
-            ci->pcloc_count = i + 1;
-        }
-    }
-    if (bc_get_leb128(&r->bc, &v))
-        return -1;
-    if (v > UINT16_MAX)
-        return snap_error(r, "invalid Python inline cache count");
-    ci->ic_count = v;
-    /* inline caches restored empty, kinds from the bytecode */
-    return qp_code_info_setup_ic(ctx, b);
+    return qp_bc_read_code(&r->bc, b);
 }
 
 /* ========================================================================= */
@@ -1006,18 +1141,19 @@ static int qp_snap_read_code(SnapReader *r, JSFunctionBytecode *b)
     X(config.bytes_warning) X(config.utf8_mode) X(config.dev_mode)           \
     X(config.warn_default_encoding)                                          \
     X(recursion_limit) X(int_max_str_digits) X(lazy_imports_mode)           \
-    X(import_lock_level) X(override_frozen_modules)
+    X(import_lock_level) X(override_frozen_modules) X(dlopenflags)
 
 /* QPModState JSValue fields and arrays, in format order */
 #define QP_SNAP_MS_VALUES(X)                                                 \
     X(atexit_callbacks) X(sig_default_int_handler) X(sig_dfl) X(sig_ign)     \
-    X(sig_itimer_error) X(gc_callbacks) X(gc_garbage) X(warn_filters)        \
+    X(sig_itimer_error) X(sig_siginfo_type) X(gc_callbacks) X(gc_garbage) X(warn_filters)        \
     X(warn_once_registry) X(warn_default_action) X(warn_context)             \
     X(ctx_current) X(thread_shutdown_handles) X(codec_search_path)           \
-    X(codec_search_cache) X(codec_error_registry) X(codec_encoding_map_type)
+    X(codec_search_cache) X(codec_error_registry) X(codec_encoding_map_type) \
+    X(ast_state) X(mon_callbacks) X(mon_local_events) X(async_exc)
 #define QP_SNAP_MS_ARRAYS(X)                                                 \
     X(sig_handlers) X(ctx_types) X(thread_types) X(wr_types)                 \
-    X(codec_builtin_handlers)
+    X(codec_builtin_handlers) X(mon_tool_names)
 #define QP_SNAP_MS_INTS(X)                                                   \
     X(sig_wakeup_warn_on_full_buffer) X(gc_enabled) X(gc_debug)              \
     X(gc_threshold[0]) X(gc_threshold[1]) X(gc_threshold[2])                 \
@@ -1027,7 +1163,9 @@ static int qp_snap_read_code(SnapReader *r, JSFunctionBytecode *b)
     X(gc_collections[2]) X(gc_collected[0]) X(gc_collected[1])               \
     X(gc_collected[2]) X(gc_uncollectable[0]) X(gc_uncollectable[1])        \
     X(gc_uncollectable[2]) X(gc_candidates[0]) X(gc_candidates[1])          \
-    X(gc_candidates[2]) X(gc_baseline) X(warn_filters_version)
+    X(gc_candidates[2]) X(gc_baseline) X(warn_filters_version)               \
+    X(mon_events[0]) X(mon_events[1]) X(mon_events[2]) X(mon_events[3])      \
+    X(mon_events[4]) X(mon_events[5])
 
 static int qp_snap_write_modstate(SnapWriter *w, QPModState *ms)
 {
@@ -1116,6 +1254,10 @@ static int qp_snap_write_state(SnapWriter *w, JSContext *ctx)
         JS_ThrowTypeError(w->ctx, "snapshot: Python code is running");
         return -1;
     }
+    if (qp_thread_others_exist(w->ctx)) {
+        JS_ThrowTypeError(w->ctx, "snapshot: other Python threads are running");
+        return -1;
+    }
     for (i = 0; i < QP_T__COUNT; i++) {
         if (qp_snap_put_type(w, s->types[i]))
             return -1;
@@ -1185,6 +1327,11 @@ static int qp_snap_read_state(SnapReader *r, JSContext *ctx)
     rs = qp_snap_read_state_get(r);
     if (!rs)
         return -1;
+#ifdef CONFIG_PYTHON_CAPI
+    /* as qp_state_init: the restored session imports the C modules too */
+    if (qp_capi_register_core_modules() < 0)
+        return -1;
+#endif
     /* same initial values as qp_state_init (finalizer-safe) */
     s = js_mallocz(ctx, sizeof(*s));
     if (!s)
@@ -1237,6 +1384,10 @@ static int qp_snap_read_state(SnapReader *r, JSContext *ctx)
         bc_get_buf(&r->bc, s->hash_key, sizeof(s->hash_key)))
         return -1;
     s->next_dict_uid = uid;
+    /* qp_main: the hash key of this process (the deferred re-validation
+       of the hash tables then rehashes their keys) */
+    if (r->rt->py_snap_hash_key)
+        memcpy(s->hash_key, r->rt->py_snap_hash_key, sizeof(s->hash_key));
     if (qp_snap_read_modstate(r, s))
         return -1;
     /* the object slot carries the context (see qp_snap_run_deferred) */
@@ -1281,6 +1432,231 @@ static int qp_snap_run_deferred(SnapReader *r, QPSnapDefer *tab, int count)
     return 0;
 }
 
+#ifdef CONFIG_PYTHON_CAPI
+static BOOL qp_capi_snap_is_c_slot(const void *fn);
+
+/* key whose hash runs no Python code and needs no C-extension state */
+static BOOL qp_snap_hash_pure(JSContext *ctx, JSValueConst k, int depth)
+{
+    JSObject *p;
+    QPType *t;
+
+    if (JS_VALUE_GET_TAG(k) != JS_TAG_OBJECT)
+        return TRUE;
+    if (depth > 8)
+        return FALSE;
+    p = JS_VALUE_GET_OBJ(k);
+    /* C-extension objects (records) and definitions not restored yet */
+    if (p->class_id == JS_CLASS_PY_NATIVE || p->class_id == JS_CLASS_PY_CFUNCTION ||
+        p->class_id == JS_CLASS_PY_DESCR)
+        return FALSE;
+    if (!p->shape->proto || p->shape->proto->class_id != JS_CLASS_PY_TYPE)
+        return FALSE;
+    t = p->shape->proto->u.opaque;
+    /* types saved by reference have no slots until their module ran */
+    if (!t || !t->slots.tp_hash || t->slots.tp_hash == qp_slot_tp_hash ||
+        qp_capi_snap_is_c_slot((const void *)t->slots.tp_hash))
+        return FALSE;
+    switch (p->class_id) {
+    case JS_CLASS_PY_TUPLE:
+        {
+            QPTuple *tu = p->u.opaque;
+            uint32_t i;
+            for (i = 0; tu && i < tu->len; i++) {
+                if (!qp_snap_hash_pure(ctx, tu->items[i], depth + 1))
+                    return FALSE;
+            }
+            return TRUE;
+        }
+    case JS_CLASS_PY_FROZENSET:
+        {
+            qp_setcore *sc;
+            Py_ssize_t i;
+            if (!p->u.opaque)
+                return FALSE;
+            sc = &((QPSet *)p->u.opaque)->core;
+            for (i = 0; i <= sc->mask; i++) {
+                if (QP_SETENTRY_ACTIVE(&sc->table[i]) &&
+                    !qp_snap_hash_pure(ctx, sc->table[i].key, depth + 1))
+                    return FALSE;
+            }
+            return TRUE;
+        }
+    default:
+        return TRUE;
+    }
+}
+
+/* Before C modules run again (Python code): the dicts and sets whose keys
+   are pure get their identity hashes now, so that the module code finds
+   e.g. type-keyed entries; the late pass rehashes everything again. */
+static void qp_snap_prerehash(QPSnapRead *s)
+{
+    JSContext *ctx = s->py_ctx;
+    int i;
+
+    for (i = 0; i < s->late_count; i++) {
+        JSObject *p = s->late[i].obj;
+        BOOL pure = TRUE;
+        if (s->late[i].func == qp_snap_coll_dict_rehash) {
+            QPDict *d = p->u.opaque;
+            qp_dictkeys *keys;
+            Py_ssize_t j;
+            if (!d || d->core.keys == QP_SNAP_COLL_EMPTY_KEYS)
+                continue;
+            keys = d->core.keys;
+            for (j = 0; pure && j < keys->nentries; j++) {
+                if (QP_DICTENTRY_ACTIVE(&keys->entries[j]))
+                    pure = qp_snap_hash_pure(ctx, keys->entries[j].key, 0);
+            }
+        } else if (s->late[i].func == qp_snap_coll_set_rehash) {
+            QPSet *st = p->u.opaque;
+            Py_ssize_t j;
+            if (!st)
+                continue;
+            for (j = 0; pure && j <= st->core.mask; j++) {
+                if (QP_SETENTRY_ACTIVE(&st->core.table[j]))
+                    pure = qp_snap_hash_pure(ctx, st->core.table[j].key, 0);
+            }
+        } else {
+            continue;
+        }
+        if (pure && s->late[i].func(ctx, p) < 0)
+            JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+}
+#endif
+
+/* The _thread objects bound to the writer's main thread (see
+   qp_snap_thread_bound) name the main thread of this process: the ident
+   slot (slot 0 of _ThreadHandle and RLock) gets its ident.  Before any
+   Python code runs: a held RLock is held by the running thread. */
+static int qp_snap_thread_rebind(SnapReader *r, QPSnapRead *s)
+{
+    JSContext *ctx = s->py_ctx;
+    int i;
+
+    for (i = 0; i < s->thread_bound_count; i++) {
+        JSObject *p = s->thread_bound[i];
+        JSValue obj = JS_MKPTR(JS_TAG_OBJECT, p), ident;
+        QPType *t = p->shape->proto && p->shape->proto->class_id == JS_CLASS_PY_TYPE ?
+            p->shape->proto->u.opaque : NULL;
+        if (!ctx || !t || !p->u.opaque)
+            return snap_error(r, "invalid Python object bound to the main thread");
+        for (; t && t->spec != &qp_thread_handle_spec && t->spec != &qp_thread_rlock_spec;
+             t = t->base)
+            continue;
+        if (!t)
+            return snap_error(r, "invalid Python object bound to the main thread");
+        if (t->spec == &qp_thread_handle_spec && !s->thread_rebound) {
+            s->thread_rebound = TRUE;
+            s->thread_old_ident = qp_thread_slot_u64(ctx, obj, 0);
+        }
+        ident = qp_long_from_uint64(ctx, qp_thread_main_ident(ctx));
+        if (JS_IsException(ident))
+            return snap_error(r, "out of memory");
+        qp_thread_set_slot(ctx, obj, 0, ident);
+    }
+    return 0;
+}
+
+/* threading.py keeps the ident of its main Thread (Thread._ident, the key
+   of threading._active) and its native id: the main thread of this
+   process, like threading._after_fork() does for the thread that forked */
+static const char qp_snap_threading_src[] =
+    "def rebind(threading, old, new):\n"
+    "    main = getattr(threading, '_main_thread', None)\n"
+    "    if main is None or getattr(main, '_ident', None) != old:\n"
+    "        return\n"
+    "    active = getattr(threading, '_active', None)\n"
+    "    if type(active) is dict and active.get(old) is main:\n"
+    "        del active[old]\n"
+    "        active[new] = main\n"
+    "    main._ident = new\n"
+    "    if getattr(threading, '_HAVE_THREAD_NATIVE_ID', False):\n"
+    "        main._set_native_id()\n";
+
+static int qp_snap_threading_rebind(SnapReader *r, QPSnapRead *s)
+{
+    JSContext *ctx = s->py_ctx;
+    JSValue mod = QP_NULL, ns = QP_NULL, f = QP_NULL, res, exc;
+    JSValueConst args[3];
+    const char *msg;
+    JSAtom a;
+    int ret;
+
+    if (!s->thread_rebound)
+        return 0;
+    a = JS_NewAtom(ctx, "threading");
+    if (a == JS_ATOM_NULL)
+        goto fail;
+    ret = qp_dict_get_item_atom(ctx, QP_STATE(ctx)->modules, a, &mod);
+    JS_FreeAtom(ctx, a);
+    if (ret <= 0) {
+        if (ret < 0)
+            goto fail;
+        return 0;
+    }
+    ns = qp_dict_new(ctx);
+    if (JS_IsException(ns)) {
+        ns = QP_NULL;
+        goto fail;
+    }
+    if (qp_dict_set_item_atom(ctx, ns, QP_ATOM(ctx, __builtins__),
+                              QP_STATE(ctx)->builtins_module) < 0)
+        goto fail;
+    res = qp_run_string(ctx, qp_snap_threading_src, sizeof(qp_snap_threading_src) - 1,
+                        "<snapshot>", QP_INPUT_FILE, ns, ns);
+    if (JS_IsException(res))
+        goto fail;
+    JS_FreeValue(ctx, res);
+    a = JS_NewAtom(ctx, "rebind");
+    if (a == JS_ATOM_NULL)
+        goto fail;
+    ret = qp_dict_get_item_atom(ctx, ns, a, &f);
+    JS_FreeAtom(ctx, a);
+    if (ret <= 0) {
+        if (ret == 0)
+            qp_raise_system_error(ctx, "snapshot helper rebind missing");
+        goto fail;
+    }
+    args[0] = mod;
+    args[1] = qp_long_from_uint64(ctx, s->thread_old_ident);
+    if (JS_IsException(args[1]))
+        goto fail;
+    args[2] = qp_long_from_uint64(ctx, qp_thread_main_ident(ctx));
+    if (JS_IsException(args[2])) {
+        JS_FreeValue(ctx, (JSValue)args[1]);
+        goto fail;
+    }
+    res = qp_vectorcall(ctx, f, args, 3, QP_NULL);
+    JS_FreeValue(ctx, (JSValue)args[1]);
+    JS_FreeValue(ctx, (JSValue)args[2]);
+    if (JS_IsException(res))
+        goto fail;
+    JS_FreeValue(ctx, res);
+    JS_FreeValue(ctx, f);
+    JS_FreeValue(ctx, ns);
+    JS_FreeValue(ctx, mod);
+    return 0;
+ fail:
+    exc = JS_GetException(ctx);
+    msg = JS_IsNull(exc) || JS_IsUndefined(exc) ? NULL : JS_ToCString(ctx, exc);
+    if (!msg)
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    snap_error(r, "restoring the threading module failed: %s", msg ? msg : "error");
+    if (msg)
+        JS_FreeCString(ctx, msg);
+    JS_FreeValue(ctx, exc);
+    if (!QP_IS_NULL(f))
+        JS_FreeValue(ctx, f);
+    if (!QP_IS_NULL(ns))
+        JS_FreeValue(ctx, ns);
+    if (!QP_IS_NULL(mod))
+        JS_FreeValue(ctx, mod);
+    return -1;
+}
+
 /* Called by JS_ReadSnapshot() once every body is read and the object flags
    are restored (the garbage collector stays off until it returns). */
 static int qp_snap_finish(SnapReader *r)
@@ -1289,9 +1665,24 @@ static int qp_snap_finish(SnapReader *r)
 
     if (!s)
         return 0;
+    if (qp_snap_thread_rebind(r, s))
+        return -1;
     if (qp_snap_run_deferred(r, s->early, s->early_count))
         return -1;
-    return qp_snap_run_deferred(r, s->late, s->late_count);
+#ifdef CONFIG_PYTHON_CAPI
+    /* C modules, C types and functions, then C-extension instances: runs
+       Python code (module execs, reconstructors) */
+    if (s->capi) {
+        if (!s->py_ctx)
+            return snap_error(r, "C extension state without Python state");
+        qp_snap_prerehash(s);
+        if (qp_capi_snap_finish(r, s->py_ctx))
+            return -1;
+    }
+#endif
+    if (qp_snap_run_deferred(r, s->late, s->late_count))
+        return -1;
+    return qp_snap_threading_rebind(r, s);
 }
 
 /* ========================================================================= */
@@ -1339,6 +1730,9 @@ int qp_embed_exec(JSContext *ctx, const char *src, const char *filename)
         return qp_handle_uncaught(ctx);
     res = qp_run_string(ctx, src, strlen(src), filename, QP_INPUT_FILE, d, d);
     JS_FreeValue(ctx, d);
+    /* the queued __del__ methods and weakref callbacks (see qp_drepl_exec) */
+    qp_run_pending_finalizers(ctx);
+    qp_weakref_run_pending(ctx);
     if (JS_IsException(res))
         return qp_handle_uncaught(ctx);
     JS_FreeValue(ctx, res);

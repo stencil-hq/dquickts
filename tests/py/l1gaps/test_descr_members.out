@@ -1,0 +1,333 @@
+function
+   __annotate__ getset_descriptor
+   __annotations__ getset_descriptor
+   __builtins__ member_descriptor
+   __call__ wrapper_descriptor
+   __closure__ member_descriptor
+   __code__ getset_descriptor
+   __defaults__ getset_descriptor
+   __dict__ getset_descriptor
+   __doc__ getset_descriptor
+   __get__ wrapper_descriptor
+   __globals__ member_descriptor
+   __kwdefaults__ getset_descriptor
+   __module__ getset_descriptor
+   __name__ getset_descriptor
+   __new__ builtin_function_or_method
+   __qualname__ getset_descriptor
+   __repr__ wrapper_descriptor
+   __type_params__ getset_descriptor
+method
+   __call__ wrapper_descriptor
+   __doc__ getset_descriptor
+   __eq__ wrapper_descriptor
+   __func__ member_descriptor
+   __ge__ wrapper_descriptor
+   __get__ wrapper_descriptor
+   __getattribute__ wrapper_descriptor
+   __gt__ wrapper_descriptor
+   __hash__ wrapper_descriptor
+   __le__ wrapper_descriptor
+   __lt__ wrapper_descriptor
+   __ne__ wrapper_descriptor
+   __new__ builtin_function_or_method
+   __reduce__ method_descriptor
+   __repr__ wrapper_descriptor
+   __self__ member_descriptor
+builtin_function_or_method
+   __call__ wrapper_descriptor
+   __doc__ getset_descriptor
+   __eq__ wrapper_descriptor
+   __ge__ wrapper_descriptor
+   __gt__ wrapper_descriptor
+   __hash__ wrapper_descriptor
+   __le__ wrapper_descriptor
+   __lt__ wrapper_descriptor
+   __module__ member_descriptor
+   __name__ getset_descriptor
+   __ne__ wrapper_descriptor
+   __qualname__ getset_descriptor
+   __reduce__ method_descriptor
+   __repr__ wrapper_descriptor
+   __self__ getset_descriptor
+   __text_signature__ getset_descriptor
+code
+   __doc__ str
+   __eq__ wrapper_descriptor
+   __ge__ wrapper_descriptor
+   __gt__ wrapper_descriptor
+   __hash__ wrapper_descriptor
+   __le__ wrapper_descriptor
+   __lt__ wrapper_descriptor
+   __ne__ wrapper_descriptor
+   __new__ builtin_function_or_method
+   __replace__ method_descriptor
+   __repr__ wrapper_descriptor
+   __sizeof__ method_descriptor
+   _co_code_adaptive getset_descriptor
+   _varname_from_oparg method_descriptor
+   co_argcount member_descriptor
+   co_cellvars getset_descriptor
+   co_code getset_descriptor
+   co_consts member_descriptor
+   co_exceptiontable member_descriptor
+   co_filename member_descriptor
+   co_firstlineno member_descriptor
+   co_flags member_descriptor
+   co_freevars getset_descriptor
+   co_kwonlyargcount member_descriptor
+   co_lines method_descriptor
+   co_linetable member_descriptor
+   co_name member_descriptor
+   co_names member_descriptor
+   co_nlocals member_descriptor
+   co_positions method_descriptor
+   co_posonlyargcount member_descriptor
+   co_qualname member_descriptor
+   co_stacksize member_descriptor
+   co_varnames getset_descriptor
+   replace method_descriptor
+module
+   __annotate__ getset_descriptor
+   __annotations__ getset_descriptor
+   __dict__ member_descriptor
+   __dir__ method_descriptor
+   __doc__ str
+   __getattribute__ wrapper_descriptor
+   __init__ wrapper_descriptor
+   __new__ builtin_function_or_method
+   __repr__ wrapper_descriptor
+generator
+   __class_getitem__ classmethod_descriptor
+   __doc__ NoneType
+   __iter__ wrapper_descriptor
+   __name__ getset_descriptor
+   __next__ wrapper_descriptor
+   __qualname__ getset_descriptor
+   __repr__ wrapper_descriptor
+   __sizeof__ method_descriptor
+   close method_descriptor
+   gi_code getset_descriptor
+   gi_frame getset_descriptor
+   gi_running getset_descriptor
+   gi_state getset_descriptor
+   gi_suspended getset_descriptor
+   gi_yieldfrom getset_descriptor
+   send method_descriptor
+   throw method_descriptor
+coroutine
+   __await__ wrapper_descriptor
+   __class_getitem__ classmethod_descriptor
+   __doc__ NoneType
+   __name__ getset_descriptor
+   __qualname__ getset_descriptor
+   __repr__ wrapper_descriptor
+   __sizeof__ method_descriptor
+   close method_descriptor
+   cr_await getset_descriptor
+   cr_code getset_descriptor
+   cr_frame getset_descriptor
+   cr_origin member_descriptor
+   cr_running getset_descriptor
+   cr_state getset_descriptor
+   cr_suspended getset_descriptor
+   send method_descriptor
+   throw method_descriptor
+frame
+   __doc__ NoneType
+   __repr__ wrapper_descriptor
+   __sizeof__ method_descriptor
+   clear method_descriptor
+   f_back getset_descriptor
+   f_builtins getset_descriptor
+   f_code getset_descriptor
+   f_generator getset_descriptor
+   f_globals getset_descriptor
+   f_lasti getset_descriptor
+   f_lineno getset_descriptor
+   f_locals getset_descriptor
+   f_trace getset_descriptor
+   f_trace_lines member_descriptor
+   f_trace_opcodes getset_descriptor
+cell
+   __doc__ str
+   __eq__ wrapper_descriptor
+   __ge__ wrapper_descriptor
+   __gt__ wrapper_descriptor
+   __hash__ NoneType
+   __le__ wrapper_descriptor
+   __lt__ wrapper_descriptor
+   __ne__ wrapper_descriptor
+   __new__ builtin_function_or_method
+   __repr__ wrapper_descriptor
+   cell_contents getset_descriptor
+member_descriptor
+   __delete__ wrapper_descriptor
+   __doc__ getset_descriptor
+   __get__ wrapper_descriptor
+   __name__ member_descriptor
+   __objclass__ member_descriptor
+   __qualname__ getset_descriptor
+   __reduce__ method_descriptor
+   __repr__ wrapper_descriptor
+   __set__ wrapper_descriptor
+getset_descriptor
+   __delete__ wrapper_descriptor
+   __doc__ getset_descriptor
+   __get__ wrapper_descriptor
+   __name__ member_descriptor
+   __objclass__ member_descriptor
+   __qualname__ getset_descriptor
+   __repr__ wrapper_descriptor
+   __set__ wrapper_descriptor
+method_descriptor
+   __call__ wrapper_descriptor
+   __doc__ getset_descriptor
+   __get__ wrapper_descriptor
+   __name__ member_descriptor
+   __objclass__ member_descriptor
+   __qualname__ getset_descriptor
+   __reduce__ method_descriptor
+   __repr__ wrapper_descriptor
+   __text_signature__ getset_descriptor
+wrapper_descriptor
+   __call__ wrapper_descriptor
+   __doc__ getset_descriptor
+   __get__ wrapper_descriptor
+   __name__ member_descriptor
+   __objclass__ member_descriptor
+   __qualname__ getset_descriptor
+   __reduce__ method_descriptor
+   __repr__ wrapper_descriptor
+   __text_signature__ getset_descriptor
+method-wrapper
+   __call__ wrapper_descriptor
+   __doc__ getset_descriptor
+   __eq__ wrapper_descriptor
+   __ge__ wrapper_descriptor
+   __gt__ wrapper_descriptor
+   __hash__ wrapper_descriptor
+   __le__ wrapper_descriptor
+   __lt__ wrapper_descriptor
+   __name__ getset_descriptor
+   __ne__ wrapper_descriptor
+   __objclass__ getset_descriptor
+   __qualname__ getset_descriptor
+   __reduce__ method_descriptor
+   __repr__ wrapper_descriptor
+   __self__ member_descriptor
+   __text_signature__ getset_descriptor
+staticmethod
+   __annotate__ getset_descriptor
+   __annotations__ getset_descriptor
+   __call__ wrapper_descriptor
+   __class_getitem__ classmethod_descriptor
+   __dict__ getset_descriptor
+   __doc__ str
+   __func__ member_descriptor
+   __get__ wrapper_descriptor
+   __init__ wrapper_descriptor
+   __isabstractmethod__ getset_descriptor
+   __new__ builtin_function_or_method
+   __repr__ wrapper_descriptor
+   __wrapped__ member_descriptor
+classmethod
+   __annotate__ getset_descriptor
+   __annotations__ getset_descriptor
+   __class_getitem__ classmethod_descriptor
+   __dict__ getset_descriptor
+   __doc__ str
+   __func__ member_descriptor
+   __get__ wrapper_descriptor
+   __init__ wrapper_descriptor
+   __isabstractmethod__ getset_descriptor
+   __new__ builtin_function_or_method
+   __repr__ wrapper_descriptor
+   __wrapped__ member_descriptor
+property
+   __delete__ wrapper_descriptor
+   __doc__ member_descriptor
+   __get__ wrapper_descriptor
+   __init__ wrapper_descriptor
+   __isabstractmethod__ getset_descriptor
+   __name__ getset_descriptor
+   __new__ builtin_function_or_method
+   __set__ wrapper_descriptor
+   __set_name__ method_descriptor
+   deleter method_descriptor
+   fdel member_descriptor
+   fget member_descriptor
+   fset member_descriptor
+   getter method_descriptor
+   setter method_descriptor
+SimpleNamespace
+   __dict__ member_descriptor
+   __doc__ str
+   __eq__ wrapper_descriptor
+   __ge__ wrapper_descriptor
+   __gt__ wrapper_descriptor
+   __hash__ NoneType
+   __init__ wrapper_descriptor
+   __le__ wrapper_descriptor
+   __lt__ wrapper_descriptor
+   __ne__ wrapper_descriptor
+   __new__ builtin_function_or_method
+   __reduce__ method_descriptor
+   __replace__ method_descriptor
+   __repr__ wrapper_descriptor
+BaseException
+   __cause__ getset_descriptor
+   __context__ getset_descriptor
+   __dict__ getset_descriptor
+   __doc__ str
+   __init__ wrapper_descriptor
+   __new__ builtin_function_or_method
+   __reduce__ method_descriptor
+   __repr__ wrapper_descriptor
+   __setstate__ method_descriptor
+   __str__ wrapper_descriptor
+   __suppress_context__ member_descriptor
+   __traceback__ getset_descriptor
+   add_note method_descriptor
+   args getset_descriptor
+   with_traceback method_descriptor
+traceback
+   __dir__ method_descriptor
+   __doc__ str
+   __new__ builtin_function_or_method
+   tb_frame member_descriptor
+   tb_lasti member_descriptor
+   tb_lineno getset_descriptor
+   tb_next getset_descriptor
+<member '__globals__' of 'function' objects>
+<member 'co_name' of 'code' objects> None
+<member '__func__' of 'method' objects> the function (or other callable) implementing a method
+<member '__name__' of 'method_descriptor' objects>
+1 {'x': 1}
+2 2
+f.__globals__ = {} AttributeError readonly attribute
+del f.__closure__ AttributeError readonly attribute
+f.__code__.co_name = 'x' AttributeError readonly attribute
+str.upper.__name__ = 'x' AttributeError readonly attribute
+property().fget = 1 AttributeError readonly attribute
+object.__getattribute__(f, 'nope') AttributeError 'function' object has no attribute 'nope'
+object.__delattr__(f, 'nope') AttributeError 'function' object has no attribute 'nope'
+descriptor '__closure__' for 'function' objects doesn't apply to a 'int' object
+3 True ['__doc__', '__module__', '__name__', '__qualname__', 'z']
+5 5 dyn
+'M' object has no attribute 'a' a True
+1
+object.__getattribute__(mod, 'nope') 'module' object has no attribute 'nope' nope
+object.__delattr__(mod, 'nope') 'module' object has no attribute 'nope' nope
+mod.nope module 'mm' has no attribute 'nope' nope
+False
+fr.f_trace_lines = 1 TypeError attribute value type must be bool
+del fr.f_trace_lines TypeError can't delete numeric/char attribute
+del fr.f_trace_opcodes AttributeError attribute 'f_trace_opcodes' of 'frame' objects cannot be deleted
+del fr.f_lineno AttributeError attribute 'f_lineno' of 'frame' objects cannot be deleted
+e.__suppress_context__ = 1 TypeError attribute value type must be bool
+del e.__suppress_context__ TypeError can't delete numeric/char attribute
+e
+builtins
+x
+None

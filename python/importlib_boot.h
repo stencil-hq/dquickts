@@ -19,5 +19,14 @@
    (CPython pymain_sys_path_add_path0 runs after Py_Initialize).  0, or -1
    with a Python exception pending (a fatal initialization error). */
 static int qp_importlib_boot(JSContext *ctx);
+/* The two halves of qp_importlib_boot: qp_importlib_boot_core is
+   everything up to _signal (independent of the process: the base
+   snapshot embedded in qpy holds its result), qp_importlib_boot_process
+   the standard streams, the warnings options and site.  A state restored
+   from the base snapshot gets qp_importlib_boot_paths (the getpath sys
+   attributes of this process) and then qp_importlib_boot_process. */
+static int qp_importlib_boot_core(JSContext *ctx);
+static int qp_importlib_boot_process(JSContext *ctx);
+static int qp_importlib_boot_paths(JSContext *ctx);
 
 #endif /* QP_IMPORTLIB_BOOT_H */

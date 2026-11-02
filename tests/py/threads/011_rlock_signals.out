@@ -1,0 +1,3 @@
+[False, False, 'cannot release un-acquired lock', 'signal only works in main thread of the main interpreter'] 2
+True True
+KeyboardInterrupt in main

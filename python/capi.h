@@ -19,7 +19,7 @@
  * through capi/include/Python.h, the CPython 3.15 public API.  The C API
  * functions declared by Python.h (PyAPI_FUNC/PyAPI_DATA) are defined in
  * these files WITHOUT `static`: they are the exported symbols of
- * qpy/libquickjs (visibility default), linked by the CPython Modules/*.c
+ * qpy/libquickjs (visibility default), linked by the CPython Modules/ *.c
  * translation units (capi/modules) and, from M5, by dlopen'ed abi3 modules.
  * Everything else in these files is `static` and named qp_capi_* / QPCapi*;
  * runtime-provided public-header helpers are named _PyQp_* (exported).
@@ -28,8 +28,11 @@
  * - One C-API interpreter per process: the JSContext given to
  *   qp_capi_init() (the first Python context that imports a C module).
  *   Exported functions find it in qp_capi.ctx; no exported function takes
- *   a JSContext.  Another context importing a C module gets ImportError
- *   "C extension modules are bound to another interpreter".
+ *   a JSContext.  Another context (or runtime, maybe in another thread)
+ *   importing a C module gets ImportError "C extension modules are bound
+ *   to another interpreter" until qp_capi_context_free released the
+ *   binding (qp_capi_owner); it resets the interpreter-level C state, so
+ *   a later runtime binds the C API again.
  * - CPython reference semantics at the C boundary: PyObject* results are
  *   new or borrowed exactly as documented by CPython 3.15; errors are the
  *   pending JS exception of qp_capi.ctx (PyErr_Occurred() <=> a pending
@@ -134,13 +137,19 @@
      LIVE, else (weak mirror) the mirror's children directly. */
 typedef struct QPCapiHead {
     JSGCObjectHeader gc;        /* node link (gc_obj_list) while LIVE */
-    struct list_head live_link; /* qp_capi.live_list while LIVE */
+    struct list_head live_link; /* qp_capi.live_list while LIVE, qp_capi.weak_list while WEAK */
     JSValue v;                  /* JS value of the object; QP_NULL = unbound (C-primary, not crossed yet) */
     struct QPCapiPins *pins;    /* borrowed references handed out by this object, NULL = none */
     uint16_t kind;              /* QP_CAPI_K_*: layout after the PyObject header */
     uint16_t flags;             /* QP_CAPI_F_* */
     uint32_t tag;               /* QP_CAPI_TAG_*: MUST stay the last field (read at op - 4) */
 } QPCapiHead;
+
+/* _PyQp_HasFlag (capi/include/object.h) reads the flags word at op - 6 and
+   tests the static flag as bit 2 of ob_flags; _Py_QP_BOUND_FLAG and
+   _Py_QP_LIVE_SIZE_FLAG share the word with the QP_CAPI_F_* bits */
+_Static_assert(offsetof(QPCapiHead, flags) == sizeof(QPCapiHead) - 6, "QPCapiHead.flags at op - 6");
+_Static_assert(_Py_STATICALLY_ALLOCATED_FLAG == (1 << 2), "_PyQp_HasFlag static bit");
 
 #define QP_CAPI_TAG_OBJECT 0x4f504351u  /* "QCPO": a PyObject follows */
 #define QP_CAPI_TAG_RAW    0x57415251u  /* "QRAW": PyObject_Malloc block not (yet) an object */
@@ -161,6 +170,8 @@ typedef struct QPCapiHead {
 #define QP_CAPI_F_ORPHAN    0x0040  /* bound JS object freed by cycle collection while LIVE: v is dead */
 #define QP_CAPI_F_INTERNED  0x0080  /* str mirror in qp_capi.str_map (identity while live) */
 #define QP_CAPI_F_DEALLOC   0x0100  /* tp_dealloc in progress (re-entrancy guard) */
+/* 0x1000 _Py_QP_BOUND_FLAG, 0x2000 _Py_QP_LIVE_SIZE_FLAG (capi/include/object.h,
+   read by inline header code); 0x8000 QP_CAPI_F_LEAKED (capi_mirror.c) */
 
 /* mirror kinds: the layout following PyObject.  Builtin kinds may also
    carry QP_CAPI_F_NATIVE when a C type extends the builtin (defaultdict:
@@ -250,16 +261,19 @@ typedef struct QPCapiState {
     JSContext *ctx;                 /* the C-API interpreter (NULL before qp_capi_init) */
     JSRuntime *rt;
     struct list_head live_list;     /* live heads (refcount sync pass) */
+    struct list_head weak_list;     /* weak heads (bound, ob_refcnt dropped to 0): revived by the sync pass
+                                       when C took a reference back with an inline Py_INCREF */
     struct QPCapiMap *obj_map;      /* JSObject* -> head (objects with py_has_mirror) */
     struct QPCapiMap *str_map;      /* JSString* -> live str head (identity of live str mirrors) */
     struct QPCapiMap *id_map;       /* _Py_ID / _Py_STR / PyUnicode_InternFromString: name -> immortal interned str mirror */
+    struct QPCapiMap *static_map;   /* statically allocated extension instance -> its PY_NATIVE JSObject* (owned) */
     QPCapiKindOps kind_ops[QP_CAPI_K__COUNT];
     int initialized;                /* 0 none, 1 in progress, 2 ready */
     /* (B) */
     struct QPCapiTypeMap *type_map; /* B-private: QPType* -> bound static PyTypeObject* (reverse: tp_cache) */
     struct QPCapiRegistry *defs;    /* PyMethodDef/PyGetSetDef/PyMemberDef registry: QP magic -> C def */
     struct _inittab *inittab;       /* PyImport_ExtendInittab/AppendInittab tables (B owns the registry) */
-    QPModuleDef *qp_moddefs;        /* synthesized inittab entries (B) */
+    QPModuleDef **qp_moddefs;       /* synthesized inittab entries (B; each entry allocated once, stable) */
     int qp_moddef_count;
     /* (D) */
     struct QPCapiCodecState *codecs;
@@ -301,9 +315,12 @@ static void qp_capi_free_cycle_node(JSRuntime *rt, JSGCObjectHeader *gp);
    mirror -> released (tp_dealloc for natives); live mirror -> ORPHAN. */
 static void qp_capi_object_freed(JSRuntime *rt, JSObject *p);
 /* JS_FreeContext of the C-API context (before QPState is freed): drops the
-   JS references of every live node and unlinks the nodes (process exit:
-   C-side memory still referenced by extension globals is leaked). */
+   JS references of every live node and unlinks the nodes (C-side memory
+   still referenced by extension globals is leaked), resets the
+   interpreter-level C state (static types back to their compiled-in
+   state, interned strings, thread states...) and releases the binding. */
 static void qp_capi_context_free(JSContext *ctx);
+static void qp_capi_runtime_free(JSRuntime *rt);
 /* gc_free_cycles() final loop: a PY_CAPI node still listed after the free
    phase (tp_traverse misreported) is unlinked and leaked. */
 static void qp_capi_leak_node(JSRuntime *rt, JSGCObjectHeader *gp);
@@ -326,6 +343,25 @@ static void qp_capi_incref(PyObject *op);
 /* (_Py_Dealloc, exported) 1 -> 0: mirrors drop their JS reference and are
    released unless PERSIST; unbound natives run tp_dealloc; bound natives
    wait for their JS object (qp_capi_object_freed). */
+
+/* -- C method calls in progress (Py_REFCNT of their arguments) --
+   CPython 3.14 passes self and the vectorcall arguments borrowed, and loads
+   locals with LOAD_FAST_BORROW, so `a.resize(n)` on a function local sees
+   Py_REFCNT(a) == 1.  The bridge holds references of its own and the QuickJS
+   operand stack always counts its copies; _PyQp_RefcntBound leaves out those
+   that CPython borrows (capi_mirror.c qp_capi_calls_borrowed). */
+typedef struct QPCapiCall {
+    struct QPCapiCall *prev;
+    PyObject *self;             /* bridge reference of self, NULL if none */
+    PyObject *const *args;      /* bridge references of the n arguments */
+    int n;
+    JSStackFrame *sf;           /* the calling Python frame when `slots` lie in its operand stack, else NULL */
+    JSValueConst *slots;        /* the arguments as passed (slots[-1] = self when self_slot) */
+    BOOL self_slot;             /* slots[-1] is the operand stack copy of self */
+} QPCapiCall;
+static void qp_capi_call_enter(JSContext *ctx, QPCapiCall *c, PyObject *self, PyObject *const *args,
+                               JSValueConst self_v, JSValueConst *slots, int n);
+static void qp_capi_call_leave(QPCapiCall *c);
 
 /* -- crossings JS -> C -- */
 /* New reference to the mirror of v (singletons, small ints and builtin
@@ -361,8 +397,10 @@ static JSValue qp_capi_value(JSContext *ctx, PyObject *op);
 /* New JS reference (qp_capi_value + dup). */
 static JSValue qp_capi_to_js(JSContext *ctx, PyObject *op);
 /* Arrays: new JS references of n objects into out[] (JS_UNDEFINED filled
-   on failure, all freed); used by the call bridges. */
-static int qp_capi_to_js_array(JSContext *ctx, PyObject *const *objs, Py_ssize_t n, JSValue *out);
+   on failure, all freed); unit A API for the call bridges, currently
+   without a user. */
+static __maybe_unused int qp_capi_to_js_array(JSContext *ctx, PyObject *const *objs, Py_ssize_t n,
+                                              JSValue *out);
 
 /* -- pins -- */
 static PyObject *qp_capi_pin_get(PyObject *owner, uint64_t key);               /* borrowed or NULL */
@@ -472,6 +510,9 @@ static int qp_capi_init_types(JSContext *ctx);
    (created and pinned on first use; persists with the type). */
 static QPType *qp_capi_type_qp(PyTypeObject *tp);
 static PyTypeObject *qp_capi_type_from_qp(JSContext *ctx, QPType *t);
+/* CPython's `Py_TYPE(o)->tp_as_buffer->bf_releasebuffer != NULL` seen
+   through the reverse buffer bridge (capi_bytes.c). */
+static int qp_capi_buffer_needs_release(PyObject *o);
 /* Mirror type of a JS value: Py_TYPE() of its mirror (borrowed). */
 static PyTypeObject *qp_capi_type_of(JSContext *ctx, JSValueConst v);
 /* Hook called by qp_type_modified (unit h, request R5 of capi-design.md):
@@ -563,6 +604,10 @@ static int qp_capi_init_errors(JSContext *ctx);     /* PyExc_* pointers, kind op
 static Py_ssize_t qp_capi_list_size(PyObject *op);
 static void qp_capi_list_set_size(PyObject *op, Py_ssize_t n);
 static PyObject **qp_capi_list_items(PyObject *op);
+/* tp_alloc of a C type whose solid base is tuple (IsoCalendarDate, ...):
+   a C-primary tuple mirror of `type` with n NULL items; its JS value, an
+   instance of the subtype, is built at the first crossing. */
+static PyObject *qp_capi_tuple_alloc_type(PyTypeObject *type, Py_ssize_t n);
 
 /* ========================================================================= */
 /* (E2) ARGUMENTS, RUNTIME SERVICES: python/capi_getargs.c,                   */
@@ -570,10 +615,30 @@ static PyObject **qp_capi_list_items(PyObject *op);
 /* ========================================================================= */
 
 static int qp_capi_init_runtime(JSContext *ctx);    /* thread/interpreter state, kind ops CODE */
+/* (M5 Tier B) python/capi_stable.c: the remaining stable-ABI exports; runs
+   after qp_capi_init_runtime (Py_UTF8Mode from the configuration). */
+static int qp_capi_init_stable(JSContext *ctx);
 
 /* Thread state (M3: single thread; M5 makes the GIL real).  The main
    PyThreadState is allocated by qp_capi_init_runtime and current except
    between PyEval_SaveThread() and PyEval_RestoreThread(). */
 struct QPCapiThreadState;   /* private: PyThreadState + _PyThreadStateImpl fields used by modules */
+
+/* ========================================================================= */
+/* TRACEMALLOC: python/capi_tracemalloc.c                                     */
+/* ========================================================================= */
+
+/* Set while tracemalloc traces: PyMem_Raw* (and PyMem_*, which share the
+   raw allocator) go through the qp_capi_tm_raw_* functions, which also
+   trace the block.  The runtime's js_malloc_rt() and co. (hence the
+   Python objects and PyObject_Malloc) are traced through
+   JSRuntime.py_tm_tracing.  Read with relaxed atomics (PyMem_Raw* may be
+   called without the GIL). */
+static int qp_capi_tm_tracing;
+static void *qp_capi_tm_raw_alloc(size_t nelem, size_t elsize, BOOL zero);
+static void *qp_capi_tm_raw_realloc(void *ptr, size_t new_size);
+static void qp_capi_tm_raw_free(void *ptr);
+/* tracemalloc.stop() when the C-API context goes away */
+static void qp_capi_tm_context_free(JSContext *ctx);
 
 #endif /* QP_CAPI_H */

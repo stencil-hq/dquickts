@@ -1,5 +1,11 @@
 unreleased:
 
+- Python: JS_FreeRuntime() finalizes the Python contexts (atexit, module
+  finalization) and frees everything an embedder created through
+  JS_InitPython/JS_EvalPython/JS_PythonImport; the C extension modules
+  bind again to a later runtime of the process (Py_Initialize/Py_Finalize
+  cycles); runtimes in other threads get ImportError for them meanwhile
+
 - added in-process suspension of running code (JS_RequestSuspend(),
   JS_IsSuspended(), JS_Resume())
 - added heap snapshots (JS_WriteSnapshot(), JS_ReadSnapshot()): a
@@ -28,6 +34,61 @@ unreleased:
   runtime saved to 'file' after each command (as a delta of a new
   session, rebuilt at startup) and restored from it at startup;
   qjs --typescript also applies to the REPL commands
+- qjs --drepl file --python: durable Python REPL (CPython REPL
+  conventions, top-level await, Ctrl-C raises KeyboardInterrupt); the
+  file holds the hash seed of the session and the delta; objects
+  holding host state make the save fail and keep the previous file
+- added Python 3.15 (CONFIG_PYTHON, python/): Python source is compiled
+  to QuickJS bytecode and runs in the same runtime, heap and GC as JS
+- added the qpy program with CPython's command line; qjs runs .py files
+  and qjs --python takes the qpy options
+- added JS_InitPython(), JS_EvalPython() (exec/eval/single modes,
+  JS_PY_EVAL_FLAG_ASYNC for top-level await) and JS_PythonImport()
+- JS <-> Python interop: values shared by identity, js.JsObject,
+  js.JsError, callKw()/toJs()/to_py(), awaitable promises, coroutines as
+  thenables, and ES imports of .py modules
+- added pylib/: a pure-Python stdlib subset pinned to CPython v3.15.2
+  (make pylib-sync)
+- added a CPython-compatible C API with CPython's accelerator modules
+  linked into qpy (CONFIG_PYTHON_CAPI, capi/, make capi-sync)
+- added the Python test harness tests/py/run.py (make testpy,
+  testpy-l3b, testpy-ast, testpy-replay, testpy-golden)
+- qpy: pylib adds tomllib, xml, zoneinfo, filecmp, pty, tty, wave,
+  optparse, timeit, dbm, profile/pstats and more; the C modules fcntl,
+  termios, pwd, grp, mmap, syslog, _elementtree, _zoneinfo and (macOS)
+  _scproxy are built from CPython's sources
+- qpy: __del__ of an object freed by reference counting runs at the
+  next call or loop iteration instead of at the next gc.collect(), so
+  unclosed files are flushed as in CPython
+- qpy: tracemalloc traces the runtime's allocations (Python objects,
+  PyObject_Malloc, PyMem_*, PyTraceMalloc_Track domains) with Python
+  tracebacks: start/stop, snapshots, get_object_traceback(), traced and
+  peak memory; -X tracemalloc[=N] and PYTHONTRACEMALLOC start it at
+  startup; no cost but one test per allocation while it is not tracing
+- qpy: io.BytesIO / io.StringIO pickle state (__getstate__ /
+  __setstate__) and instance __dict__ follow the C _io module
+- qpy: os gains the missing POSIX functions and constants (openpty,
+  forkpty, system, wait3/wait4/waitid, posix_spawn, setuid family, ...)
+  and the full stat_result (st_blocks, st_blksize, st_rdev, st_flags,
+  st_gen, st_birthtime)
+- qpy: sys.getdlopenflags() / sys.setdlopenflags() set the dlopen()
+  flags of extension modules (RTLD_NOW by default, as in CPython)
+- make capi-testmods builds CPython's _testlimitedcapi as a test-only
+  abi3 extension that the L3 runs import (test_bytes runs in full)
+- Python snapshots (qjs --drepl --python, JS_WriteSnapshot()) save
+  sessions that import asyncio, csv, threading, logging or subprocess:
+  _ThreadHandle and RLock objects of the main thread are bound to the
+  main thread of the reading process (threading.main_thread() included),
+  locks no thread holds and threads that ended are values, a running
+  thread other than the main one makes the save fail; dialects
+  registered with csv stay registered; queued weakref callbacks and
+  __del__ methods run at the end of each command
+- qpy: _imp.create_builtin() no longer runs the module's exec, which
+  _imp.exec_builtin() runs once the module is in sys.modules, so a C
+  module whose exec imports itself back (_asyncio through asyncio) is
+  executed once
+- tests/py/omp_prelude_check.py checks that omp's eval prelude imports
+  and runs under qpy
 - quickjs-libc: exported js_std_print() and js_std_console_log()
 - quickjs-libc: js_module_normalize() resolves './x.js' / './x' to an
   existing './x.ts' ('./x.mjs' to './x.mts'); std.evalScript()

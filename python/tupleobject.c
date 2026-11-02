@@ -630,7 +630,8 @@ static const QPTypeSpec qp_tuple_spec = {
            "If iterable is specified the tuple is initialized from iterable's items.\n\n"
            "If the argument is a tuple, the return value is the same object.",
     .flags = QP_TPFLAGS_BASETYPE | QP_TPFLAGS_TUPLE_SUBCLASS |
-             QP_TPFLAGS_MATCH_SELF | QP_TPFLAGS_SEQUENCE,
+             QP_TPFLAGS_MATCH_SELF | QP_TPFLAGS_SEQUENCE | QP_TPFLAGS_IMMUTABLETYPE |
+             QP_TPFLAGS_PRIV_VARSIZE,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_TUPLE,

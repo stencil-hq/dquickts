@@ -1,28 +1,34 @@
 /*
  * _thread module: port of CPython Modules/_threadmodule.c (PSF-2.0).
  *
- * SINGLE-THREADED UNTIL M5.  dquickts has no OS threads before milestone
- * M5, so this module behaves exactly like CPython in a process where the
- * calling (main) thread is the only thread and new threads cannot be
- * created:
- *   - start_new_thread / start_new / start_joinable_thread validate their
- *     arguments exactly like CPython, then fail the way CPython does when
- *     the OS refuses to create a thread: RuntimeError("can't start new
- *     thread").  Hence _count() is always 0 and _shutdown() has no handle to
- *     wait for.
- *   - Locks keep their state in QPInstance slots (JS ints).  Acquiring a lock
- *     that is held (by "another thread", i.e. nobody who can release it
- *     except a Python signal handler) is a real wait: the thread sleeps,
- *     running Python signal handlers between sleeps (qp_signal_check, the
- *     _PY_LOCK_HANDLE_SIGNALS behaviour), so with a timeout it sleeps the
- *     timeout and returns False, without one it waits until a signal handler
- *     releases the lock or raises (Ctrl-C -> KeyboardInterrupt), as CPython
- *     does when no other thread can release the lock.
- *   - _local keeps one per-instance __dict__ (the instance's managed dict):
- *     with a single thread CPython's per-thread dict is created by local_new
- *     and the "re-run __init__ in a new thread" rule never fires.
- *   - Thread idents: get_ident() is (unsigned long)pthread_self() of the
- *     calling thread, which is the main thread.
+ * Threads are OS threads sharing the runtime under the GIL (python/ceval.c,
+ * "Threads and the GIL").  The first start_new_thread() /
+ * start_joinable_thread() creates the runtime's QPThreads, the calling
+ * thread becoming the main thread.  A new thread (qp_thread_entry) takes
+ * the GIL, calls the function and, when it returns, releases its thread
+ * state (thread-local dicts, handled exception, contextvars Context),
+ * marks its _ThreadHandle done and drops the GIL for good, like CPython's
+ * thread_run().  Threads are created detached: joining waits for the
+ * handle to be done.
+ *
+ *   - The state of lock, RLock and _ThreadHandle objects is kept in their
+ *     QPInstance slots (JS ints) and only changed under the GIL.  A
+ *     blocking acquire or join waits in qp_thread_wait(), the GIL released;
+ *     releasing a lock or finishing a thread calls qp_thread_notify().  The
+ *     main thread runs the Python signal handlers while it waits
+ *     (_PY_LOCK_HANDLE_SIGNALS); with a single thread only a signal handler
+ *     can release a held lock.
+ *   - _local keeps one dict per thread in slot 0 (thread serial -> dict);
+ *     the running thread's dict is installed as the instance __dict__ before
+ *     every attribute access (qp_thread_local_switch), creating it and
+ *     re-running __init__ on the first access from a new thread.  A thread
+ *     exiting removes its dicts from the _local objects it used.
+ *   - get_ident() is (unsigned long)pthread_self() of the calling thread.
+ *   - _shutdown() joins the non-daemon handles; the launcher calls
+ *     threading._shutdown() before the atexit callbacks.
+ *   - os.fork() in a threaded process: qp_thread_after_fork_child() (called
+ *     by posix.fork in the child) keeps only the forking thread, which
+ *     becomes the main thread (CPython PyOS_AfterFork_Child).
  */
 #include "modstate.h"
 #include <pthread.h>
@@ -39,6 +45,14 @@
 /* python/mod_misc.c (_signal): PyErr_SetInterruptEx; 0, or -1 with
    ValueError "signal number out of range". */
 static int qp_signal_trip(JSContext *ctx, int signum);
+/* python/typeobject_attr.h: obj.__dict__ = value (subtype_setdict) */
+static int qp_subtype_dict_set(JSContext *ctx, JSValueConst self, JSValueConst value, int magic);
+/* python/mod_weakref.c */
+static JSValue qp_weakref_new(JSContext *ctx, JSValueConst obj, JSValueConst callback);
+static JSValue qp_weakref_get(JSContext *ctx, JSValueConst ref);
+/* python/errors.c */
+static void qp_exc_write_unraisable_msg(JSContext *ctx, JSValueConst exc,
+                                        const char *err_msg, JSValueConst obj);
 
 enum {
     QP_THREAD_T_LOCK = 0,
@@ -60,9 +74,8 @@ enum {
 #define QP_THREAD_NAME_MAXLEN 15
 #endif
 
-/* Thread stack size for new threads (PyThread_set_stacksize; process-wide
-   here, used by M5 thread creation). */
-static size_t qp_thread_stacksize;
+/* qp_thread_stacksize (python/ceval.h): stack size of new threads
+   (PyThread_set_stacksize; process-wide) */
 
 /* ThreadHandle states */
 enum { QP_TH_NOT_STARTED, QP_TH_STARTING, QP_TH_RUNNING, QP_TH_DONE };
@@ -114,13 +127,6 @@ static uint64_t qp_thread_slot_u64(JSContext *ctx, JSValueConst obj, int i)
         return (uint64_t)d;
     }
     return (uint64_t)r;
-}
-
-static double qp_thread_monotonic_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec;
 }
 
 /* Type name for reprs: tp_name of builtin types, __name__ of heap types
@@ -205,35 +211,6 @@ static int qp_thread_parse_timeout(JSContext *ctx, JSValueConst timeout_obj, int
         *timeout = -1;
     }
     return 0;
-}
-
-typedef BOOL QPThreadReadyFunc(JSContext *ctx, JSValueConst obj);
-
-/* Wait until ready(obj) (only a Python signal handler can make it so in a
-   single-threaded process).  timeout_ns: -1 = forever.  1 ready, 0 timed
-   out, -1 exception raised by a signal handler. */
-static int qp_thread_wait(JSContext *ctx, QPThreadReadyFunc *ready, JSValueConst obj,
-                          int64_t timeout_ns)
-{
-    double deadline = timeout_ns >= 0 ? qp_thread_monotonic_ns() + (double)timeout_ns : 0;
-    for (;;) {
-        double chunk = 50e6;    /* 50 ms between signal polls */
-        struct timespec ts;
-        if (ready(ctx, obj))
-            return 1;
-        if (timeout_ns >= 0) {
-            double rem = deadline - qp_thread_monotonic_ns();
-            if (rem <= 0)
-                return 0;
-            if (rem < chunk)
-                chunk = rem;
-        }
-        ts.tv_sec = (time_t)(chunk / 1e9);
-        ts.tv_nsec = (long)(chunk - (double)ts.tv_sec * 1e9);
-        nanosleep(&ts, NULL);   /* EINTR: a signal arrived, poll now */
-        if (qp_signal_check(ctx) < 0)
-            return -1;
-    }
 }
 
 /* __new__ of lock / RLock: clinic checks for the exact type only */
@@ -328,12 +305,19 @@ static int qp_thread_handle_join_impl(JSContext *ctx, JSValueConst self, int64_t
     if (qp_thread_handle_check_started(ctx, self) < 0)
         return -1;
     if (!qp_thread_handle_is_exiting(ctx, self)) {
+        QPThreads *thr = ctx->rt->py_threads;
         if (qp_thread_slot_u64(ctx, self, 0) == qp_thread_ident()) {
             qp_raise_runtime_error(ctx, "Cannot join current thread");
             return -1;
         }
+        if (thr && thr->finalizing) {
+            qp_raise(ctx, QP_EXC(ctx, PythonFinalizationError),
+                     "cannot join thread at interpreter shutdown");
+            return -1;
+        }
     }
-    r = qp_thread_wait(ctx, qp_thread_handle_is_exiting, self, timeout_ns < 0 ? -1 : timeout_ns);
+    r = qp_thread_wait(ctx, qp_thread_handle_is_exiting, self, timeout_ns < 0 ? -1 : timeout_ns,
+                       TRUE);
     return r < 0 ? -1 : 0;
 }
 
@@ -367,6 +351,7 @@ static JSValue qp_thread_handle_set_done(JSContext *ctx, JSValueConst self, JSVa
     if (qp_thread_handle_check_started(ctx, self) < 0)
         return JS_EXCEPTION;
     qp_thread_set_slot(ctx, self, 1, JS_NewInt32(ctx, QP_TH_DONE));
+    qp_thread_notify(ctx);
     return JS_UNDEFINED;
 }
 
@@ -427,7 +412,7 @@ static JSValue qp_thread_lock_new(JSContext *ctx, QPType *subtype, JSValueConst 
 /* _PyMutex_LockTimed with _PY_LOCK_HANDLE_SIGNALS */
 static JSValue qp_thread_lock_acquire_impl(JSContext *ctx, JSValueConst self, int64_t timeout)
 {
-    int r = qp_thread_wait(ctx, qp_thread_lock_is_free, self, timeout);
+    int r = qp_thread_wait(ctx, qp_thread_lock_is_free, self, timeout, TRUE);
     if (r < 0)
         return JS_EXCEPTION;
     if (r)
@@ -457,6 +442,7 @@ static JSValue qp_thread_lock_release(JSContext *ctx, JSValueConst self, JSValue
     if (qp_thread_slot_int(self, 0) == 0)
         return qp_raise_runtime_error(ctx, "release unlocked lock");
     qp_thread_set_slot(ctx, self, 0, JS_NewInt32(ctx, 0));
+    qp_thread_notify(ctx);
     return JS_UNDEFINED;
 }
 
@@ -601,7 +587,7 @@ static JSValue qp_thread_rlock_acquire_impl(JSContext *ctx, JSValueConst self, i
         qp_thread_set_slot(ctx, self, 1, JS_NewInt32(ctx, level + 1));
         return qp_bool_new(1);
     }
-    r = qp_thread_wait(ctx, qp_thread_rlock_is_free, self, timeout);
+    r = qp_thread_wait(ctx, qp_thread_rlock_is_free, self, timeout, TRUE);
     if (r < 0)
         return JS_EXCEPTION;
     if (r && qp_thread_rlock_take(ctx, self, qp_thread_ident(), 1) < 0)
@@ -634,6 +620,8 @@ static JSValue qp_thread_rlock_release(JSContext *ctx, JSValueConst self, JSValu
     if (level == 0)
         qp_thread_set_slot(ctx, self, 0, JS_NewInt32(ctx, 0));
     qp_thread_set_slot(ctx, self, 1, JS_NewInt32(ctx, level));
+    if (level == 0)
+        qp_thread_notify(ctx);
     return JS_UNDEFINED;
 }
 
@@ -689,7 +677,7 @@ static JSValue qp_thread_rlock_acquire_restore(JSContext *ctx, JSValueConst self
     if (count < 1 || count > INT32_MAX)
         return qp_raise_overflow_error(ctx, "Internal lock count overflowed");
     /* _PyRecursiveMutex_Lock: wait without timeout */
-    r = qp_thread_wait(ctx, qp_thread_rlock_is_free, self, -1);
+    r = qp_thread_wait(ctx, qp_thread_rlock_is_free, self, -1, FALSE);
     if (r < 0)
         return JS_EXCEPTION;
     if (qp_thread_rlock_take(ctx, self, (uint64_t)owner, (int32_t)count) < 0)
@@ -713,6 +701,7 @@ static JSValue qp_thread_rlock_release_save(JSContext *ctx, JSValueConst self, J
     items[0] = JS_NewInt32(ctx, count);
     qp_thread_set_slot(ctx, self, 0, JS_NewInt32(ctx, 0));
     qp_thread_set_slot(ctx, self, 1, JS_NewInt32(ctx, 0));
+    qp_thread_notify(ctx);
     return qp_tuple_new_steal(ctx, 2, items);
 }
 
@@ -817,17 +806,246 @@ static const QPTypeSpec qp_thread_rlock_spec = {
 };
 
 /* ======================= _local ========================================== */
-/* The single thread's locals dict is the instance's managed __dict__ (see
-   the header comment); `__dict__` cannot be assigned or deleted. */
+/* slots: dicts (dict: thread serial -> that thread's dict), args (tuple),
+   kw (dict or QP_NULL), owner (serial of the dict installed as __dict__,
+   QP_NULL: none).  The installed dict is the instance's managed __dict__,
+   so the generic attribute code (without inline caches: the type has its
+   own tp_getattro/tp_setattro) reads the running thread's dict once
+   qp_thread_local_switch() installed it. */
+enum { QP_LOCAL_DICTS, QP_LOCAL_ARGS, QP_LOCAL_KW, QP_LOCAL_OWNER, QP_LOCAL__NSLOTS };
+
+/* make d the instance __dict__ of self, owned by the thread `serial` */
+static int qp_thread_local_install(JSContext *ctx, JSValueConst self, JSValueConst d,
+                                   JSValue serial)
+{
+    if (qp_subtype_dict_set(ctx, self, d, 0) < 0) {
+        JS_FreeValue(ctx, serial);
+        return -1;
+    }
+    qp_thread_set_slot(ctx, self, QP_LOCAL_OWNER, serial);
+    return 0;
+}
+
+/* Remember that the running thread has a dict in self, so that it is
+   removed when the thread exits (the main thread outlives the objects). */
+static int qp_thread_local_register(JSContext *ctx, JSValueConst self)
+{
+    QPThreadState *ts = qp_thread_current(ctx);
+    JSValue wr;
+    int r;
+
+    if (!ts || ts == ts->thr->main_ts)
+        return 0;
+    if (QP_IS_NULL(ts->local_refs)) {
+        JSValue l = qp_list_new(ctx, 0);
+        if (JS_IsException(l))
+            return -1;
+        ts->local_refs = l;
+    }
+    wr = qp_weakref_new(ctx, self, QP_NULL);
+    if (JS_IsException(wr))
+        return -1;
+    r = qp_list_append(ctx, ts->local_refs, wr);
+    JS_FreeValue(ctx, wr);
+    return r;
+}
+
+/* _ldict(): install the running thread's dict, creating it and calling
+   __init__(*args, **kw) on the first access from this thread. */
+static int qp_thread_local_switch(JSContext *ctx, JSValueConst self)
+{
+    JSValue *slots = qp_instance_slots(self);
+    uint64_t serial = qp_thread_serial(ctx);
+    JSValue key, d, init, res, args, kw;
+    int r;
+
+    if (!QP_IS_NULL(slots[QP_LOCAL_OWNER]) &&
+        qp_thread_slot_u64(ctx, self, QP_LOCAL_OWNER) == serial)
+        return 0;
+    if (QP_IS_NULL(slots[QP_LOCAL_DICTS])) {
+        d = qp_dict_new(ctx);
+        if (JS_IsException(d))
+            return -1;
+        qp_thread_set_slot(ctx, self, QP_LOCAL_DICTS, d);
+        slots = qp_instance_slots(self);
+    }
+    if (QP_IS_NULL(slots[QP_LOCAL_ARGS])) {
+        JSValue t = qp_tuple_new(ctx, 0);
+        if (JS_IsException(t))
+            return -1;
+        qp_thread_set_slot(ctx, self, QP_LOCAL_ARGS, t);
+        slots = qp_instance_slots(self);
+    }
+    key = qp_long_from_uint64(ctx, serial);
+    if (JS_IsException(key))
+        return -1;
+    r = qp_dict_get_item(ctx, slots[QP_LOCAL_DICTS], key, &d);
+    if (r < 0) {
+        JS_FreeValue(ctx, key);
+        return -1;
+    }
+    if (r > 0) {
+        r = qp_thread_local_install(ctx, self, d, key);
+        JS_FreeValue(ctx, d);
+        return r;
+    }
+    /* first access from this thread (_local_create_dummy) */
+    d = qp_dict_new(ctx);
+    if (JS_IsException(d)) {
+        JS_FreeValue(ctx, key);
+        return -1;
+    }
+    if (qp_dict_set_item(ctx, slots[QP_LOCAL_DICTS], key, d) < 0 ||
+        qp_thread_local_register(ctx, self) < 0 ||
+        qp_thread_local_install(ctx, self, d, JS_DupValue(ctx, key)) < 0) {
+        JS_FreeValue(ctx, d);
+        JS_FreeValue(ctx, key);
+        return -1;
+    }
+    JS_FreeValue(ctx, d);
+    if (qp_type_of(ctx, self)->slots.tp_init != QP_TYPE(ctx, object)->slots.tp_init) {
+        init = qp_getattr(ctx, self, QP_ATOM(ctx, __init__));
+        if (JS_IsException(init)) {
+            res = JS_EXCEPTION;
+        } else {
+            slots = qp_instance_slots(self);
+            args = JS_DupValue(ctx, slots[QP_LOCAL_ARGS]);
+            kw = QP_IS_NULL(slots[QP_LOCAL_KW]) ? QP_NULL : JS_DupValue(ctx, slots[QP_LOCAL_KW]);
+            res = qp_call_tuple(ctx, init, args, kw);
+            JS_FreeValue(ctx, init);
+            JS_FreeValue(ctx, args);
+            if (!QP_IS_NULL(kw))
+                JS_FreeValue(ctx, kw);
+        }
+        if (JS_IsException(res)) {
+            /* forget the dict: the next access creates a new one */
+            JSValue exc = qp_exc_fetch(ctx);
+            slots = qp_instance_slots(self);
+            if (qp_dict_del_item(ctx, slots[QP_LOCAL_DICTS], key) < 0)
+                JS_FreeValue(ctx, qp_exc_fetch(ctx));
+            qp_thread_set_slot(ctx, self, QP_LOCAL_OWNER, QP_NULL);
+            JS_FreeValue(ctx, key);
+            qp_raise_object(ctx, exc);
+            return -1;
+        }
+        JS_FreeValue(ctx, res);
+    }
+    JS_FreeValue(ctx, key);
+    return 0;
+}
+
+/* The thread ts exits: drop its dicts from the _local objects it used. */
+static void qp_thread_local_release(JSContext *ctx, QPThreadState *ts)
+{
+    JSValue refs = ts->local_refs, key;
+    Py_ssize_t i, n;
+
+    ts->local_refs = QP_NULL;
+    if (QP_IS_NULL(refs))
+        return;
+    key = qp_long_from_uint64(ctx, ts->serial);
+    if (JS_IsException(key)) {
+        JS_FreeValue(ctx, qp_exc_fetch(ctx));
+        JS_FreeValue(ctx, refs);
+        return;
+    }
+    for (i = 0;; i++) {
+        JSValue *items = qp_list_items(refs, &n), obj, *slots;
+        if (!items || i >= n)
+            break;
+        obj = qp_weakref_get(ctx, items[i]);
+        if (JS_IsException(obj)) {
+            JS_FreeValue(ctx, qp_exc_fetch(ctx));
+            continue;
+        }
+        if (JS_IsUndefined(obj))
+            continue;
+        slots = qp_instance_slots(obj);
+        if (slots && !QP_IS_NULL(slots[QP_LOCAL_DICTS])) {
+            if (qp_dict_del_item(ctx, slots[QP_LOCAL_DICTS], key) < 0)
+                JS_FreeValue(ctx, qp_exc_fetch(ctx));
+            slots = qp_instance_slots(obj);
+            if (!QP_IS_NULL(slots[QP_LOCAL_OWNER]) &&
+                qp_thread_slot_u64(ctx, obj, QP_LOCAL_OWNER) == ts->serial) {
+                /* uninstall the dict of the exiting thread */
+                JSValue empty = qp_dict_new(ctx);
+                if (JS_IsException(empty) || qp_subtype_dict_set(ctx, obj, empty, 0) < 0)
+                    JS_FreeValue(ctx, qp_exc_fetch(ctx));
+                if (!JS_IsException(empty))
+                    JS_FreeValue(ctx, empty);
+                qp_thread_set_slot(ctx, obj, QP_LOCAL_OWNER, QP_NULL);
+            }
+        }
+        JS_FreeValue(ctx, obj);
+    }
+    JS_FreeValue(ctx, key);
+    JS_FreeValue(ctx, refs);
+}
 
 static JSValue qp_thread_local_new(JSContext *ctx, QPType *subtype, JSValueConst *args,
                                    size_t nargsf, JSValueConst kwnames)
 {
     int nargs = (int)(nargsf & ~QP_VECTORCALL_ARGUMENTS_OFFSET);
     int nkw = (QP_IS_NULL(kwnames) || JS_IsUndefined(kwnames)) ? 0 : (int)QP_TUPLE_SIZE(kwnames);
+    JSValue obj, v, d;
+    int i;
+
     if (subtype->slots.tp_init == QP_TYPE(ctx, object)->slots.tp_init && (nargs > 0 || nkw > 0))
         return qp_raise_type_error(ctx, "Initialization arguments are not supported");
-    return qp_object_new_instance(ctx, subtype, JS_CLASS_PY_OBJECT);
+    obj = qp_object_new_instance(ctx, subtype, JS_CLASS_PY_OBJECT);
+    if (JS_IsException(obj))
+        return obj;
+    v = qp_tuple_new(ctx, nargs);
+    if (JS_IsException(v))
+        goto fail;
+    for (i = 0; i < nargs; i++) {
+        JS_FreeValue(ctx, QP_TUPLE_ITEMS(v)[i]);
+        QP_TUPLE_ITEMS(v)[i] = JS_DupValue(ctx, args[i]);
+    }
+    qp_thread_set_slot(ctx, obj, QP_LOCAL_ARGS, v);
+    if (nkw > 0) {
+        v = qp_dict_new(ctx);
+        if (JS_IsException(v))
+            goto fail;
+        qp_thread_set_slot(ctx, obj, QP_LOCAL_KW, v);
+        for (i = 0; i < nkw; i++) {
+            if (qp_dict_set_item(ctx, v, QP_TUPLE_ITEMS(kwnames)[i], args[nargs + i]) < 0)
+                goto fail;
+        }
+    }
+    v = qp_dict_new(ctx);
+    if (JS_IsException(v))
+        goto fail;
+    qp_thread_set_slot(ctx, obj, QP_LOCAL_DICTS, v);
+    /* the dict of the creating thread; __init__ runs through the call */
+    d = qp_dict_new(ctx);
+    if (JS_IsException(d))
+        goto fail;
+    {
+        JSValue key = qp_long_from_uint64(ctx, qp_thread_serial(ctx));
+        if (JS_IsException(key) ||
+            qp_dict_set_item(ctx, v, key, d) < 0 ||
+            qp_thread_local_register(ctx, obj) < 0 ||
+            qp_thread_local_install(ctx, obj, d, JS_DupValue(ctx, key)) < 0) {
+            if (!JS_IsException(key))
+                JS_FreeValue(ctx, key);
+            JS_FreeValue(ctx, d);
+            goto fail;
+        }
+        JS_FreeValue(ctx, key);
+    }
+    JS_FreeValue(ctx, d);
+    return obj;
+ fail:
+    JS_FreeValue(ctx, obj);
+    return JS_EXCEPTION;
+}
+
+static JSValue qp_thread_local_getattro(JSContext *ctx, JSValueConst obj, JSAtom name)
+{
+    if (qp_thread_local_switch(ctx, obj) < 0)
+        return JS_EXCEPTION;
+    return qp_generic_getattr(ctx, obj, name);
 }
 
 static int qp_thread_local_setattro(JSContext *ctx, JSValueConst obj, JSAtom name, JSValueConst v)
@@ -842,11 +1060,15 @@ static int qp_thread_local_setattro(JSContext *ctx, JSValueConst obj, JSAtom nam
             JS_FreeCString(ctx, tn);
         return -1;
     }
+    if (qp_thread_local_switch(ctx, obj) < 0)
+        return -1;
     return qp_generic_setattr(ctx, obj, name, v);
 }
 
 static JSValue qp_thread_local_get_dict(JSContext *ctx, JSValueConst self, int magic)
 {
+    if (qp_thread_local_switch(ctx, self) < 0)
+        return JS_EXCEPTION;
     return qp_object_get_dict(ctx, self);
 }
 
@@ -863,9 +1085,9 @@ static const QPTypeSpec qp_thread_local_spec = {
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_OBJECT,
-    .nslots = 0,
+    .nslots = QP_LOCAL__NSLOTS,
     .slots = {
-        .tp_getattro = qp_generic_getattr,
+        .tp_getattro = qp_thread_local_getattro,
         .tp_setattro = qp_thread_local_setattro,
         .tp_new = qp_thread_local_new,
     },
@@ -905,17 +1127,335 @@ static JSValue qp_thread_daemon_threads_allowed(JSContext *ctx, JSValueConst sel
     return qp_bool_new(1);
 }
 
-/* ThreadHandle_start + do_start_new_thread: OS threads arrive in M5; until
-   then thread creation fails like PyThread_start_joinable_thread failing. */
-static JSValue qp_thread_start_failed(JSContext *ctx)
+/* ======================= threads ========================================= */
+
+/* add_to_shutdown_handles */
+static int qp_thread_add_shutdown_handle(JSContext *ctx, JSValueConst handle)
 {
-    return qp_raise_runtime_error(ctx, "can't start new thread");
+    QPModState *ms = qp_modstate(ctx);
+    if (!ms)
+        return -1;
+    if (QP_IS_NULL(ms->thread_shutdown_handles)) {
+        JSValue l = qp_list_new(ctx, 0);
+        if (JS_IsException(l))
+            return -1;
+        ms->thread_shutdown_handles = l;
+    }
+    return qp_list_append(ctx, ms->thread_shutdown_handles, handle);
+}
+
+/* remove_from_shutdown_handles (no exception) */
+static void qp_thread_remove_shutdown_handle(JSContext *ctx, JSValueConst handle)
+{
+    QPModState *ms = QP_STATE(ctx)->mod_state;
+    JSValue *items;
+    Py_ssize_t n, i;
+
+    if (!ms || QP_IS_NULL(ms->thread_shutdown_handles))
+        return;
+    items = qp_list_items(ms->thread_shutdown_handles, &n);
+    for (i = 0; items && i < n; i++) {
+        if (JS_VALUE_GET_PTR(items[i]) == JS_VALUE_GET_PTR(handle)) {
+            JSValue idx = qp_long_from_int64(ctx, i);
+            if (JS_IsException(idx) || qp_delitem(ctx, ms->thread_shutdown_handles, idx) < 0)
+                JS_FreeValue(ctx, qp_exc_fetch(ctx));
+            JS_FreeValue(ctx, idx);
+            return;
+        }
+    }
+}
+
+/* the handle of a thread that is done (or could not start): done, waiters
+   woken, not waited for at shutdown */
+static void qp_thread_handle_done(JSContext *ctx, JSValueConst handle)
+{
+    qp_thread_remove_shutdown_handle(ctx, handle);
+    qp_thread_set_slot(ctx, handle, 1, JS_NewInt32(ctx, QP_TH_DONE));
+    qp_thread_notify(ctx);
+}
+
+/* PyErr_FormatUnraisable("Exception ignored in thread started by %R", func) */
+static void qp_thread_unraisable(JSContext *ctx, JSValueConst exc, JSValueConst func)
+{
+    JSValue r = qp_repr(ctx, func);
+    const char *s = JS_IsException(r) ? NULL : qp_str_utf8(ctx, r, NULL);
+    char *msg = NULL;
+    if (s) {
+        size_t len = strlen(s) + 64;
+        msg = js_malloc(ctx, len);
+        if (msg)
+            snprintf(msg, len, "Exception ignored in thread started by %s", s);
+        JS_FreeCString(ctx, s);
+    }
+    if (!msg)
+        JS_FreeValue(ctx, qp_exc_fetch(ctx));
+    qp_exc_write_unraisable_msg(ctx, exc, msg ? msg : "Exception ignored in thread started by",
+                                QP_NULL);
+    js_free(ctx, msg);
+    if (!JS_IsException(r))
+        JS_FreeValue(ctx, r);
+}
+
+/* Release what the exiting thread ts (the running thread) holds:
+   PyThreadState_Clear. */
+static void qp_thread_tstate_clear(JSContext *ctx, QPThreadState *ts)
+{
+    JSRuntime *rt = ctx->rt;
+    QPState *s = QP_STATE(ctx);
+    QPModState *ms = s->mod_state;
+    JSValue v;
+
+    qp_thread_local_release(ctx, ts);
+#define QP_THREAD_CLEAR(field, none) \
+    v = field; field = none; if (!QP_IS_NULL(v)) JS_FreeValue(ctx, v);
+    QP_THREAD_CLEAR(ts->func, QP_NULL)
+    QP_THREAD_CLEAR(ts->args, QP_NULL)
+    QP_THREAD_CLEAR(ts->kwargs, QP_NULL)
+    QP_THREAD_CLEAR(s->repr_stack, JS_UNDEFINED)
+    QP_THREAD_CLEAR(s->asyncgen_firstiter, JS_UNDEFINED)
+    QP_THREAD_CLEAR(s->asyncgen_finalizer, JS_UNDEFINED)
+    QP_THREAD_CLEAR(s->exc_info_base.exc_value, JS_UNDEFINED)
+    QP_THREAD_CLEAR(s->trace_func, JS_UNDEFINED)
+    QP_THREAD_CLEAR(s->profile_func, JS_UNDEFINED)
+    if (s->trace_active) {
+        s->trace_active = 0;
+        qp_trace_dispatch(0);
+    }
+    s->tracing = 0;
+    if (ms) {
+        QP_THREAD_CLEAR(ms->ctx_current, QP_NULL)
+        QP_THREAD_CLEAR(ms->async_exc, QP_NULL)
+    }
+    if (JS_HasException(ctx))
+        JS_FreeValue(ctx, JS_GetException(ctx));
+#undef QP_THREAD_CLEAR
+    s->exc_info = &s->exc_info_base;
+    s->recursion_depth = 0;
+    s->reraise = 0;
+    rt->current_exception = JS_UNINITIALIZED;
+}
+
+/* thread_run(): body of a thread started by _thread */
+static void *qp_thread_entry(void *arg)
+{
+    QPThreadState *ts = arg;
+    QPThreads *thr = ts->thr;
+    JSContext *ctx = thr->ctx;
+    JSRuntime *rt = thr->rt;
+    JSValue res, handle;
+    int i;
+
+    qp_gil_take(thr, ts);
+    qp_gil_switch_in(thr, ts);
+    JS_UpdateStackTop(rt);
+    if (qp_tstate_capi_hook)
+        qp_tstate_capi_hook(ts, QP_TSTATE_START);
+    thr->count++;
+
+    res = qp_call_tuple(ctx, ts->func, ts->args, ts->kwargs);
+    if (JS_IsException(res)) {
+        JSValue exc = qp_exc_fetch(ctx);
+        /* SystemExit is ignored silently */
+        if (!qp_exc_given_matches(ctx, exc, QP_TYPE_VALUE(QP_EXC(ctx, SystemExit))))
+            qp_thread_unraisable(ctx, exc, ts->func);
+        JS_FreeValue(ctx, exc);
+    } else {
+        JS_FreeValue(ctx, res);
+    }
+    thr->count--;
+    qp_thread_tstate_clear(ctx, ts);
+    handle = ts->handle;
+    ts->handle = QP_NULL;
+    if (!QP_IS_NULL(handle)) {
+        qp_thread_handle_done(ctx, handle);
+        JS_FreeValue(ctx, handle);
+    }
+    /* recursive mutexes left locked by the thread stay locked (CPython);
+       their owner becomes the main thread (no dangling owner) */
+    for (i = 0; i < QP_RMUTEX__COUNT; i++) {
+        if (thr->rmutex_owner[i] == ts)
+            thr->rmutex_owner[i] = NULL;
+    }
+    if (qp_tstate_capi_hook)
+        qp_tstate_capi_hook(ts, QP_TSTATE_EXIT);
+    list_del(&ts->link);
+    thr->current = NULL;
+    qp_tstate_tls = NULL;
+    js_free_rt(rt, ts);
+    qp_gil_drop(thr, NULL);
+    return NULL;
+}
+
+/* ThreadHandle_start + do_start_new_thread: start func(*args, **kwargs)
+   (kwargs QP_NULL: none) in a new OS thread; handle QP_NULL or a
+   not-started _ThreadHandle. */
+static int qp_thread_start(JSContext *ctx, JSValueConst func, JSValueConst args,
+                           JSValueConst kwargs, JSValueConst handle, int daemon)
+{
+    QPThreads *thr;
+    QPThreadState *ts;
+    pthread_attr_t attr;
+    pthread_t tid;
+    size_t stack_size;
+    uintptr_t js_stack;
+    int rc;
+
+    thr = qp_threads_get(ctx);
+    if (!thr)
+        return -1;
+    if (thr->finalizing) {
+        qp_raise(ctx, QP_EXC(ctx, PythonFinalizationError),
+                 "can't create new thread at interpreter shutdown");
+        return -1;
+    }
+    /* the native stack of the thread, and the part the runtime may use
+       (the rest is the margin of the stack overflow checks) */
+    stack_size = qp_thread_stacksize ? qp_thread_stacksize : QP_THREAD_DEFAULT_STACK;
+    js_stack = stack_size > 2 * 1024 * 1024 ? stack_size - 512 * 1024 : stack_size * 3 / 4;
+    if (ctx->rt->stack_size == 0)
+        js_stack = 0;
+    ts = qp_tstate_new(thr, js_stack);
+    if (!ts) {
+        qp_raise_memory_error(ctx);
+        return -1;
+    }
+    if (!QP_IS_NULL(handle)) {
+        if (!daemon && qp_thread_add_shutdown_handle(ctx, handle) < 0) {
+            js_free_rt(ctx->rt, ts);
+            return -1;
+        }
+        qp_thread_set_slot(ctx, handle, 1, JS_NewInt32(ctx, QP_TH_STARTING));
+        ts->handle = JS_DupValue(ctx, handle);
+    }
+    ts->func = JS_DupValue(ctx, func);
+    ts->args = JS_DupValue(ctx, args);
+    ts->kwargs = QP_IS_NULL(kwargs) ? QP_NULL : JS_DupValue(ctx, kwargs);
+
+    rc = pthread_attr_init(&attr);
+    if (rc == 0) {
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        rc = pthread_attr_setstacksize(&attr, stack_size);
+        if (rc == 0)
+            rc = pthread_create(&tid, &attr, qp_thread_entry, ts);
+        pthread_attr_destroy(&attr);
+    }
+    if (rc != 0) {
+        JS_FreeValue(ctx, ts->func);
+        JS_FreeValue(ctx, ts->args);
+        if (!QP_IS_NULL(ts->kwargs))
+            JS_FreeValue(ctx, ts->kwargs);
+        if (!QP_IS_NULL(ts->handle)) {
+            /* force_done */
+            qp_thread_handle_done(ctx, ts->handle);
+            JS_FreeValue(ctx, ts->handle);
+        }
+        js_free_rt(ctx->rt, ts);
+        qp_raise_runtime_error(ctx, "can't start new thread");
+        return -1;
+    }
+    /* the thread waits for the GIL: publish its state first */
+    ts->ident = (uint64_t)(uintptr_t)tid;
+    list_add_tail(&ts->link, &thr->tstates);
+    if (!QP_IS_NULL(handle)) {
+        JSValue id = qp_long_from_uint64(ctx, ts->ident);
+        if (JS_IsException(id)) {
+            JS_FreeValue(ctx, qp_exc_fetch(ctx));
+            id = JS_NewInt32(ctx, 0);
+        }
+        qp_thread_set_slot(ctx, handle, 0, id);
+        qp_thread_set_slot(ctx, handle, 1, JS_NewInt32(ctx, QP_TH_RUNNING));
+    }
+    return 0;
+}
+
+/* PyOS_AfterFork_Child, thread part (_PyEval_ReInitThreads,
+   _PyInterpreterState_DeleteExceptMain, _PyThread_AfterFork): the forking
+   thread is the only thread of the child; it becomes the main thread and
+   holds a fresh GIL.  The other thread states are released and their
+   handles marked done; the objects referenced from their stack frames are
+   leaked (their native stacks do not exist in the child). */
+static void qp_thread_after_fork_child(JSContext *ctx)
+{
+    QPThreads *thr = ctx->rt->py_threads;
+    QPThreadState *cur, *ts;
+    struct list_head *el, *el1;
+    int i;
+
+    if (!thr || thr->ctx != ctx) {
+        if (qp_tstate_capi_hook)
+            qp_tstate_capi_hook(NULL, QP_TSTATE_FORK_CHILD);
+        return;
+    }
+    cur = thr->current;
+    /* the old mutexes may be held by threads which do not exist here */
+    qp_thread_sync_init(thr);
+    thr->locked = 1;
+    thr->last_holder = cur;
+    thr->switch_number = 0;
+    thr->drop_request = 0;
+    thr->wait_gen = 0;
+    thr->nwaiters = 0;
+    thr->count = 0;
+    for (i = 0; i < QP_RMUTEX__COUNT; i++) {
+        int *plevel = qp_rmutex_level_ptr(ctx, i);
+        if (!thr->rmutex_owner[i] && plevel && *plevel > 0)
+            thr->rmutex_owner[i] = thr->main_ts;    /* explicit owner */
+    }
+    thr->main_ts = cur;
+    cur->ident = qp_thread_self_ident();
+    list_for_each_safe(el, el1, &thr->tstates) {
+        ts = list_entry(el, QPThreadState, link);
+        if (ts == cur)
+            continue;
+        list_del(&ts->link);
+        for (i = 0; i < QP_RMUTEX__COUNT; i++) {
+            if (thr->rmutex_owner[i] == ts) {
+                /* held by a thread that does not exist: unlock */
+                int *plevel = qp_rmutex_level_ptr(ctx, i);
+                thr->rmutex_owner[i] = NULL;
+                if (plevel)
+                    *plevel = 0;
+            }
+        }
+        qp_thread_local_release(ctx, ts);
+#define QP_THREAD_FREE(v) if (!QP_IS_NULL(v)) JS_FreeValue(ctx, v)
+        QP_THREAD_FREE(ts->func);
+        QP_THREAD_FREE(ts->args);
+        QP_THREAD_FREE(ts->kwargs);
+        QP_THREAD_FREE(ts->repr_stack);
+        QP_THREAD_FREE(ts->asyncgen_firstiter);
+        QP_THREAD_FREE(ts->asyncgen_finalizer);
+        QP_THREAD_FREE(ts->exc_info_base.exc_value);
+        QP_THREAD_FREE(ts->context);
+        QP_THREAD_FREE(ts->trace_func);
+        QP_THREAD_FREE(ts->profile_func);
+        QP_THREAD_FREE(ts->async_exc);
+        if (ts->trace_active)
+            qp_trace_dispatch(0);
+        QP_THREAD_FREE(ts->js.current_exception);
+        QP_THREAD_FREE(ts->js.resume_value);
+#undef QP_THREAD_FREE
+        if (!QP_IS_NULL(ts->handle)) {
+            qp_thread_handle_done(ctx, ts->handle);
+            JS_FreeValue(ctx, ts->handle);
+        }
+        if (qp_tstate_capi_hook)
+            qp_tstate_capi_hook(ts, QP_TSTATE_EXIT);
+        if (ts->foreign)
+            qp_sys_free(ts);
+        else
+            js_free_rt(ctx->rt, ts);
+    }
+    if (qp_tstate_capi_hook)
+        qp_tstate_capi_hook(cur, QP_TSTATE_FORK_CHILD);
 }
 
 static JSValue qp_thread_start_new_thread(JSContext *ctx, JSValueConst self, JSValueConst *args,
                                           int nargs, JSValueConst kwnames, int magic)
 {
     const char *fname = "start_new_thread";
+    JSValue handle, ident;
+    QPType *ht = qp_thread_type(ctx, QP_THREAD_T_HANDLE);
     if (qp_arg_check_positional(ctx, fname, nargs, 2, 3) < 0)
         return JS_EXCEPTION;
     if (!qp_thread_callable(ctx, args[0]))
@@ -924,7 +1464,18 @@ static JSValue qp_thread_start_new_thread(JSContext *ctx, JSValueConst self, JSV
         return qp_raise_type_error(ctx, "2nd arg must be a tuple");
     if (nargs > 2 && !qp_dict_check(ctx, args[2]))
         return qp_raise_type_error(ctx, "optional 3rd arg must be a dictionary");
-    return qp_thread_start_failed(ctx);
+    if (!ht)
+        return JS_EXCEPTION;
+    handle = qp_thread_handle_alloc(ctx, ht);
+    if (JS_IsException(handle))
+        return handle;
+    if (qp_thread_start(ctx, args[0], args[1], nargs > 2 ? args[2] : QP_NULL, handle, 1) < 0) {
+        JS_FreeValue(ctx, handle);
+        return JS_EXCEPTION;
+    }
+    ident = qp_long_from_uint64(ctx, qp_thread_slot_u64(ctx, handle, 0));
+    JS_FreeValue(ctx, handle);
+    return ident;
 }
 
 static JSValue qp_thread_start_joinable_thread(JSContext *ctx, JSValueConst self,
@@ -934,7 +1485,8 @@ static JSValue qp_thread_start_joinable_thread(JSContext *ctx, JSValueConst self
     static const char *const kw[] = { "function", "handle", "daemon", NULL };
     QPArgSpec spec = { "start_joinable_thread", kw, 1, 3, 0 };
     JSValueConst a[3];
-    int daemon = 1;
+    JSValue handle, empty;
+    int daemon = 1, r;
     QPType *ht = qp_thread_type(ctx, QP_THREAD_T_HANDLE);
     if (!ht)
         return JS_EXCEPTION;
@@ -949,10 +1501,24 @@ static JSValue qp_thread_start_joinable_thread(JSContext *ctx, JSValueConst self
             return qp_raise_type_error(ctx, "'handle' must be a _ThreadHandle");
         if (qp_thread_slot_int(a[1], 1) != QP_TH_NOT_STARTED)
             return qp_raise_runtime_error(ctx, "thread already started");
+        handle = JS_DupValue(ctx, a[1]);
+    } else {
+        handle = qp_thread_handle_alloc(ctx, ht);
+        if (JS_IsException(handle))
+            return handle;
     }
-    /* A non-daemon handle would be added to ms->thread_shutdown_handles and
-       removed again because the start fails. */
-    return qp_thread_start_failed(ctx);
+    empty = qp_tuple_new(ctx, 0);
+    if (JS_IsException(empty)) {
+        JS_FreeValue(ctx, handle);
+        return empty;
+    }
+    r = qp_thread_start(ctx, a[0], empty, QP_NULL, handle, daemon);
+    JS_FreeValue(ctx, empty);
+    if (r < 0) {
+        JS_FreeValue(ctx, handle);
+        return JS_EXCEPTION;
+    }
+    return handle;
 }
 
 static JSValue qp_thread_exit(JSContext *ctx, JSValueConst self, JSValueConst *args,
@@ -1014,7 +1580,8 @@ static JSValue qp_thread_get_native_id(JSContext *ctx, JSValueConst self, JSValu
 static JSValue qp_thread_count(JSContext *ctx, JSValueConst self, JSValueConst *args,
                                int nargs, JSValueConst kwnames, int magic)
 {
-    return JS_NewInt32(ctx, 0);   /* no thread can have been started (M5) */
+    QPThreads *thr = ctx->rt->py_threads;
+    return JS_NewInt32(ctx, thr ? thr->count : 0);
 }
 
 static JSValue qp_thread_stack_size(JSContext *ctx, JSValueConst self, JSValueConst *args,
@@ -1169,7 +1736,7 @@ static JSValue qp_thread_is_main_interpreter(JSContext *ctx, JSValueConst self, 
 }
 
 /* thread_shutdown: join every registered non-daemon handle of another
-   thread.  Until M5 no thread can start, so the list stays empty. */
+   thread (a thread removes its handle when it exits). */
 static JSValue qp_thread_shutdown(JSContext *ctx, JSValueConst self, JSValueConst *args,
                                   int nargs, JSValueConst kwnames, int magic)
 {
@@ -1192,8 +1759,13 @@ static JSValue qp_thread_shutdown(JSContext *ctx, JSValueConst self, JSValueCons
         if (QP_IS_NULL(handle))
             break;
         if (qp_thread_handle_join_impl(ctx, handle, -1) < 0) {
+            /* interrupted (Ctrl-C): report and stop waiting */
+            JSValue exc = qp_exc_fetch(ctx);
+            qp_exc_write_unraisable_msg(ctx, exc, "Exception ignored while joining a thread "
+                                        "in _thread._shutdown()", QP_NULL);
+            JS_FreeValue(ctx, exc);
             JS_FreeValue(ctx, handle);
-            return JS_EXCEPTION;
+            return JS_UNDEFINED;
         }
         /* remove_from_shutdown_handles (done by the exiting thread in CPython) */
         items = qp_list_items(ms->thread_shutdown_handles, &n);
@@ -1245,8 +1817,7 @@ static JSValue qp_thread_get_main_thread_ident(JSContext *ctx, JSValueConst self
                                                JSValueConst *args, int nargs,
                                                JSValueConst kwnames, int magic)
 {
-    /* the only thread is the main thread until M5 */
-    return qp_long_from_uint64(ctx, qp_thread_ident());
+    return qp_long_from_uint64(ctx, qp_thread_main_ident(ctx));
 }
 
 #ifdef QP_THREAD_NAME_MAXLEN

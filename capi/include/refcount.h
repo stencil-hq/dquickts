@@ -107,7 +107,7 @@ PyAPI_FUNC(Py_ssize_t) Py_REFCNT(PyObject *ob);
     PyAPI_FUNC(Py_ssize_t) _PyQp_RefcntBound(PyObject *ob);
     static inline Py_ssize_t _Py_REFCNT(PyObject *ob) {
     #if !defined(Py_GIL_DISABLED)
-        if (ob->ob_flags & _Py_QP_BOUND_FLAG) {
+        if (_PyQp_HasFlag(ob, _Py_QP_BOUND_FLAG)) {
             return _PyQp_RefcntBound(ob);
         }
         return ob->ob_refcnt;

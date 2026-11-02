@@ -39,6 +39,14 @@ import * as os from "os";
        each command. It keeps the values: it returns their rendering
        and answers the completion queries with JSON copies. */
     var durable = options.durable;
+    /* qjs --drepl FILE --python: the commands are Python. The durable
+       runtime decides when the lines form a complete input
+       (durable.complete()), gives the prompts (sys.ps1, sys.ps2) and the
+       completions, and Python writes the results and the tracebacks
+       itself. */
+    var python = !!(durable && durable.python);
+    /* Python with stdin not a terminal: read lines without editing them */
+    var plain = false;
 
     /* close global objects */
     var Object = g.Object;
@@ -137,6 +145,8 @@ import * as os from "os";
                 /* set the TTY to raw mode */
                 os.ttySetRaw(term_fd);
             }
+        } else if (python) {
+            plain = true;
         }
 
         /* install a Ctrl-C signal handler */
@@ -155,6 +165,10 @@ import * as os from "os";
     function term_read_handler() {
         var l, i;
         l = os.read(term_fd, term_read_buf.buffer, 0, term_read_buf.length);
+        if (l <= 0 && python) {
+            python_eof();
+            return;
+        }
         for(i = 0; i < l; i++)
             handle_byte(term_read_buf[i]);
     }
@@ -279,13 +293,14 @@ import * as os from "os";
         /* cursor_pos is the position in 16 bit characters inside the
            UTF-16 string 'cmd' */
         if (cmd != last_cmd) {
-            if (!show_colors && last_cmd.substring(0, last_cursor_pos) == cmd.substring(0, last_cursor_pos)) {
+            if ((!show_colors || python) &&
+                last_cmd.substring(0, last_cursor_pos) == cmd.substring(0, last_cursor_pos)) {
                 /* optimize common case */
                 std.puts(cmd.substring(last_cursor_pos));
             } else {
                 /* goto the start of the line */
                 move_cursor(-ucs_length(last_cmd.substring(0, last_cursor_pos)));
-                if (show_colors) {
+                if (show_colors && !python) {
                     var str = mexpr ? mexpr + '\n' + cmd : cmd;
                     var start = str.length - cmd.length;
                     var colorstate = colorize_js(str);
@@ -550,6 +565,13 @@ import * as os from "os";
     }
 
     function control_c() {
+        if (python) {
+            /* like Python: the input is dropped */
+            std.puts("\nKeyboardInterrupt\n");
+            mexpr = "";
+            readline_start("", readline_cb);
+            return;
+        }
         if (last_fun === control_c) {
             std.puts("\n");
             std.exit(0);
@@ -687,9 +709,28 @@ import * as os from "os";
         return { tab: r, pos: s.length, expr: expr };
     }
 
+    /* the Python names completing the word before 'pos' (an attribute
+       after a dotted name, like rlcompleter) */
+    function get_py_completions(line, pos) {
+        var s, m, expr = "", names;
+        s = get_context_word(line, pos);
+        m = /([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\.$/.exec(line.substring(0, pos - s.length));
+        if (m)
+            expr = m[1];
+        else if (pos - s.length > 0 && line[pos - s.length - 1] === ".")
+            return { tab: [], pos: s.length };
+        names = durable.names(expr, s);
+        return { tab: names ? names.split("\n") : [], pos: s.length };
+    }
+
     function completion() {
         var tab, res, s, i, j, len, t, max_width, col, n_cols, row, n_rows;
-        res = get_completions(cmd, cursor_pos);
+        if (python && /^\s*$/.test(cmd.substring(0, cursor_pos))) {
+            /* indentation */
+            insert("    ");
+            return;
+        }
+        res = python ? get_py_completions(cmd, cursor_pos) : get_completions(cmd, cursor_pos);
         tab = res.tab;
         if (tab.length === 0)
             return;
@@ -708,7 +749,7 @@ import * as os from "os";
         for(i = res.pos; i < len; i++) {
             insert(s[i]);
         }
-        if (last_fun === completion && tab.length == 1) {
+        if (last_fun === completion && tab.length == 1 && !python) {
             /* append parentheses to function names */
             insert(query_suffix(res.expr, tab[0]));
         }
@@ -817,7 +858,9 @@ import * as os from "os";
 
         prompt = pstate;
 
-        if (mexpr) {
+        if (python) {
+            prompt = durable.prompt(!!mexpr);
+        } else if (mexpr) {
             prompt += dupstr(" ", plen - prompt.length);
             prompt += ps2;
         } else {
@@ -835,6 +878,19 @@ import * as os from "os";
 
     function handle_char(c1) {
         var c;
+        if (plain) {
+            /* one line, without echo */
+            if (c1 == 10) {
+                c = cmd;
+                cmd = "";
+                readline_cb(c);
+            } else if (c1 == 3) {
+                control_c(); /* from sigint_handler() */
+            } else if (c1 != 13) {
+                cmd += String.fromCodePoint(c1);
+            }
+            return;
+        }
         c = String.fromCodePoint(c1);
         switch(readline_state) {
         case 0:
@@ -980,7 +1036,10 @@ import * as os from "os";
     }
 
     function cmd_start() {
-        std.puts('QuickJS - Type "\\h" for help\n');
+        if (python)
+            std.puts(durable.banner);
+        else
+            std.puts('QuickJS - Type "\\h" for help\n');
         if (durable) {
             std.puts((durable.restored ? "Restored" : "Created") +
                      " the durable session " + durable.path + "\n");
@@ -999,10 +1058,51 @@ import * as os from "os";
         }
     }
 
+    /* a Python line: run the input when it is complete (return true) */
+    function handle_py_cmd(line) {
+        var src;
+        if (line === null)
+            return false;
+        if (!mexpr && /^[ \t\f\r]*(#.*)?$/.test(line))
+            return false; /* blank line or comment */
+        src = mexpr ? mexpr + "\n" + line : line;
+        if (!durable.complete(src)) {
+            mexpr = src;
+            return false;
+        }
+        mexpr = "";
+        eval_and_print_start(src);
+        return true;
+    }
+
+    /* end of the input of a Python session: run the pending input, as
+       Python does, then quit */
+    function python_eof() {
+        var src = mexpr;
+        if (cmd)
+            src = src ? src + "\n" + cmd : cmd;
+        mexpr = cmd = "";
+        std.puts("\n");
+        if (src && !/^[ \t\f\r]*(#.*)?$/.test(src))
+            python_eval(src);
+        os.signal(os.SIGINT, null);
+        os.setReadHandler(term_fd, null);
+    }
+
+    /* run the complete Python input 'src' (Python prints the results);
+       SystemExit ends qjs */
+    function python_eval(src) {
+        var result = durable.eval(src);
+        if (result.exit !== undefined)
+            std.exit(result.exit);
+    }
+
     /* return true if async termination */
     function handle_cmd(expr) {
         var colorstate, cmd;
 
+        if (python)
+            return handle_py_cmd(expr);
         if (expr === null) {
             expr = "";
             return false;
@@ -1052,6 +1152,11 @@ import * as os from "os";
         var result;
 
         eval_start_time = os.now();
+        if (python) {
+            python_eval(expr);
+            handle_cmd_end();
+            return;
+        }
         if (durable) {
             /* synchronous: the durable runtime also runs the jobs of
                the command */

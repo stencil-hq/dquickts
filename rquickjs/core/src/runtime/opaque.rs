@@ -138,6 +138,12 @@ pub(crate) struct Opaque<'js> {
 
     userdata: UserDataMap,
 
+    /// The strings of the [`PythonConfig`](crate::context::PythonConfig)s given to
+    /// `JS_InitPython`, which keeps pointers to them (sys.argv, the stdlib home...) for the
+    /// lifetime of the context: kept until the runtime is freed.
+    #[cfg(feature = "python")]
+    python_strings: UnsafeCell<Vec<crate::context::PythonStrings>>,
+
     #[cfg(feature = "futures")]
     spawner: Option<UnsafeCell<Spawner>>,
 
@@ -172,6 +178,9 @@ impl<'js> Opaque<'js> {
             static_atoms: UnsafeCell::new(StaticAtomMap::default()),
 
             userdata: UserDataMap::default(),
+
+            #[cfg(feature = "python")]
+            python_strings: UnsafeCell::new(Vec::new()),
 
             _marker: PhantomData,
 
@@ -284,6 +293,13 @@ impl<'js> Opaque<'js> {
         U::Changed<'static>: Any,
     {
         self.userdata.remove()
+    }
+
+    /// Keeps `strings` alive until the runtime is freed (see `python_strings`).
+    #[cfg(feature = "python")]
+    pub fn keep_python_strings(&self, strings: crate::context::PythonStrings) {
+        // only called with the runtime lock held, never reentrantly
+        unsafe { (*self.python_strings.get()).push(strings) }
     }
 
     pub fn get_userdata<U>(&self) -> Option<UserDataGuard<U>>

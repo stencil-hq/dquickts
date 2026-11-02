@@ -354,7 +354,7 @@ static JSValue qp_unpack_args(JSContext *ctx, JSValueConst item)
     QPGAVec newargs = { 0 };
     BOOL is_tuple = qp_tuple_check(ctx, item);
     Py_ssize_t nitems = is_tuple ? QP_TUPLE_SIZE(item) : 1;
-    const JSValue *argitems = is_tuple ? QP_TUPLE_ITEMS(item) : &item;
+    const JSValueConst *argitems = is_tuple ? (const JSValueConst *)QP_TUPLE_ITEMS(item) : &item;
 
     for (Py_ssize_t i = 0; i < nitems; i++) {
         JSValueConst it = argitems[i];
@@ -714,7 +714,7 @@ static JSValue qp_ga_richcompare(JSContext *ctx, JSValueConst a, JSValueConst b,
 static JSValue qp_ga_mro_entries(JSContext *ctx, JSValueConst self, JSValueConst *args,
                                  int nargs, JSValueConst kwnames, int magic)
 {
-    return qp_tuple_pack(ctx, 1, &qp_instance_slots(self)[QP_GA_ORIGIN]);
+    return qp_tuple_pack(ctx, 1, (JSValueConst *)&qp_instance_slots(self)[QP_GA_ORIGIN]);
 }
 
 static JSValue qp_ga_instancecheck(JSContext *ctx, JSValueConst self, JSValueConst *args,
@@ -727,28 +727,6 @@ static JSValue qp_ga_subclasscheck(JSContext *ctx, JSValueConst self, JSValueCon
                                    int nargs, JSValueConst kwnames, int magic)
 {
     return qp_raise_type_error(ctx, "issubclass() argument 2 cannot be a parameterized generic");
-}
-
-/* _PyEval_GetBuiltin: builtins of the calling frame (AttributeError(name)
-   if missing). */
-static JSValue qp_ga_get_builtin(JSContext *ctx, JSAtom name)
-{
-    JSValue builtins = qp_frame_builtins(qp_py_frame_at(ctx, 0));
-    JSValue v;
-    if (QP_IS_NULL(builtins))
-        builtins = QP_STATE(ctx)->builtins_dict;
-    int r = qp_dict_get_item_atom(ctx, builtins, name, &v);
-    if (r < 0)
-        return JS_EXCEPTION;
-    if (r == 0) {
-        JSValue s = qp_str_from_atom(ctx, name);
-        if (JS_IsException(s))
-            return JS_EXCEPTION;
-        qp_raise_value(ctx, QP_EXC(ctx, AttributeError), s);
-        JS_FreeValue(ctx, s);
-        return JS_EXCEPTION;
-    }
-    return v;
 }
 
 static JSValue qp_ga_reduce(JSContext *ctx, JSValueConst self, JSValueConst *args,
@@ -764,7 +742,7 @@ static JSValue qp_ga_reduce(JSContext *ctx, JSValueConst self, JSValueConst *arg
         JS_FreeValue(ctx, tmp);
         if (JS_IsException(it))
             return JS_EXCEPTION;
-        JSValue fn = qp_ga_get_builtin(ctx, QP_ATOM(ctx, next));
+        JSValue fn = qp_eval_get_builtin(ctx, QP_ATOM(ctx, next));
         if (JS_IsException(fn)) {
             JS_FreeValue(ctx, it);
             return JS_EXCEPTION;
@@ -777,7 +755,7 @@ static JSValue qp_ga_reduce(JSContext *ctx, JSValueConst self, JSValueConst *arg
         JSValue items[2] = { fn, inner };
         return qp_tuple_new_steal(ctx, 2, items);
     }
-    JSValue inner = qp_tuple_pack(ctx, 2, &s[QP_GA_ORIGIN]);
+    JSValue inner = qp_tuple_pack(ctx, 2, (JSValueConst *)&s[QP_GA_ORIGIN]);
     if (JS_IsException(inner))
         return JS_EXCEPTION;
     JSValue items[2] = { JS_DupValue(ctx, QP_TYPE_VALUE(qp_type_of(ctx, self))), inner };
@@ -848,7 +826,7 @@ static const QPTypeSpec qp_ga_spec = {
            "\n"
            "For example, for t = list[int], t.__origin__ is list and t.__args__\n"
            "is (int,).",
-    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_BASETYPE,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_BASETYPE | QP_TPFLAGS_WEAKREF,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_OBJECT,
@@ -897,13 +875,13 @@ static JSValue qp_ga_iter_reduce(JSContext *ctx, JSValueConst self, JSValueConst
                                  int nargs, JSValueConst kwnames, int magic)
 {
     /* the builtin lookup may run arbitrary code: read the slot after it */
-    JSValue fn = qp_ga_get_builtin(ctx, QP_ATOM(ctx, iter));
+    JSValue fn = qp_eval_get_builtin(ctx, QP_ATOM(ctx, iter));
     if (JS_IsException(fn))
         return JS_EXCEPTION;
     JSValue obj = qp_instance_slots(self)[QP_GAITER_OBJ];
     JSValue inner;
     if (!QP_IS_NULL(obj)) {
-        inner = qp_tuple_pack(ctx, 1, &obj);
+        inner = qp_tuple_pack(ctx, 1, (JSValueConst *)&obj);
     } else {
         JSValue empty = JS_DupValue(ctx, QP_STATE(ctx)->empty_tuple);
         inner = qp_tuple_new_steal(ctx, 1, &empty);
@@ -923,7 +901,7 @@ static const QPMethodDef qp_ga_iter_methods[] = {
 
 static const QPTypeSpec qp_ga_iter_spec = {
     .name = "generic_alias_iterator",
-    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_DISALLOW_INSTANTIATION,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_DISALLOW_INSTANTIATION | QP_TPFLAGS_IMMUTABLETYPE,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_OBJECT,
@@ -1362,7 +1340,7 @@ static const QPTypeSpec qp_union_spec = {
     .doc = "Represent a union type\n"
            "\n"
            "E.g. for int | str",
-    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_DISALLOW_INSTANTIATION,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_DISALLOW_INSTANTIATION | QP_TPFLAGS_WEAKREF,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_OBJECT,

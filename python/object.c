@@ -189,14 +189,14 @@ static JSValue qp_call_method(JSContext *ctx, JSValueConst obj, JSAtom name,
         res = qp_vectorcall(ctx, meth, args, nargsf, kwnames);
     } else if (nargsf & QP_VECTORCALL_ARGUMENTS_OFFSET) {
         /* args[-1] is scratch: prepend self in place */
-        JSValue *a = (JSValue *)args - 1;
-        JSValue saved = a[0];
+        JSValueConst *a = args - 1;
+        JSValueConst saved = a[0];
         a[0] = self;
         res = qp_vectorcall(ctx, meth, a, (size_t)(nargs + 1), kwnames);
         a[0] = saved;
     } else {
-        JSValue stack_buf[9];
-        JSValue *a = stack_buf;
+        JSValueConst stack_buf[9];
+        JSValueConst *a = stack_buf;
         if (total + 2 > (Py_ssize_t)countof(stack_buf)) {
             a = js_malloc(ctx, sizeof(JSValue) * (total + 2));
             if (!a) {

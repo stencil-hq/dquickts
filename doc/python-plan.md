@@ -1,5 +1,17 @@
 # Python on dquickts: plan
 
+## Status (2026-11-02)
+
+| Milestone | Status |
+|---|---|
+| M0 | Done |
+| M1 parser | Done: L2 identical on 100% of `Lib/**/*.py` |
+| M2 core | Done: L0 163/167 core scripts pass |
+| M3 stdlib + C API | In progress: `pylib/` subset in place; C API and `capi/modules` being integrated |
+| M4 snapshots, JS interop, rquickjs | Done, pending verification; durable Python REPL in progress |
+| M5 threads | In progress (`_thread.start_new_thread` still raises) |
+| M6 tracing / omp integration | In progress |
+
 Goal: run CPython 3.15 code on the QuickJS VM by compiling Python to QuickJS bytecode. Python
 and JS/TS share one runtime: heap, GC, job queue, module graph and snapshot format. C extensions
 load through a CPython-compatible C API.
@@ -233,7 +245,10 @@ implicitly, except numbers at call boundaries.
 - **Snapshots.** Every new class gets snapshot write/read cases. Files, sockets and processes
   are host state: `JS_WriteSnapshot()` fails with its existing TypeError.
   C-extension objects persist through the existing `save_opaque`/`load_opaque` hooks using
-  `__reduce_ex__`, and their modules are re-imported on load.
+  `__reduce_ex__`, and their modules are re-imported on load; module state dicts shown in the
+  namespace (`_csv._dialects`) get their saved entries back. Threads other than the main thread
+  are host state; what names the main thread (`_ThreadHandle`, a held `RLock`,
+  `threading._main_thread`/`_active`) is bound to the reading process's main thread.
 
 ## 5. Decision D4: new primitives
 
@@ -288,6 +303,12 @@ Decision: a cpyext-style mirror model, with two compatibility tiers.
   crossing and cached per object. It lives while C holds references or the JS object is alive,
   so borrowed references stay valid as long as their owner. Singletons, small ints and builtin
   types have static mirrors.
+- **Reference counts seen by C** follow CPython 3.14+. `Py_REFCNT` of an object bound to a JS
+  value adds the JS references to `ob_refcnt`. During a C method call it leaves out the
+  references CPython borrows: the bridge's own references to self and the arguments
+  (vectorcall), and the caller's operand-stack copy of a value that a local of the calling frame
+  holds (`LOAD_FAST_BORROW`). So `a.resize(n)` on a function local is uniquely referenced, as
+  numpy's refcheck expects.
 - **Extension-type instances** are C allocations: a CPython header plus `tp_basicsize` payload,
   with a `PY_NATIVE` JS companion. `tp_traverse` feeds the QJS cycle collector.
 - **Tier S (source): our `Python.h`** covers the full non-limited API. Macros that read
@@ -300,12 +321,62 @@ Decision: a cpyext-style mirror model, with two compatibility tiers.
     _socket, _posixsubprocess, _sha2/_md5/_blake2, _csv, _sqlite3, pyexpat, _ssl`.
   - The private API they use (Argument Clinic `_PyArg_*`, `pycore_*` headers) gets shims in
     `capi/compat`.
+  - Build: `tools/capi_sync.py` vendors `Include/` into `capi/include`, the layout-independent
+    `pycore_*` headers into `capi/compat` and the modules listed in `capi/Setup.qp` (with their
+    clinic files, `_hacl/`, `expat/`) into `capi/modules`, each area patched by its `PATCHES`
+    (`--check` verifies, `--record` captures local edits). With `CONFIG_PYTHON_CAPI=y` (64-bit
+    POSIX) the modules are compiled as separate translation units (`make capi-modules`). The
+    self-contained ones are part of the engine library (linked with `quickjs.o`, archived in
+    `libquickjs.a`) and registered by the runtime itself (`qp_state_init`), so every embedder
+    has them; the ones that link a system library (zlib, bz2, lzma, zstd, sqlite3, OpenSSL,
+    libffi, readline/libedit, libuuid; `*external*` in `Setup.qp`) are archived in
+    `libqpcapi.a`, which `qpy` and `qjs` link and register with
+    `PyImport_ExtendInittab(_PyQp_ExtInittab)`; rquickjs builds them under `python-*` cargo
+    features. The system libraries are optional pkg-config dependencies
+    (`CONFIG_PYTHON_CAPI_NO_*`). `_decimal` uses the bundled libmpdec. Not built:
+    `_interpreters`/`_interpchannels`/`_interpqueues` (one interpreter, no PEP 684
+    subinterpreters) and the test-only modules.
 - **Tier B (binary).** Load unmodified `*.abi3.so` and `*.abi3t.so`: export every stable ABI
   symbol (`Misc/stable_abi.toml`), `dlopen`, then `PyInit_*` or the PEP 793 export hook. Good
   first targets are PyO3 abi3 wheels (e.g. `cryptography`).
 - **Not planned:** version-specific `cp315` binaries, which would need CPython's struct layouts
   for the builtin types plus its internal symbols. numpy and Pillow get built from source
   against Tier S; PyPy and GraalPy both do this.
+- **Tier S source builds (M7).** They carry our own ABI tag. `SOABI` is `quickpy-315-<multiarch>`
+  and `EXT_SUFFIX` is `.quickpy-315-darwin.so`. That suffix is the first entry of
+  `importlib.machinery.EXTENSION_SUFFIXES`, ahead of the abi3 ones.
+  - Loading: `python/capi_dynload.c` loads these files without the `Py_mod_abi` stable check.
+  - Build settings from `sysconfig`: `INCLUDEPY` is `<prefix>/capi/include` and `LIBPYTHON` is
+    `''`. Extensions link with `-undefined dynamic_lookup` (`LDSHARED`/`LDCXXSHARED`) against the
+    symbols qpy exports, and there is no libpython.
+  - Wheel tag: meson-python and setuptools tag these wheels
+    `quickpy315-quickpy_315_<multiarch>-<platform>`. pip's bundled `packaging.tags`, patched by
+    `tools/pylib_sync.py`, offers that tag first.
+  - Cython: `pyconfig.h` defines `CYTHON_LIMITED_API`. Cython's CPython mode writes
+    `PyListObject.ob_item`, `tstate->current_exception` and frame structs directly, and none of
+    those exist here.
+  - numpy recipe: `tools/build_numpy.sh`. pip and meson-python run under qpy, so meson's python
+    introspection queries qpy. Meson itself (`MESON=` wrapper), Cython and ninja run on the
+    host python3.15, because they only configure and generate code.
+  - numpy 2.5.4 test subset under qpy (`NUMPY_TESTS=1`; pytest 9.2.0, hypothesis 6.170.14),
+    against CPython 3.15 with the PyPI wheel on the same machine:
+
+    | file | qpy | CPython 3.15 |
+    |---|---|---|
+    | `_core/tests/test_multiarray.py` | 14273 passed, 6 skipped, 1 failed (99.99%) | 14276 passed, 4 skipped |
+    | `_core/tests/test_umath.py` | 4683 passed, 75 skipped, 13 xfailed (100%) | 4683 passed, 75 skipped, 13 xfailed |
+    | `_core/tests/test_numeric.py` | 1706 passed, 1 skipped, 1 xfailed (100%) | 1706 passed, 1 skipped, 1 xfailed |
+    | `linalg/tests/test_linalg.py` | 502 passed, 2 skipped, 1 xfailed (100%) | 503 passed, 2 skipped |
+    | `random/tests/test_random.py` | 142 passed (100%) | 142 passed |
+    The linalg xfail (`test_blas64_geqrf_lwork_smoketest`) is build configuration: the source
+    build uses the system BLAS/LAPACK, the PyPI wheel 64-bit OpenBLAS. In test_multiarray, the
+    failure is `TestCreation::test_tracemalloc`: `tracemalloc.start()` raises because the
+    runtime does not trace its allocations (`capi/compat/qp_internals.c`). The two extra skips
+    need CPython's test-only `_testbuffer` and `_interpreters` modules, which qpy does not build.
+    The four skips that CPython also has are BLAS FPE support, pickle protocol 5, and two
+    huge-memory dot tests.
+  - Pillow 13.0.0 subset (`tools/build_pillow.sh -t`): 719 passed, 4 skipped, 1 xfailed. All
+    skips are upstream conditions.
 - **Our own modules** (not taken from CPython): `builtins, sys, posix` (over quickjs-libc and
   libc), `time, _thread, _weakref` (QJS WeakRef), `gc, _imp, marshal` (data only), `_ast,
   _tokenize, _opcode`/`dis`, `_contextvars, atexit, _signal, errno, _stat`. `_io` starts as

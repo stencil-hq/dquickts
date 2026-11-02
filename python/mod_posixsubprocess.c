@@ -556,7 +556,7 @@ static JSValue qp_psp_fork_exec(JSContext *ctx, JSValueConst self, JSValueConst 
     pid_t pid = -1;
     BOOL has_preexec;
 
-    if (qp_arg_check_positional(ctx, "fork_exec", nargs, 23, 23) < 0)
+    if (qp_arg_check_positional(ctx, "fork_exec", nargs, 22, 22) < 0)
         return JS_EXCEPTION;
     process_args = args[0];
     executable_list = args[1];

@@ -896,8 +896,8 @@ static JSValue qp_time_pthread_getcpuclockid(JSContext *ctx, JSValueConst self, 
 /* sleep                                                                     */
 /* ------------------------------------------------------------------------- */
 
-/* pysleep: the interpreter is single-threaded (no GIL to release before
-   M5); EINTR runs the Python signal handlers (PyErr_CheckSignals) and
+/* pysleep: the sleep releases the GIL (sleep(0) too, to let other threads
+   run); EINTR runs the Python signal handlers (PyErr_CheckSignals) and
    resumes with the remaining time. */
 static int qp_time_pysleep(JSContext *ctx, int64_t timeout)
 {
@@ -922,12 +922,16 @@ static int qp_time_pysleep(JSContext *ctx, int64_t timeout)
     do {
         int ret;
 #ifdef QP_TIME_HAVE_CLOCK_NANOSLEEP
+        QP_BEGIN_ALLOW_THREADS(ctx)
         ret = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &timeout_abs, NULL);
+        QP_END_ALLOW_THREADS(ctx)
         err = ret;
 #else
         qp_time_as_timespec(timeout, &timeout_ts);
+        QP_BEGIN_ALLOW_THREADS(ctx)
         ret = nanosleep(&timeout_ts, NULL);
         err = errno;
+        QP_END_ALLOW_THREADS(ctx)
 #endif
         if (ret == 0)
             break;
@@ -1685,11 +1689,11 @@ static const QPMethodDef qp_time_methods[] = {
     { "time_ns", qp_time_time, QP_METH_NOARGS, 1, qp_time_doc_time_ns },
     { "clock_gettime", qp_time_clock_gettime, QP_METH_O, 0, qp_time_doc_clock_gettime },
     { "clock_gettime_ns", qp_time_clock_gettime, QP_METH_O, 1, qp_time_doc_clock_gettime_ns },
-    { "clock_settime", qp_time_clock_settime, QP_METH_FASTCALL, 0, qp_time_doc_clock_settime },
-    { "clock_settime_ns", qp_time_clock_settime, QP_METH_FASTCALL, 1, qp_time_doc_clock_settime_ns },
-    { "clock_getres", qp_time_clock_getres, QP_METH_FASTCALL, 0, qp_time_doc_clock_getres },
+    { "clock_settime", qp_time_clock_settime, QP_METH_FASTCALL | QP_METH_VARARGS, 0, qp_time_doc_clock_settime },
+    { "clock_settime_ns", qp_time_clock_settime, QP_METH_FASTCALL | QP_METH_VARARGS, 1, qp_time_doc_clock_settime_ns },
+    { "clock_getres", qp_time_clock_getres, QP_METH_FASTCALL | QP_METH_VARARGS, 0, qp_time_doc_clock_getres },
 #ifdef QP_TIME_HAVE_PTHREAD_GETCPUCLOCKID
-    { "pthread_getcpuclockid", qp_time_pthread_getcpuclockid, QP_METH_FASTCALL, 0,
+    { "pthread_getcpuclockid", qp_time_pthread_getcpuclockid, QP_METH_FASTCALL | QP_METH_VARARGS, 0,
       qp_time_doc_pthread_getcpuclockid },
 #endif
     { "sleep", qp_time_sleep, QP_METH_O, 0, qp_time_doc_sleep },
@@ -1698,7 +1702,7 @@ static const QPMethodDef qp_time_methods[] = {
     { "asctime", qp_time_asctime, QP_METH_FASTCALL, 0, qp_time_doc_asctime },
     { "ctime", qp_time_ctime, QP_METH_FASTCALL, 0, qp_time_doc_ctime },
     { "mktime", qp_time_mktime, QP_METH_O, 0, qp_time_doc_mktime },
-    { "strftime", qp_time_strftime, QP_METH_FASTCALL, 0, qp_time_doc_strftime },
+    { "strftime", qp_time_strftime, QP_METH_FASTCALL | QP_METH_VARARGS, 0, qp_time_doc_strftime },
     { "strptime", qp_time_strptime, QP_METH_FASTCALL, 0, qp_time_doc_strptime },
     { "tzset", qp_time_tzset, QP_METH_NOARGS, 0, qp_time_doc_tzset },
     { "monotonic", qp_time_monotonic, QP_METH_NOARGS, 0, qp_time_doc_monotonic },
@@ -1712,7 +1716,7 @@ static const QPMethodDef qp_time_methods[] = {
     /* perf_counter shares the monotonic clock on POSIX (PyTime_PerfCounter) */
     { "perf_counter", qp_time_monotonic, QP_METH_NOARGS, 0, qp_time_doc_perf_counter },
     { "perf_counter_ns", qp_time_monotonic, QP_METH_NOARGS, 1, qp_time_doc_perf_counter_ns },
-    { "get_clock_info", qp_time_get_clock_info, QP_METH_FASTCALL, 0, qp_time_doc_get_clock_info },
+    { "get_clock_info", qp_time_get_clock_info, QP_METH_FASTCALL | QP_METH_VARARGS, 0, qp_time_doc_get_clock_info },
     { NULL }
 };
 

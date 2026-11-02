@@ -72,15 +72,6 @@ qp_rc_diff(double a, QPComplex b)
 }
 
 static QPComplex
-qp_c_neg(QPComplex a)
-{
-    QPComplex r;
-    r.real = -a.real;
-    r.imag = -a.imag;
-    return r;
-}
-
-static QPComplex
 qp_c_prod(QPComplex z, QPComplex w)
 {
     double a = z.real, b = z.imag, c = w.real, d = w.imag;

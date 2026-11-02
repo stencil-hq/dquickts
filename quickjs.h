@@ -1962,6 +1962,71 @@ void JS_PrintValueRT(JSRuntime *rt, JSPrintValueWrite *write_func, void *write_o
 void JS_PrintValue(JSContext *ctx, JSPrintValueWrite *write_func, void *write_opaque,
                    JSValueConst val, const JSPrintValueOptions *options);
 
+/* Python 3.15 in the same runtime (builds with CONFIG_PYTHON; see
+   doc/python-plan.md D3).  Python and JS values are shared by identity:
+   list = Array, str = string, int = int32 or BigInt, float = float64,
+   None = undefined (null also reads as None), functions are functions.
+   Python objects seen from JS: `o.x` is getattr (missing -> undefined),
+   integer keys / dict keys are items, Symbol.iterator, toJSON, toString,
+   coroutines are thenables; JS objects seen from Python are js.JsObject.
+   JS has no keyword arguments: use `f.callKw(args, kwargs)`.  Python
+   exceptions are thrown into JS unchanged; JS throws reach Python as
+   js.JsError (attribute js_error = the thrown value).  `.py` specifiers
+   in ES imports load Python modules (named exports = public globals,
+   default = the module object). */
+
+typedef struct JSPythonConfig {
+    int argc;                   /* sys.argv; the strings are not copied */
+    char **argv;
+    const char *executable;     /* sys.executable, NULL = "" */
+    const char *sys_path_0;     /* inserted as sys.path[0], NULL = none */
+    const char *pythonpath;     /* PYTHONPATH-style directory list, NULL = none */
+    const char *hash_seed;      /* PYTHONHASHSEED text, NULL = random */
+    int optimize;               /* -O level (0 = __debug__ is True) */
+    int isolated;               /* -I: ignore the environment and user site */
+    int recursion_limit;        /* sys.getrecursionlimit(), 0 = 1000 */
+    const char *home;           /* like QPYHOME (not copied): stdlib = home/pylib, prefix = home;
+                                   NULL = $QPYHOME, else QP_PYLIB_DIR, else
+                                   <executable dir>/pylib */
+} JSPythonConfig;
+
+/* Create the Python state of ctx (builtins, sys, importlib, __main__, the
+   `js` module support; `site` is not imported).  cfg may be NULL
+   (defaults).  Idempotent: returns 0 at
+   once when Python is already initialized in ctx (cfg is then ignored).
+   Returns -1 with an exception pending on failure.  JS_EvalPython,
+   JS_PythonImport and `.py` imports initialize with defaults on first
+   use.
+   Teardown: JS_FreeRuntime() finalizes every Python context of the
+   runtime first, as Py_FinalizeEx does at the exit of qpy
+   (threading._shutdown, atexit, standard streams flushed, modules
+   finalized and their garbage collected), then releases the C extension
+   state, so it frees everything.  The CPython C modules (capi/Setup.qp,
+   dlopen'ed extensions) are bound to one runtime of the process at a
+   time: the first context that imports one; other contexts and runtimes
+   (other threads included) get ImportError for them until that runtime
+   is freed, and a later runtime then binds them again. */
+int JS_InitPython(JSContext *ctx, const JSPythonConfig *cfg);
+
+/* JS_EvalPython() modes (CPython compile() modes) */
+#define JS_PY_EVAL_EXEC      0 /* statements ("exec"); returns None (undefined) */
+#define JS_PY_EVAL_EVAL      1 /* one expression ("eval"); returns its value */
+#define JS_PY_EVAL_SINGLE    2 /* interactive statement ("single"); expression
+                                  values go to sys.displayhook */
+#define JS_PY_EVAL_MODE_MASK 3
+/* allow top-level await; the result is a Promise (of the value) and code
+   that awaits runs as a Task driven by the job queue */
+#define JS_PY_EVAL_FLAG_ASYNC (1 << 2)
+
+/* Compile and run Python source in the globals of __main__.  input need
+   not be NUL-terminated; filename may be NULL ("<string>").  Errors:
+   JS_EXCEPTION with the Python exception object pending. */
+JSValue JS_EvalPython(JSContext *ctx, const char *input, size_t input_len,
+                      const char *filename, int flags);
+/* importlib.import_module(module): the module object (new reference) or
+   JS_EXCEPTION. */
+JSValue JS_PythonImport(JSContext *ctx, const char *module);
+
 #undef js_unlikely
 #undef js_force_inline
 

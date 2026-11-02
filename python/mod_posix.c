@@ -2,11 +2,14 @@
  * posix module (port of the POSIX parts of CPython Modules/posixmodule.c,
  * PSF-2.0) for macOS and Linux.
  *
- * Not provided (absent exactly as on a CPython build without them):
- * the Windows-only functions, posix_spawn*, sched_*, xattr, statx, waitid,
- * pidfd, copy_file_range/splice, timerfd, ptsname family, os.fwalk extras
- * that depend on them.  Threads (M5): blocking calls run on the only
- * interpreter thread.
+ * The availability of each function follows CPython's configure results
+ * on these platforms (QP_OS_HAVE_* below stand for pyconfig.h HAVE_*;
+ * macOS functions newer than the deployment target are checked at run
+ * time like HAVE_*_RUNTIME).  Not provided (absent exactly as on a
+ * CPython build without them): the Windows-only functions, xattr, statx,
+ * timerfd.  Blocking calls release the GIL; EINTR runs the Python signal
+ * handlers and retries (PEP 475).  sys.audit hooks are not available to
+ * native modules, so the os.* audit events are not raised.
  */
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -27,6 +30,19 @@
 #include <langinfo.h>
 #include <grp.h>
 #include <math.h>
+#include <sched.h>
+#include <spawn.h>
+#include <sysexits.h>
+#include <dlfcn.h>
+#include <sys/param.h>
+#include <sys/socket.h>
+#ifdef __APPLE__
+#include <util.h>
+#include <copyfile.h>
+#else
+#include <pty.h>
+#include <utmp.h>
+#endif
 #ifdef __APPLE__
 #include <crt_externs.h>
 #define QP_OS_ENVIRON (*_NSGetEnviron())
@@ -38,6 +54,74 @@ extern char **environ;
 #ifdef __linux__
 #include <sys/sysmacros.h>
 #include <sys/sendfile.h>
+#include <sys/syscall.h>
+#include <sys/mman.h>
+#include <sys/eventfd.h>
+#endif
+
+#if defined(__GLIBC__)
+#define QP_OS_GLIBC_PREREQ(maj, min) \
+    (__GLIBC__ > (maj) || (__GLIBC__ == (maj) && __GLIBC_MINOR__ >= (min)))
+#else
+#define QP_OS_GLIBC_PREREQ(maj, min) 0
+#endif
+
+/* pyconfig.h HAVE_* of the functions that are not on every POSIX system */
+#ifdef __APPLE__
+#define QP_OS_HAVE_CHFLAGS 1
+#define QP_OS_HAVE_LCHFLAGS 1
+#define QP_OS_HAVE_FCOPYFILE 1
+#ifdef __MAC_27_0
+#define QP_OS_HAVE_PIPE2 1
+#define QP_OS_HAVE_PIPE2_RUNTIME __builtin_available(macOS 27.0, *)
+#endif
+#define QP_OS_HAVE_MKFIFOAT_RUNTIME __builtin_available(macOS 13.0, *)
+#define QP_OS_HAVE_MKNODAT_RUNTIME __builtin_available(macOS 13.0, *)
+#define QP_OS_HAVE_PTSNAME_R_RUNTIME __builtin_available(macOS 10.13.4, *)
+#define QP_OS_HAVE_PWRITEV_RUNTIME __builtin_available(macOS 11.0, *)
+#define QP_OS_HAVE_POSIX_SPAWN_SETSID_RUNTIME __builtin_available(macOS 10.15, *)
+#endif /* __APPLE__ */
+#ifdef __linux__
+#define QP_OS_HAVE_PIPE2 1
+#define QP_OS_HAVE_SCHED_SETSCHEDULER 1
+#define QP_OS_HAVE_SCHED_SETPARAM 1
+#define QP_OS_HAVE_SCHED_RR_GET_INTERVAL 1
+#define QP_OS_HAVE_SCHED_SETAFFINITY 1
+#define QP_OS_HAVE_SETRESUID 1
+#define QP_OS_HAVE_POSIX_FALLOCATE 1
+#define QP_OS_HAVE_POSIX_FADVISE 1
+#define QP_OS_HAVE_CLEARENV 1
+#define QP_OS_HAVE_SETNS 1
+#define QP_OS_HAVE_UNSHARE 1
+#define QP_OS_HAVE_SPLICE 1
+#define QP_OS_HAVE_EVENTFD 1
+#define QP_OS_HAVE_FUTIMESAT 1
+#if defined(__NR_pidfd_open) && !(defined(__ANDROID__) && __ANDROID_API__ < 31)
+#define QP_OS_HAVE_PIDFD_OPEN 1
+#endif
+#if QP_OS_GLIBC_PREREQ(2, 27) || !defined(__GLIBC__)
+#define QP_OS_HAVE_COPY_FILE_RANGE 1
+#define QP_OS_HAVE_MEMFD_CREATE 1
+#endif
+#if QP_OS_GLIBC_PREREQ(2, 26)
+#define QP_OS_HAVE_PREADV2 1
+#endif
+#if QP_OS_GLIBC_PREREQ(2, 34)
+#define QP_OS_HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP 1
+#endif
+#endif /* __linux__ */
+#ifndef QP_OS_HAVE_PIPE2_RUNTIME
+#define QP_OS_HAVE_PIPE2_RUNTIME 1
+#endif
+#ifndef QP_OS_HAVE_MKFIFOAT_RUNTIME
+#define QP_OS_HAVE_MKFIFOAT_RUNTIME 1
+#define QP_OS_HAVE_MKNODAT_RUNTIME 1
+#define QP_OS_HAVE_PTSNAME_R_RUNTIME 1
+#define QP_OS_HAVE_PWRITEV_RUNTIME 1
+#endif
+#if defined(QP_OS_HAVE_SCHED_SETSCHEDULER) || defined(QP_OS_HAVE_SCHED_SETPARAM) || \
+    defined(POSIX_SPAWN_SETSCHEDULER) || defined(POSIX_SPAWN_SETSCHEDPARAM)
+#define QP_OS_HAVE_SCHED_PARAM 1
 #endif
 
 /* pyconfig.h equivalents */
@@ -125,18 +209,20 @@ static JSValue qp_os_error(JSContext *ctx, int err)
 /* PyErr_SetFromErrnoWithFilenameObjects */
 static JSValue qp_os_error2(JSContext *ctx, int err, JSValueConst f1, JSValueConst f2)
 {
-    JSValue items[5], exc;
+    JSValueConst items[5];
+    JSValue msg, exc;
     if (QP_IS_NULL(f2) || JS_IsUndefined(f2))
         return qp_raise_os_error(ctx, err, f1);
-    items[0] = JS_NewInt32(ctx, err);
-    items[1] = qp_str_from_cstr(ctx, err ? strerror(err) : "Error");
-    if (JS_IsException(items[1]))
+    msg = qp_str_from_cstr(ctx, err ? strerror(err) : "Error");
+    if (JS_IsException(msg))
         return JS_EXCEPTION;
+    items[0] = JS_NewInt32(ctx, err);
+    items[1] = msg;
     items[2] = f1;
     items[3] = JS_UNDEFINED;
     items[4] = f2;
     exc = qp_exc_new(ctx, QP_EXC(ctx, OSError), 5, items);
-    JS_FreeValue(ctx, items[1]);
+    JS_FreeValue(ctx, msg);
     if (JS_IsException(exc))
         return exc;
     return qp_raise_object(ctx, exc);
@@ -308,11 +394,15 @@ static int qp_os_id_conv(JSContext *ctx, JSValueConst o, uint32_t *out, const ch
     if (qp_long_as_int64_overflow(index, &v, &overflow) < 0)
         overflow = qp_long_sign(index);
     JS_FreeValue(ctx, index);
-    if (overflow < 0 || (!overflow && v < -1)) {
+    /* CPython with a 64-bit long: a value that fits a long must be -1 or
+       survive the truncation to uid_t (so 2**32-1 is (uid_t)-1), others
+       "underflow"; beyond a long (an unsigned long at most) the value
+       never fits: "overflow" */
+    if (overflow < 0 || (!overflow && (v < -1 || v > (int64_t)UINT32_MAX))) {
         qp_raise_overflow_error(ctx, "%s is less than minimum", what);
         return -1;
     }
-    if (overflow > 0 || v >= (int64_t)UINT32_MAX) {
+    if (overflow > 0) {
         qp_raise_overflow_error(ctx, "%s is greater than maximum", what);
         return -1;
     }
@@ -574,34 +664,34 @@ static const char *const qp_os_stat_result_fields[] = {
     "st_atime_ns",
     "st_mtime_ns",
     "st_ctime_ns",
-#ifdef QP_OS_HAVE_ST_ST_BLKSIZE
+#ifdef QP_OS_HAVE_ST_BLKSIZE
     "st_blksize",
 #endif
-#ifdef QP_OS_HAVE_ST_ST_BLOCKS
+#ifdef QP_OS_HAVE_ST_BLOCKS
     "st_blocks",
 #endif
-#ifdef QP_OS_HAVE_ST_ST_RDEV
+#ifdef QP_OS_HAVE_ST_RDEV
     "st_rdev",
 #endif
-#ifdef QP_OS_HAVE_ST_ST_FLAGS
+#ifdef QP_OS_HAVE_ST_FLAGS
     "st_flags",
 #endif
-#ifdef QP_OS_HAVE_ST_ST_GEN
+#ifdef QP_OS_HAVE_ST_GEN
     "st_gen",
 #endif
-#if defined(QP_OS_HAVE_ST_ST_BIRTHTIME) || defined(MS_WINDOWS)
+#if defined(QP_OS_HAVE_ST_BIRTHTIME) || defined(MS_WINDOWS)
     "st_birthtime",
 #endif
 #ifdef MS_WINDOWS
     "st_birthtime_ns",
 #endif
-#ifdef QP_OS_HAVE_ST_ST_FILE_ATTRIBUTES
+#ifdef QP_OS_HAVE_ST_FILE_ATTRIBUTES
     "st_file_attributes",
 #endif
-#ifdef QP_OS_HAVE_ST_ST_FSTYPE
+#ifdef QP_OS_HAVE_ST_FSTYPE
     "st_fstype",
 #endif
-#ifdef QP_OS_HAVE_ST_ST_REPARSE_TAG
+#ifdef QP_OS_HAVE_ST_REPARSE_TAG
     "st_reparse_tag",
 #endif
     NULL
@@ -623,34 +713,34 @@ static const char *const qp_os_stat_result_docs[] = {
     "time of last access in nanoseconds",
     "time of last modification in nanoseconds",
     "time of last change in nanoseconds",
-#ifdef QP_OS_HAVE_ST_ST_BLKSIZE
+#ifdef QP_OS_HAVE_ST_BLKSIZE
     "blocksize for filesystem I/O",
 #endif
-#ifdef QP_OS_HAVE_ST_ST_BLOCKS
+#ifdef QP_OS_HAVE_ST_BLOCKS
     "number of blocks allocated",
 #endif
-#ifdef QP_OS_HAVE_ST_ST_RDEV
+#ifdef QP_OS_HAVE_ST_RDEV
     "device type (if inode device)",
 #endif
-#ifdef QP_OS_HAVE_ST_ST_FLAGS
+#ifdef QP_OS_HAVE_ST_FLAGS
     "user defined flags for file",
 #endif
-#ifdef QP_OS_HAVE_ST_ST_GEN
+#ifdef QP_OS_HAVE_ST_GEN
     "generation number",
 #endif
-#if defined(QP_OS_HAVE_ST_ST_BIRTHTIME) || defined(MS_WINDOWS)
+#if defined(QP_OS_HAVE_ST_BIRTHTIME) || defined(MS_WINDOWS)
     "time of creation",
 #endif
 #ifdef MS_WINDOWS
     "time of creation in nanoseconds",
 #endif
-#ifdef QP_OS_HAVE_ST_ST_FILE_ATTRIBUTES
+#ifdef QP_OS_HAVE_ST_FILE_ATTRIBUTES
     "Windows file attribute bits",
 #endif
-#ifdef QP_OS_HAVE_ST_ST_FSTYPE
+#ifdef QP_OS_HAVE_ST_FSTYPE
     "Type of filesystem",
 #endif
-#ifdef QP_OS_HAVE_ST_ST_REPARSE_TAG
+#ifdef QP_OS_HAVE_ST_REPARSE_TAG
     "Windows reparse tag",
 #endif
     NULL
@@ -1086,9 +1176,12 @@ QP_OS_FN(qp_os_chmod)
         result = fchmodat(dir_fd, path.narrow, (mode_t)mode, follow ? 0 : AT_SYMLINK_NOFOLLOW);
         err = errno;
         /* fchmodat(AT_SYMLINK_NOFOLLOW) is not supported for symlinks
-           on Linux (CPython: follow_symlinks unavailable) */
+           on Linux (CPython: fchmodat_nofollow_unsupported) */
         if (result && !follow && (err == ENOTSUP || err == EOPNOTSUPP)) {
-            qp_os_unavailable(ctx, "chmod", "follow_symlinks");
+            if (dir_fd != QP_OS_DEFAULT_DIR_FD)
+                qp_os_dir_fd_and_follow_invalid(ctx, "chmod", dir_fd, follow);
+            else
+                qp_os_unavailable(ctx, "chmod", "follow_symlinks");
             r = JS_EXCEPTION;
             goto done;
         }
@@ -1637,11 +1730,13 @@ QP_OS_FN(qp_os_open)
     }
     flags |= O_CLOEXEC;
     for (;;) {
+        QP_BEGIN_ALLOW_THREADS(ctx)
         if (dir_fd != QP_OS_DEFAULT_DIR_FD)
             fd = openat(dir_fd, path.narrow, flags, mode);
         else
             fd = open(path.narrow, flags, mode);
         err = errno;
+        QP_END_ALLOW_THREADS(ctx)
         if (fd >= 0)
             break;
         if (err == EINTR) {
@@ -1666,8 +1761,15 @@ QP_OS_FN(qp_os_close)
     if (qp_os_int(ctx, a[0], &fd) < 0)
         return JS_EXCEPTION;
     /* PEP 475 does not retry close() */
-    if (close(fd) < 0)
-        return qp_os_error(ctx, errno);
+    {
+        int res, err;
+        QP_BEGIN_ALLOW_THREADS(ctx)
+        res = close(fd);
+        err = errno;
+        QP_END_ALLOW_THREADS(ctx)
+        if (res < 0)
+            return qp_os_error(ctx, err);
+    }
     return JS_UNDEFINED;
 }
 
@@ -1755,8 +1857,10 @@ QP_OS_FN(qp_os_read)
     if (!buf)
         return JS_EXCEPTION;
     for (;;) {
+        QP_BEGIN_ALLOW_THREADS(ctx)
         n = magic ? pread(fd, buf, length, offset) : read(fd, buf, length);
         err = errno;
+        QP_END_ALLOW_THREADS(ctx)
         if (n >= 0)
             break;
         if (err == EINTR) {
@@ -1772,6 +1876,46 @@ QP_OS_FN(qp_os_read)
     r = qp_bytes_new(ctx, buf, n);
     js_free(ctx, buf);
     return r;
+}
+
+/* readinto(fd, buffer, /) */
+QP_OS_FN(qp_os_readinto)
+{
+    int fd, err;
+    ssize_t n;
+    QPBuffer view;
+    if (qp_arg_check_positional(ctx, "readinto", nargs, 2, 2) < 0 ||
+        qp_arg_int(ctx, args[0], &fd) < 0)
+        return JS_EXCEPTION;
+    /* Py_buffer(accept={rwbuffer}): _PyArg_BadArgument */
+    if (qp_buffer_get(ctx, args[1], &view, QP_BUF_WRITABLE) < 0) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return qp_raise_type_error(ctx, "readinto() argument 2 must be read-write bytes-like object, not %s",
+                                   JS_IsUndefined(args[1]) ? "None" : qp_os_tname(ctx, args[1]));
+    }
+    if (view.len < 0) {
+        qp_buffer_release(ctx, &view);
+        return qp_raise_value_error(ctx, "negative buffer length");
+    }
+    for (;;) {
+        QP_BEGIN_ALLOW_THREADS(ctx)
+        n = read(fd, view.buf, view.len);
+        err = errno;
+        QP_END_ALLOW_THREADS(ctx)
+        if (n >= 0)
+            break;
+        if (err == EINTR) {
+            if (qp_signal_check(ctx) < 0) {
+                qp_buffer_release(ctx, &view);
+                return JS_EXCEPTION;
+            }
+            continue;
+        }
+        qp_buffer_release(ctx, &view);
+        return qp_os_error(ctx, err);
+    }
+    qp_buffer_release(ctx, &view);
+    return qp_os_long(ctx, (int64_t)n);
 }
 
 /* write (magic 0) / pwrite (magic 1) */
@@ -1791,8 +1935,10 @@ QP_OS_FN(qp_os_write)
         return JS_EXCEPTION;
     }
     for (;;) {
+        QP_BEGIN_ALLOW_THREADS(ctx)
         n = magic ? pwrite(fd, view.buf, view.len, offset) : write(fd, view.buf, view.len);
         err = errno;
+        QP_END_ALLOW_THREADS(ctx)
         if (n >= 0)
             break;
         if (err == EINTR) {
@@ -1860,8 +2006,10 @@ QP_OS_FN(qp_os_readv)
         iov[i].iov_len = views[i].len;
     }
     for (;;) {
+        QP_BEGIN_ALLOW_THREADS(ctx)
         res = magic ? writev(fd, iov, cnt) : readv(fd, iov, cnt);
         err = errno;
+        QP_END_ALLOW_THREADS(ctx)
         if (res >= 0 || err != EINTR)
             break;
         if (qp_signal_check(ctx) < 0) {
@@ -1894,12 +2042,14 @@ QP_OS_FN(qp_os_fsync)
         return JS_EXCEPTION;
     for (;;) {
         int res, err;
+        QP_BEGIN_ALLOW_THREADS(ctx)
 #ifdef __linux__
         res = magic ? fdatasync(fd) : fsync(fd);
 #else
         res = fsync(fd);
 #endif
         err = errno;
+        QP_END_ALLOW_THREADS(ctx)
         if (res == 0)
             return JS_UNDEFINED;
         if ((res = qp_os_eintr_retry(ctx, err)) < 0)
@@ -1959,10 +2109,20 @@ static JSValue qp_os_fd_pair(JSContext *ctx, int a0, int a1)
 QP_OS_FN(qp_os_pipe)
 {
     int fds[2];
-#ifdef __linux__
-    if (pipe2(fds, O_CLOEXEC) < 0)
-        return qp_os_error(ctx, errno);
-#else
+#ifdef QP_OS_HAVE_PIPE2
+    /* pipe2() is available on Linux and macOS 27+ */
+    static int pipe2_works = -1;
+    if (pipe2_works != 0) {
+        if (QP_OS_HAVE_PIPE2_RUNTIME) {
+            int res = pipe2(fds, O_CLOEXEC), err = errno;
+            if (res == 0)
+                return qp_os_fd_pair(ctx, fds[0], fds[1]);
+            if (err != ENOSYS)
+                return qp_os_error(ctx, err);
+        }
+        pipe2_works = 0;
+    }
+#endif
     if (pipe(fds) < 0)
         return qp_os_error(ctx, errno);
     if (qp_os_set_inheritable(fds[0], 0) < 0 || qp_os_set_inheritable(fds[1], 0) < 0) {
@@ -1971,17 +2131,22 @@ QP_OS_FN(qp_os_pipe)
         close(fds[1]);
         return qp_os_error(ctx, err);
     }
-#endif
     return qp_os_fd_pair(ctx, fds[0], fds[1]);
 }
 
-#ifdef __linux__
+#ifdef QP_OS_HAVE_PIPE2
 QP_OS_FN(qp_os_pipe2)
 {
-    int fds[2], flags;
+    int fds[2], flags, res;
     if (qp_arg_int(ctx, args[0], &flags) < 0)
         return JS_EXCEPTION;
-    if (pipe2(fds, flags) < 0)
+    if (QP_OS_HAVE_PIPE2_RUNTIME) {
+        res = pipe2(fds, flags);
+    } else {
+        res = -1;
+        errno = ENOSYS;
+    }
+    if (res != 0)
         return qp_os_error(ctx, errno);
     return qp_os_fd_pair(ctx, fds[0], fds[1]);
 }
@@ -2508,7 +2673,9 @@ QP_OS_FN(qp_os_scandir)
     s[QP_SI_PREFIX] = path.is_fd ? JS_UNDEFINED
         : qp_bytes_new(ctx, path.narrow ? path.narrow : ".", path.narrow ? path.length : 1);
     s[QP_SI_ISBYTES] = qp_bool_new(path.is_bytes);
-    s[QP_SI_FD] = JS_NewInt32(ctx, fd);
+    /* iterator->path.fd: the caller's descriptor (entries stat relative to
+       it after the iterator, which owns only the dup, is closed) */
+    s[QP_SI_FD] = JS_NewInt32(ctx, path.is_fd ? path.fd : -1);
     s[QP_SI_MODULE] = JS_DupValue(ctx, self);
     qp_os_path_clean(ctx, &path);
     if (JS_IsException(s[QP_SI_PREFIX])) {
@@ -2711,8 +2878,10 @@ QP_OS_FN(qp_os_waitpid)
     }
     for (;;) {
         int err;
+        QP_BEGIN_ALLOW_THREADS(ctx)
         res = magic ? wait(&status) : waitpid(pid, &status, options);
         err = errno;
+        QP_END_ALLOW_THREADS(ctx)
         if (res >= 0)
             break;
         if (err != EINTR)
@@ -2878,23 +3047,67 @@ static void qp_os_after_fork(JSContext *ctx, int child)
     JS_FreeValue(ctx, m);
 }
 
-QP_OS_FN(qp_os_fork)
+/* os.fork() (master_fd NULL) / os.forkpty(): PyOS_BeforeFork, the fork,
+   then PyOS_AfterFork_Child or PyOS_AfterFork_Parent */
+static JSValue qp_os_do_fork(JSContext *ctx, JSValueConst self, int *master_fd)
 {
     pid_t pid;
     int err;
+    BOOL threaded;
     qp_os_run_at_forkers(ctx, self, QP_OS_PROP_FORK_BEFORE, 1);
+    /* PyOS_BeforeFork: no other thread is in the middle of an import */
+    qp_rmutex_lock(ctx, QP_RMUTEX_IMPORT);
+    threaded = qp_thread_others_exist(ctx);
     fflush(stdout);
     fflush(stderr);
-    pid = fork();
+    pid = master_fd ? forkpty(master_fd, NULL, NULL, NULL) : fork();
     err = errno;
     if (pid == 0) {
+        /* PyOS_AfterFork_Child: only this thread exists in the child */
+        qp_thread_after_fork_child(ctx);
+        qp_signal_after_fork_child();
+        qp_rmutex_unlock(ctx, QP_RMUTEX_IMPORT);
         qp_os_run_at_forkers(ctx, self, QP_OS_PROP_FORK_CHILD, 0);
     } else {
+        /* warn_about_fork_with_threads, then PyOS_AfterFork_Parent */
+        if (pid != -1 && threaded &&
+            qp_warn(ctx, QP_EXC(ctx, DeprecationWarning), 1,
+                    "This process (pid=%d) is multi-threaded, use of %s() may lead "
+                    "to deadlocks in the child.", (int)getpid(),
+                    master_fd ? "forkpty" : "fork") < 0)
+            JS_FreeValue(ctx, qp_exc_fetch(ctx));
+        qp_rmutex_unlock(ctx, QP_RMUTEX_IMPORT);
         qp_os_run_at_forkers(ctx, self, QP_OS_PROP_FORK_PARENT, 0);
+        /* forkpty: set O_CLOEXEC on master_fd */
+        if (pid != -1 && master_fd && qp_os_set_inheritable(*master_fd, 0) < 0) {
+            JSValue exc;
+            qp_os_error(ctx, errno);
+            exc = qp_exc_fetch(ctx);
+            qp_exc_write_unraisable_msg(ctx, exc, "Exception ignored when setting master_fd "
+                                        "non-inheritable in forkpty()", QP_NULL);
+            JS_FreeValue(ctx, exc);
+        }
     }
     if (pid == -1)
         return qp_os_error(ctx, err);
     return JS_NewInt32(ctx, (int)pid);
+}
+
+QP_OS_FN(qp_os_fork)
+{
+    return qp_os_do_fork(ctx, self, NULL);
+}
+
+/* forkpty() */
+QP_OS_FN(qp_os_forkpty)
+{
+    int master_fd = -1;
+    JSValue items[2];
+    items[0] = qp_os_do_fork(ctx, self, &master_fd);
+    if (JS_IsException(items[0]))
+        return items[0];
+    items[1] = JS_NewInt32(ctx, master_fd);
+    return qp_tuple_new_steal(ctx, 2, items);
 }
 
 static void qp_os_free_strv(JSContext *ctx, char **v, Py_ssize_t n)
@@ -3058,15 +3271,10 @@ fail:
     return NULL;
 }
 
+/* PyMapping_Check */
 static BOOL qp_os_mapping_check(JSContext *ctx, JSValueConst o)
 {
-    JSValue m;
-    if (qp_anydict_check(ctx, o))
-        return TRUE;
-    if (qp_list_check(ctx, o) || qp_tuple_check(ctx, o) || qp_str_check(ctx, o))
-        return FALSE;
-    m = qp_type_lookup(ctx, qp_type_of(ctx, o), QP_ATOM(ctx, __getitem__));
-    return !QP_IS_NULL(m);
+    return qp_bi_mapping_check(ctx, o);
 }
 
 QP_OS_FN(qp_os_execv)
@@ -4293,6 +4501,2473 @@ static int qp_os_conftable(JSContext *ctx, JSValueConst module, const char *name
 }
 
 /* ---------------------------------------------------------------------- */
+/* processes, terminals, scheduling and devices                            */
+
+/* PySequence_Fast(o, msg) as a tuple: the items stay alive while the
+   conversions below run Python code */
+static JSValue qp_os_seq_tuple(JSContext *ctx, JSValueConst o, const char *msg)
+{
+    JSValue it, r;
+    if (qp_tuple_check_exact(ctx, o))
+        return JS_DupValue(ctx, o);
+    it = qp_iter(ctx, o);
+    if (JS_IsException(it)) {
+        if (qp_exc_pending_matches(ctx, QP_EXC(ctx, TypeError))) {
+            JS_FreeValue(ctx, qp_exc_fetch(ctx));
+            qp_raise_type_error(ctx, "%s", msg);
+        }
+        return JS_EXCEPTION;
+    }
+    r = qp_tuple_from_iterable(ctx, it);
+    JS_FreeValue(ctx, it);
+    return r;
+}
+
+/* unsigned_int / unsigned_long / unsigned_long_long converters of size
+   'size' (PyLong_AsNativeBytes with ALLOW_INDEX | UNSIGNED_BUFFER).
+   bitwise (clinic bitwise=True): PyIndex_Check (TypeError naming the
+   argument 'arg' of 'fn'), the value modulo 2**(8*size) and a
+   DeprecationWarning when it does not fit; otherwise REJECT_NEGATIVE
+   (ValueError) and OverflowError "Python int too large for C <ctype>". */
+static int qp_os_unsigned(JSContext *ctx, JSValueConst o, int size, int bitwise,
+                          const char *fn, const char *arg, const char *ctype, uint64_t *out)
+{
+    JSValue v;
+    JSValueConst u;
+    int64_t x;
+    int overflow = 0, fits;
+    uint64_t r;
+    if (bitwise && !qp_os_index_check(ctx, o)) {
+        qp_raise_type_error(ctx, "%s() %s must be int, not %s", fn, arg, qp_os_tname(ctx, o));
+        return -1;
+    }
+    v = qp_index(ctx, o);
+    if (JS_IsException(v))
+        return -1;
+    u = qp_long_unwrap(v);
+    if (qp_long_as_int64_overflow(v, &x, &overflow) == 0 && !overflow) {
+        r = (uint64_t)x;
+        if (size >= 8)
+            fits = bitwise || x >= 0;
+        else if (bitwise)
+            fits = x >= -((int64_t)1 << (size * 8 - 1)) && x < ((int64_t)1 << (size * 8));
+        else
+            fits = x >= 0 && x < ((int64_t)1 << (size * 8));
+    } else {
+        fits = size >= 8 && overflow > 0 && qp_li_numbits(u) <= 64;
+        if (JS_ToBigUint64(ctx, &r, u) < 0) {
+            JS_FreeValue(ctx, v);
+            return -1;
+        }
+    }
+    JS_FreeValue(ctx, v);
+    if (!fits) {
+        if (!bitwise) {
+            if (overflow < 0 || (!overflow && x < 0))
+                qp_raise_value_error(ctx, "Cannot convert negative int");
+            else
+                qp_raise_overflow_error(ctx, "Python int too large for C %s", ctype);
+            return -1;
+        }
+        if (qp_warn(ctx, QP_EXC(ctx, DeprecationWarning), 1, "integer value out of range") < 0)
+            return -1;
+    }
+    if (size < 8)
+        r &= ((uint64_t)1 << (size * 8)) - 1;
+    *out = r;
+    return 0;
+}
+
+/* PyLong_AsPid */
+static int qp_os_pid(JSContext *ctx, JSValueConst o, pid_t *out)
+{
+    int v;
+    if (qp_arg_int(ctx, o, &v) < 0)
+        return -1;
+    *out = (pid_t)v;
+    return 0;
+}
+
+/* _Py_Dev_Converter */
+static int qp_os_dev_conv(JSContext *ctx, JSValueConst o, dev_t *out)
+{
+    JSValue v = qp_index(ctx, o);
+    JSValueConst u;
+    int64_t x;
+    int overflow = 0;
+    uint64_t r;
+    if (JS_IsException(v))
+        return -1;
+    u = qp_long_unwrap(v);
+    qp_long_as_int64_overflow(v, &x, &overflow);
+#ifdef NODEV
+    if (!overflow && x == (int64_t)NODEV) {
+        JS_FreeValue(ctx, v);
+        *out = NODEV;
+        return 0;
+    }
+#endif
+    if (overflow < 0 || (!overflow && x < 0)) {
+        JS_FreeValue(ctx, v);
+        qp_raise_overflow_error(ctx, "can't convert negative int to unsigned");
+        return -1;
+    }
+    if (!overflow) {
+        r = (uint64_t)x;
+    } else if (qp_li_numbits(u) > 64) {
+        JS_FreeValue(ctx, v);
+        qp_raise_overflow_error(ctx, "int too big to convert");
+        return -1;
+    } else if (JS_ToBigUint64(ctx, &r, u) < 0) {
+        JS_FreeValue(ctx, v);
+        return -1;
+    }
+    JS_FreeValue(ctx, v);
+    if ((uint64_t)(dev_t)r != r) {
+        qp_raise_overflow_error(ctx, "Python int too large to convert to C dev_t");
+        return -1;
+    }
+    *out = (dev_t)r;
+    return 0;
+}
+
+/* _PyLong_FromDev */
+static JSValue qp_os_long_from_dev(JSContext *ctx, dev_t d)
+{
+#ifdef NODEV
+    if (d == NODEV)
+        return qp_long_from_int64(ctx, (int64_t)(long long)d);
+#endif
+    return qp_long_from_uint64(ctx, (uint64_t)d);
+}
+
+/* argument_unavailable_error */
+static JSValue qp_os_argument_unavailable(JSContext *ctx, const char *fn, const char *arg)
+{
+    qp_os_unavailable(ctx, fn, arg);
+    return JS_EXCEPTION;
+}
+
+/* os.ttyname(fd, /) */
+QP_OS_FN(qp_os_ttyname)
+{
+    int fd, ret;
+    long size;
+    char *buffer;
+    JSValue r;
+    if (qp_arg_int(ctx, args[0], &fd) < 0)
+        return JS_EXCEPTION;
+    size = sysconf(_SC_TTY_NAME_MAX);
+    if (size == -1)
+        return qp_os_error(ctx, errno);
+    buffer = js_malloc(ctx, size);
+    if (!buffer)
+        return JS_EXCEPTION;
+    ret = ttyname_r(fd, buffer, size);
+    if (ret != 0) {
+        js_free(ctx, buffer);
+        return qp_os_error(ctx, ret);
+    }
+    r = qp_os_fsdecode(ctx, buffer, strlen(buffer));
+    js_free(ctx, buffer);
+    return r;
+}
+
+#ifdef QP_OS_HAVE_CHFLAGS
+/* chflags (magic 0) / lchflags (magic 1) */
+QP_OS_FN(qp_os_chflags)
+{
+    static const char *const kw[] = { "path", "flags", "follow_symlinks", NULL };
+    static const QPArgSpec specs[2] = { { "chflags", kw, 2, 3, 0 }, { "lchflags", kw, 2, 2, 0 } };
+    const char *fn = magic ? "lchflags" : "chflags";
+    QPOSPath path = QP_OS_PATH(NULL, "path", 0, 0);
+    JSValueConst a[3];
+    uint64_t flags;
+    int follow = 1, res, err;
+    JSValue r = JS_UNDEFINED;
+    path.function_name = fn;
+    if (qp_arg_parse(ctx, &specs[magic], args, nargs, kwnames, a) < 0)
+        return JS_EXCEPTION;
+    if (qp_os_path_conv(ctx, a[0], &path) < 0)
+        return JS_EXCEPTION;
+    if (qp_os_unsigned(ctx, a[1], sizeof(unsigned long), 1, fn, "argument 'flags'",
+                       "unsigned long", &flags) < 0 ||
+        (!magic && qp_os_opt_bool(ctx, a[2], 1, &follow) < 0)) {
+        qp_os_path_clean(ctx, &path);
+        return JS_EXCEPTION;
+    }
+    QP_BEGIN_ALLOW_THREADS(ctx)
+    if (magic || !follow)
+        res = lchflags(path.narrow, (unsigned long)flags);
+    else
+        res = chflags(path.narrow, (unsigned long)flags);
+    err = errno;
+    QP_END_ALLOW_THREADS(ctx)
+    if (res)
+        r = qp_os_path_error(ctx, &path, err);
+    qp_os_path_clean(ctx, &path);
+    return r;
+}
+#endif /* QP_OS_HAVE_CHFLAGS */
+
+/* os.chroot(path) */
+QP_OS_FN(qp_os_chroot)
+{
+    QPOSPath path = QP_OS_PATH("chroot", "path", 0, 0);
+    int res, err;
+    JSValue r = JS_UNDEFINED;
+    QP_OS_PARSE("chroot", 1, 1, "path");
+    if (qp_os_path_conv(ctx, a[0], &path) < 0)
+        return JS_EXCEPTION;
+    QP_BEGIN_ALLOW_THREADS(ctx)
+    res = chroot(path.narrow);
+    err = errno;
+    QP_END_ALLOW_THREADS(ctx)
+    if (res < 0)
+        r = qp_os_path_error(ctx, &path, err);
+    qp_os_path_clean(ctx, &path);
+    return r;
+}
+
+/* os.nice(increment, /) */
+QP_OS_FN(qp_os_nice)
+{
+    int increment, value;
+    if (qp_arg_int(ctx, args[0], &increment) < 0)
+        return JS_EXCEPTION;
+    /* nice() returns the new priority on macOS and Linux (glibc); -1 may
+       be the new priority, so errno is cleared before the call */
+    errno = 0;
+    value = nice(increment);
+    if (value == -1 && errno != 0)
+        return qp_os_error(ctx, errno);
+    return JS_NewInt32(ctx, value);
+}
+
+/* os.getpriority(which, who) */
+QP_OS_FN(qp_os_getpriority)
+{
+    int which, who, retval;
+    QP_OS_PARSE("getpriority", 2, 2, "which", "who");
+    if (qp_os_int(ctx, a[0], &which) < 0 || qp_os_int(ctx, a[1], &who) < 0)
+        return JS_EXCEPTION;
+    errno = 0;
+    retval = getpriority(which, who);
+    if (errno != 0)
+        return qp_os_error(ctx, errno);
+    return JS_NewInt32(ctx, retval);
+}
+
+/* os.setpriority(which, who, priority) */
+QP_OS_FN(qp_os_setpriority)
+{
+    int which, who, priority;
+    QP_OS_PARSE("setpriority", 3, 3, "which", "who", "priority");
+    if (qp_os_int(ctx, a[0], &which) < 0 || qp_os_int(ctx, a[1], &who) < 0 ||
+        qp_os_int(ctx, a[2], &priority) < 0)
+        return JS_EXCEPTION;
+    if (setpriority(which, who, priority) == -1)
+        return qp_os_error(ctx, errno);
+    return JS_UNDEFINED;
+}
+
+/* os.system(command) -> long (unicode_fs_encoded) */
+QP_OS_FN(qp_os_system)
+{
+    JSValue command;
+    const uint8_t *bytes;
+    Py_ssize_t len;
+    long result;
+    QP_OS_PARSE("system", 1, 1, "command");
+    command = qp_os_fsconvert(ctx, a[0]);
+    if (JS_IsException(command))
+        return command;
+    bytes = qp_bytes_data(command, &len);
+    QP_BEGIN_ALLOW_THREADS(ctx)
+    result = system((const char *)bytes);
+    QP_END_ALLOW_THREADS(ctx)
+    JS_FreeValue(ctx, command);
+    return qp_long_from_int64(ctx, result);
+}
+
+/* path_t(make_wide=True, nonstrict=True) of the _path_* helpers: the
+   argument (or its __fspath__()) as UTF-8 bytes (new reference).  str
+   is encoded with surrogatepass so that every code point round-trips;
+   the algorithms below only look at the ASCII '/' and '.' bytes, which
+   never occur inside a multibyte UTF-8 sequence. */
+static JSValue qp_os_path_wide(JSContext *ctx, const char *fn, JSValueConst o, int *is_bytes)
+{
+    JSValue v, r;
+    if (qp_str_check(ctx, o) || qp_bytes_check(ctx, o)) {
+        v = JS_DupValue(ctx, o);
+    } else {
+        JSValue func = qp_lookup_special(ctx, o, QP_ATOM(ctx, __fspath__));
+        if (JS_IsException(func))
+            return func;
+        if (QP_IS_NULL(func) || JS_IsUndefined(func)) {
+            JS_FreeValue(ctx, func);
+            return qp_raise_type_error(ctx, "%s: path should be string, bytes or os.PathLike, not %s",
+                                       fn, qp_os_tname(ctx, o));
+        }
+        v = qp_call0(ctx, func);
+        JS_FreeValue(ctx, func);
+        if (JS_IsException(v))
+            return v;
+        if (!qp_str_check(ctx, v) && !qp_bytes_check(ctx, v)) {
+            qp_raise_type_error(ctx, "expected %s.__fspath__() to return str or bytes, not %s",
+                                qp_os_tname(ctx, o), qp_os_tname(ctx, v));
+            JS_FreeValue(ctx, v);
+            return JS_EXCEPTION;
+        }
+    }
+    *is_bytes = qp_bytes_check(ctx, v);
+    if (*is_bytes)
+        return v;
+    r = qp_str_encode(ctx, v, "utf-8", "surrogatepass");
+    JS_FreeValue(ctx, v);
+    return r;
+}
+
+static JSValue qp_os_path_wide_result(JSContext *ctx, int is_bytes, const uint8_t *s, Py_ssize_t len)
+{
+    if (is_bytes)
+        return qp_bytes_new(ctx, s, len);
+    return qp_str_decode(ctx, (const char *)s, len, "utf-8", "surrogatepass");
+}
+
+/* _Py_skiproot (POSIX): no drive; the root is '/' or exactly two
+   leading slashes */
+static void qp_os_skiproot(const uint8_t *path, Py_ssize_t size, Py_ssize_t *rootsize)
+{
+    if (size < 1 || path[0] != '/')
+        *rootsize = 0;   /* relative path, e.g.: 'foo' */
+    else if (size < 2 || path[1] != '/' || (size > 2 && path[2] == '/'))
+        *rootsize = 1;   /* absolute path, e.g.: '/foo', '///foo' */
+    else
+        *rootsize = 2;   /* precisely two leading slashes, e.g.: '//foo' */
+}
+
+/* os._path_splitroot_ex(path, /) */
+QP_OS_FN(qp_os__path_splitroot_ex)
+{
+    int is_bytes;
+    JSValue b = qp_os_path_wide(ctx, "_path_splitroot_ex", args[0], &is_bytes), items[3];
+    const uint8_t *p;
+    Py_ssize_t len, rootsize;
+    if (JS_IsException(b))
+        return b;
+    p = qp_bytes_data(b, &len);
+    qp_os_skiproot(p, len, &rootsize);
+    items[0] = qp_os_path_wide_result(ctx, is_bytes, p, 0);
+    items[1] = qp_os_path_wide_result(ctx, is_bytes, p, rootsize);
+    items[2] = qp_os_path_wide_result(ctx, is_bytes, p + rootsize, len - rootsize);
+    JS_FreeValue(ctx, b);
+    if (JS_IsException(items[0]) || JS_IsException(items[1]) || JS_IsException(items[2])) {
+        JS_FreeValue(ctx, items[0]);
+        JS_FreeValue(ctx, items[1]);
+        JS_FreeValue(ctx, items[2]);
+        return JS_EXCEPTION;
+    }
+    return qp_tuple_new_steal(ctx, 3, items);
+}
+
+/* _Py_normpath_and_size (POSIX): in-place normalisation of path[0:size];
+   returns the normalized length */
+static Py_ssize_t qp_os_normpath(uint8_t *path, Py_ssize_t size)
+{
+    uint8_t *pEnd = path + size;
+    uint8_t *p1 = path;     /* sequentially scanned address in the path */
+    uint8_t *p2 = path;     /* destination of a scanned character to be ljusted */
+    uint8_t *minP2 = path;  /* the beginning of the destination range */
+    uint8_t lastC = 0;      /* the last ljusted character, p2[-1] in most cases */
+    Py_ssize_t rootsize;
+
+#define QP_NP_IS_END(x) ((x) >= pEnd)
+#define QP_NP_IS_SEP(x) (!QP_NP_IS_END(x) && *(x) == '/')
+#define QP_NP_SEP_OR_END(x) (QP_NP_IS_END(x) || *(x) == '/')
+    if (size == 0)
+        return 0;
+    qp_os_skiproot(path, size, &rootsize);
+    if (rootsize) {
+        /* Skip past root and update minP2 */
+        p1 = &path[rootsize];
+        p2 = p1;
+        minP2 = p2 - 1;
+        lastC = *minP2;
+    }
+    if (!QP_NP_IS_END(p1) && p1[0] == '.' && QP_NP_SEP_OR_END(&p1[1])) {
+        /* Skip leading './' */
+        ++p1;
+        lastC = QP_NP_IS_END(p1) ? 0 : *p1;
+        while (QP_NP_IS_SEP(p1))
+            p1++;
+    }
+    for (; !QP_NP_IS_END(p1); ++p1) {
+        uint8_t c = *p1;
+        if (lastC == '/') {
+            if (c == '.') {
+                int sep_at_1 = QP_NP_SEP_OR_END(&p1[1]);
+                int sep_at_2 = !sep_at_1 && QP_NP_SEP_OR_END(&p1[2]);
+                if (sep_at_2 && p1[1] == '.') {
+                    uint8_t *p3 = p2;
+                    while (p3 != minP2 && *--p3 == '/') { }
+                    while (p3 != minP2 && *(p3 - 1) != '/') { --p3; }
+                    if (p2 == minP2 ||
+                        (p3[0] == '.' && p3[1] == '.' && p3[2] == '/')) {
+                        /* Previous segment is also ../, so append instead.
+                           Relative path does not absorb ../ at minP2 as well. */
+                        *p2++ = '.';
+                        *p2++ = '.';
+                        lastC = '.';
+                    } else if (p3[0] == '/') {
+                        /* Absolute path, so absorb segment */
+                        p2 = p3 + 1;
+                    } else {
+                        p2 = p3;
+                    }
+                    p1 += 1;
+                } else if (sep_at_1) {
+                } else {
+                    *p2++ = lastC = c;
+                }
+            } else if (c == '/') {
+            } else {
+                *p2++ = lastC = c;
+            }
+        } else {
+            *p2++ = lastC = c;
+        }
+    }
+    if (p2 != minP2) {
+        while (--p2 != minP2 && *p2 == '/') { }
+    } else {
+        --p2;
+    }
+#undef QP_NP_IS_END
+#undef QP_NP_IS_SEP
+#undef QP_NP_SEP_OR_END
+    return p2 - path + 1;
+}
+
+/* os._path_normpath(path) */
+QP_OS_FN(qp_os__path_normpath)
+{
+    int is_bytes;
+    JSValue b, r;
+    const uint8_t *p;
+    uint8_t *buf;
+    Py_ssize_t len, norm_len;
+    QP_OS_PARSE("_path_normpath", 1, 1, "path");
+    b = qp_os_path_wide(ctx, "_path_normpath", a[0], &is_bytes);
+    if (JS_IsException(b))
+        return b;
+    p = qp_bytes_data(b, &len);
+    buf = js_malloc(ctx, len + 1);
+    if (!buf) {
+        JS_FreeValue(ctx, b);
+        return JS_EXCEPTION;
+    }
+    memcpy(buf, p, len);
+    buf[len] = 0;
+    JS_FreeValue(ctx, b);
+    norm_len = qp_os_normpath(buf, len);
+    if (!norm_len)
+        r = qp_os_path_wide_result(ctx, is_bytes, (const uint8_t *)".", 1);
+    else
+        r = qp_os_path_wide_result(ctx, is_bytes, buf, norm_len);
+    js_free(ctx, buf);
+    return r;
+}
+
+/* ---- posix_spawn ---- */
+
+enum {
+    QP_OS_SPAWN_OPEN,
+    QP_OS_SPAWN_CLOSE,
+    QP_OS_SPAWN_DUP2,
+#ifdef QP_OS_HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP
+    QP_OS_SPAWN_CLOSEFROM,
+#endif
+};
+
+#ifdef QP_OS_HAVE_SCHED_PARAM
+static int qp_os_sched_param_conv(JSContext *ctx, JSValueConst module, JSValueConst param,
+                                  struct sched_param *res);
+#endif
+
+/* parse_arglist: the items of a list or tuple (already checked) as a
+   NULL-terminated array of fsencoded strings */
+static char **qp_os_parse_arglist(JSContext *ctx, JSValueConst argv, Py_ssize_t *pargc)
+{
+    JSValue seq = qp_tuple_check(ctx, argv) ? JS_DupValue(ctx, argv) : qp_list_as_tuple(ctx, argv);
+    Py_ssize_t n, i;
+    char **v;
+    if (JS_IsException(seq))
+        return NULL;
+    n = QP_TUPLE_SIZE(seq);
+    v = js_mallocz(ctx, sizeof(char *) * (n + 1));
+    if (!v) {
+        JS_FreeValue(ctx, seq);
+        return NULL;
+    }
+    for (i = 0; i < n; i++) {
+        v[i] = qp_os_fs_strdup(ctx, QP_TUPLE_ITEMS(seq)[i]);
+        if (!v[i]) {
+            qp_os_free_strv(ctx, v, i);
+            JS_FreeValue(ctx, seq);
+            return NULL;
+        }
+    }
+    JS_FreeValue(ctx, seq);
+    *pargc = n;
+    return v;
+}
+
+/* parse_posix_spawn_flags: initializes *attrp (destroyed on failure) */
+static int qp_os_spawn_flags(JSContext *ctx, JSValueConst module, const char *fn,
+                             JSValueConst setpgroup, int resetids, int setsid,
+                             JSValueConst setsigmask, JSValueConst setsigdef,
+                             JSValueConst scheduler, posix_spawnattr_t *attrp)
+{
+    long all_flags = 0;
+    int err = posix_spawnattr_init(attrp);
+    if (err) {
+        qp_os_error(ctx, err);
+        return -1;
+    }
+    if (!QP_IS_NULL(setpgroup) && !JS_IsUndefined(setpgroup) && !JS_IsNull(setpgroup)) {
+        pid_t pgid;
+        if (qp_os_pid(ctx, setpgroup, &pgid) < 0)
+            goto fail;
+        err = posix_spawnattr_setpgroup(attrp, pgid);
+        if (err) {
+            qp_os_error(ctx, err);
+            goto fail;
+        }
+        all_flags |= POSIX_SPAWN_SETPGROUP;
+    }
+    if (resetids)
+        all_flags |= POSIX_SPAWN_RESETIDS;
+    if (setsid) {
+#ifdef QP_OS_HAVE_POSIX_SPAWN_SETSID_RUNTIME
+        if (QP_OS_HAVE_POSIX_SPAWN_SETSID_RUNTIME) {
+#endif
+#ifdef POSIX_SPAWN_SETSID
+            all_flags |= POSIX_SPAWN_SETSID;
+#elif defined(POSIX_SPAWN_SETSID_NP)
+            all_flags |= POSIX_SPAWN_SETSID_NP;
+#else
+            qp_os_argument_unavailable(ctx, fn, "setsid");
+            goto fail;
+#endif
+#ifdef QP_OS_HAVE_POSIX_SPAWN_SETSID_RUNTIME
+        } else {
+            qp_os_argument_unavailable(ctx, fn, "setsid");
+            goto fail;
+        }
+#endif
+    }
+    if (!QP_IS_NULL(setsigmask)) {
+        sigset_t set;
+        if (qp_signal_sigset_conv(ctx, setsigmask, &set) < 0)
+            goto fail;
+        err = posix_spawnattr_setsigmask(attrp, &set);
+        if (err) {
+            qp_os_error(ctx, err);
+            goto fail;
+        }
+        all_flags |= POSIX_SPAWN_SETSIGMASK;
+    }
+    if (!QP_IS_NULL(setsigdef)) {
+        sigset_t set;
+        if (qp_signal_sigset_conv(ctx, setsigdef, &set) < 0)
+            goto fail;
+        err = posix_spawnattr_setsigdefault(attrp, &set);
+        if (err) {
+            qp_os_error(ctx, err);
+            goto fail;
+        }
+        all_flags |= POSIX_SPAWN_SETSIGDEF;
+    }
+    if (!QP_IS_NULL(scheduler) && !JS_IsUndefined(scheduler) && !JS_IsNull(scheduler)) {
+#ifdef POSIX_SPAWN_SETSCHEDULER
+        JSValueConst py_schedpolicy, schedparam_obj;
+        struct sched_param schedparam;
+        if (QP_TUPLE_SIZE(scheduler) != 2) {
+            qp_raise_type_error(ctx, "A scheduler tuple must have two elements");
+            goto fail;
+        }
+        py_schedpolicy = QP_TUPLE_ITEMS(scheduler)[0];
+        schedparam_obj = QP_TUPLE_ITEMS(scheduler)[1];
+        if (qp_os_sched_param_conv(ctx, module, schedparam_obj, &schedparam) < 0)
+            goto fail;
+        if (!JS_IsUndefined(py_schedpolicy) && !JS_IsNull(py_schedpolicy)) {
+            int schedpolicy;
+            if (qp_arg_int(ctx, py_schedpolicy, &schedpolicy) < 0)
+                goto fail;
+            err = posix_spawnattr_setschedpolicy(attrp, schedpolicy);
+            if (err) {
+                qp_os_error(ctx, err);
+                goto fail;
+            }
+            all_flags |= POSIX_SPAWN_SETSCHEDULER;
+        }
+        err = posix_spawnattr_setschedparam(attrp, &schedparam);
+        if (err) {
+            qp_os_error(ctx, err);
+            goto fail;
+        }
+        all_flags |= POSIX_SPAWN_SETSCHEDPARAM;
+#else
+        qp_raise(ctx, QP_EXC(ctx, NotImplementedError),
+                 "The scheduler option is not supported in this system.");
+        goto fail;
+#endif
+    }
+    err = posix_spawnattr_setflags(attrp, all_flags);
+    if (err) {
+        qp_os_error(ctx, err);
+        goto fail;
+    }
+    return 0;
+fail:
+    (void)posix_spawnattr_destroy(attrp);
+    return -1;
+}
+
+/* A file_actions tuple item as an int ("i" of PyArg_ParseTuple) */
+static int qp_os_fa_int(JSContext *ctx, JSValueConst t, int i, int *out)
+{
+    return qp_arg_int(ctx, QP_TUPLE_ITEMS(t)[i], out);
+}
+
+/* parse_file_actions: initializes *fap (destroyed on failure); the
+   fsencoded paths are kept in temp_buffer until posix_spawn() ran */
+static int qp_os_spawn_file_actions(JSContext *ctx, JSValueConst file_actions,
+                                    posix_spawn_file_actions_t *fap, JSValueConst temp_buffer)
+{
+    JSValue seq = qp_os_seq_tuple(ctx, file_actions, "file_actions must be a sequence or None");
+    Py_ssize_t i;
+    int err;
+    if (JS_IsException(seq))
+        return -1;
+    err = posix_spawn_file_actions_init(fap);
+    if (err) {
+        qp_os_error(ctx, err);
+        JS_FreeValue(ctx, seq);
+        return -1;
+    }
+    for (i = 0; i < QP_TUPLE_SIZE(seq); i++) {
+        JSValueConst fa = QP_TUPLE_ITEMS(seq)[i];
+        int64_t tag;
+        Py_ssize_t n;
+        JSValue tagv;
+        if (!qp_tuple_check(ctx, fa) || QP_TUPLE_SIZE(fa) == 0) {
+            qp_raise_type_error(ctx, "Each file_actions element must be a non-empty tuple");
+            goto fail;
+        }
+        n = QP_TUPLE_SIZE(fa);
+        /* PyLong_AsLong */
+        tagv = qp_index(ctx, QP_TUPLE_ITEMS(fa)[0]);
+        if (JS_IsException(tagv))
+            goto fail;
+        err = qp_long_as_int64(ctx, tagv, &tag);
+        JS_FreeValue(ctx, tagv);
+        if (err < 0)
+            goto fail;
+        switch (tag) {
+        case QP_OS_SPAWN_OPEN: {
+            int fd, oflag;
+            uint64_t mode;
+            JSValue path;
+            const uint8_t *p;
+            Py_ssize_t plen;
+            if (n != 5) {
+                qp_raise_type_error(ctx, "A open file_action tuple must have 5 elements");
+                goto fail;
+            }
+            if (qp_os_fa_int(ctx, fa, 1, &fd) < 0)
+                goto fail;
+            path = qp_os_fsconvert(ctx, QP_TUPLE_ITEMS(fa)[2]);
+            if (JS_IsException(path))
+                goto fail;
+            if (qp_os_fa_int(ctx, fa, 3, &oflag) < 0 ||
+                qp_os_unsigned(ctx, QP_TUPLE_ITEMS(fa)[4], sizeof(unsigned long), 1, NULL, NULL,
+                               "unsigned long", &mode) < 0 ||
+                qp_list_append(ctx, temp_buffer, path) < 0) {
+                JS_FreeValue(ctx, path);
+                goto fail;
+            }
+            p = qp_bytes_data(path, &plen);
+            err = posix_spawn_file_actions_addopen(fap, fd, (const char *)p, oflag, (mode_t)mode);
+            JS_FreeValue(ctx, path);
+            if (err) {
+                qp_os_error(ctx, err);
+                goto fail;
+            }
+            break;
+        }
+        case QP_OS_SPAWN_CLOSE: {
+            int fd;
+            if (n != 2) {
+                qp_raise_type_error(ctx, "A close file_action tuple must have 2 elements");
+                goto fail;
+            }
+            if (qp_os_fa_int(ctx, fa, 1, &fd) < 0)
+                goto fail;
+            err = posix_spawn_file_actions_addclose(fap, fd);
+            if (err) {
+                qp_os_error(ctx, err);
+                goto fail;
+            }
+            break;
+        }
+        case QP_OS_SPAWN_DUP2: {
+            int fd1, fd2;
+            if (n != 3) {
+                qp_raise_type_error(ctx, "A dup2 file_action tuple must have 3 elements");
+                goto fail;
+            }
+            if (qp_os_fa_int(ctx, fa, 1, &fd1) < 0 || qp_os_fa_int(ctx, fa, 2, &fd2) < 0)
+                goto fail;
+            err = posix_spawn_file_actions_adddup2(fap, fd1, fd2);
+            if (err) {
+                qp_os_error(ctx, err);
+                goto fail;
+            }
+            break;
+        }
+#ifdef QP_OS_HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP
+        case QP_OS_SPAWN_CLOSEFROM: {
+            int fd;
+            if (n != 2) {
+                qp_raise_type_error(ctx, "A closefrom file_action tuple must have 2 elements");
+                goto fail;
+            }
+            if (qp_os_fa_int(ctx, fa, 1, &fd) < 0)
+                goto fail;
+            err = posix_spawn_file_actions_addclosefrom_np(fap, fd);
+            if (err) {
+                qp_os_error(ctx, err);
+                goto fail;
+            }
+            break;
+        }
+#endif
+        default:
+            qp_raise_type_error(ctx, "Unknown file_actions identifier");
+            goto fail;
+        }
+    }
+    JS_FreeValue(ctx, seq);
+    return 0;
+fail:
+    JS_FreeValue(ctx, seq);
+    (void)posix_spawn_file_actions_destroy(fap);
+    return -1;
+}
+
+/* posix_spawn (magic 0) / posix_spawnp (magic 1): py_posix_spawn */
+QP_OS_FN(qp_os_posix_spawn)
+{
+    static const char *const kw[] = { "", "", "", "file_actions", "setpgroup", "resetids",
+                                      "setsid", "setsigmask", "setsigdef", "scheduler", NULL };
+    static const QPArgSpec specs[2] = { { "posix_spawn", kw, 3, 3, 0 },
+                                        { "posix_spawnp", kw, 3, 3, 0 } };
+    const char *fn = magic ? "posix_spawnp" : "posix_spawn";
+    QPOSPath path = QP_OS_PATH(NULL, "path", 0, 0);
+    JSValueConst a[10], argv, env, file_actions, scheduler;
+    char **argvlist = NULL, **envlist = NULL;
+    Py_ssize_t argc = 0, envc = 0;
+    posix_spawn_file_actions_t file_actions_buf, *file_actionsp = NULL;
+    posix_spawnattr_t attr, *attrp = NULL;
+    JSValue result = JS_EXCEPTION, temp_buffer = JS_UNDEFINED;
+    int resetids, setsid, err_code;
+    pid_t pid;
+
+    path.function_name = fn;
+    if (qp_arg_parse(ctx, &specs[magic], args, nargs, kwnames, a) < 0)
+        return JS_EXCEPTION;
+    if (qp_os_path_conv(ctx, a[0], &path) < 0)
+        return JS_EXCEPTION;
+    argv = a[1];
+    env = a[2];
+    file_actions = a[3];
+    scheduler = a[9];
+    if (qp_os_opt_bool(ctx, a[5], 0, &resetids) < 0 || qp_os_opt_bool(ctx, a[6], 0, &setsid) < 0)
+        goto exit;
+    if (!qp_list_check(ctx, argv) && !qp_tuple_check(ctx, argv)) {
+        qp_raise_type_error(ctx, "%s: argv must be a tuple or list", fn);
+        goto exit;
+    }
+    if ((qp_list_check(ctx, argv) ? qp_list_size(argv) : QP_TUPLE_SIZE(argv)) < 1) {
+        qp_raise_value_error(ctx, "%s: argv must not be empty", fn);
+        goto exit;
+    }
+    if (!qp_os_mapping_check(ctx, env) && !JS_IsUndefined(env) && !JS_IsNull(env)) {
+        qp_raise_type_error(ctx, "%s: environment must be a mapping object or None", fn);
+        goto exit;
+    }
+    if (!QP_IS_NULL(scheduler) && !qp_tuple_check(ctx, scheduler) &&
+        !JS_IsUndefined(scheduler) && !JS_IsNull(scheduler)) {
+        qp_raise_type_error(ctx, "%s: scheduler must be a tuple or None", fn);
+        goto exit;
+    }
+    argvlist = qp_os_parse_arglist(ctx, argv, &argc);
+    if (!argvlist)
+        goto exit;
+    if (!argvlist[0][0]) {
+        qp_raise_value_error(ctx, "%s: argv first element cannot be empty", fn);
+        goto exit;
+    }
+    if (JS_IsUndefined(env) || JS_IsNull(env)) {
+        envlist = QP_OS_ENVIRON;
+    } else {
+        envlist = qp_os_parse_envlist(ctx, env, &envc);
+        if (!envlist)
+            goto exit;
+    }
+    if (!QP_IS_NULL(file_actions) && !JS_IsUndefined(file_actions) && !JS_IsNull(file_actions)) {
+        /* old glibc posix_spawn_file_actions_addopen() did not copy the
+           path (bpo-33630): temp_buffer keeps the strings alive */
+        temp_buffer = qp_list_new(ctx, 0);
+        if (JS_IsException(temp_buffer))
+            goto exit;
+        if (qp_os_spawn_file_actions(ctx, file_actions, &file_actions_buf, temp_buffer) < 0)
+            goto exit;
+        file_actionsp = &file_actions_buf;
+    }
+    if (qp_os_spawn_flags(ctx, self, fn, a[4], resetids, setsid, a[7], a[8], scheduler, &attr) < 0)
+        goto exit;
+    attrp = &attr;
+    if (magic)
+        err_code = posix_spawnp(&pid, path.narrow, file_actionsp, attrp, argvlist, envlist);
+    else
+        err_code = posix_spawn(&pid, path.narrow, file_actionsp, attrp, argvlist, envlist);
+    if (err_code) {
+        qp_os_path_error(ctx, &path, err_code);
+        goto exit;
+    }
+    result = JS_NewInt32(ctx, (int)pid);
+exit:
+    if (file_actionsp)
+        (void)posix_spawn_file_actions_destroy(file_actionsp);
+    if (attrp)
+        (void)posix_spawnattr_destroy(attrp);
+    if (envlist && envlist != QP_OS_ENVIRON)
+        qp_os_free_strv(ctx, envlist, envc);
+    qp_os_free_strv(ctx, argvlist, argc);
+    JS_FreeValue(ctx, temp_buffer);
+    qp_os_path_clean(ctx, &path);
+    return result;
+}
+
+/* ---- sched_* ---- */
+
+/* os.sched_get_priority_max (magic 0) / sched_get_priority_min (magic 1) */
+QP_OS_FN(qp_os_sched_get_priority)
+{
+    static const char *const kw[] = { "policy", NULL };
+    static const QPArgSpec specs[2] = { { "sched_get_priority_max", kw, 1, 1, 0 },
+                                        { "sched_get_priority_min", kw, 1, 1, 0 } };
+    JSValueConst a[1];
+    int policy, r;
+    if (qp_arg_parse(ctx, &specs[magic], args, nargs, kwnames, a) < 0 ||
+        qp_os_int(ctx, a[0], &policy) < 0)
+        return JS_EXCEPTION;
+    /* make sure that errno is cleared before the call */
+    errno = 0;
+    r = magic ? sched_get_priority_min(policy) : sched_get_priority_max(policy);
+    if (r == -1 && errno)
+        return qp_os_error(ctx, errno);
+    return JS_NewInt32(ctx, r);
+}
+
+/* os.sched_yield() */
+QP_OS_FN(qp_os_sched_yield)
+{
+    int result, err;
+    QP_BEGIN_ALLOW_THREADS(ctx)
+    result = sched_yield();
+    err = errno;
+    QP_END_ALLOW_THREADS(ctx)
+    if (result < 0)
+        return qp_os_error(ctx, err);
+    return JS_UNDEFINED;
+}
+
+#ifdef QP_OS_HAVE_SCHED_PARAM
+#define QP_OS_PROP_SCHEDPARAM "\x01qp_os_sched_param"
+
+static const char *const qp_os_sched_param_fields[] = { "sched_priority", NULL };
+static const char *const qp_os_sched_param_docs[] = { "the scheduling priority", NULL };
+static const QPStructSeqDesc qp_os_sched_param_desc = {
+    "posix.sched_param", "sched_param(sched_priority)\n--\n\n"
+    "Currently has only one field: sched_priority\n\n"
+    "  sched_priority\n"
+    "    A scheduling parameter.",
+    qp_os_sched_param_fields, qp_os_sched_param_docs, 1, 0
+};
+
+/* sched_param.__new__(type, sched_priority) */
+QP_OS_FN(qp_os_sched_param_new)
+{
+    static const char *const kw[] = { "", "sched_priority", NULL };
+    static const QPArgSpec spec = { "sched_param", kw, 2, 2, 0 };
+    JSValueConst a[2];
+    JSValue items[1];
+    QPType *t;
+    if (qp_arg_parse(ctx, &spec, args, nargs, kwnames, a) < 0)
+        return JS_EXCEPTION;
+    t = qp_type_from_value(a[0]);
+    if (!t)
+        return qp_raise_type_error(ctx, "sched_param.__new__(X): X is not a type object");
+    items[0] = JS_DupValue(ctx, a[1]);
+    return qp_structseq_new(ctx, t, items);
+}
+
+/* sched_param.__reduce__ */
+QP_OS_FN(qp_os_sched_param_reduce)
+{
+    JSValue items[2], arg[1];
+    arg[0] = qp_ss_get(ctx, self, 0);
+    if (JS_IsException(arg[0]))
+        return JS_EXCEPTION;
+    items[1] = qp_tuple_new_steal(ctx, 1, arg);
+    if (JS_IsException(items[1]))
+        return JS_EXCEPTION;
+    items[0] = JS_DupValue(ctx, QP_TYPE_VALUE(qp_type_of(ctx, self)));
+    return qp_tuple_new_steal(ctx, 2, items);
+}
+
+static const QPMethodDef qp_os_sched_param_new_def = {
+    "__new__", qp_os_sched_param_new, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+    "Create and return a new object.  See help(type) for accurate signature."
+};
+static const QPMethodDef qp_os_sched_param_reduce_def = {
+    "__reduce__", qp_os_sched_param_reduce, QP_METH_NOARGS, 0, NULL
+};
+
+/* convert_sched_param */
+static int qp_os_sched_param_conv(JSContext *ctx, JSValueConst module, JSValueConst param,
+                                  struct sched_param *res)
+{
+    QPType *t = qp_os_get_type(ctx, module, QP_OS_PROP_SCHEDPARAM);
+    JSValue v;
+    int64_t priority;
+    int r;
+    if (!t)
+        return -1;
+    if (qp_type_of(ctx, param) != t) {
+        qp_raise_type_error(ctx, "must have a sched_param object");
+        return -1;
+    }
+    v = qp_ss_get(ctx, param, 0);
+    if (JS_IsException(v))
+        return -1;
+    /* PyLong_AsLong */
+    {
+        JSValue i = qp_index(ctx, v);
+        JS_FreeValue(ctx, v);
+        if (JS_IsException(i))
+            return -1;
+        r = qp_long_as_int64(ctx, i, &priority);
+        JS_FreeValue(ctx, i);
+    }
+    if (r < 0)
+        return -1;
+    if (priority > INT_MAX || priority < INT_MIN) {
+        qp_raise_overflow_error(ctx, "sched_priority out of range");
+        return -1;
+    }
+    res->sched_priority = (int)priority;
+    return 0;
+}
+#endif /* QP_OS_HAVE_SCHED_PARAM */
+
+#ifdef QP_OS_HAVE_SCHED_SETSCHEDULER
+/* os.sched_getscheduler(pid, /) */
+QP_OS_FN(qp_os_sched_getscheduler)
+{
+    pid_t pid;
+    int policy;
+    if (qp_os_pid(ctx, args[0], &pid) < 0)
+        return JS_EXCEPTION;
+    policy = sched_getscheduler(pid);
+    if (policy < 0)
+        return qp_os_error(ctx, errno);
+    return JS_NewInt32(ctx, policy);
+}
+
+/* os.sched_setscheduler(pid, policy, param, /) */
+QP_OS_FN(qp_os_sched_setscheduler)
+{
+    pid_t pid;
+    int policy;
+    struct sched_param param;
+    if (qp_arg_check_positional(ctx, "sched_setscheduler", nargs, 3, 3) < 0 ||
+        qp_os_pid(ctx, args[0], &pid) < 0 || qp_arg_int(ctx, args[1], &policy) < 0 ||
+        qp_os_sched_param_conv(ctx, self, args[2], &param) < 0)
+        return JS_EXCEPTION;
+    /* sched_setscheduler() returns 0 in Linux, but the previous scheduling
+       policy under Solaris/Illumos, and others; -1 on error everywhere */
+    if (sched_setscheduler(pid, policy, &param) == -1)
+        return qp_os_error(ctx, errno);
+    return JS_UNDEFINED;
+}
+#endif /* QP_OS_HAVE_SCHED_SETSCHEDULER */
+
+#ifdef QP_OS_HAVE_SCHED_SETPARAM
+/* os.sched_getparam(pid, /) */
+QP_OS_FN(qp_os_sched_getparam)
+{
+    pid_t pid;
+    struct sched_param param;
+    QPType *t;
+    JSValue items[1];
+    if (qp_os_pid(ctx, args[0], &pid) < 0)
+        return JS_EXCEPTION;
+    if (sched_getparam(pid, &param))
+        return qp_os_error(ctx, errno);
+    t = qp_os_get_type(ctx, self, QP_OS_PROP_SCHEDPARAM);
+    if (!t)
+        return JS_EXCEPTION;
+    items[0] = JS_NewInt32(ctx, param.sched_priority);
+    return qp_structseq_new(ctx, t, items);
+}
+
+/* os.sched_setparam(pid, param, /) */
+QP_OS_FN(qp_os_sched_setparam)
+{
+    pid_t pid;
+    struct sched_param param;
+    if (qp_arg_check_positional(ctx, "sched_setparam", nargs, 2, 2) < 0 ||
+        qp_os_pid(ctx, args[0], &pid) < 0 ||
+        qp_os_sched_param_conv(ctx, self, args[1], &param) < 0)
+        return JS_EXCEPTION;
+    if (sched_setparam(pid, &param))
+        return qp_os_error(ctx, errno);
+    return JS_UNDEFINED;
+}
+#endif /* QP_OS_HAVE_SCHED_SETPARAM */
+
+#ifdef QP_OS_HAVE_SCHED_RR_GET_INTERVAL
+/* os.sched_rr_get_interval(pid, /) -> double */
+QP_OS_FN(qp_os_sched_rr_get_interval)
+{
+    pid_t pid;
+    struct timespec interval;
+    if (qp_os_pid(ctx, args[0], &pid) < 0)
+        return JS_EXCEPTION;
+    if (sched_rr_get_interval(pid, &interval))
+        return qp_os_error(ctx, errno);
+    return qp_float_new(ctx, (double)interval.tv_sec + 1e-9 * interval.tv_nsec);
+}
+#endif /* QP_OS_HAVE_SCHED_RR_GET_INTERVAL */
+
+#ifdef QP_OS_HAVE_SCHED_SETAFFINITY
+/* The minimum number of CPUs allocated in a cpu_set_t */
+#define QP_OS_NCPUS_START ((int)(sizeof(unsigned long) * CHAR_BIT))
+
+/* os.sched_setaffinity(pid, mask, /) */
+QP_OS_FN(qp_os_sched_setaffinity)
+{
+    pid_t pid;
+    int ncpus;
+    size_t setsize;
+    cpu_set_t *cpu_set = NULL;
+    JSValue iterator = JS_UNDEFINED, item;
+    if (qp_arg_check_positional(ctx, "sched_setaffinity", nargs, 2, 2) < 0 ||
+        qp_os_pid(ctx, args[0], &pid) < 0)
+        return JS_EXCEPTION;
+    iterator = qp_iter(ctx, args[1]);
+    if (JS_IsException(iterator))
+        return iterator;
+    ncpus = QP_OS_NCPUS_START;
+    setsize = CPU_ALLOC_SIZE(ncpus);
+    cpu_set = CPU_ALLOC(ncpus);
+    if (!cpu_set) {
+        JS_ThrowOutOfMemory(ctx);
+        goto error;
+    }
+    CPU_ZERO_S(setsize, cpu_set);
+    for (;;) {
+        int64_t cpu;
+        JSValue iv;
+        int r;
+        item = qp_next(ctx, iterator);
+        if (QP_IS_NULL(item))
+            break;
+        if (JS_IsException(item))
+            goto error;
+        if (!qp_os_index_check(ctx, item)) {
+            qp_raise_type_error(ctx, "expected an iterator of ints, but iterator yielded %R",
+                                QP_TYPE_VALUE(qp_type_of(ctx, item)));
+            JS_FreeValue(ctx, item);
+            goto error;
+        }
+        iv = qp_index(ctx, item);
+        JS_FreeValue(ctx, item);
+        if (JS_IsException(iv))
+            goto error;
+        r = qp_long_as_int64(ctx, iv, &cpu);
+        JS_FreeValue(ctx, iv);
+        if (r < 0)
+            goto error;
+        if (cpu < 0) {
+            qp_raise_value_error(ctx, "negative CPU number");
+            goto error;
+        }
+        if (cpu > INT_MAX - 1) {
+            qp_raise_overflow_error(ctx, "CPU number too large");
+            goto error;
+        }
+        if (cpu >= ncpus) {
+            /* Grow CPU mask to fit the CPU number */
+            int newncpus = ncpus;
+            cpu_set_t *newmask;
+            size_t newsetsize;
+            while (newncpus <= cpu) {
+                if (newncpus > INT_MAX / 2)
+                    newncpus = (int)cpu + 1;
+                else
+                    newncpus = newncpus * 2;
+            }
+            newmask = CPU_ALLOC(newncpus);
+            if (!newmask) {
+                JS_ThrowOutOfMemory(ctx);
+                goto error;
+            }
+            newsetsize = CPU_ALLOC_SIZE(newncpus);
+            CPU_ZERO_S(newsetsize, newmask);
+            memcpy(newmask, cpu_set, setsize);
+            CPU_FREE(cpu_set);
+            setsize = newsetsize;
+            cpu_set = newmask;
+            ncpus = newncpus;
+        }
+        CPU_SET_S((int)cpu, setsize, cpu_set);
+    }
+    JS_FreeValue(ctx, iterator);
+    iterator = JS_UNDEFINED;
+    if (sched_setaffinity(pid, setsize, cpu_set)) {
+        qp_os_error(ctx, errno);
+        goto error;
+    }
+    CPU_FREE(cpu_set);
+    return JS_UNDEFINED;
+error:
+    if (cpu_set)
+        CPU_FREE(cpu_set);
+    JS_FreeValue(ctx, iterator);
+    return JS_EXCEPTION;
+}
+
+/* os.sched_getaffinity(pid, /) */
+QP_OS_FN(qp_os_sched_getaffinity)
+{
+    pid_t pid;
+    int ncpus = QP_OS_NCPUS_START, cpu, count;
+    size_t setsize;
+    cpu_set_t *mask;
+    JSValue res;
+    if (qp_os_pid(ctx, args[0], &pid) < 0)
+        return JS_EXCEPTION;
+    for (;;) {
+        setsize = CPU_ALLOC_SIZE(ncpus);
+        mask = CPU_ALLOC(ncpus);
+        if (!mask)
+            return JS_ThrowOutOfMemory(ctx);
+        if (sched_getaffinity(pid, setsize, mask) == 0)
+            break;
+        CPU_FREE(mask);
+        if (errno != EINVAL)
+            return qp_os_error(ctx, errno);
+        if (ncpus > INT_MAX / 2)
+            return qp_raise_overflow_error(ctx, "could not allocate a large enough CPU set");
+        ncpus *= 2;
+    }
+    res = qp_set_new(ctx, QP_NULL);
+    if (JS_IsException(res)) {
+        CPU_FREE(mask);
+        return res;
+    }
+    count = CPU_COUNT_S(setsize, mask);
+    for (cpu = 0; count; cpu++) {
+        if (CPU_ISSET_S(cpu, setsize, mask)) {
+            JSValue cpu_num = JS_NewInt32(ctx, cpu);
+            --count;
+            if (qp_set_add(ctx, res, cpu_num) < 0) {
+                CPU_FREE(mask);
+                JS_FreeValue(ctx, res);
+                return JS_EXCEPTION;
+            }
+        }
+    }
+    CPU_FREE(mask);
+    return res;
+}
+#endif /* QP_OS_HAVE_SCHED_SETAFFINITY */
+
+/* ---- pseudo-terminals ---- */
+
+/* os.posix_openpt(oflag, /) -> int */
+QP_OS_FN(qp_os_posix_openpt)
+{
+    int oflag, fd;
+    if (qp_arg_int(ctx, args[0], &oflag) < 0)
+        return JS_EXCEPTION;
+#ifdef O_CLOEXEC
+    oflag |= O_CLOEXEC;
+#endif
+    fd = posix_openpt(oflag);
+    if (fd == -1)
+        return qp_os_error(ctx, errno);
+    /* Just in case, likely a no-op given O_CLOEXEC above. */
+    if (qp_os_set_inheritable(fd, 0) < 0) {
+        int err = errno;
+        close(fd);
+        return qp_os_error(ctx, err);
+    }
+    return JS_NewInt32(ctx, fd);
+}
+
+/* os.grantpt(fd, /) */
+QP_OS_FN(qp_os_grantpt)
+{
+    int fd, ret, saved_errno = 0;
+    void (*sig_saved)(int);
+    if (qp_object_as_fd(ctx, args[0], &fd) < 0)
+        return JS_EXCEPTION;
+    sig_saved = qp_signal_setsig(SIGCHLD, SIG_DFL);
+    ret = grantpt(fd);
+    if (ret == -1)
+        saved_errno = errno;
+    qp_signal_setsig(SIGCHLD, sig_saved);
+    if (ret == -1)
+        return qp_os_error(ctx, saved_errno);
+    return JS_UNDEFINED;
+}
+
+/* os.unlockpt(fd, /) */
+QP_OS_FN(qp_os_unlockpt)
+{
+    int fd;
+    if (qp_object_as_fd(ctx, args[0], &fd) < 0)
+        return JS_EXCEPTION;
+    if (unlockpt(fd) == -1)
+        return qp_os_error(ctx, errno);
+    return JS_UNDEFINED;
+}
+
+/* os.ptsname(fd, /): ptsname_r() (HAVE_PTSNAME_R), ptsname() otherwise */
+QP_OS_FN(qp_os_ptsname)
+{
+    int fd, ret;
+    char name[MAXPATHLEN + 1];
+    if (qp_object_as_fd(ctx, args[0], &fd) < 0)
+        return JS_EXCEPTION;
+    if (QP_OS_HAVE_PTSNAME_R_RUNTIME) {
+        ret = ptsname_r(fd, name, sizeof(name));
+    } else {
+        /* POSIX: upon failure, ptsname() returns a null pointer and may set
+           errno; always initialize errno */
+        char *p;
+        errno = 0;
+        p = ptsname(fd);
+        if (p == NULL)
+            return qp_os_error(ctx, errno);
+        return qp_os_fsdecode(ctx, p, strlen(p));
+    }
+    if (ret != 0)
+        return qp_os_error(ctx, ret);
+    return qp_os_fsdecode(ctx, name, strlen(name));
+}
+
+/* os.openpty() */
+QP_OS_FN(qp_os_openpty)
+{
+    int master_fd = -1, slave_fd = -1, err;
+    if (openpty(&master_fd, &slave_fd, NULL, NULL, NULL) != 0)
+        return qp_os_error(ctx, errno);
+    if (qp_os_set_inheritable(master_fd, 0) < 0 || qp_os_set_inheritable(slave_fd, 0) < 0) {
+        err = errno;
+        close(master_fd);
+        close(slave_fd);
+        return qp_os_error(ctx, err);
+    }
+    return qp_os_fd_pair(ctx, master_fd, slave_fd);
+}
+
+/* os.login_tty(fd, /) */
+QP_OS_FN(qp_os_login_tty)
+{
+    int fd;
+    if (qp_object_as_fd(ctx, args[0], &fd) < 0)
+        return JS_EXCEPTION;
+    if (login_tty(fd) == -1)
+        return qp_os_error(ctx, errno);
+    return JS_UNDEFINED;
+}
+
+/* ---- users and groups ---- */
+
+#ifdef NGROUPS_MAX
+#define QP_OS_MAX_GROUPS NGROUPS_MAX
+#else
+#define QP_OS_MAX_GROUPS 64
+#endif
+
+/* os.getgrouplist(user, group, /): the group is an int on macOS, gid_t
+   elsewhere */
+QP_OS_FN(qp_os_getgrouplist)
+{
+    JSValue list, ub;
+    const char *user;
+    Py_ssize_t ulen;
+    int i, ngroups;
+#ifdef __APPLE__
+    int basegid, *groups;
+#else
+    uint32_t basegid;
+    gid_t *groups;
+#endif
+    if (qp_arg_check_positional(ctx, "getgrouplist", nargs, 2, 2) < 0)
+        return JS_EXCEPTION;
+    if (!qp_str_check(ctx, args[0]))
+        return qp_raise_type_error(ctx, "getgrouplist() argument 1 must be str, not %s",
+                                   qp_os_tname(ctx, args[0]));
+    ub = qp_str_encode(ctx, args[0], "utf-8", "strict");
+    if (JS_IsException(ub))
+        return ub;
+    user = (const char *)qp_bytes_data(ub, &ulen);
+    if ((Py_ssize_t)strlen(user) != ulen) {
+        JS_FreeValue(ctx, ub);
+        return qp_raise_value_error(ctx, "embedded null character");
+    }
+#ifdef __APPLE__
+    if (qp_arg_int(ctx, args[1], &basegid) < 0) {
+#else
+    if (qp_os_id_conv(ctx, args[1], &basegid, "gid") < 0) {
+#endif
+        JS_FreeValue(ctx, ub);
+        return JS_EXCEPTION;
+    }
+    /* NGROUPS_MAX is the maximum number of supplemental groups a user can
+       belong to; getgrouplist() returns the primary group too */
+    ngroups = 1 + QP_OS_MAX_GROUPS;
+    for (;;) {
+        int old_ngroups;
+        groups = js_malloc(ctx, sizeof(*groups) * ngroups);
+        if (!groups) {
+            JS_FreeValue(ctx, ub);
+            return JS_EXCEPTION;
+        }
+        old_ngroups = ngroups;
+        if (getgrouplist(user, basegid, groups, &ngroups) != -1)
+            break;
+        /* getgrouplist() fails if the group list is too small */
+        js_free(ctx, groups);
+        if (ngroups <= old_ngroups) {
+            /* (glibc sets ngroups to the total number of groups) */
+            if (ngroups > INT_MAX / 2) {
+                JS_FreeValue(ctx, ub);
+                return JS_ThrowOutOfMemory(ctx);
+            }
+            ngroups *= 2;
+        }
+    }
+    JS_FreeValue(ctx, ub);
+    list = qp_list_new(ctx, 0);
+    for (i = 0; i < ngroups && !JS_IsException(list); i++) {
+#ifdef __APPLE__
+        JSValue o = qp_long_from_uint64(ctx, (unsigned long)groups[i]);
+#else
+        JSValue o = qp_os_from_id(ctx, groups[i]);
+#endif
+        if (JS_IsException(o) || qp_list_append(ctx, list, o) < 0) {
+            JS_FreeValue(ctx, list);
+            list = JS_EXCEPTION;
+        }
+        JS_FreeValue(ctx, o);
+    }
+    js_free(ctx, groups);
+    return list;
+}
+
+/* os.initgroups(username, gid, /): the gid is an int on macOS */
+QP_OS_FN(qp_os_initgroups)
+{
+    JSValue oname;
+    const uint8_t *username;
+    Py_ssize_t len;
+    int r;
+#ifdef __APPLE__
+    int gid;
+#else
+    uint32_t gid;
+#endif
+    if (qp_arg_check_positional(ctx, "initgroups", nargs, 2, 2) < 0)
+        return JS_EXCEPTION;
+    oname = qp_os_fsconvert(ctx, args[0]);
+    if (JS_IsException(oname))
+        return oname;
+#ifdef __APPLE__
+    r = qp_arg_int(ctx, args[1], &gid);
+#else
+    r = qp_os_id_conv(ctx, args[1], &gid, "gid");
+#endif
+    if (r < 0) {
+        JS_FreeValue(ctx, oname);
+        return JS_EXCEPTION;
+    }
+    username = qp_bytes_data(oname, &len);
+    r = initgroups((const char *)username, gid);
+    JS_FreeValue(ctx, oname);
+    if (r == -1)
+        return qp_os_error(ctx, errno);
+    return JS_UNDEFINED;
+}
+
+/* os.setpgrp() */
+QP_OS_FN(qp_os_setpgrp)
+{
+    if (setpgrp() < 0)
+        return qp_os_error(ctx, errno);
+    return JS_UNDEFINED;
+}
+
+/* setuid (0), seteuid (1), setegid (2), setgid (3): one uid_t/gid_t */
+QP_OS_FN(qp_os_setid)
+{
+    uint32_t id;
+    int r;
+    if (qp_os_id_conv(ctx, args[0], &id, magic >= 2 ? "gid" : "uid") < 0)
+        return JS_EXCEPTION;
+    switch (magic) {
+    case 0: r = setuid(id); break;
+    case 1: r = seteuid(id); break;
+    case 2: r = setegid(id); break;
+    default: r = setgid(id); break;
+    }
+    if (r < 0)
+        return qp_os_error(ctx, errno);
+    return JS_UNDEFINED;
+}
+
+/* setreuid (0), setregid (1) */
+QP_OS_FN(qp_os_setreid)
+{
+    uint32_t r_id, e_id;
+    const char *what = magic ? "gid" : "uid";
+    int r;
+    if (qp_arg_check_positional(ctx, magic ? "setregid" : "setreuid", nargs, 2, 2) < 0 ||
+        qp_os_id_conv(ctx, args[0], &r_id, what) < 0 || qp_os_id_conv(ctx, args[1], &e_id, what) < 0)
+        return JS_EXCEPTION;
+    r = magic ? setregid(r_id, e_id) : setreuid(r_id, e_id);
+    if (r < 0)
+        return qp_os_error(ctx, errno);
+    return JS_UNDEFINED;
+}
+
+/* os.setgroups(groups, /) */
+QP_OS_FN(qp_os_setgroups)
+{
+    JSValue seq;
+    Py_ssize_t len, i;
+    gid_t *grouplist;
+    if (!qp_abs_sequence_check(ctx, args[0]))
+        return qp_raise_type_error(ctx, "setgroups argument must be a sequence");
+    seq = qp_os_seq_tuple(ctx, args[0], "setgroups argument must be a sequence");
+    if (JS_IsException(seq))
+        return seq;
+    len = QP_TUPLE_SIZE(seq);
+    if (len > QP_OS_MAX_GROUPS) {
+        JS_FreeValue(ctx, seq);
+        return qp_raise_value_error(ctx, "too many groups");
+    }
+    grouplist = js_malloc(ctx, sizeof(gid_t) * (len ? len : 1));
+    if (!grouplist) {
+        JS_FreeValue(ctx, seq);
+        return JS_EXCEPTION;
+    }
+    for (i = 0; i < len; i++) {
+        JSValueConst elem = QP_TUPLE_ITEMS(seq)[i];
+        uint32_t gid;
+        if (!qp_os_index_check(ctx, elem)) {
+            qp_raise_type_error(ctx, "groups must be integers");
+            goto fail;
+        }
+        if (qp_os_id_conv(ctx, elem, &gid, "gid") < 0)
+            goto fail;
+        grouplist[i] = gid;
+    }
+    JS_FreeValue(ctx, seq);
+    if (setgroups((int)len, grouplist) < 0) {
+        int err = errno;
+        js_free(ctx, grouplist);
+        return qp_os_error(ctx, err);
+    }
+    js_free(ctx, grouplist);
+    return JS_UNDEFINED;
+fail:
+    js_free(ctx, grouplist);
+    JS_FreeValue(ctx, seq);
+    return JS_EXCEPTION;
+}
+
+#ifdef QP_OS_HAVE_SETRESUID
+/* setresuid (0) / setresgid (1) */
+QP_OS_FN(qp_os_setresid)
+{
+    uint32_t ids[3];
+    const char *what = magic ? "gid" : "uid";
+    int i, r;
+    if (qp_arg_check_positional(ctx, magic ? "setresgid" : "setresuid", nargs, 3, 3) < 0)
+        return JS_EXCEPTION;
+    for (i = 0; i < 3; i++) {
+        if (qp_os_id_conv(ctx, args[i], &ids[i], what) < 0)
+            return JS_EXCEPTION;
+    }
+    r = magic ? setresgid(ids[0], ids[1], ids[2]) : setresuid(ids[0], ids[1], ids[2]);
+    if (r < 0)
+        return qp_os_error(ctx, errno);
+    return JS_UNDEFINED;
+}
+
+/* getresuid (0) / getresgid (1) */
+QP_OS_FN(qp_os_getresid)
+{
+    JSValue items[3];
+    int i;
+    if (magic) {
+        gid_t g[3];
+        if (getresgid(&g[0], &g[1], &g[2]) < 0)
+            return qp_os_error(ctx, errno);
+        for (i = 0; i < 3; i++)
+            items[i] = qp_os_from_id(ctx, g[i]);
+    } else {
+        uid_t u[3];
+        if (getresuid(&u[0], &u[1], &u[2]) < 0)
+            return qp_os_error(ctx, errno);
+        for (i = 0; i < 3; i++)
+            items[i] = qp_os_from_id(ctx, u[i]);
+    }
+    for (i = 0; i < 3; i++) {
+        if (JS_IsException(items[i])) {
+            for (i = 0; i < 3; i++)
+                JS_FreeValue(ctx, items[i]);
+            return JS_EXCEPTION;
+        }
+    }
+    return qp_tuple_new_steal(ctx, 3, items);
+}
+#endif /* QP_OS_HAVE_SETRESUID */
+
+/* ---- wait3 / wait4 / waitid ---- */
+
+/* wait_helper: (pid, status, resource.struct_rusage) */
+static JSValue qp_os_wait_helper(JSContext *ctx, pid_t pid, int status, struct rusage *ru)
+{
+    JSValue mod, struct_rusage, fields[16], tup, rusage, items[3];
+    JSAtom at;
+    int i = 0;
+    /* If wait succeeded but no child was ready to report status, ru will
+       not have been populated. */
+    if (pid == 0)
+        memset(ru, 0, sizeof(*ru));
+    mod = qp_import_module(ctx, "resource");
+    if (JS_IsException(mod))
+        return mod;
+    at = JS_NewAtom(ctx, "struct_rusage");
+    struct_rusage = qp_getattr(ctx, mod, at);
+    JS_FreeAtom(ctx, at);
+    JS_FreeValue(ctx, mod);
+    if (JS_IsException(struct_rusage))
+        return struct_rusage;
+#define QP_OS_DOUBLETIME(TV) ((double)(TV).tv_sec + (TV).tv_usec * 0.000001)
+    fields[i++] = qp_float_new(ctx, QP_OS_DOUBLETIME(ru->ru_utime));
+    fields[i++] = qp_float_new(ctx, QP_OS_DOUBLETIME(ru->ru_stime));
+#undef QP_OS_DOUBLETIME
+    fields[i++] = qp_long_from_int64(ctx, ru->ru_maxrss);
+    fields[i++] = qp_long_from_int64(ctx, ru->ru_ixrss);
+    fields[i++] = qp_long_from_int64(ctx, ru->ru_idrss);
+    fields[i++] = qp_long_from_int64(ctx, ru->ru_isrss);
+    fields[i++] = qp_long_from_int64(ctx, ru->ru_minflt);
+    fields[i++] = qp_long_from_int64(ctx, ru->ru_majflt);
+    fields[i++] = qp_long_from_int64(ctx, ru->ru_nswap);
+    fields[i++] = qp_long_from_int64(ctx, ru->ru_inblock);
+    fields[i++] = qp_long_from_int64(ctx, ru->ru_oublock);
+    fields[i++] = qp_long_from_int64(ctx, ru->ru_msgsnd);
+    fields[i++] = qp_long_from_int64(ctx, ru->ru_msgrcv);
+    fields[i++] = qp_long_from_int64(ctx, ru->ru_nsignals);
+    fields[i++] = qp_long_from_int64(ctx, ru->ru_nvcsw);
+    fields[i++] = qp_long_from_int64(ctx, ru->ru_nivcsw);
+    for (i = 0; i < 16; i++) {
+        if (JS_IsException(fields[i])) {
+            for (i = 0; i < 16; i++)
+                JS_FreeValue(ctx, fields[i]);
+            JS_FreeValue(ctx, struct_rusage);
+            return JS_EXCEPTION;
+        }
+    }
+    tup = qp_tuple_new_steal(ctx, 16, fields);
+    if (JS_IsException(tup)) {
+        JS_FreeValue(ctx, struct_rusage);
+        return tup;
+    }
+    rusage = qp_call1(ctx, struct_rusage, tup);
+    JS_FreeValue(ctx, tup);
+    JS_FreeValue(ctx, struct_rusage);
+    if (JS_IsException(rusage))
+        return rusage;
+    items[0] = JS_NewInt32(ctx, (int)pid);
+    items[1] = JS_NewInt32(ctx, status);
+    items[2] = rusage;
+    return qp_tuple_new_steal(ctx, 3, items);
+}
+
+/* os.wait3(options) (magic 0) / os.wait4(pid, options) (magic 1) */
+QP_OS_FN(qp_os_wait3)
+{
+    static const char *const kw3[] = { "options", NULL };
+    static const char *const kw4[] = { "pid", "options", NULL };
+    static const QPArgSpec specs[2] = { { "wait3", kw3, 1, 1, 0 }, { "wait4", kw4, 2, 2, 0 } };
+    JSValueConst a[2];
+    pid_t pid = -1, res;
+    int options, status = 0, err;
+    struct rusage ru;
+    if (qp_arg_parse(ctx, &specs[magic], args, nargs, kwnames, a) < 0)
+        return JS_EXCEPTION;
+    if (magic) {
+        if (qp_os_pid(ctx, a[0], &pid) < 0 || qp_os_int(ctx, a[1], &options) < 0)
+            return JS_EXCEPTION;
+    } else if (qp_os_int(ctx, a[0], &options) < 0) {
+        return JS_EXCEPTION;
+    }
+    for (;;) {
+        QP_BEGIN_ALLOW_THREADS(ctx)
+        res = magic ? wait4(pid, &status, options, &ru) : wait3(&status, options, &ru);
+        err = errno;
+        QP_END_ALLOW_THREADS(ctx)
+        if (res >= 0)
+            break;
+        if (err != EINTR)
+            return qp_os_error(ctx, err);
+        if (qp_signal_check(ctx) < 0)
+            return JS_EXCEPTION;
+    }
+    return qp_os_wait_helper(ctx, res, status, &ru);
+}
+
+#define QP_OS_PROP_WAITID "\x01qp_os_waitid_result"
+
+static const char *const qp_os_waitid_result_fields[] = {
+    "si_pid", "si_uid", "si_signo", "si_status", "si_code", NULL
+};
+static const QPStructSeqDesc qp_os_waitid_result_desc = {
+    "posix.waitid_result", "waitid_result: Result from waitid.\n\n\
+This object may be accessed either as a tuple of\n\
+  (si_pid, si_uid, si_signo, si_status, si_code),\n\
+or via the attributes si_pid, si_uid, and so on.\n\
+\n\
+See os.waitid for more information.",
+    qp_os_waitid_result_fields, NULL, 5, 0
+};
+
+/* os.waitid(idtype, id, options, /) */
+QP_OS_FN(qp_os_waitid)
+{
+    int idtype, id, options, res, err, i;
+    siginfo_t si;
+    QPType *t;
+    JSValue items[5];
+    if (qp_arg_check_positional(ctx, "waitid", nargs, 3, 3) < 0 ||
+        qp_arg_int(ctx, args[0], &idtype) < 0 || qp_arg_int(ctx, args[1], &id) < 0 ||
+        qp_arg_int(ctx, args[2], &options) < 0)
+        return JS_EXCEPTION;
+    memset(&si, 0, sizeof(si));
+    for (;;) {
+        QP_BEGIN_ALLOW_THREADS(ctx)
+        res = waitid((idtype_t)idtype, (id_t)id, &si, options);
+        err = errno;
+        QP_END_ALLOW_THREADS(ctx)
+        if (res >= 0)
+            break;
+        if (err != EINTR)
+            return qp_os_error(ctx, err);
+        if (qp_signal_check(ctx) < 0)
+            return JS_EXCEPTION;
+    }
+    if (si.si_pid == 0)
+        return JS_UNDEFINED;
+    t = qp_os_get_type(ctx, self, QP_OS_PROP_WAITID);
+    if (!t)
+        return JS_EXCEPTION;
+    items[0] = JS_NewInt32(ctx, (int)si.si_pid);
+    items[1] = qp_os_from_id(ctx, si.si_uid);
+    items[2] = JS_NewInt32(ctx, si.si_signo);
+    items[3] = JS_NewInt32(ctx, si.si_status);
+    items[4] = JS_NewInt32(ctx, si.si_code);
+    if (JS_IsException(items[1])) {
+        for (i = 0; i < 5; i++)
+            JS_FreeValue(ctx, items[i]);
+        return JS_EXCEPTION;
+    }
+    return qp_structseq_new(ctx, t, items);
+}
+
+/* ---- Linux process descriptors and namespaces ---- */
+
+#ifdef QP_OS_HAVE_PIDFD_OPEN
+/* os.pidfd_open(pid, flags=0) */
+QP_OS_FN(qp_os_pidfd_open)
+{
+    pid_t pid;
+    uint64_t flags = 0;
+    int fd;
+    QP_OS_PARSE("pidfd_open", 1, 2, "pid", "flags");
+    if (qp_os_pid(ctx, a[0], &pid) < 0 ||
+        (!QP_IS_NULL(a[1]) &&
+         qp_os_unsigned(ctx, a[1], sizeof(unsigned int), 0, NULL, NULL, "unsigned int", &flags) < 0))
+        return JS_EXCEPTION;
+    fd = (int)syscall(__NR_pidfd_open, pid, (unsigned int)flags);
+    if (fd < 0)
+        return qp_os_error(ctx, errno);
+    return JS_NewInt32(ctx, fd);
+}
+#endif
+
+#ifdef QP_OS_HAVE_SETNS
+/* os.setns(fd, nstype=0) */
+QP_OS_FN(qp_os_setns)
+{
+    int fd, nstype, res, err;
+    QP_OS_PARSE("setns", 1, 2, "fd", "nstype");
+    if (qp_object_as_fd(ctx, a[0], &fd) < 0 || qp_os_opt_int(ctx, a[1], 0, &nstype) < 0)
+        return JS_EXCEPTION;
+    QP_BEGIN_ALLOW_THREADS(ctx)
+    res = setns(fd, nstype);
+    err = errno;
+    QP_END_ALLOW_THREADS(ctx)
+    if (res != 0)
+        return qp_os_error(ctx, err);
+    return JS_UNDEFINED;
+}
+#endif
+
+#ifdef QP_OS_HAVE_UNSHARE
+/* os.unshare(flags) */
+QP_OS_FN(qp_os_unshare)
+{
+    int flags, res, err;
+    QP_OS_PARSE("unshare", 1, 1, "flags");
+    if (qp_os_int(ctx, a[0], &flags) < 0)
+        return JS_EXCEPTION;
+    QP_BEGIN_ALLOW_THREADS(ctx)
+    res = unshare(flags);
+    err = errno;
+    QP_END_ALLOW_THREADS(ctx)
+    if (res != 0)
+        return qp_os_error(ctx, err);
+    return JS_UNDEFINED;
+}
+#endif
+
+/* ---- terminals and file locks ---- */
+
+/* os.tcgetpgrp(fd, /) */
+QP_OS_FN(qp_os_tcgetpgrp)
+{
+    int fd;
+    pid_t pgid;
+    if (qp_arg_int(ctx, args[0], &fd) < 0)
+        return JS_EXCEPTION;
+    pgid = tcgetpgrp(fd);
+    if (pgid < 0)
+        return qp_os_error(ctx, errno);
+    return JS_NewInt32(ctx, (int)pgid);
+}
+
+/* os.tcsetpgrp(fd, pgid, /) */
+QP_OS_FN(qp_os_tcsetpgrp)
+{
+    int fd;
+    pid_t pgid;
+    if (qp_arg_check_positional(ctx, "tcsetpgrp", nargs, 2, 2) < 0 ||
+        qp_arg_int(ctx, args[0], &fd) < 0 || qp_os_pid(ctx, args[1], &pgid) < 0)
+        return JS_EXCEPTION;
+    if (tcsetpgrp(fd, pgid) < 0)
+        return qp_os_error(ctx, errno);
+    return JS_UNDEFINED;
+}
+
+/* os.lockf(fd, command, length, /) */
+QP_OS_FN(qp_os_lockf)
+{
+    int fd, command, res, err;
+    off_t length;
+    if (qp_arg_check_positional(ctx, "lockf", nargs, 3, 3) < 0 ||
+        qp_arg_int(ctx, args[0], &fd) < 0 || qp_arg_int(ctx, args[1], &command) < 0 ||
+        qp_os_off(ctx, args[2], &length) < 0)
+        return JS_EXCEPTION;
+    QP_BEGIN_ALLOW_THREADS(ctx)
+    res = lockf(fd, command, length);
+    err = errno;
+    QP_END_ALLOW_THREADS(ctx)
+    if (res < 0)
+        return qp_os_error(ctx, err);
+    return JS_UNDEFINED;
+}
+
+/* ---- vectored and kernel-side I/O ---- */
+
+/* iov_setup over the items of a tuple: buffers of kind 'type'
+   (QP_BUF_WRITABLE / QP_BUF_SIMPLE); qp_os_iov_cleanup() releases them */
+static int qp_os_iov_setup(JSContext *ctx, JSValueConst seq, int type, struct iovec **piov,
+                           QPBuffer **pviews)
+{
+    Py_ssize_t cnt = QP_TUPLE_SIZE(seq), i;
+    QPBuffer *views = js_mallocz(ctx, sizeof(QPBuffer) * (cnt ? cnt : 1));
+    struct iovec *iov = js_malloc(ctx, sizeof(struct iovec) * (cnt ? cnt : 1));
+    if (!views || !iov) {
+        js_free(ctx, views);
+        js_free(ctx, iov);
+        return -1;
+    }
+    for (i = 0; i < cnt; i++) {
+        if (qp_buffer_get(ctx, QP_TUPLE_ITEMS(seq)[i], &views[i], type) < 0) {
+            while (--i >= 0)
+                qp_buffer_release(ctx, &views[i]);
+            js_free(ctx, views);
+            js_free(ctx, iov);
+            return -1;
+        }
+        iov[i].iov_base = views[i].buf;
+        iov[i].iov_len = views[i].len;
+    }
+    *piov = iov;
+    *pviews = views;
+    return 0;
+}
+
+static void qp_os_iov_cleanup(JSContext *ctx, struct iovec *iov, QPBuffer *views, Py_ssize_t cnt)
+{
+    Py_ssize_t i;
+    for (i = 0; i < cnt; i++)
+        qp_buffer_release(ctx, &views[i]);
+    js_free(ctx, views);
+    js_free(ctx, iov);
+}
+
+/* os.preadv(fd, buffers, offset, flags=0, /) (magic 0) /
+   os.pwritev(fd, buffers, offset, flags=0, /) (magic 1) -> Py_ssize_t */
+QP_OS_FN(qp_os_preadv)
+{
+    const char *fn = magic ? "pwritev" : "preadv";
+    int fd, flags = 0, err = 0, cnt;
+    off_t offset;
+    JSValue seq;
+    struct iovec *iov;
+    QPBuffer *views;
+    ssize_t n;
+    if (qp_arg_check_positional(ctx, fn, nargs, 3, 4) < 0 ||
+        qp_arg_int(ctx, args[0], &fd) < 0)
+        return JS_EXCEPTION;
+    if (!qp_abs_sequence_check(ctx, args[1]))
+        return qp_raise_type_error(ctx, magic ? "pwritev() arg 2 must be a sequence"
+                                              : "preadv2() arg 2 must be a sequence");
+    if (qp_os_off(ctx, args[2], &offset) < 0 || (nargs > 3 && qp_arg_int(ctx, args[3], &flags) < 0))
+        return JS_EXCEPTION;
+#ifndef QP_OS_HAVE_PREADV2
+    if (flags != 0)
+        return qp_os_argument_unavailable(ctx, magic ? "pwritev2" : "preadv2", "flags");
+#endif
+    seq = qp_os_seq_tuple(ctx, args[1], magic ? "pwritev() arg 2 must be a sequence"
+                                              : "preadv2() arg 2 must be a sequence");
+    if (JS_IsException(seq))
+        return seq;
+    if (QP_TUPLE_SIZE(seq) > INT_MAX) {
+        JS_FreeValue(ctx, seq);
+        return qp_raise_overflow_error(ctx, "too many buffers");
+    }
+    cnt = (int)QP_TUPLE_SIZE(seq);
+    if (qp_os_iov_setup(ctx, seq, magic ? QP_BUF_SIMPLE : QP_BUF_WRITABLE, &iov, &views) < 0) {
+        JS_FreeValue(ctx, seq);
+        return JS_EXCEPTION;
+    }
+    for (;;) {
+        QP_BEGIN_ALLOW_THREADS(ctx)
+#ifdef QP_OS_HAVE_PREADV2
+        n = magic ? pwritev2(fd, iov, cnt, offset, flags) : preadv2(fd, iov, cnt, offset, flags);
+#else
+        n = magic ? pwritev(fd, iov, cnt, offset) : preadv(fd, iov, cnt, offset);
+#endif
+        err = errno;
+        QP_END_ALLOW_THREADS(ctx)
+        if (n >= 0 || err != EINTR)
+            break;
+        if (qp_signal_check(ctx) < 0) {
+            n = -2;
+            break;
+        }
+    }
+    qp_os_iov_cleanup(ctx, iov, views, cnt);
+    JS_FreeValue(ctx, seq);
+    if (n == -2)
+        return JS_EXCEPTION;
+    if (n < 0)
+        return qp_os_error(ctx, err);
+    return qp_long_from_int64(ctx, (int64_t)n);
+}
+
+#ifdef __APPLE__
+/* sendfile() headers / trailers: a sequence of buffers (cnt 0: none) */
+static int qp_os_sf_vec(JSContext *ctx, JSValueConst o, const char *what, JSValue *pseq,
+                        struct iovec **piov, QPBuffer **pviews, int *pcnt)
+{
+    char msg[64];
+    JSValue seq;
+    *pseq = JS_UNDEFINED;
+    *pcnt = 0;
+    if (QP_IS_NULL(o))
+        return 0;
+    snprintf(msg, sizeof(msg), "sendfile() %s must be a sequence", what);
+    if (!qp_abs_sequence_check(ctx, o)) {
+        qp_raise_type_error(ctx, "%s", msg);
+        return -1;
+    }
+    seq = qp_os_seq_tuple(ctx, o, msg);
+    if (JS_IsException(seq))
+        return -1;
+    if (QP_TUPLE_SIZE(seq) > INT_MAX) {
+        JS_FreeValue(ctx, seq);
+        qp_raise_overflow_error(ctx, "sendfile() %s is too large",
+                                what[0] == 'h' ? "header" : "trailer");
+        return -1;
+    }
+    if (QP_TUPLE_SIZE(seq) > 0) {
+        if (qp_os_iov_setup(ctx, seq, QP_BUF_SIMPLE, piov, pviews) < 0) {
+            JS_FreeValue(ctx, seq);
+            return -1;
+        }
+        *pcnt = (int)QP_TUPLE_SIZE(seq);
+    }
+    *pseq = seq;
+    return 0;
+}
+
+/* os.sendfile(out_fd, in_fd, offset, count, headers=(), trailers=(),
+   flags=0): macOS sendfile(2), count 0 sends until the end of in_fd */
+QP_OS_FN(qp_os_sendfile)
+{
+    JSValue hseq = JS_UNDEFINED, tseq = JS_UNDEFINED;
+    struct iovec *hiov = NULL, *tiov = NULL;
+    QPBuffer *hviews = NULL, *tviews = NULL;
+    struct sf_hdtr sf;
+    int out_fd, in_fd, flags, ret, err = 0, i;
+    off_t offset, sbytes;
+    QP_OS_PARSE("sendfile", 4, 7, "out_fd", "in_fd", "offset", "count", "headers",
+                "trailers", "flags");
+    if (qp_os_int(ctx, a[0], &out_fd) < 0 || qp_os_int(ctx, a[1], &in_fd) < 0 ||
+        qp_os_off(ctx, a[2], &offset) < 0 || qp_os_off(ctx, a[3], &sbytes) < 0 ||
+        qp_os_opt_int(ctx, a[6], 0, &flags) < 0)
+        return JS_EXCEPTION;
+    if (sbytes < 0)
+        return qp_raise_value_error(ctx, "count cannot be negative");
+    memset(&sf, 0, sizeof(sf));
+    if (qp_os_sf_vec(ctx, a[4], "headers", &hseq, &hiov, &hviews, &sf.hdr_cnt) < 0)
+        return JS_EXCEPTION;
+    if (sf.hdr_cnt) {
+        sf.headers = hiov;
+        for (i = 0; i < sf.hdr_cnt; i++) {
+            Py_ssize_t blen = hiov[i].iov_len;
+            if (sbytes >= 0x7fffffffffffffffLL - blen) {
+                qp_raise_overflow_error(ctx, "sendfile() header is too large");
+                goto fail;
+            }
+            sbytes += blen;
+        }
+    }
+    if (qp_os_sf_vec(ctx, a[5], "trailers", &tseq, &tiov, &tviews, &sf.trl_cnt) < 0)
+        goto fail;
+    if (sf.trl_cnt)
+        sf.trailers = tiov;
+    for (;;) {
+        QP_BEGIN_ALLOW_THREADS(ctx)
+        ret = sendfile(in_fd, out_fd, offset, &sbytes, &sf, flags);
+        err = errno;
+        QP_END_ALLOW_THREADS(ctx)
+        if (ret >= 0 || err != EINTR)
+            break;
+        if (qp_signal_check(ctx) < 0)
+            goto fail;
+    }
+    if (sf.hdr_cnt)
+        qp_os_iov_cleanup(ctx, hiov, hviews, sf.hdr_cnt);
+    if (sf.trl_cnt)
+        qp_os_iov_cleanup(ctx, tiov, tviews, sf.trl_cnt);
+    JS_FreeValue(ctx, hseq);
+    JS_FreeValue(ctx, tseq);
+    if (ret < 0) {
+        /* EAGAIN / EBUSY after some data was sent is a partial success; the
+           caller is supposed to retry when nothing was sent */
+        if ((err == EAGAIN || err == EBUSY) && sbytes != 0)
+            return qp_long_from_int64(ctx, (int64_t)sbytes);
+        return qp_os_error(ctx, err);
+    }
+    return qp_long_from_int64(ctx, (int64_t)sbytes);
+fail:
+    if (sf.hdr_cnt)
+        qp_os_iov_cleanup(ctx, hiov, hviews, sf.hdr_cnt);
+    if (sf.trl_cnt)
+        qp_os_iov_cleanup(ctx, tiov, tviews, sf.trl_cnt);
+    JS_FreeValue(ctx, hseq);
+    JS_FreeValue(ctx, tseq);
+    return JS_EXCEPTION;
+}
+#else /* !__APPLE__ */
+/* os.sendfile(out_fd, in_fd, offset, count): Linux sendfile(2), offset
+   None reads from the current position of in_fd */
+QP_OS_FN(qp_os_sendfile)
+{
+    int out_fd, in_fd, err;
+    Py_ssize_t count;
+    off_t offset, *poffset = NULL;
+    ssize_t ret;
+    QP_OS_PARSE("sendfile", 4, 4, "out_fd", "in_fd", "offset", "count");
+    if (qp_os_int(ctx, a[0], &out_fd) < 0 || qp_os_int(ctx, a[1], &in_fd) < 0 ||
+        qp_arg_ssize(ctx, a[3], &count) < 0)
+        return JS_EXCEPTION;
+    if (count < 0)
+        return qp_raise_value_error(ctx, "count cannot be negative");
+    if (!JS_IsUndefined(a[2]) && !JS_IsNull(a[2])) {
+        if (qp_os_off(ctx, a[2], &offset) < 0)
+            return JS_EXCEPTION;
+        poffset = &offset;
+    }
+    for (;;) {
+        QP_BEGIN_ALLOW_THREADS(ctx)
+        ret = sendfile(out_fd, in_fd, poffset, count);
+        err = errno;
+        QP_END_ALLOW_THREADS(ctx)
+        if (ret >= 0 || err != EINTR)
+            break;
+        if (qp_signal_check(ctx) < 0)
+            return JS_EXCEPTION;
+    }
+    if (ret < 0)
+        return qp_os_error(ctx, err);
+    return qp_long_from_int64(ctx, (int64_t)ret);
+}
+#endif /* __APPLE__ */
+
+#ifdef QP_OS_HAVE_FCOPYFILE
+/* os._fcopyfile(in_fd, out_fd, flags, /) */
+QP_OS_FN(qp_os__fcopyfile)
+{
+    int in_fd, out_fd, flags, ret, err;
+    if (qp_arg_check_positional(ctx, "_fcopyfile", nargs, 3, 3) < 0 ||
+        qp_arg_int(ctx, args[0], &in_fd) < 0 || qp_arg_int(ctx, args[1], &out_fd) < 0 ||
+        qp_arg_int(ctx, args[2], &flags) < 0)
+        return JS_EXCEPTION;
+    QP_BEGIN_ALLOW_THREADS(ctx)
+    ret = fcopyfile(in_fd, out_fd, NULL, flags);
+    err = errno;
+    QP_END_ALLOW_THREADS(ctx)
+    if (ret < 0)
+        return qp_os_error(ctx, err);
+    return JS_UNDEFINED;
+}
+#endif
+
+#if defined(QP_OS_HAVE_COPY_FILE_RANGE) || defined(QP_OS_HAVE_SPLICE)
+/* os.copy_file_range(src, dst, count, offset_src=None, offset_dst=None)
+   (magic 0) / os.splice(src, dst, count, offset_src=None,
+   offset_dst=None, flags=0) (magic 1) */
+QP_OS_FN(qp_os_copy_file_range)
+{
+    static const char *const kw[] = { "src", "dst", "count", "offset_src", "offset_dst",
+                                      "flags", NULL };
+    static const QPArgSpec specs[2] = { { "copy_file_range", kw, 3, 5, 0 },
+                                        { "splice", kw, 3, 6, 0 } };
+    JSValueConst a[6];
+    int src, dst, err;
+    Py_ssize_t count;
+    off_t offset_src_val, offset_dst_val, *p_offset_src = NULL, *p_offset_dst = NULL;
+    uint64_t flags = 0;
+    ssize_t ret;
+    if (qp_arg_parse(ctx, &specs[magic], args, nargs, kwnames, a) < 0 ||
+        qp_os_int(ctx, a[0], &src) < 0 || qp_os_int(ctx, a[1], &dst) < 0 ||
+        qp_arg_ssize(ctx, a[2], &count) < 0)
+        return JS_EXCEPTION;
+    if (count < 0)
+        return qp_raise_value_error(ctx, "count cannot be negative");
+    if (!QP_IS_NULL(a[3]) && !JS_IsUndefined(a[3]) && !JS_IsNull(a[3])) {
+        if (qp_os_off(ctx, a[3], &offset_src_val) < 0)
+            return JS_EXCEPTION;
+        p_offset_src = &offset_src_val;
+    }
+    if (!QP_IS_NULL(a[4]) && !JS_IsUndefined(a[4]) && !JS_IsNull(a[4])) {
+        if (qp_os_off(ctx, a[4], &offset_dst_val) < 0)
+            return JS_EXCEPTION;
+        p_offset_dst = &offset_dst_val;
+    }
+    if (magic && !QP_IS_NULL(a[5]) &&
+        qp_os_unsigned(ctx, a[5], sizeof(unsigned int), 0, NULL, NULL, "unsigned int", &flags) < 0)
+        return JS_EXCEPTION;
+    for (;;) {
+        QP_BEGIN_ALLOW_THREADS(ctx)
+        if (magic) {
+#ifdef QP_OS_HAVE_SPLICE
+            ret = splice(src, p_offset_src, dst, p_offset_dst, count, (unsigned int)flags);
+#else
+            ret = -1;
+            errno = ENOSYS;
+#endif
+        } else {
+#ifdef QP_OS_HAVE_COPY_FILE_RANGE
+            /* the flags argument is for future extensions and must be 0 */
+            ret = copy_file_range(src, p_offset_src, dst, p_offset_dst, count, 0);
+#else
+            ret = -1;
+            errno = ENOSYS;
+#endif
+        }
+        err = errno;
+        QP_END_ALLOW_THREADS(ctx)
+        if (ret >= 0 || err != EINTR)
+            break;
+        if (qp_signal_check(ctx) < 0)
+            return JS_EXCEPTION;
+    }
+    if (ret < 0)
+        return qp_os_error(ctx, err);
+    return qp_long_from_int64(ctx, (int64_t)ret);
+}
+#endif
+
+/* ---- special files and device numbers ---- */
+
+/* os.mkfifo(path, mode=0o666, *, dir_fd=None) (magic 0) /
+   os.mknod(path, mode=0o600, device=0, *, dir_fd=None) (magic 1) */
+QP_OS_FN(qp_os_mkfifo)
+{
+    static const char *const kwf[] = { "path", "mode", "dir_fd", NULL };
+    static const char *const kwn[] = { "path", "mode", "device", "dir_fd", NULL };
+    static const QPArgSpec specs[2] = { { "mkfifo", kwf, 1, 2, 0 }, { "mknod", kwn, 1, 3, 0 } };
+    const char *fn = magic ? "mknod" : "mkfifo";
+    QPOSPath path = QP_OS_PATH(NULL, "path", 0, 0);
+    JSValueConst a[4];
+    int mode, dir_fd, result, err = 0, unavailable = 0;
+    dev_t device = 0;
+    JSValue r = JS_UNDEFINED;
+    path.function_name = fn;
+    if (qp_arg_parse(ctx, &specs[magic], args, nargs, kwnames, a) < 0)
+        return JS_EXCEPTION;
+    if (qp_os_path_conv(ctx, a[0], &path) < 0)
+        return JS_EXCEPTION;
+    if (qp_os_opt_int(ctx, a[1], magic ? 0600 : 0666, &mode) < 0 ||
+        (magic && !QP_IS_NULL(a[2]) && qp_os_dev_conv(ctx, a[2], &device) < 0) ||
+        qp_os_dir_fd_conv(ctx, a[magic ? 3 : 2], &dir_fd) < 0) {
+        qp_os_path_clean(ctx, &path);
+        return JS_EXCEPTION;
+    }
+    for (;;) {
+        QP_BEGIN_ALLOW_THREADS(ctx)
+        if (dir_fd != QP_OS_DEFAULT_DIR_FD && magic) {
+            if (QP_OS_HAVE_MKNODAT_RUNTIME) {
+                result = mknodat(dir_fd, path.narrow, mode, device);
+            } else {
+                unavailable = 1;
+                result = 0;
+            }
+        } else if (dir_fd != QP_OS_DEFAULT_DIR_FD) {
+            if (QP_OS_HAVE_MKFIFOAT_RUNTIME) {
+                result = mkfifoat(dir_fd, path.narrow, mode);
+            } else {
+                unavailable = 1;
+                result = 0;
+            }
+        } else {
+            result = magic ? mknod(path.narrow, mode, device) : mkfifo(path.narrow, mode);
+        }
+        err = errno;
+        QP_END_ALLOW_THREADS(ctx)
+        if (result == 0 || err != EINTR)
+            break;
+        if (qp_signal_check(ctx) < 0) {
+            qp_os_path_clean(ctx, &path);
+            return JS_EXCEPTION;
+        }
+    }
+    if (unavailable)
+        r = qp_os_argument_unavailable(ctx, NULL, "dir_fd");
+    else if (result != 0)
+        r = qp_os_error(ctx, err);
+    qp_os_path_clean(ctx, &path);
+    return r;
+}
+
+/* major_minor_conv */
+static JSValue qp_os_major_minor_conv(JSContext *ctx, unsigned int value)
+{
+#ifdef NODEV
+    if (value == (unsigned int)NODEV)
+        return JS_NewInt32(ctx, (int)NODEV);
+#endif
+    return qp_long_from_uint64(ctx, value);
+}
+
+/* major_minor_check */
+static int qp_os_major_minor_check(dev_t value)
+{
+#ifdef NODEV
+    if (value == NODEV)
+        return 1;
+#endif
+    return (dev_t)(unsigned int)value == value;
+}
+
+/* os.major(device, /) (magic 0) / os.minor(device, /) (magic 1) */
+QP_OS_FN(qp_os_major)
+{
+    dev_t device;
+    if (qp_os_dev_conv(ctx, args[0], &device) < 0)
+        return JS_EXCEPTION;
+    return qp_os_major_minor_conv(ctx, magic ? (unsigned int)minor(device)
+                                             : (unsigned int)major(device));
+}
+
+/* os.makedev(major, minor, /) -> dev_t */
+QP_OS_FN(qp_os_makedev)
+{
+    dev_t maj, min;
+    if (qp_arg_check_positional(ctx, "makedev", nargs, 2, 2) < 0 ||
+        qp_os_dev_conv(ctx, args[0], &maj) < 0 || qp_os_dev_conv(ctx, args[1], &min) < 0)
+        return JS_EXCEPTION;
+    if (!qp_os_major_minor_check(maj) || !qp_os_major_minor_check(min))
+        return qp_raise_overflow_error(ctx, "Python int too large to convert to C unsigned int");
+    return qp_os_long_from_dev(ctx, makedev(maj, min));
+}
+
+#if defined(QP_OS_HAVE_POSIX_FALLOCATE) || defined(QP_OS_HAVE_POSIX_FADVISE)
+/* os.posix_fallocate(fd, offset, length, /) (magic 0) /
+   os.posix_fadvise(fd, offset, length, advice, /) (magic 1) */
+QP_OS_FN(qp_os_posix_fallocate)
+{
+    int fd, advice = 0, result;
+    off_t offset, length;
+    if (qp_arg_check_positional(ctx, magic ? "posix_fadvise" : "posix_fallocate", nargs,
+                                3 + magic, 3 + magic) < 0 ||
+        qp_arg_int(ctx, args[0], &fd) < 0 || qp_os_off(ctx, args[1], &offset) < 0 ||
+        qp_os_off(ctx, args[2], &length) < 0 || (magic && qp_arg_int(ctx, args[3], &advice) < 0))
+        return JS_EXCEPTION;
+    for (;;) {
+        QP_BEGIN_ALLOW_THREADS(ctx)
+        result = magic ? posix_fadvise(fd, offset, length, advice)
+                       : posix_fallocate(fd, offset, length);
+        /* DragonFly BSD returns -1 and sets errno */
+        if (result == -1)
+            result = errno;
+        QP_END_ALLOW_THREADS(ctx)
+        if (result != EINTR)
+            break;
+        if (qp_signal_check(ctx) < 0)
+            return JS_EXCEPTION;
+    }
+    if (result == 0)
+        return JS_UNDEFINED;
+    return qp_os_error(ctx, result);
+}
+#endif
+
+#ifdef QP_OS_HAVE_CLEARENV
+/* os._clearenv() */
+QP_OS_FN(qp_os__clearenv)
+{
+    errno = 0;
+    if (clearenv())
+        return qp_os_error(ctx, errno);
+    return JS_UNDEFINED;
+}
+#endif
+
+/* ---- Linux file descriptors ---- */
+
+#ifdef QP_OS_HAVE_MEMFD_CREATE
+/* os.memfd_create(name, flags=MFD_CLOEXEC) */
+QP_OS_FN(qp_os_memfd_create)
+{
+    JSValue name;
+    const uint8_t *bytes;
+    Py_ssize_t len;
+    uint64_t flags = MFD_CLOEXEC;
+    int fd, err;
+    QP_OS_PARSE("memfd_create", 1, 2, "name", "flags");
+    name = qp_os_fsconvert(ctx, a[0]);
+    if (JS_IsException(name))
+        return name;
+    if (!QP_IS_NULL(a[1]) &&
+        qp_os_unsigned(ctx, a[1], sizeof(unsigned int), 1, "memfd_create", "argument 'flags'",
+                       "unsigned int", &flags) < 0) {
+        JS_FreeValue(ctx, name);
+        return JS_EXCEPTION;
+    }
+    bytes = qp_bytes_data(name, &len);
+    QP_BEGIN_ALLOW_THREADS(ctx)
+    fd = memfd_create((const char *)bytes, (unsigned int)flags);
+    err = errno;
+    QP_END_ALLOW_THREADS(ctx)
+    JS_FreeValue(ctx, name);
+    if (fd == -1)
+        return qp_os_error(ctx, err);
+    return JS_NewInt32(ctx, fd);
+}
+#endif
+
+#if defined(QP_OS_HAVE_EVENTFD) && defined(EFD_CLOEXEC)
+/* os.eventfd(initval, flags=EFD_CLOEXEC) */
+QP_OS_FN(qp_os_eventfd)
+{
+    uint64_t initval;
+    int flags, fd, err;
+    QP_OS_PARSE("eventfd", 1, 2, "initval", "flags");
+    if (qp_os_unsigned(ctx, a[0], sizeof(unsigned int), 0, NULL, NULL, "unsigned int", &initval) < 0 ||
+        qp_os_opt_int(ctx, a[1], EFD_CLOEXEC, &flags) < 0)
+        return JS_EXCEPTION;
+    /* initval is limited to uint32_t, internal counter is uint64_t */
+    QP_BEGIN_ALLOW_THREADS(ctx)
+    fd = eventfd((unsigned int)initval, flags);
+    err = errno;
+    QP_END_ALLOW_THREADS(ctx)
+    if (fd == -1)
+        return qp_os_error(ctx, err);
+    return JS_NewInt32(ctx, fd);
+}
+
+/* os.eventfd_read(fd) */
+QP_OS_FN(qp_os_eventfd_read)
+{
+    eventfd_t value;
+    int fd, result, err;
+    QP_OS_PARSE("eventfd_read", 1, 1, "fd");
+    if (qp_object_as_fd(ctx, a[0], &fd) < 0)
+        return JS_EXCEPTION;
+    QP_BEGIN_ALLOW_THREADS(ctx)
+    result = eventfd_read(fd, &value);
+    err = errno;
+    QP_END_ALLOW_THREADS(ctx)
+    if (result == -1)
+        return qp_os_error(ctx, err);
+    return qp_long_from_uint64(ctx, value);
+}
+
+/* os.eventfd_write(fd, value) */
+QP_OS_FN(qp_os_eventfd_write)
+{
+    uint64_t value;
+    int fd, result, err;
+    QP_OS_PARSE("eventfd_write", 2, 2, "fd", "value");
+    if (qp_object_as_fd(ctx, a[0], &fd) < 0 ||
+        qp_os_unsigned(ctx, a[1], sizeof(unsigned long long), 0, NULL, NULL,
+                       "unsigned long long", &value) < 0)
+        return JS_EXCEPTION;
+    QP_BEGIN_ALLOW_THREADS(ctx)
+    result = eventfd_write(fd, value);
+    err = errno;
+    QP_END_ALLOW_THREADS(ctx)
+    if (result == -1)
+        return qp_os_error(ctx, err);
+    return JS_UNDEFINED;
+}
+#endif /* QP_OS_HAVE_EVENTFD && EFD_CLOEXEC */
+
+#ifdef __linux__
+/* os.getrandom(size, flags=0) */
+QP_OS_FN(qp_os_getrandom)
+{
+    Py_ssize_t size, n;
+    int flags, err = 0;
+    char *buf;
+    JSValue r;
+    QP_OS_PARSE("getrandom", 1, 2, "size", "flags");
+    if (qp_arg_ssize(ctx, a[0], &size) < 0 || qp_os_opt_int(ctx, a[1], 0, &flags) < 0)
+        return JS_EXCEPTION;
+    if (size < 0)
+        return qp_os_error(ctx, EINVAL);
+    buf = js_malloc(ctx, size ? size : 1);
+    if (!buf)
+        return JS_EXCEPTION;
+    for (;;) {
+        n = getrandom(buf, size, flags);
+        err = errno;
+        if (n >= 0 || err != EINTR)
+            break;
+        if (qp_signal_check(ctx) < 0) {
+            js_free(ctx, buf);
+            return JS_EXCEPTION;
+        }
+    }
+    if (n < 0) {
+        js_free(ctx, buf);
+        return qp_os_error(ctx, err);
+    }
+    r = qp_bytes_new(ctx, buf, n);
+    js_free(ctx, buf);
+    return r;
+}
+#endif
+
+/* ---- interpreter helpers ---- */
+
+#ifdef CONFIG_PYTHON_CAPI
+/* python/capi_stable.c (PyAPI_DATA of pythonrun.h) */
+extern __attribute__((visibility("default"))) int (*PyOS_InputHook)(void);
+#endif
+
+/* os._inputhook(): call PyOS_InputHook (set by extensions like tkinter) */
+QP_OS_FN(qp_os__inputhook)
+{
+    int result = 0;
+#ifdef CONFIG_PYTHON_CAPI
+    int (*hook)(void) = PyOS_InputHook;
+    if (hook) {
+        QP_BEGIN_ALLOW_THREADS(ctx)
+        result = hook();
+        QP_END_ALLOW_THREADS(ctx)
+    }
+#endif
+    return JS_NewInt32(ctx, result);
+}
+
+/* os._is_inputhook_installed() */
+QP_OS_FN(qp_os__is_inputhook_installed)
+{
+#ifdef CONFIG_PYTHON_CAPI
+    return qp_bool_new(PyOS_InputHook != NULL);
+#else
+    return qp_bool_new(0);
+#endif
+}
+
+static int qp_os_environ_fill(JSContext *ctx, JSValueConst d);
+
+/* os._create_environ(): a new posix.environ-like dict of the current
+   process environment (os.reload_environ) */
+QP_OS_FN(qp_os__create_environ)
+{
+    JSValue d = qp_dict_new(ctx);
+    if (JS_IsException(d))
+        return d;
+    if (qp_os_environ_fill(ctx, d) < 0) {
+        JS_FreeValue(ctx, d);
+        return JS_EXCEPTION;
+    }
+    return d;
+}
+
+/* ---------------------------------------------------------------------- */
 /* module                                                                  */
 
 static const QPMethodDef qp_posix_methods[] = {
@@ -4715,6 +7390,21 @@ static const QPMethodDef qp_posix_methods[] = {
       "--\n"
       "\n"
       "Read from a file descriptor.  Returns a bytes object." },
+    { "readinto", qp_os_readinto, QP_METH_FASTCALL, 0,
+      "readinto($module, fd, buffer, /)\n"
+      "--\n"
+      "\n"
+      "Read into a buffer object from a file descriptor.\n"
+      "\n"
+      "The buffer should be mutable and bytes-like.  On success, returns the\n"
+      "number of bytes read.  Less bytes may be read than the size of the\n"
+      "buffer.  The underlying system call will be retried when interrupted by\n"
+      "a signal, unless the signal handler raises an exception.  Other errors\n"
+      "will not be retried and an error will be raised.\n"
+      "\n"
+      "Returns 0 if *fd* is at end of file or if the provided *buffer* has\n"
+      "length 0 (which can be used to check for errors without reading data).\n"
+      "Never returns negative." },
     { "pread", qp_os_read, QP_METH_FASTCALL, 1,
       "pread($module, fd, length, offset, /)\n"
       "--\n"
@@ -4792,7 +7482,7 @@ static const QPMethodDef qp_posix_methods[] = {
       "\n"
       "Returns a tuple of two file descriptors:\n"
       "  (read_fd, write_fd)" },
-#ifdef __linux__
+#ifdef QP_OS_HAVE_PIPE2
     { "pipe2", qp_os_pipe2, QP_METH_O, 0,
       "pipe2($module, flags, /)\n"
       "--\n"
@@ -5206,16 +7896,682 @@ static const QPMethodDef qp_posix_methods[] = {
       "On some platforms, path may also be specified as an open file\n"
       "descriptor.  If this functionality is unavailable, using it raises\n"
       "an exception." },
+    { "ttyname", qp_os_ttyname, QP_METH_O, 0,
+      "ttyname($module, fd, /)\n"
+      "--\n"
+      "\n"
+      "Return the name of the terminal device connected to \'fd\'.\n"
+      "\n"
+      "  fd\n"
+      "    Integer file descriptor handle." },
+#ifdef QP_OS_HAVE_CHFLAGS
+    { "chflags", qp_os_chflags, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "chflags($module, /, path, flags, follow_symlinks=True)\n"
+      "--\n"
+      "\n"
+      "Set file flags.\n"
+      "\n"
+      "If follow_symlinks is False, and the last element of the path is\n"
+      "a symbolic link, chflags() will change flags on the symbolic link itself\n"
+      "instead of the file the link points to.\n"
+      "follow_symlinks may not be implemented on your platform.  If it is\n"
+      "unavailable, using it will raise a NotImplementedError." },
+    { "lchflags", qp_os_chflags, QP_METH_FASTCALL | QP_METH_KEYWORDS, 1,
+      "lchflags($module, /, path, flags)\n"
+      "--\n"
+      "\n"
+      "Set file flags.\n"
+      "\n"
+      "This function will not follow symbolic links.\n"
+      "Equivalent to chflags(path, flags, follow_symlinks=False)." },
+#endif
+    { "chroot", qp_os_chroot, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "chroot($module, /, path)\n"
+      "--\n"
+      "\n"
+      "Change root directory to path." },
+    { "nice", qp_os_nice, QP_METH_O, 0,
+      "nice($module, increment, /)\n"
+      "--\n"
+      "\n"
+      "Add increment to the priority of process and return the new priority." },
+    { "getpriority", qp_os_getpriority, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "getpriority($module, /, which, who)\n"
+      "--\n"
+      "\n"
+      "Return program scheduling priority." },
+    { "setpriority", qp_os_setpriority, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "setpriority($module, /, which, who, priority)\n"
+      "--\n"
+      "\n"
+      "Set program scheduling priority." },
+    { "system", qp_os_system, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "system($module, /, command)\n"
+      "--\n"
+      "\n"
+      "Execute the command in a subshell." },
+    { "_path_splitroot_ex", qp_os__path_splitroot_ex, QP_METH_O, 0,
+      "_path_splitroot_ex($module, path, /)\n"
+      "--\n"
+      "\n"
+      "Split a pathname into drive, root and tail.\n"
+      "\n"
+      "The tail contains anything after the root." },
+    { "_path_normpath", qp_os__path_normpath, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "_path_normpath($module, /, path)\n"
+      "--\n"
+      "\n"
+      "Normalize path, eliminating double slashes, etc." },
+    { "posix_spawn", qp_os_posix_spawn, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "posix_spawn($module, path, argv, env, /, *, file_actions=(),\n"
+      "            setpgroup=None, resetids=False, setsid=False,\n"
+      "            setsigmask=(), setsigdef=(), scheduler=None)\n"
+      "--\n"
+      "\n"
+      "Execute the program specified by path in a new process.\n"
+      "\n"
+      "  path\n"
+      "    Path of executable file.\n"
+      "  argv\n"
+      "    Tuple or list of strings.\n"
+      "  env\n"
+      "    Dictionary of strings mapping to strings.\n"
+      "  file_actions\n"
+      "    A sequence of file action tuples.\n"
+      "  setpgroup\n"
+      "    The pgroup to use with the POSIX_SPAWN_SETPGROUP flag.\n"
+      "  resetids\n"
+      "    If the value is `true` the POSIX_SPAWN_RESETIDS will be activated.\n"
+      "  setsid\n"
+      "    If the value is `true` the POSIX_SPAWN_SETSID or POSIX_SPAWN_SETSID_NP\n"
+      "    will be activated.\n"
+      "  setsigmask\n"
+      "    The sigmask to use with the POSIX_SPAWN_SETSIGMASK flag.\n"
+      "  setsigdef\n"
+      "    The sigmask to use with the POSIX_SPAWN_SETSIGDEF flag.\n"
+      "  scheduler\n"
+      "    A tuple with the scheduler policy (optional) and parameters." },
+    { "posix_spawnp", qp_os_posix_spawn, QP_METH_FASTCALL | QP_METH_KEYWORDS, 1,
+      "posix_spawnp($module, path, argv, env, /, *, file_actions=(),\n"
+      "             setpgroup=None, resetids=False, setsid=False,\n"
+      "             setsigmask=(), setsigdef=(), scheduler=None)\n"
+      "--\n"
+      "\n"
+      "Execute the program specified by path in a new process.\n"
+      "\n"
+      "  path\n"
+      "    Path of executable file.\n"
+      "  argv\n"
+      "    Tuple or list of strings.\n"
+      "  env\n"
+      "    Dictionary of strings mapping to strings.\n"
+      "  file_actions\n"
+      "    A sequence of file action tuples.\n"
+      "  setpgroup\n"
+      "    The pgroup to use with the POSIX_SPAWN_SETPGROUP flag.\n"
+      "  resetids\n"
+      "    If the value is `True` the POSIX_SPAWN_RESETIDS will be activated.\n"
+      "  setsid\n"
+      "    If the value is `True` the POSIX_SPAWN_SETSID or POSIX_SPAWN_SETSID_NP\n"
+      "    will be activated.\n"
+      "  setsigmask\n"
+      "    The sigmask to use with the POSIX_SPAWN_SETSIGMASK flag.\n"
+      "  setsigdef\n"
+      "    The sigmask to use with the POSIX_SPAWN_SETSIGDEF flag.\n"
+      "  scheduler\n"
+      "    A tuple with the scheduler policy (optional) and parameters." },
+    { "sched_get_priority_max", qp_os_sched_get_priority, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "sched_get_priority_max($module, /, policy)\n"
+      "--\n"
+      "\n"
+      "Get the maximum scheduling priority for policy." },
+    { "sched_get_priority_min", qp_os_sched_get_priority, QP_METH_FASTCALL | QP_METH_KEYWORDS, 1,
+      "sched_get_priority_min($module, /, policy)\n"
+      "--\n"
+      "\n"
+      "Get the minimum scheduling priority for policy." },
+#ifdef QP_OS_HAVE_SCHED_SETSCHEDULER
+    { "sched_getscheduler", qp_os_sched_getscheduler, QP_METH_O, 0,
+      "sched_getscheduler($module, pid, /)\n"
+      "--\n"
+      "\n"
+      "Get the scheduling policy for the process identified by pid.\n"
+      "\n"
+      "Passing 0 for pid returns the scheduling policy for the calling process." },
+    { "sched_setscheduler", qp_os_sched_setscheduler, QP_METH_FASTCALL, 0,
+      "sched_setscheduler($module, pid, policy, param, /)\n"
+      "--\n"
+      "\n"
+      "Set the scheduling policy for the process identified by pid.\n"
+      "\n"
+      "If pid is 0, the calling process is changed.\n"
+      "param is an instance of sched_param." },
+#endif
+#ifdef QP_OS_HAVE_SCHED_SETPARAM
+    { "sched_getparam", qp_os_sched_getparam, QP_METH_O, 0,
+      "sched_getparam($module, pid, /)\n"
+      "--\n"
+      "\n"
+      "Returns scheduling parameters for the process identified by pid.\n"
+      "\n"
+      "If pid is 0, returns parameters for the calling process.\n"
+      "Return value is an instance of sched_param." },
+    { "sched_setparam", qp_os_sched_setparam, QP_METH_FASTCALL, 0,
+      "sched_setparam($module, pid, param, /)\n"
+      "--\n"
+      "\n"
+      "Set scheduling parameters for the process identified by pid.\n"
+      "\n"
+      "If pid is 0, sets parameters for the calling process.\n"
+      "param should be an instance of sched_param." },
+#endif
+#ifdef QP_OS_HAVE_SCHED_RR_GET_INTERVAL
+    { "sched_rr_get_interval", qp_os_sched_rr_get_interval, QP_METH_O, 0,
+      "sched_rr_get_interval($module, pid, /)\n"
+      "--\n"
+      "\n"
+      "Return the round-robin quantum for the process identified by pid, in seconds.\n"
+      "\n"
+      "Value returned is a float." },
+#endif
+    { "sched_yield", qp_os_sched_yield, QP_METH_NOARGS, 0,
+      "sched_yield($module, /)\n"
+      "--\n"
+      "\n"
+      "Voluntarily relinquish the CPU." },
+#ifdef QP_OS_HAVE_SCHED_SETAFFINITY
+    { "sched_setaffinity", qp_os_sched_setaffinity, QP_METH_FASTCALL, 0,
+      "sched_setaffinity($module, pid, mask, /)\n"
+      "--\n"
+      "\n"
+      "Set the CPU affinity of the process identified by pid to mask.\n"
+      "\n"
+      "mask should be an iterable of integers identifying CPUs." },
+    { "sched_getaffinity", qp_os_sched_getaffinity, QP_METH_O, 0,
+      "sched_getaffinity($module, pid, /)\n"
+      "--\n"
+      "\n"
+      "Return the affinity of the process identified by pid (or the current process if zero).\n"
+      "\n"
+      "The affinity is returned as a set of CPU identifiers." },
+#endif
+    { "posix_openpt", qp_os_posix_openpt, QP_METH_O, 0,
+      "posix_openpt($module, oflag, /)\n"
+      "--\n"
+      "\n"
+      "Open and return a file descriptor for a master pseudo-terminal device.\n"
+      "\n"
+      "Performs a posix_openpt() C function call. The oflag argument is used to\n"
+      "set file status flags and file access modes as specified in the manual\n"
+      "page of posix_openpt() of your system." },
+    { "grantpt", qp_os_grantpt, QP_METH_O, 0,
+      "grantpt($module, fd, /)\n"
+      "--\n"
+      "\n"
+      "Grant access to the slave pseudo-terminal device.\n"
+      "\n"
+      "  fd\n"
+      "    File descriptor of a master pseudo-terminal device.\n"
+      "\n"
+      "Performs a grantpt() C function call." },
+    { "unlockpt", qp_os_unlockpt, QP_METH_O, 0,
+      "unlockpt($module, fd, /)\n"
+      "--\n"
+      "\n"
+      "Unlock a pseudo-terminal master/slave pair.\n"
+      "\n"
+      "  fd\n"
+      "    File descriptor of a master pseudo-terminal device.\n"
+      "\n"
+      "Performs an unlockpt() C function call." },
+    { "ptsname", qp_os_ptsname, QP_METH_O, 0,
+      "ptsname($module, fd, /)\n"
+      "--\n"
+      "\n"
+      "Return the name of the slave pseudo-terminal device.\n"
+      "\n"
+      "  fd\n"
+      "    File descriptor of a master pseudo-terminal device.\n"
+      "\n"
+      "If the ptsname_r() C function is available, it is called;\n"
+      "otherwise, performs a ptsname() C function call." },
+    { "openpty", qp_os_openpty, QP_METH_NOARGS, 0,
+      "openpty($module, /)\n"
+      "--\n"
+      "\n"
+      "Open a pseudo-terminal.\n"
+      "\n"
+      "Return a tuple of (master_fd, slave_fd) containing open file descriptors\n"
+      "for both the master and slave ends." },
+    { "login_tty", qp_os_login_tty, QP_METH_O, 0,
+      "login_tty($module, fd, /)\n"
+      "--\n"
+      "\n"
+      "Prepare the tty of which fd is a file descriptor for a new login session.\n"
+      "\n"
+      "Make the calling process a session leader; make the tty the\n"
+      "controlling tty, the stdin, the stdout, and the stderr of the\n"
+      "calling process; close fd." },
+    { "forkpty", qp_os_forkpty, QP_METH_NOARGS, 0,
+      "forkpty($module, /)\n"
+      "--\n"
+      "\n"
+      "Fork a new process with a new pseudo-terminal as controlling tty.\n"
+      "\n"
+      "Returns a tuple of (pid, master_fd).\n"
+      "Like fork(), return pid of 0 to the child process,\n"
+      "and pid of child to the parent process.\n"
+      "To both, return fd of newly opened pseudo-terminal.\n"
+      "The master_fd is non-inheritable." },
+    { "getgrouplist", qp_os_getgrouplist, QP_METH_FASTCALL, 0,
+      "getgrouplist($module, user, group, /)\n"
+      "--\n"
+      "\n"
+      "Returns a list of groups to which a user belongs.\n"
+      "\n"
+      "  user\n"
+      "    username to lookup\n"
+      "  group\n"
+      "    base group id of the user" },
+    { "initgroups", qp_os_initgroups, QP_METH_FASTCALL, 0,
+      "initgroups($module, username, gid, /)\n"
+      "--\n"
+      "\n"
+      "Initialize the group access list.\n"
+      "\n"
+      "Call the system initgroups() to initialize the group access list with\n"
+      "all of the groups of which the specified username is a member, plus the\n"
+      "specified group id." },
+    { "setpgrp", qp_os_setpgrp, QP_METH_NOARGS, 0,
+      "setpgrp($module, /)\n"
+      "--\n"
+      "\n"
+      "Make the current process the leader of its process group." },
+    { "setuid", qp_os_setid, QP_METH_O, 0,
+      "setuid($module, uid, /)\n"
+      "--\n"
+      "\n"
+      "Set the current process\'s user id." },
+    { "seteuid", qp_os_setid, QP_METH_O, 1,
+      "seteuid($module, euid, /)\n"
+      "--\n"
+      "\n"
+      "Set the current process\'s effective user id." },
+    { "setegid", qp_os_setid, QP_METH_O, 2,
+      "setegid($module, egid, /)\n"
+      "--\n"
+      "\n"
+      "Set the current process\'s effective group id." },
+    { "setreuid", qp_os_setreid, QP_METH_FASTCALL, 0,
+      "setreuid($module, ruid, euid, /)\n"
+      "--\n"
+      "\n"
+      "Set the current process\'s real and effective user ids." },
+    { "setregid", qp_os_setreid, QP_METH_FASTCALL, 1,
+      "setregid($module, rgid, egid, /)\n"
+      "--\n"
+      "\n"
+      "Set the current process\'s real and effective group ids." },
+    { "setgid", qp_os_setid, QP_METH_O, 3,
+      "setgid($module, gid, /)\n"
+      "--\n"
+      "\n"
+      "Set the current process\'s group id." },
+    { "setgroups", qp_os_setgroups, QP_METH_O, 0,
+      "setgroups($module, groups, /)\n"
+      "--\n"
+      "\n"
+      "Set the groups of the current process to list." },
+#ifdef QP_OS_HAVE_SETRESUID
+    { "setresuid", qp_os_setresid, QP_METH_FASTCALL, 0,
+      "setresuid($module, ruid, euid, suid, /)\n"
+      "--\n"
+      "\n"
+      "Set the current process\'s real, effective, and saved user ids." },
+    { "setresgid", qp_os_setresid, QP_METH_FASTCALL, 1,
+      "setresgid($module, rgid, egid, sgid, /)\n"
+      "--\n"
+      "\n"
+      "Set the current process\'s real, effective, and saved group ids." },
+    { "getresuid", qp_os_getresid, QP_METH_NOARGS, 0,
+      "getresuid($module, /)\n"
+      "--\n"
+      "\n"
+      "Return a tuple of the current process\'s real, effective, and saved user ids." },
+    { "getresgid", qp_os_getresid, QP_METH_NOARGS, 1,
+      "getresgid($module, /)\n"
+      "--\n"
+      "\n"
+      "Return a tuple of the current process\'s real, effective, and saved group ids." },
+#endif
+    { "wait3", qp_os_wait3, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "wait3($module, /, options)\n"
+      "--\n"
+      "\n"
+      "Wait for completion of a child process.\n"
+      "\n"
+      "Returns a tuple of information about the child process:\n"
+      "  (pid, status, rusage)" },
+    { "wait4", qp_os_wait3, QP_METH_FASTCALL | QP_METH_KEYWORDS, 1,
+      "wait4($module, /, pid, options)\n"
+      "--\n"
+      "\n"
+      "Wait for completion of a specific child process.\n"
+      "\n"
+      "Returns a tuple of information about the child process:\n"
+      "  (pid, status, rusage)" },
+    { "waitid", qp_os_waitid, QP_METH_FASTCALL, 0,
+      "waitid($module, idtype, id, options, /)\n"
+      "--\n"
+      "\n"
+      "Returns the result of waiting for a process or processes.\n"
+      "\n"
+      "  idtype\n"
+      "    Must be one of be P_PID, P_PGID or P_ALL.\n"
+      "  id\n"
+      "    The id to wait on.\n"
+      "  options\n"
+      "    Constructed from the ORing of one or more of WEXITED, WSTOPPED\n"
+      "    or WCONTINUED and additionally may be ORed with WNOHANG or WNOWAIT.\n"
+      "\n"
+      "Returns either waitid_result or None if WNOHANG is specified and there\n"
+      "are no children in a waitable state." },
+#ifdef QP_OS_HAVE_PIDFD_OPEN
+    { "pidfd_open", qp_os_pidfd_open, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "pidfd_open($module, /, pid, flags=0)\n"
+      "--\n"
+      "\n"
+      "Return a file descriptor referring to the process *pid*.\n"
+      "\n"
+      "The descriptor can be used to perform process management without races\n"
+      "and signals." },
+#endif
+#ifdef QP_OS_HAVE_SETNS
+    { "setns", qp_os_setns, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "setns($module, /, fd, nstype=0)\n"
+      "--\n"
+      "\n"
+      "Move the calling thread into different namespaces.\n"
+      "\n"
+      "  fd\n"
+      "    A file descriptor to a namespace.\n"
+      "  nstype\n"
+      "    Type of namespace." },
+#endif
+#ifdef QP_OS_HAVE_UNSHARE
+    { "unshare", qp_os_unshare, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "unshare($module, /, flags)\n"
+      "--\n"
+      "\n"
+      "Disassociate parts of a process (or thread) execution context.\n"
+      "\n"
+      "  flags\n"
+      "    Namespaces to be unshared." },
+#endif
+    { "tcgetpgrp", qp_os_tcgetpgrp, QP_METH_O, 0,
+      "tcgetpgrp($module, fd, /)\n"
+      "--\n"
+      "\n"
+      "Return the process group associated with the terminal specified by fd." },
+    { "tcsetpgrp", qp_os_tcsetpgrp, QP_METH_FASTCALL, 0,
+      "tcsetpgrp($module, fd, pgid, /)\n"
+      "--\n"
+      "\n"
+      "Set the process group associated with the terminal specified by fd." },
+    { "lockf", qp_os_lockf, QP_METH_FASTCALL, 0,
+      "lockf($module, fd, command, length, /)\n"
+      "--\n"
+      "\n"
+      "Apply, test or remove a POSIX lock on an open file descriptor.\n"
+      "\n"
+      "  fd\n"
+      "    An open file descriptor.\n"
+      "  command\n"
+      "    One of F_LOCK, F_TLOCK, F_ULOCK or F_TEST.\n"
+      "  length\n"
+      "    The number of bytes to lock, starting at the current position." },
+    { "preadv", qp_os_preadv, QP_METH_FASTCALL, 0,
+      "preadv($module, fd, buffers, offset, flags=0, /)\n"
+      "--\n"
+      "\n"
+      "Reads from a file descriptor into a number of mutable bytes-like objects.\n"
+      "\n"
+      "Combines the functionality of readv() and pread().  As readv(), it will\n"
+      "transfer data into each buffer until it is full and then move on to the\n"
+      "next buffer in the sequence to hold the rest of the data.  Its fourth\n"
+      "argument, specifies the file offset at which the input operation is to\n"
+      "be performed.  It will return the total number of bytes read (which can\n"
+      "be less than the total capacity of all the objects).\n"
+      "\n"
+      "The flags argument contains a bitwise OR of zero or more of the\n"
+      "following flags:\n"
+      "\n"
+      "- RWF_HIPRI\n"
+      "- RWF_NOWAIT\n"
+      "- RWF_DONTCACHE\n"
+      "\n"
+      "Using non-zero flags requires Linux 4.6 or newer." },
+    { "pwritev", qp_os_preadv, QP_METH_FASTCALL, 1,
+      "pwritev($module, fd, buffers, offset, flags=0, /)\n"
+      "--\n"
+      "\n"
+      "Writes the contents of bytes-like objects to a file descriptor at a given offset.\n"
+      "\n"
+      "Combines the functionality of writev() and pwrite(). All buffers must be\n"
+      "a sequence of bytes-like objects.  Buffers are processed in array order.\n"
+      "Entire contents of first buffer is written before proceeding to second,\n"
+      "and so on. The operating system may set a limit (sysconf() value\n"
+      "SC_IOV_MAX) on the number of buffers that can be used.\n"
+      "This function writes the contents of each object to the file descriptor\n"
+      "and returns the total number of bytes written.\n"
+      "\n"
+      "The flags argument contains a bitwise OR of zero or more of the\n"
+      "following flags:\n"
+      "\n"
+      "- RWF_DSYNC\n"
+      "- RWF_SYNC\n"
+      "- RWF_APPEND\n"
+      "- RWF_DONTCACHE\n"
+      "- RWF_ATOMIC\n"
+      "\n"
+      "Using non-zero flags requires Linux 4.7 or newer." },
+#ifdef __APPLE__
+    { "sendfile", qp_os_sendfile, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "sendfile($module, /, out_fd, in_fd, offset, count, headers=(),\n"
+      "         trailers=(), flags=0)\n"
+      "--\n"
+      "\n"
+      "Copy count bytes from file descriptor in_fd to file descriptor out_fd." },
+#else
+    { "sendfile", qp_os_sendfile, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "sendfile($module, /, out_fd, in_fd, offset, count)\n"
+      "--\n"
+      "\n"
+      "Copy count bytes from file descriptor in_fd to file descriptor out_fd." },
+#endif
+#ifdef QP_OS_HAVE_FCOPYFILE
+    { "_fcopyfile", qp_os__fcopyfile, QP_METH_FASTCALL, 0,
+      "_fcopyfile($module, in_fd, out_fd, flags, /)\n"
+      "--\n"
+      "\n"
+      "Efficiently copy content or metadata of 2 regular file descriptors (macOS)." },
+#endif
+#ifdef QP_OS_HAVE_COPY_FILE_RANGE
+    { "copy_file_range", qp_os_copy_file_range, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "copy_file_range($module, /, src, dst, count, offset_src=None,\n"
+      "                offset_dst=None)\n"
+      "--\n"
+      "\n"
+      "Copy count bytes from one file descriptor to another.\n"
+      "\n"
+      "  src\n"
+      "    Source file descriptor.\n"
+      "  dst\n"
+      "    Destination file descriptor.\n"
+      "  count\n"
+      "    Number of bytes to copy.\n"
+      "  offset_src\n"
+      "    Starting offset in src.\n"
+      "  offset_dst\n"
+      "    Starting offset in dst.\n"
+      "\n"
+      "If offset_src is None, then src is read from the current position;\n"
+      "respectively for offset_dst." },
+#endif
+#ifdef QP_OS_HAVE_SPLICE
+    { "splice", qp_os_copy_file_range, QP_METH_FASTCALL | QP_METH_KEYWORDS, 1,
+      "splice($module, /, src, dst, count, offset_src=None, offset_dst=None,\n"
+      "       flags=0)\n"
+      "--\n"
+      "\n"
+      "Transfer count bytes from one pipe to a descriptor or vice versa.\n"
+      "\n"
+      "  src\n"
+      "    Source file descriptor.\n"
+      "  dst\n"
+      "    Destination file descriptor.\n"
+      "  count\n"
+      "    Number of bytes to copy.\n"
+      "  offset_src\n"
+      "    Starting offset in src.\n"
+      "  offset_dst\n"
+      "    Starting offset in dst.\n"
+      "  flags\n"
+      "    Flags to modify the semantics of the call.\n"
+      "\n"
+      "If offset_src is None, then src is read from the current position;\n"
+      "respectively for offset_dst. The offset associated to the file\n"
+      "descriptor that refers to a pipe must be None." },
+#endif
+    { "mkfifo", qp_os_mkfifo, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "mkfifo($module, /, path, mode=438, *, dir_fd=None)\n"
+      "--\n"
+      "\n"
+      "Create a \"fifo\" (a POSIX named pipe).\n"
+      "\n"
+      "If dir_fd is not None, it should be a file descriptor open to\n"
+      "a directory, and path should be relative; path will then be relative to\n"
+      "that directory.\n"
+      "dir_fd may not be implemented on your platform.  If it is unavailable,\n"
+      "using it will raise a NotImplementedError." },
+    { "mknod", qp_os_mkfifo, QP_METH_FASTCALL | QP_METH_KEYWORDS, 1,
+      "mknod($module, /, path, mode=384, device=0, *, dir_fd=None)\n"
+      "--\n"
+      "\n"
+      "Create a node in the file system.\n"
+      "\n"
+      "Create a node in the file system (file, device special file or named\n"
+      "pipe) at path.  mode specifies both the permissions to use and the\n"
+      "type of node to be created, being combined (bitwise OR) with one of\n"
+      "S_IFREG, S_IFCHR, S_IFBLK, and S_IFIFO.  If S_IFCHR or S_IFBLK is set\n"
+      "on mode, device defines the newly created device special file (probably\n"
+      "using os.makedev()).  Otherwise device is ignored.\n"
+      "\n"
+      "If dir_fd is not None, it should be a file descriptor open to\n"
+      "a directory, and path should be relative; path will then be relative\n"
+      "to that directory.\n"
+      "dir_fd may not be implemented on your platform.  If it is unavailable,\n"
+      "using it will raise a NotImplementedError." },
+    { "major", qp_os_major, QP_METH_O, 0,
+      "major($module, device, /)\n"
+      "--\n"
+      "\n"
+      "Extracts a device major number from a raw device number." },
+    { "minor", qp_os_major, QP_METH_O, 1,
+      "minor($module, device, /)\n"
+      "--\n"
+      "\n"
+      "Extracts a device minor number from a raw device number." },
+    { "makedev", qp_os_makedev, QP_METH_FASTCALL, 0,
+      "makedev($module, major, minor, /)\n"
+      "--\n"
+      "\n"
+      "Composes a raw device number from the major and minor device numbers." },
+#ifdef QP_OS_HAVE_POSIX_FALLOCATE
+    { "posix_fallocate", qp_os_posix_fallocate, QP_METH_FASTCALL, 0,
+      "posix_fallocate($module, fd, offset, length, /)\n"
+      "--\n"
+      "\n"
+      "Ensure a file has allocated at least a particular number of bytes on disk.\n"
+      "\n"
+      "Ensure that the file specified by fd encompasses a range of bytes\n"
+      "starting at offset bytes from the beginning and continuing for length\n"
+      "bytes." },
+#endif
+#ifdef QP_OS_HAVE_POSIX_FADVISE
+    { "posix_fadvise", qp_os_posix_fallocate, QP_METH_FASTCALL, 1,
+      "posix_fadvise($module, fd, offset, length, advice, /)\n"
+      "--\n"
+      "\n"
+      "Announce an intention to access data in a specific pattern.\n"
+      "\n"
+      "Announce an intention to access data in a specific pattern, thus\n"
+      "allowing the kernel to make optimizations.\n"
+      "The advice applies to the region of the file specified by fd starting at\n"
+      "offset and continuing for length bytes.\n"
+      "advice is one of POSIX_FADV_NORMAL, POSIX_FADV_SEQUENTIAL,\n"
+      "POSIX_FADV_RANDOM, POSIX_FADV_NOREUSE, POSIX_FADV_WILLNEED, or\n"
+      "POSIX_FADV_DONTNEED." },
+#endif
+#ifdef QP_OS_HAVE_CLEARENV
+    { "_clearenv", qp_os__clearenv, QP_METH_NOARGS, 0,
+      "_clearenv($module, /)\n"
+      "--\n"
+      "\n" },
+#endif
+#ifdef QP_OS_HAVE_MEMFD_CREATE
+    { "memfd_create", qp_os_memfd_create, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "memfd_create($module, /, name, flags=MFD_CLOEXEC)\n"
+      "--\n"
+      "\n" },
+#endif
+#if defined(QP_OS_HAVE_EVENTFD) && defined(EFD_CLOEXEC)
+    { "eventfd", qp_os_eventfd, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "eventfd($module, /, initval, flags=EFD_CLOEXEC)\n"
+      "--\n"
+      "\n"
+      "Creates and returns an event notification file descriptor." },
+    { "eventfd_read", qp_os_eventfd_read, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "eventfd_read($module, /, fd)\n"
+      "--\n"
+      "\n"
+      "Read eventfd value" },
+    { "eventfd_write", qp_os_eventfd_write, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "eventfd_write($module, /, fd, value)\n"
+      "--\n"
+      "\n"
+      "Write eventfd value." },
+#endif
+#ifdef __linux__
+    { "getrandom", qp_os_getrandom, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "getrandom($module, /, size, flags=0)\n"
+      "--\n"
+      "\n"
+      "Obtain a series of random bytes." },
+#endif
+    { "_inputhook", qp_os__inputhook, QP_METH_NOARGS, 0,
+      "_inputhook($module, /)\n"
+      "--\n"
+      "\n"
+      "Calls PyOS_InputHook dropping the GIL first" },
+    { "_is_inputhook_installed", qp_os__is_inputhook_installed, QP_METH_NOARGS, 0,
+      "_is_inputhook_installed($module, /)\n"
+      "--\n"
+      "\n"
+      "Checks if PyOS_InputHook is set" },
+    { "_create_environ", qp_os__create_environ, QP_METH_NOARGS, 0,
+      "_create_environ($module, /)\n"
+      "--\n"
+      "\n"
+      "Create the environment dictionary." },
     { NULL }
 };
 
-/* convertenviron: bytes -> bytes dict (first occurrence wins) */
-static JSValue qp_os_convertenviron(JSContext *ctx)
+/* convertenviron: the process environment into the bytes -> bytes dict
+   'd' (first occurrence wins) */
+static int qp_os_environ_fill(JSContext *ctx, JSValueConst d)
 {
-    JSValue d = qp_dict_new(ctx);
     char **e;
-    if (JS_IsException(d))
-        return d;
     for (e = QP_OS_ENVIRON; e && *e; e++) {
         const char *p = strchr(*e, '=');
         JSValue k, v, old;
@@ -5223,38 +8579,136 @@ static JSValue qp_os_convertenviron(JSContext *ctx)
             continue;
         k = qp_bytes_new(ctx, *e, p - *e);
         if (JS_IsException(k))
-            goto fail;
+            return -1;
         v = qp_bytes_new(ctx, p + 1, strlen(p + 1));
         if (JS_IsException(v)) {
             JS_FreeValue(ctx, k);
-            goto fail;
+            return -1;
         }
         old = qp_dict_setdefault(ctx, d, k, v);
         JS_FreeValue(ctx, k);
         JS_FreeValue(ctx, v);
         if (JS_IsException(old))
-            goto fail;
+            return -1;
         JS_FreeValue(ctx, old);
     }
-    return d;
-fail:
-    JS_FreeValue(ctx, d);
-    return JS_EXCEPTION;
+    return 0;
 }
 
-static const char *const qp_os_have_functions[] = {
-    "HAVE_FACCESSAT", "HAVE_FCHDIR", "HAVE_FCHMOD", "HAVE_FCHMODAT", "HAVE_FCHOWN",
-    "HAVE_FCHOWNAT", "HAVE_FDOPENDIR", "HAVE_FPATHCONF", "HAVE_FSTATAT", "HAVE_FSTATVFS",
-    "HAVE_FTRUNCATE", "HAVE_FUTIMENS", "HAVE_LINKAT", "HAVE_LCHOWN", "HAVE_LSTAT",
-    "HAVE_MKDIRAT", "HAVE_OPENAT", "HAVE_READLINKAT", "HAVE_RENAMEAT", "HAVE_SYMLINKAT",
-    "HAVE_UNLINKAT", "HAVE_UTIMENSAT",
-#ifdef __APPLE__
-    "HAVE_LCHMOD",
+/* posix.environ: empty with QPConfig.detached (the base of a durable
+   REPL session must not depend on the environment, see
+   qp_os_drepl_environ()) */
+static JSValue qp_os_convertenviron(JSContext *ctx)
+{
+    JSValue d = qp_dict_new(ctx);
+    if (JS_IsException(d))
+        return d;
+    if (!QP_STATE(ctx)->config.detached && qp_os_environ_fill(ctx, d) < 0) {
+        JS_FreeValue(ctx, d);
+        return JS_EXCEPTION;
+    }
+    return d;
+}
+
+/* posix.environ of a durable REPL session, emptied in place before the
+   session is saved (the session file never holds the values of the
+   environment) and filled from the process environment otherwise
+   ('fill'). os.environ wraps the same dict. Nothing happens if
+   sys.modules['posix'].environ is not a dict. */
+static void qp_os_drepl_environ(JSContext *ctx, BOOL fill)
+{
+    QPState *s = QP_STATE(ctx);
+    JSValue m = QP_NULL, d = JS_EXCEPTION;
+    JSAtom name;
+    int r = 0;
+
+    name = JS_NewAtom(ctx, "posix");
+    if (name != JS_ATOM_NULL) {
+        r = qp_dict_check(ctx, s->modules) ?
+            qp_dict_get_item_atom(ctx, s->modules, name, &m) : 0;
+        JS_FreeAtom(ctx, name);
+    } else {
+        r = -1;
+    }
+    if (r > 0) {
+        name = JS_NewAtom(ctx, "environ");
+        if (name != JS_ATOM_NULL) {
+            d = qp_getattr(ctx, m, name);
+            JS_FreeAtom(ctx, name);
+        }
+        JS_FreeValue(ctx, m);
+        if (JS_IsException(d)) {
+            r = -1;
+        } else if (qp_dict_check(ctx, d)) {
+            qp_dictcore_clear(ctx, &QP_DICT(d)->core);
+            if (fill && qp_os_environ_fill(ctx, d) < 0)
+                r = -1;
+        }
+        JS_FreeValue(ctx, d);
+    }
+    /* out of memory, or an attribute error */
+    if (r < 0)
+        qp_tw_clear_exc(ctx);
+}
+
+/* probes of the functions newer than the macOS deployment target */
+static int qp_os_probe_mkfifoat(void)
+{
+    if (QP_OS_HAVE_MKFIFOAT_RUNTIME)
+        return 1;
+    return 0;
+}
+
+static int qp_os_probe_mknodat(void)
+{
+    if (QP_OS_HAVE_MKNODAT_RUNTIME)
+        return 1;
+    return 0;
+}
+
+static int qp_os_probe_ptsname_r(void)
+{
+    if (QP_OS_HAVE_PTSNAME_R_RUNTIME)
+        return 1;
+    return 0;
+}
+
+/* have_functions (CPython order); probe NULL: always present */
+static const struct {
+    const char *name;
+    int (*probe)(void);
+} qp_os_have_functions[] = {
+#if defined(QP_OS_HAVE_EVENTFD) && defined(EFD_CLOEXEC)
+    { "HAVE_EVENTFD", NULL },
 #endif
+    { "HAVE_FACCESSAT", NULL }, { "HAVE_FCHDIR", NULL }, { "HAVE_FCHMOD", NULL },
+    { "HAVE_FCHMODAT", NULL }, { "HAVE_FCHOWN", NULL }, { "HAVE_FCHOWNAT", NULL },
 #ifdef __linux__
-    "HAVE_FDATASYNC", "HAVE_FEXECVE",
+    { "HAVE_FEXECVE", NULL },
 #endif
-    NULL
+    { "HAVE_FDOPENDIR", NULL }, { "HAVE_FPATHCONF", NULL }, { "HAVE_FSTATAT", NULL },
+    { "HAVE_FSTATVFS", NULL }, { "HAVE_FTRUNCATE", NULL }, { "HAVE_FUTIMENS", NULL },
+    { "HAVE_FUTIMES", NULL },
+#ifdef QP_OS_HAVE_FUTIMESAT
+    { "HAVE_FUTIMESAT", NULL },
+#endif
+    { "HAVE_LINKAT", NULL },
+#ifdef QP_OS_HAVE_LCHFLAGS
+    { "HAVE_LCHFLAGS", NULL },
+#endif
+#ifdef __APPLE__
+    { "HAVE_LCHMOD", NULL },
+#endif
+    { "HAVE_LCHOWN", NULL }, { "HAVE_LSTAT", NULL }, { "HAVE_LUTIMES", NULL },
+#ifdef QP_OS_HAVE_MEMFD_CREATE
+    { "HAVE_MEMFD_CREATE", NULL },
+#endif
+    { "HAVE_MKDIRAT", NULL }, { "HAVE_MKFIFOAT", qp_os_probe_mkfifoat },
+    { "HAVE_MKNODAT", qp_os_probe_mknodat }, { "HAVE_OPENAT", NULL },
+    { "HAVE_READLINKAT", NULL }, { "HAVE_RENAMEAT", NULL }, { "HAVE_SYMLINKAT", NULL },
+    { "HAVE_UNLINKAT", NULL }, { "HAVE_UTIMENSAT", NULL },
+    { "HAVE_PTSNAME_R", qp_os_probe_ptsname_r },
+    { NULL, NULL }
 };
 
 static int qp_os_add_type(JSContext *ctx, JSValueConst module, const char *prop,
@@ -5533,6 +8987,306 @@ static int qp_posix_exec(JSContext *ctx, JSValueConst module)
 #ifdef WSTOPPED
     QP_OS_INT(WSTOPPED);
 #endif
+#ifdef PRIO_PROCESS
+    QP_OS_INT(PRIO_PROCESS);
+#endif
+#ifdef PRIO_PGRP
+    QP_OS_INT(PRIO_PGRP);
+#endif
+#ifdef PRIO_USER
+    QP_OS_INT(PRIO_USER);
+#endif
+#ifdef PRIO_DARWIN_THREAD
+    QP_OS_INT(PRIO_DARWIN_THREAD);
+#endif
+#ifdef PRIO_DARWIN_PROCESS
+    QP_OS_INT(PRIO_DARWIN_PROCESS);
+#endif
+#ifdef PRIO_DARWIN_BG
+    QP_OS_INT(PRIO_DARWIN_BG);
+#endif
+#ifdef PRIO_DARWIN_NONUI
+    QP_OS_INT(PRIO_DARWIN_NONUI);
+#endif
+    /* constants for posix_fadvise */
+#ifdef POSIX_FADV_NORMAL
+    QP_OS_INT(POSIX_FADV_NORMAL);
+#endif
+#ifdef POSIX_FADV_SEQUENTIAL
+    QP_OS_INT(POSIX_FADV_SEQUENTIAL);
+#endif
+#ifdef POSIX_FADV_RANDOM
+    QP_OS_INT(POSIX_FADV_RANDOM);
+#endif
+#ifdef POSIX_FADV_NOREUSE
+    QP_OS_INT(POSIX_FADV_NOREUSE);
+#endif
+#ifdef POSIX_FADV_WILLNEED
+    QP_OS_INT(POSIX_FADV_WILLNEED);
+#endif
+#ifdef POSIX_FADV_DONTNEED
+    QP_OS_INT(POSIX_FADV_DONTNEED);
+#endif
+    /* constants for waitid (idtype_t enumerators) */
+    QP_OS_INT(P_PID);
+    QP_OS_INT(P_PGID);
+    QP_OS_INT(P_ALL);
+#ifdef P_PIDFD
+    QP_OS_INT(P_PIDFD);
+#endif
+#ifdef PIDFD_NONBLOCK
+    QP_OS_INT(PIDFD_NONBLOCK);
+#endif
+#ifdef CLD_EXITED
+    QP_OS_INT(CLD_EXITED);
+#endif
+#ifdef CLD_KILLED
+    QP_OS_INT(CLD_KILLED);
+#endif
+#ifdef CLD_DUMPED
+    QP_OS_INT(CLD_DUMPED);
+#endif
+#ifdef CLD_TRAPPED
+    QP_OS_INT(CLD_TRAPPED);
+#endif
+#ifdef CLD_STOPPED
+    QP_OS_INT(CLD_STOPPED);
+#endif
+#ifdef CLD_CONTINUED
+    QP_OS_INT(CLD_CONTINUED);
+#endif
+    /* constants for lockf */
+#ifdef F_LOCK
+    QP_OS_INT(F_LOCK);
+#endif
+#ifdef F_TLOCK
+    QP_OS_INT(F_TLOCK);
+#endif
+#ifdef F_ULOCK
+    QP_OS_INT(F_ULOCK);
+#endif
+#ifdef F_TEST
+    QP_OS_INT(F_TEST);
+#endif
+#ifdef QP_OS_HAVE_PREADV2
+#ifdef RWF_DSYNC
+    QP_OS_INT(RWF_DSYNC);
+#endif
+#ifdef RWF_HIPRI
+    QP_OS_INT(RWF_HIPRI);
+#endif
+#ifdef RWF_SYNC
+    QP_OS_INT(RWF_SYNC);
+#endif
+#ifdef RWF_NOWAIT
+    QP_OS_INT(RWF_NOWAIT);
+#endif
+#ifdef RWF_DONTCACHE
+    QP_OS_INT(RWF_DONTCACHE);
+#endif
+#ifdef RWF_ATOMIC
+    QP_OS_INT(RWF_ATOMIC);
+#endif
+#ifdef RWF_APPEND
+    QP_OS_INT(RWF_APPEND);
+#endif
+#endif /* QP_OS_HAVE_PREADV2 */
+    /* constants for splice */
+#ifdef QP_OS_HAVE_SPLICE
+    QP_OS_INT(SPLICE_F_MOVE);
+    QP_OS_INT(SPLICE_F_NONBLOCK);
+    QP_OS_INT(SPLICE_F_MORE);
+#endif
+    /* constants for posix_spawn */
+    QP_OS_INTC("POSIX_SPAWN_OPEN", QP_OS_SPAWN_OPEN);
+    QP_OS_INTC("POSIX_SPAWN_CLOSE", QP_OS_SPAWN_CLOSE);
+    QP_OS_INTC("POSIX_SPAWN_DUP2", QP_OS_SPAWN_DUP2);
+#ifdef QP_OS_HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP
+    QP_OS_INTC("POSIX_SPAWN_CLOSEFROM", QP_OS_SPAWN_CLOSEFROM);
+#endif
+#ifdef SCHED_OTHER
+    QP_OS_INT(SCHED_OTHER);
+#endif
+#ifdef SCHED_DEADLINE
+    QP_OS_INT(SCHED_DEADLINE);
+#endif
+#ifdef SCHED_FIFO
+    QP_OS_INT(SCHED_FIFO);
+#endif
+#ifdef SCHED_NORMAL
+    QP_OS_INT(SCHED_NORMAL);
+#endif
+#ifdef SCHED_RR
+    QP_OS_INT(SCHED_RR);
+#endif
+#ifdef SCHED_SPORADIC
+    QP_OS_INT(SCHED_SPORADIC);
+#endif
+#ifdef SCHED_BATCH
+    QP_OS_INT(SCHED_BATCH);
+#endif
+#ifdef SCHED_IDLE
+    QP_OS_INT(SCHED_IDLE);
+#endif
+#ifdef SCHED_RESET_ON_FORK
+    QP_OS_INT(SCHED_RESET_ON_FORK);
+#endif
+#ifdef SCHED_SYS
+    QP_OS_INT(SCHED_SYS);
+#endif
+#ifdef SCHED_IA
+    QP_OS_INT(SCHED_IA);
+#endif
+#ifdef SCHED_FSS
+    QP_OS_INT(SCHED_FSS);
+#endif
+#ifdef SCHED_FX
+    QP_OS_INTC("SCHED_FX", SCHED_FSS);
+#endif
+    /* constants for namespaces */
+#if defined(QP_OS_HAVE_SETNS) || defined(QP_OS_HAVE_UNSHARE)
+#ifdef CLONE_FS
+    QP_OS_INT(CLONE_FS);
+#endif
+#ifdef CLONE_FILES
+    QP_OS_INT(CLONE_FILES);
+#endif
+#ifdef CLONE_NEWNS
+    QP_OS_INT(CLONE_NEWNS);
+#endif
+#ifdef CLONE_NEWCGROUP
+    QP_OS_INT(CLONE_NEWCGROUP);
+#endif
+#ifdef CLONE_NEWUTS
+    QP_OS_INT(CLONE_NEWUTS);
+#endif
+#ifdef CLONE_NEWIPC
+    QP_OS_INT(CLONE_NEWIPC);
+#endif
+#ifdef CLONE_NEWUSER
+    QP_OS_INT(CLONE_NEWUSER);
+#endif
+#ifdef CLONE_NEWPID
+    QP_OS_INT(CLONE_NEWPID);
+#endif
+#ifdef CLONE_NEWNET
+    QP_OS_INT(CLONE_NEWNET);
+#endif
+#ifdef CLONE_NEWTIME
+    QP_OS_INT(CLONE_NEWTIME);
+#endif
+#ifdef CLONE_SYSVSEM
+    QP_OS_INT(CLONE_SYSVSEM);
+#endif
+#ifdef CLONE_THREAD
+    QP_OS_INT(CLONE_THREAD);
+#endif
+#ifdef CLONE_SIGHAND
+    QP_OS_INT(CLONE_SIGHAND);
+#endif
+#ifdef CLONE_VM
+    QP_OS_INT(CLONE_VM);
+#endif
+#endif
+#ifdef RTLD_LAZY
+    QP_OS_INT(RTLD_LAZY);
+#endif
+#ifdef RTLD_NOW
+    QP_OS_INT(RTLD_NOW);
+#endif
+#ifdef RTLD_GLOBAL
+    QP_OS_INT(RTLD_GLOBAL);
+#endif
+#ifdef RTLD_LOCAL
+    QP_OS_INT(RTLD_LOCAL);
+#endif
+#ifdef RTLD_NODELETE
+    QP_OS_INT(RTLD_NODELETE);
+#endif
+#ifdef RTLD_NOLOAD
+    QP_OS_INT(RTLD_NOLOAD);
+#endif
+#ifdef RTLD_DEEPBIND
+    QP_OS_INT(RTLD_DEEPBIND);
+#endif
+#ifdef RTLD_MEMBER
+    QP_OS_INT(RTLD_MEMBER);
+#endif
+#ifdef __linux__
+    QP_OS_INT(GRND_RANDOM);
+    QP_OS_INT(GRND_NONBLOCK);
+#endif
+#ifdef QP_OS_HAVE_MEMFD_CREATE
+    QP_OS_INT(MFD_CLOEXEC);
+    QP_OS_INT(MFD_ALLOW_SEALING);
+#ifdef MFD_HUGETLB
+    QP_OS_INT(MFD_HUGETLB);
+#endif
+#ifdef MFD_HUGE_SHIFT
+    QP_OS_INT(MFD_HUGE_SHIFT);
+#endif
+#ifdef MFD_HUGE_MASK
+    QP_OS_INT(MFD_HUGE_MASK);
+#endif
+#ifdef MFD_HUGE_64KB
+    QP_OS_INT(MFD_HUGE_64KB);
+#endif
+#ifdef MFD_HUGE_512KB
+    QP_OS_INT(MFD_HUGE_512KB);
+#endif
+#ifdef MFD_HUGE_1MB
+    QP_OS_INT(MFD_HUGE_1MB);
+#endif
+#ifdef MFD_HUGE_2MB
+    QP_OS_INT(MFD_HUGE_2MB);
+#endif
+#ifdef MFD_HUGE_8MB
+    QP_OS_INT(MFD_HUGE_8MB);
+#endif
+#ifdef MFD_HUGE_16MB
+    QP_OS_INT(MFD_HUGE_16MB);
+#endif
+#ifdef MFD_HUGE_32MB
+    QP_OS_INT(MFD_HUGE_32MB);
+#endif
+#ifdef MFD_HUGE_256MB
+    QP_OS_INT(MFD_HUGE_256MB);
+#endif
+#ifdef MFD_HUGE_512MB
+    QP_OS_INT(MFD_HUGE_512MB);
+#endif
+#ifdef MFD_HUGE_1GB
+    QP_OS_INT(MFD_HUGE_1GB);
+#endif
+#ifdef MFD_HUGE_2GB
+    QP_OS_INT(MFD_HUGE_2GB);
+#endif
+#ifdef MFD_HUGE_16GB
+    QP_OS_INT(MFD_HUGE_16GB);
+#endif
+#endif /* QP_OS_HAVE_MEMFD_CREATE */
+#if defined(QP_OS_HAVE_EVENTFD) && defined(EFD_CLOEXEC)
+    QP_OS_INT(EFD_CLOEXEC);
+#ifdef EFD_NONBLOCK
+    QP_OS_INT(EFD_NONBLOCK);
+#endif
+#ifdef EFD_SEMAPHORE
+    QP_OS_INT(EFD_SEMAPHORE);
+#endif
+#endif
+#ifdef NODEV
+    if (qp_os_set(ctx, module, "NODEV", qp_os_long_from_dev(ctx, NODEV)) < 0)
+        return -1;
+#endif
+#ifdef AT_NO_AUTOMOUNT
+    QP_OS_INT(AT_NO_AUTOMOUNT);
+#endif
+#ifdef QP_OS_HAVE_FCOPYFILE
+    QP_OS_INTC("_COPYFILE_DATA", COPYFILE_DATA);
+    QP_OS_INTC("_COPYFILE_STAT", COPYFILE_STAT);
+    QP_OS_INTC("_COPYFILE_ACL", COPYFILE_ACL);
+    QP_OS_INTC("_COPYFILE_XATTR", COPYFILE_XATTR);
+#endif
 #undef QP_OS_INT
 #undef QP_OS_INTC
 
@@ -5563,8 +9317,12 @@ static int qp_posix_exec(JSContext *ctx, JSValueConst module)
             JS_FreeValue(ctx, st);
             return -1;
         }
+        /* structseq types are created immutable; CPython's posixmodule
+           patches tp_new before the type is published. */
         at = JS_NewAtom(ctx, "__new__");
+        qp_type_from_value(st)->flags &= ~QP_TPFLAGS_IMMUTABLETYPE;
         r = qp_setattr(ctx, st, at, sm);
+        qp_type_from_value(st)->flags |= QP_TPFLAGS_IMMUTABLETYPE;
         JS_FreeAtom(ctx, at);
         JS_FreeValue(ctx, sm);
         if (r < 0) {
@@ -5581,12 +9339,64 @@ static int qp_posix_exec(JSContext *ctx, JSValueConst module)
                        qp_structseq_new_type(ctx, &qp_os_terminal_size_desc)) < 0 ||
         qp_os_add_type(ctx, module, QP_OS_PROP_TIMES, "times_result",
                        qp_structseq_new_type(ctx, &qp_os_times_result_desc)) < 0 ||
+        qp_os_add_type(ctx, module, QP_OS_PROP_WAITID, "waitid_result",
+                       qp_structseq_new_type(ctx, &qp_os_waitid_result_desc)) < 0 ||
         qp_os_add_type(ctx, module, QP_OS_PROP_DIRENTRY, "DirEntry",
                        qp_type_from_spec(ctx, &qp_de_spec)) < 0 ||
         qp_os_add_type(ctx, module, QP_OS_PROP_SCANDIR, NULL,
                        qp_type_from_spec(ctx, &qp_si_spec)) < 0)
         return -1;
 
+#ifdef QP_OS_HAVE_SCHED_PARAM
+    /* sched_param: tp_new = os_sched_param, plus __reduce__ */
+    {
+        JSValue sp = qp_structseq_new_type(ctx, &qp_os_sched_param_desc), nw, sm, red;
+        QPType *spt;
+        JSAtom at;
+        int r;
+        if (JS_IsException(sp))
+            return -1;
+        spt = qp_type_from_value(sp);
+        nw = qp_cfunction_new(ctx, &qp_os_sched_param_new_def, sp, JS_UNDEFINED);
+        sm = JS_IsException(nw) ? JS_EXCEPTION : qp_staticmethod_new(ctx, nw);
+        JS_FreeValue(ctx, nw);
+        red = JS_IsException(sm) ? JS_EXCEPTION : qp_descr_new_method(ctx, spt, &qp_os_sched_param_reduce_def);
+        if (JS_IsException(red)) {
+            JS_FreeValue(ctx, sm);
+            JS_FreeValue(ctx, sp);
+            return -1;
+        }
+        spt->flags &= ~QP_TPFLAGS_IMMUTABLETYPE;
+        at = JS_NewAtom(ctx, "__new__");
+        r = qp_setattr(ctx, sp, at, sm);
+        JS_FreeAtom(ctx, at);
+        if (r == 0) {
+            at = JS_NewAtom(ctx, "__reduce__");
+            r = qp_setattr(ctx, sp, at, red);
+            JS_FreeAtom(ctx, at);
+        }
+        spt->flags |= QP_TPFLAGS_IMMUTABLETYPE;
+        JS_FreeValue(ctx, sm);
+        JS_FreeValue(ctx, red);
+        if (r < 0) {
+            JS_FreeValue(ctx, sp);
+            return -1;
+        }
+        if (qp_os_add_type(ctx, module, QP_OS_PROP_SCHEDPARAM, "sched_param", sp) < 0)
+            return -1;
+    }
+#endif
+#if defined(QP_OS_HAVE_PIPE2) && defined(__APPLE__)
+    if (QP_OS_HAVE_PIPE2_RUNTIME) {
+        /* `__builtin_available` doesn't allow `!` */
+    } else {
+        JSAtom at = JS_NewAtom(ctx, "pipe2");
+        int r = qp_dict_del_item_atom(ctx, qp_module_get_dict(module), at);
+        JS_FreeAtom(ctx, at);
+        if (r < 0)
+            return -1;
+    }
+#endif
     if (JS_DefinePropertyValueStr(ctx, module, QP_OS_PROP_FORK_BEFORE, qp_list_new(ctx, 0), 0) < 0 ||
         JS_DefinePropertyValueStr(ctx, module, QP_OS_PROP_FORK_CHILD, qp_list_new(ctx, 0), 0) < 0 ||
         JS_DefinePropertyValueStr(ctx, module, QP_OS_PROP_FORK_PARENT, qp_list_new(ctx, 0), 0) < 0)
@@ -5595,8 +9405,11 @@ static int qp_posix_exec(JSContext *ctx, JSValueConst module)
     v = qp_list_new(ctx, 0);
     if (JS_IsException(v))
         return -1;
-    for (i = 0; qp_os_have_functions[i]; i++) {
-        JSValue s = qp_str_from_cstr(ctx, qp_os_have_functions[i]);
+    for (i = 0; qp_os_have_functions[i].name; i++) {
+        JSValue s;
+        if (qp_os_have_functions[i].probe && !qp_os_have_functions[i].probe())
+            continue;
+        s = qp_str_from_cstr(ctx, qp_os_have_functions[i].name);
         if (JS_IsException(s) || qp_list_append(ctx, v, s) < 0) {
             JS_FreeValue(ctx, s);
             JS_FreeValue(ctx, v);

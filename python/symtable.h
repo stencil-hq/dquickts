@@ -34,9 +34,10 @@
  *   As in CPython's compile.c, the caller merges compiler flags into
  *   ff_features (ff.ff_features |= flags) before _PySymtable_Build; the
  *   symtable tests QP_PF_TOP_LEVEL_AWAIT (= PyCF_ALLOW_TOP_LEVEL_AWAIT) there.
- * - Not ported (Python-visible object machinery only): PySTEntry_Type,
- *   ste_repr, ste_memberlist, PySTEntry_Check, and
- *   _Py_SymtableStringObjectFlags (used only by the `symtable` module).
+ * - The Python-visible object machinery (PySTEntry_Type, ste_repr,
+ *   ste_memberlist, _Py_SymtableStringObjectFlags) lives in
+ *   python/mod_symtable.c (_symtable), which converts a finished table into
+ *   "symtable entry" objects; PySTEntry_Check is not ported.
  */
 #ifndef QP_SYMTABLE_H
 #define QP_SYMTABLE_H

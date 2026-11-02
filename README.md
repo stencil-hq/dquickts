@@ -24,6 +24,7 @@ make test-snapshot   # builds and runs the suspension and snapshot test hosts
 
 - [What this fork adds](#what-this-fork-adds)
 - [Durable REPL](#durable-repl)
+  - [Python sessions](#python-sessions)
 - [Snapshots](#snapshots)
   - [What a snapshot is](#what-a-snapshot-is)
   - [When you can take one](#when-you-can-take-one)
@@ -34,6 +35,7 @@ make test-snapshot   # builds and runs the suspension and snapshot test hosts
   - [The host's side of the contract](#the-hosts-side-of-the-contract)
   - [Limitations](#limitations)
 - [TypeScript](#typescript)
+- [Python](#python)
 - [Rust bindings](#rust-bindings)
 - [Testing](#testing)
 - [Documentation](#documentation)
@@ -121,6 +123,89 @@ Limits:
 - Tab completion lists properties of the global object. Like the regular REPL, it does not list
   top-level `let`, `const` and `class` names, but it does complete their members (`c.in` →
   `c.inc()`).
+
+### Python sessions
+
+`qjs --drepl FILE --python` is the same REPL for Python 3.15. It follows the CPython REPL:
+`>>>` and `...` prompts (`sys.ps1`, `sys.ps2`), a block ends with an empty line,
+`sys.displayhook` prints the results and sets `builtins._`, `sys.excepthook` prints the
+tracebacks, and top-level `await` works:
+
+```text
+$ ./qjs --drepl session.snap --python
+Python 3.15.2 (main) [dquickts 2026-06-04] on darwin
+Type "help", "copyright", "credits" or "license" for more information.
+Created the durable session session.snap
+>>> class Counter:
+...     def __init__(self):
+...         self.n = 0
+...     def inc(self):
+...         self.n += 1
+...         return self.n
+...
+>>> c = Counter()
+>>> c.inc()
+1
+>>> def squares():
+...     for i in range(10):
+...         yield i * i
+...
+>>> g = squares()
+>>> next(g), next(g)
+(0, 1)
+>>> ^D
+$ ./qjs --drepl session.snap --python
+Python 3.15.2 (main) [dquickts 2026-06-04] on darwin
+Type "help", "copyright", "credits" or "license" for more information.
+Restored the durable session session.snap
+>>> c.inc()
+2
+>>> next(g)
+4
+```
+
+The architecture is the one above: `repl.js` edits the lines, the durable runtime holds a Python
+session (`python/pythonrun.c`, the `qp_drepl_*` functions) and runs the inputs, and the runtime
+is saved as a delta after each input (about 6 KB for the transcript above). In detail:
+
+- The whole heap is saved: globals, functions, classes, instances, closures, generators and
+  coroutines suspended in the middle, the imported modules (not imported again on load),
+  `sys.path` and the sources that the tracebacks show.
+- Python decides when the lines form a complete input (`codeop` rules) and writes the results
+  and the tracebacks itself.
+- Top-level `await` (`PyCF_ALLOW_TOP_LEVEL_AWAIT`): an input that awaits runs as a coroutine
+  until it ends, with the job queue of the runtime. A bare `yield` lets the pending jobs run, a
+  JavaScript promise is awaited until a job settles it, any other value raises
+  `RuntimeError: Task got bad yield`.
+- Ctrl-C raises `KeyboardInterrupt` in the running input, which can catch it. At the prompt it
+  drops the input. Ctrl-D, or the end of a piped input, quits. `SystemExit` (`sys.exit()`) ends
+  `qjs` with its exit status, after the session is saved.
+- `FILE` starts with a header that holds the hash seed of the session (the `str` hashes are
+  randomized per session), then the delta. The base is rebuilt with that seed. So that the base
+  is the same in every process, the session ignores the `PYTHON*` environment variables (like
+  `python -E`), runs in UTF-8 mode without the user site, has `sys.argv == ['']` and unbuffered,
+  non-seekable standard streams that record nothing about their file descriptors, starts with
+  an empty `sys.path_importer_cache` (it depends on the working directory), and records the
+  default action of every signal. The snapshots write the hash tables whose layout depends on
+  object addresses (sets of classes, of functions...) in a canonical order.
+- `os.environ` comes from the environment of the running `qjs`, but it is emptied while the
+  session is written: `FILE` never holds the values of the environment variables (tokens,
+  passwords), and a restored session sees the environment of the new process.
+- Tab completes the keywords, the globals and the builtins, and after a dotted name its
+  attributes (evaluating the name, like `rlcompleter`). At the start of a line it indents.
+- If stdin is not a terminal, the lines are read without editing or echo.
+
+Limits:
+
+- Objects holding host state cannot be saved: files other than the standard streams, sockets,
+  child processes, threads, `os.scandir()` iterators, `select.poll()` objects. The input still
+  runs, but `qjs` reports the `TypeError` naming the object and `FILE` keeps the previous state
+  (`qjs: FILE not saved: TypeError: snapshot: cannot save Python object 'select.poll': poll
+  object on file descriptors`). The next inputs are not saved either, until the object is no
+  longer reachable (`del p`).
+- A session file only loads into the `qjs` build and the mode that wrote it: `--python` rejects
+  a JavaScript session ("not a Python session") and the JavaScript mode rejects a Python session
+  ("a Python session (add --python)").
 
 ## Snapshots
 
@@ -575,6 +660,104 @@ and so is `export { T }` when `T` is a type.
 
 The full reference is the TypeScript section of [`doc/quickjs.texi`](doc/quickjs.texi).
 
+## Python
+
+dquickts also runs Python 3.15. Python source is compiled to QuickJS bytecode and runs on the
+same VM as JS: one runtime, one heap, one GC, one job queue and one snapshot format. Python and JS
+values are shared by identity, not copied. The front end lives in `python/` (built with
+`CONFIG_PYTHON`, on by default) and the pure-Python standard library subset in `pylib/`.
+
+```sh
+make qpy                   # the Python launcher (CPython's command line: -c, -m, -X, -O, -I...)
+./qpy script.py
+./qpy -c 'print(sum(range(10)))'
+./qjs file.py              # a .py file runs with the qpy command line
+./qjs --python -m json.tool data.json
+```
+
+The stdlib directory is `$QPYHOME/pylib`, else the build's default, else `pylib/` next to the
+executable. It holds CPython's whole pure-Python `Lib/` except the test suite and the Tk
+packages (`test`, `idlelib`, `tkinter`, `turtle`, `turtledemo`, `__phello__`), copied by
+`make pylib-sync`; `pylib/MANIFEST.txt` lists the copied entries and, per pure module, the C
+modules it imports. `tools/pylib_sweep.py` imports every vendored module under `./qpy` and
+reports the ones that fail for another reason than a listed C module quickpy does not provide.
+
+### JS and Python together
+
+- `list` is an `Array`, `str` a string, `int` an int32 or `BigInt`, `float` a float64, `None` is
+  `undefined` (`null` also reads as `None`), and functions are functions.
+- From JS, a Python object's `o.x` is `getattr` (a missing attribute is `undefined`), integer
+  keys and the string keys of mappings are items, `Symbol.iterator` iterates, `toString()` is
+  `str()`, `toJSON()` converts dicts to objects and tuples/sets to arrays, coroutines are
+  thenables and `instanceof` on a Python type is `isinstance()`.
+- From Python, a JS object is a `js.JsObject`: attributes are JS properties, it supports
+  iteration, `len()`, `in`, `await` on promises, `.new(*args)` for constructors and `.to_py()`.
+- JS has no keyword arguments: call `f.callKw(args, kwargs)`. Python keyword arguments passed to
+  a JS function arrive as one trailing plain object.
+- Python exceptions are thrown into JS unchanged; JS throws reach Python as `js.JsError` (the
+  thrown value is its `js_error` attribute).
+- An ES `import` of a `.py` file loads the Python module: its public globals are the named
+  exports and the module object is the default export.
+
+```js
+// main.js
+import { mean } from "./stats.py";      // def mean(xs): return sum(xs) / len(xs)
+console.log(mean([1, 2, 3, 4]));         // 2.5
+```
+
+From C, `JS_InitPython()`, `JS_EvalPython()` (modes `JS_PY_EVAL_EXEC`, `_EVAL`, `_SINGLE`, and
+`JS_PY_EVAL_FLAG_ASYNC` for top-level `await`) and `JS_PythonImport()` in
+[`quickjs.h`](quickjs.h) run Python in any context.
+
+### C API and extension modules
+
+On 64-bit POSIX hosts (`CONFIG_PYTHON_CAPI`), the Python runtime includes a CPython-compatible
+C API and CPython's own C modules from `capi/modules` (see `capi/Setup.qp`). The
+self-contained ones (`_json`, `_sre`, `itertools`, `_struct`, `_pickle`, `_datetime`, `math`,
+`unicodedata`, `_decimal`, the hash modules, `pyexpat`, `_socket`, `_elementtree`, the CJK
+codecs and others) are part of `libquickjs` and available to every embedder (`qpy`, `qjs`,
+rquickjs, `libquickjs.a`). The modules that need a system library (`zlib`, `_bz2`, `_lzma`,
+`_zstd`, `_sqlite3`, `_ssl`/`_hashlib`, `_ctypes`, `readline`, `_uuid` on Linux) are linked by
+`qpy` and `qjs`; rquickjs has one `python-*` cargo feature per library. Optional libraries are
+found with pkg-config and each can be turned off with a
+`CONFIG_PYTHON_CAPI_NO_*` variable. `make capi-sync` re-vendors the sources and headers from the
+pinned CPython tag. The C API is being integrated; threads (a real GIL) and loading
+third-party abi3 modules with `dlopen` are in progress. Binary compatibility with
+version-specific wheels and the free-threaded ABI are not goals.
+
+### Known deviations
+
+- Strings are UTF-16: a surrogate pair can't be told apart from two lone surrogates, so Python
+  sees one character where CPython sees two.
+- `x is y` on ints and floats that crossed into C separately may be false (fresh mirrors; legal
+  CPython behaviour). C API objects are 8-byte aligned (CPython: 16).
+- `tp_finalize`/`__del__` is skipped for objects in a garbage cycle.
+- C accelerator modules are built in (a static build), so they appear in
+  `sys.builtin_module_names` and have no `__file__`; `pkgutil.iter_modules()` does not list them.
+- Running a script whose source can't be decoded reports the error like `compile()` of the file's
+  bytes (whole-file positions), not like CPython's line-by-line file tokenizer.
+- Only one interpreter per process uses the C API.
+- `_thread.start_new_thread()` raises `RuntimeError("can't start new thread")` until thread
+  support lands. `sys.settrace`-based tools (debuggers, coverage) are in progress.
+
+### Testing Python
+
+```sh
+make testpy-bootstrap    # clone CPython at the pinned tag into the test tree
+make testpy              # L0, the L2 stdlib parser check and L3a
+make testpy-l3b          # L3b: stdlib test modules
+make testpy-ast          # L2 on Lib/ and the corpus
+make testpy-golden       # regenerate the L0 .out files with host CPython 3.15
+```
+
+The harness, `tests/py/run.py`, runs under a host CPython 3.15 and drives `qpy`. L0 runs small
+golden scripts in `tests/py/golden` and compares their output with files produced by CPython.
+L1 replays recorded sessions cell by cell in `qpy` and CPython side by side (`make
+testpy-replay`). L2 compares `ast.dump()` from our parser with CPython's on every file of `Lib/`.
+L3 runs CPython's own `Lib/test` modules with `unittest`: L3a is the language core, L3b the
+stdlib. Expected failures are listed in `tests/py/l0_errors.txt` and `tests/py/cpython_errors.txt`.
+See [`doc/python-plan.md`](doc/python-plan.md) for the design.
+
 ## Rust bindings
 
 [`rquickjs/`](rquickjs/README.md) contains rquickjs 0.14.0, vendored and ported to this engine.
@@ -657,10 +840,13 @@ make test2-bootstrap && make test2    # test262
   and PDF versions.
 - [`Changelog`](Changelog): everything added since upstream `2026-06-04`.
 - [`rquickjs/README.md`](rquickjs/README.md): the Rust bindings.
+- [`doc/python-plan.md`](doc/python-plan.md): the Python design and milestones.
 
 ## Credits and license
 
 dquickts is based on QuickJS by Fabrice Bellard and Charlie Gordon. It includes code ported from
 [quickjs-ng](https://github.com/quickjs-ng/quickjs), and its Rust bindings are derived from
 [rquickjs](https://github.com/DelSkayn/rquickjs). Everything is under the MIT license; see
-[`LICENSE`](LICENSE) and [`rquickjs/LICENSE`](rquickjs/LICENSE).
+[`LICENSE`](LICENSE) and [`rquickjs/LICENSE`](rquickjs/LICENSE). The Python front end, C API
+headers, vendored modules and `pylib/` are ported from or copied from CPython and are under the
+PSF License Version 2, also reproduced in [`LICENSE`](LICENSE).

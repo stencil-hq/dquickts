@@ -102,7 +102,7 @@ static JSValue *qp_instance_slots(JSValueConst obj)
     return in ? in->slots : NULL;
 }
 
-static void qp_instance_finalizer(JSRuntime *rt, JSValueConst val)
+static void qp_instance_finalizer(JSRuntime *rt, JSValue val)
 {
     JSObject *p = JS_VALUE_GET_OBJ(val);
     QPInstance *in = (QPInstance *)p->u.opaque;
@@ -125,7 +125,7 @@ static void qp_instance_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_
         JS_MarkValue(rt, in->slots[i], mark_func);
 }
 
-static void qp_boxed_finalizer(JSRuntime *rt, JSValueConst val)
+static void qp_boxed_finalizer(JSRuntime *rt, JSValue val)
 {
     JSObject *p = JS_VALUE_GET_OBJ(val);
     JS_FreeValueRT(rt, p->u.object_data);
@@ -205,6 +205,8 @@ static JSValue qp_obj_materialize_dict(JSContext *ctx, JSObject *p)
         goto fail;
     pr->u.value = d;
     p->py_dict_mode = 1;
+    if (p->class_id == JS_CLASS_PY_NATIVE)
+        qp_capi_native_dict_made(ctx, p, d);
     return d;
 fail:
     if (atoms) {
@@ -214,6 +216,21 @@ fail:
     }
     JS_FreeValue(ctx, d);
     return JS_EXCEPTION;
+}
+
+/* Put a new object p (no instance attributes yet) in dict mode with the
+   existing dict d (the C extension object's tp_dictoffset dict). */
+static int qp_obj_adopt_dict(JSContext *ctx, JSObject *p, JSValueConst d)
+{
+    JSProperty *pr;
+    if (!QP_IS_NULL(qp_obj_dict_get(ctx, p)))
+        return 0;
+    pr = add_property(ctx, p, QP_STATE(ctx)->atom_dict_slot, JS_PROP_WRITABLE);
+    if (!pr)
+        return -1;
+    pr->u.value = JS_DupValue(ctx, d);
+    p->py_dict_mode = 1;
+    return 0;
 }
 
 /* Does the type of obj give its instances a __dict__ in our storage? */
@@ -244,16 +261,49 @@ static JSValue qp_object_get_dict(JSContext *ctx, JSValueConst obj)
     return JS_DupValue(ctx, d);
 }
 
+/* get_builtin_base_with_dict + get_dict_descriptor: for an instance whose
+   dict is not in our shape storage (type, module, ... subclasses), the
+   __dict__ descriptor of the nearest static base defining one.  QP_NULL
+   when there is none; new reference. */
+static JSValue qp_subtype_builtin_dict_descr(JSContext *ctx, JSValueConst obj)
+{
+    QPType *t = qp_type_of(ctx, obj);
+    JSValue d;
+    for (; t && t->base; t = t->base) {
+        if (t->flags & QP_TPFLAGS_HEAPTYPE)
+            continue;
+        if (qp_dict_get_item_atom(ctx, t->dict, QP_ATOM(ctx, __dict__), &d) < 0)
+            return JS_EXCEPTION;
+        if (!QP_IS_NULL(d))
+            return d;
+    }
+    return QP_NULL;
+}
+
 /* subtype_dict / subtype_setdict / subtype_getweakref */
 static JSValue qp_subtype_dict_get(JSContext *ctx, JSValueConst self, int magic)
 {
+    if (JS_VALUE_GET_TAG(self) == JS_TAG_OBJECT && !qp_shape_storage(JS_VALUE_GET_OBJ(self))) {
+        JSValue descr = qp_subtype_builtin_dict_descr(ctx, self), res;
+        QPType *dt;
+        if (JS_IsException(descr))
+            return descr;
+        dt = QP_IS_NULL(descr) ? NULL : qp_type_of(ctx, descr);
+        if (!dt || !dt->slots.tp_descr_get) {
+            JS_FreeValue(ctx, descr);
+            return qp_raise_attribute_error(ctx, self, QP_ATOM(ctx, __dict__));
+        }
+        res = dt->slots.tp_descr_get(ctx, descr, self, QP_TYPE_VALUE(qp_type_of(ctx, self)));
+        JS_FreeValue(ctx, descr);
+        return res;
+    }
     return qp_object_get_dict(ctx, self);
 }
 
 static int qp_subtype_dict_set(JSContext *ctx, JSValueConst self, JSValueConst value, int magic)
 {
     JSObject *p;
-    JSValue d;
+    JSValue d, empty = QP_NULL;
     JSShapeProperty *prs;
     JSProperty *pr;
     if (JS_VALUE_GET_TAG(self) != JS_TAG_OBJECT || !qp_shape_storage(JS_VALUE_GET_OBJ(self))) {
@@ -261,10 +311,12 @@ static int qp_subtype_dict_set(JSContext *ctx, JSValueConst self, JSValueConst v
         return -1;
     }
     if (QP_IS_NULL(value)) {
-        qp_raise_type_error(ctx, "cannot delete __dict__");
-        return -1;
-    }
-    if (!qp_dict_check(ctx, value)) {
+        /* deleting drops the dict; the next access sees a new empty one */
+        empty = qp_dict_new(ctx);
+        if (JS_IsException(empty))
+            return -1;
+        value = empty;
+    } else if (!qp_dict_check(ctx, value)) {
         JSValue tn = qp_type_tp_name(ctx, qp_type_of(ctx, value));
         qp_raise_type_error(ctx, "__dict__ must be set to a dictionary, not a '%.200U'", tn);
         JS_FreeValue(ctx, tn);
@@ -272,18 +324,17 @@ static int qp_subtype_dict_set(JSContext *ctx, JSValueConst self, JSValueConst v
     }
     p = JS_VALUE_GET_OBJ(self);
     d = qp_obj_materialize_dict(ctx, p);
-    if (JS_IsException(d))
-        return -1;
-    prs = find_own_property(&pr, p, QP_STATE(ctx)->atom_dict_slot);
-    if (!prs)
-        return -1;
-    set_value(ctx, &pr->u.value, JS_DupValue(ctx, value));
-    return 0;
+    prs = JS_IsException(d) ? NULL :
+        find_own_property(&pr, p, QP_STATE(ctx)->atom_dict_slot);
+    if (prs)
+        set_value(ctx, &pr->u.value, JS_DupValue(ctx, value));
+    JS_FreeValue(ctx, empty);
+    return prs ? 0 : -1;
 }
 
 static JSValue qp_subtype_weakref_get(JSContext *ctx, JSValueConst self, int magic)
 {
-    return JS_UNDEFINED;
+    return qp_weakref_get_first(ctx, self);
 }
 
 static const QPGetSetDef qp_subtype_getsets[2] = {
@@ -296,6 +347,38 @@ static const QPGetSetDef qp_subtype_getsets[2] = {
 /* ========================================================================= */
 /* Generic getattr / setattr                                                 */
 /* ========================================================================= */
+
+/* The tp_dictoffset dict of an instance that keeps its dict in its payload
+   (function, module, staticmethod, ...: a static base whose spec has
+   generic_attr), read through that base's __dict__ descriptor.  New
+   reference; QP_NULL when the object has none. */
+static JSValue qp_obj_payload_dict(JSContext *ctx, QPType *tp, JSValueConst obj)
+{
+    QPType *t, *dt;
+    JSValue descr, d;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT || qp_shape_storage(JS_VALUE_GET_OBJ(obj)))
+        return QP_NULL;
+    for (t = tp; t; t = t->base) {
+        if (t->spec && t->spec->generic_attr)
+            break;
+    }
+    if (!t)
+        return QP_NULL;
+    if (qp_dict_get_item_atom(ctx, t->dict, QP_ATOM(ctx, __dict__), &descr) < 0)
+        return JS_EXCEPTION;
+    if (QP_IS_NULL(descr))
+        return QP_NULL;
+    dt = qp_type_of(ctx, descr);
+    d = dt->slots.tp_descr_get ? dt->slots.tp_descr_get(ctx, descr, obj, QP_TYPE_VALUE(tp)) :
+        QP_NULL;
+    JS_FreeValue(ctx, descr);
+    if (!JS_IsException(d) && !QP_IS_NULL(d) && !qp_dict_check(ctx, d)) {
+        JS_FreeValue(ctx, d);
+        return QP_NULL;
+    }
+    return d;
+}
 
 /* _PyObject_GenericGetAttrWithDict(obj, name, NULL, suppress): with
    suppress, a missing attribute returns QP_NULL without exception. */
@@ -339,6 +422,20 @@ static JSValue qp_generic_getattr_ex(JSContext *ctx, JSValueConst obj, JSAtom na
                 return JS_DupValue(ctx, pr->u.value);
             }
         }
+    } else {
+        JSValue d = qp_obj_payload_dict(ctx, tp, obj);
+        if (JS_IsException(d)) {
+            JS_FreeValue(ctx, descr);
+            return d;
+        }
+        if (!QP_IS_NULL(d)) {
+            int r = qp_dict_get_item_atom(ctx, d, name, &res);
+            JS_FreeValue(ctx, d);
+            if (r != 0) {
+                JS_FreeValue(ctx, descr);
+                return r < 0 ? JS_EXCEPTION : res;
+            }
+        }
     }
     if (f) {
         res = f(ctx, descr, obj, QP_TYPE_VALUE(tp));
@@ -349,7 +446,7 @@ static JSValue qp_generic_getattr_ex(JSContext *ctx, JSValueConst obj, JSAtom na
         return descr;
     if (suppress)
         return QP_NULL;
-    return qp_raise_attribute_error(ctx, obj, name);
+    return qp_raise_attribute_error_ex(ctx, obj, name, TRUE);
 done:
     if (suppress && JS_IsException(res) &&
         qp_exc_pending_matches(ctx, QP_EXC(ctx, AttributeError))) {
@@ -432,6 +529,23 @@ static int qp_generic_setattr(JSContext *ctx, JSValueConst obj, JSAtom name, JSV
             return -1;
         }
         return 0;
+    } else {
+        JSValue d = qp_obj_payload_dict(ctx, tp, obj);
+        if (JS_IsException(d))
+            return -1;
+        if (!QP_IS_NULL(d)) {
+            if (QP_IS_NULL(v)) {
+                r = qp_dict_del_item_atom(ctx, d, name);
+                if (r == 0)
+                    qp_raise_attribute_error_ex(ctx, obj, name, TRUE);
+            } else {
+                r = qp_dict_set_item_atom(ctx, d, name, v);
+                if (r == 0)
+                    r = 1;
+            }
+            JS_FreeValue(ctx, d);
+            return r > 0 ? 0 : -1;
+        }
     }
     {
         JSValue tn = qp_type_tp_name(ctx, tp), n = qp_str_from_atom(ctx, name);
@@ -819,7 +933,7 @@ static QPSuper *qp_super_data(JSValueConst v)
     return (QPSuper *)p->u.opaque;
 }
 
-static void qp_super_finalizer(JSRuntime *rt, JSValueConst val)
+static void qp_super_finalizer(JSRuntime *rt, JSValue val)
 {
     JSObject *p = JS_VALUE_GET_OBJ(val);
     QPSuper *su = (QPSuper *)p->u.opaque;
@@ -1165,11 +1279,17 @@ static int qp_super_lookup(JSContext *ctx, JSValueConst global_super, JSValueCon
         *pself = QP_NULL;
     if (qp_type_from_value(global_super) == QP_TYPE(ctx, super) && ct) {
         int method = 0;
+        QPType *st;
         JSValue ot = qp_supercheck(ctx, ct, self);
         if (JS_IsException(ot))
             return -1;
+        /* like LOAD_SUPER_ATTR_METHOD: the unbound-method form only when
+           type(self) uses the generic getattr (not for class objects:
+           super().__new__(cls) gets the function unbound) */
+        st = qp_type_of(ctx, self);
         res = qp_do_super_lookup(ctx, QP_NULL, ct, self, qp_type_from_value(ot), name,
-                                 pself ? &method : NULL);
+                                 (pself && st->slots.tp_getattro == qp_generic_getattr) ?
+                                 &method : NULL);
         JS_FreeValue(ctx, ot);
         if (JS_IsException(res))
             return -1;
@@ -1196,23 +1316,57 @@ static int qp_super_lookup(JSContext *ctx, JSValueConst global_super, JSValueCon
 /* __del__                                                                   */
 /* ========================================================================= */
 
-static BOOL qp_del_hook(JSRuntime *rt, JSObject *p)
+/* the context of the Python object 'p' if its __del__ (or finalizer) is
+   due: its type has one, it has not run and the finalizer queue exists */
+static JSContext *qp_del_context(JSObject *p)
 {
-    JSObject *proto = p->shape ? p->shape->proto : NULL;
+    JSObject *proto;
     QPType *t;
     JSContext *ctx;
     QPState *s;
-    JSValue v;
 
+    if (!QP_IS_PY_CLASS(p->class_id) || p->py_finalized)
+        return NULL;
+    proto = p->shape ? p->shape->proto : NULL;
     if (!proto || proto->class_id != JS_CLASS_PY_TYPE || !proto->u.opaque)
-        return FALSE;
+        return NULL;
     t = (QPType *)proto->u.opaque;
     if (!(t->flags & QP_TPFLAGS_HAS_DEL))
-        return FALSE;
+        return NULL;
     ctx = t->ctx;
     s = ctx ? QP_STATE(ctx) : NULL;
     if (!s || JS_VALUE_GET_TAG(s->pending_del) != JS_TAG_OBJECT)
+        return NULL;
+    return ctx;
+}
+
+/* PEP 442 for the cyclic garbage (JS_RunGC): queue the unreachable object
+   'p' in QPState.pending_del (a new reference) if its __del__ is due.
+   Returns TRUE if it was queued. */
+static BOOL qp_del_queue_cyclic(JSRuntime *rt, JSObject *p)
+{
+    JSContext *ctx = qp_del_context(p);
+
+    if (!ctx)
         return FALSE;
+    if (qp_list_append(ctx, QP_STATE(ctx)->pending_del, JS_MKPTR(JS_TAG_OBJECT, p)) < 0) {
+        /* out of memory: freed without its __del__ */
+        qp_tw_clear_exc(ctx);
+        return FALSE;
+    }
+    p->py_finalized = 1;
+    return TRUE;
+}
+
+static BOOL qp_del_hook(JSRuntime *rt, JSObject *p)
+{
+    JSContext *ctx = qp_del_context(p);
+    QPState *s;
+    JSValue v;
+
+    if (!ctx)
+        return FALSE;
+    s = QP_STATE(ctx);
     p->py_finalized = 1;
     /* resurrect: back to the live object list, owned by pending_del */
     list_del(&p->header.link);
@@ -1227,6 +1381,9 @@ static BOOL qp_del_hook(JSRuntime *rt, JSObject *p)
         return TRUE;
     }
     js_rc(p)->ref_count--;
+    /* run __del__ at the next poll (qp_signal_check), i.e. before the next
+       call or loop iteration, like CPython's immediate finalization */
+    ctx->interrupt_counter = 1;
     return TRUE;
 }
 

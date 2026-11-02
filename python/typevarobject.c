@@ -666,7 +666,7 @@ static const QPMethodDef qp_nodefault_methods[] = {
 static const QPTypeSpec qp_nodefault_spec = {
     .name = "NoDefaultType",
     .doc = qp_nodefault_doc,
-    .flags = QP_TPFLAGS_DEFAULT,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_IMMUTABLETYPE,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_OBJECT,
@@ -1880,6 +1880,11 @@ static int qp_init_typevar(JSContext *ctx)
         qp_type_ready(ctx, QP_TYPE(ctx, ConstEvaluator), &qp_constevaluator_spec) < 0 ||
         qp_type_ready(ctx, QP_TYPE(ctx, TypeAliasType), &qp_typealias_spec) < 0)
         return -1;
+    /* CPython creates Generic with PyType_FromSpec (a heap type), so
+       type_ready_set_new inherits object.__new__ instead of disallowing
+       instantiation as for a static type without tp_new. */
+    QP_TYPE(ctx, Generic)->flags &= ~QP_TPFLAGS_DISALLOW_INSTANTIATION;
+    QP_TYPE(ctx, Generic)->slots.tp_new = QP_TYPE(ctx, object)->slots.tp_new;
     nodefault = qp_object_new_instance(ctx, QP_TYPE(ctx, NoDefaultType), JS_CLASS_PY_OBJECT);
     if (JS_IsException(nodefault))
         return -1;

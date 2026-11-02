@@ -1,0 +1,680 @@
+# capi/modules patches against cpython v3.15.2 (tools/capi_sync.py --record).
+#
+# Unified diffs applied by tools/capi_sync.py to the vendored Modules/ files
+# (capi-design.md §8).  Edit the files under capi/modules, then run
+# `tools/capi_sync.py --record`; the `#` notes before each diff are kept.
+#
+# Modules built unmodified, with what makes them work:
+#   _collections  defaultdict: DICT + NATIVE.  Patched below: no
+#                 OrderedDict export (see the note of the diff).
+#   _pickle       _Py_Mangle/_Py_IsPrivateName exported by D (P1).
+#   _datetime     PyObject_Malloc + _PyObject_Init (= PyObject_Init, A);
+#                 patched below to ready its static types.
+#   _opcode       compat shims + capi/compat/qp_internals.c (F):
+#                 ENABLE_SPECIALIZATION 0, no executors, no Py_STATS.
+#   _asyncio      pycore_qp_tstate.h (_PyThreadStateImpl, struct _is),
+#                 freelists disabled (pycore_freelist.h).
+#   hashes        Modules/_hacl with CPython's LIBHACL flags; SIMD objects
+#                 on x86_64 only (capi/Setup.qp @x86_64).
+#   pyexpat       bundled Modules/expat (or CONFIG_PYTHON_CAPI_SYSTEM_EXPAT).
+#   _elementtree  _PyDict_CopyAsDict (E1); expat through pyexpat's capsule.
+#   cjkcodecs     _multibytecodec and the _codecs_* modules, unmodified.
+#   _tracemalloc  capi/compat/pycore_tracemalloc.h over
+#                 python/capi_tracemalloc.c (traces of the runtime).
+#   _zoneinfo     static C types are immutable (PyType_Ready, B).
+#   grp, pwd      _PyLong_FromUid/Gid, _Py_Uid/Gid_Converter (E2, over the
+#                 native posix module's converters).
+#   readline      PyOS_Readline / PyOS_ReadlineFunctionPointer (E2), used by
+#                 input() and the basic REPL once the module is loaded.
+#   _dbm          macOS ndbm (-DUSE_NDBM); "s#" accepts bytes (E2).
+#   _hmac         Modules/_hacl HMAC over the hash objects of the hash modules.
+#   fcntl, termios, syslog, _posixshmem, _multiprocessing, _uuid: unmodified
+#                 (pyconfig.h entries; capi/compat/pycore_signal.h).
+#   _ctypes       libffi through pkg-config (capi/Setup.qp @ffi); the libffi
+#                 and loader HAVE_* of configure in capi/include/pyconfig.h;
+#                 PEP 697 type data of the metaclasses (StgInfo) on Python
+#                 classes: python/capi_mirror.c sizes their type mirrors.
+#   all           Py_BUILD_CORE_MODULE: clinic KWTUPLE is NULL.
+
+# _heapq: list items live in the JS array, not in a C array: the sift loops
+# read with PyList_GET_ITEM and swap with PyList_SetItem (heap_swap), and
+# the four `list->ob_item[0] = x` sites take a reference to the old top
+# item and replace it with PyList_SetItem (CPython moved the slot's
+# reference to the returned item; here the list drops its own).
+
+# _collections: PyODict_Type is defined (B) but has no implementation
+# (Objects/odictobject.c is not vendored), so the module does not export
+# it: `from _collections import OrderedDict` fails with ImportError and
+# collections keeps its pure-Python OrderedDict.
+
+# _datetime: CPython readies the static datetime types at interpreter init
+# (pylifecycle.c pycore_init_types -> _PyDateTime_InitTypes); here the first
+# module exec does it.
+
+--- a/_collectionsmodule.c
++++ b/_collectionsmodule.c
+@@ -2870,9 +2870,8 @@
+     ADD_TYPE(module, &dequereviter_spec, state->dequereviter_type, NULL);
+     ADD_TYPE(module, &tuplegetter_spec, state->tuplegetter_type, NULL);
+ 
+-    if (PyModule_AddType(module, &PyODict_Type) < 0) {
+-        return -1;
+-    }
++    /* dquickts: no C OrderedDict (Objects/odictobject.c); collections
++       falls back to its pure-Python class when the name is missing */
+ 
+     return 0;
+ }
+
+# _ctypes: CPython's configure defines USING_APPLE_OS_LIBFFI when it links
+# the macOS SDK's libffi (no ffi_prep_closure there on arm64, runtime
+# availability checks); pkg-config picks the libffi here, so ctypes.h
+# detects the SDK header by its FFI_AVAILABLE_APPLE macro.
+--- a/_ctypes/ctypes.h
++++ b/_ctypes/ctypes.h
+@@ -20,6 +20,14 @@
+ #include "pycore_typeobject.h"    // _PyType_GetModuleState()
+ #include "pycore_critical_section.h"
+ #include "pycore_pyatomic_ft_wrappers.h"
++
++/* dquickts: CPython's configure defines USING_APPLE_OS_LIBFFI when it builds
++   against the SDK's libffi; here pkg-config picks the libffi, so detect the
++   SDK header (it defines FFI_AVAILABLE_APPLE; every file includes <ffi.h>
++   before this header). */
++#if defined(__APPLE__) && defined(FFI_AVAILABLE_APPLE) && !defined(USING_APPLE_OS_LIBFFI)
++#   define USING_APPLE_OS_LIBFFI 1
++#endif
+ 
+ // Do we support C99 complex types in ffi?
+ // For Apple's libffi, this must be determined at runtime (see gh-128156).
+
+--- a/_datetimemodule.c
++++ b/_datetimemodule.c
+@@ -7629,6 +7629,18 @@
+     }
+     /* We actually set the "current" module right before a successful return. */
+ 
++    /* dquickts: no interpreter init readies the static types
++       (pylifecycle.c pycore_init_types); the first exec does */
++    if (!PyType_HasFeature(&PyDateTime_DateType, Py_TPFLAGS_READY)) {
++        PyStatus status = _PyDateTime_InitTypes(interp);
++        if (_PyStatus_EXCEPTION(status)) {
++            if (!PyErr_Occurred()) {
++                PyErr_SetString(PyExc_SystemError, status.err_msg);
++            }
++            goto error;
++        }
++    }
++
+     for (size_t i = 0; i < Py_ARRAY_LENGTH(capi_types); i++) {
+         PyTypeObject *type = capi_types[i];
+         const char *name = _PyType_Name(type);
+
+--- a/_heapqmodule.c
++++ b/_heapqmodule.c
+@@ -22,10 +22,22 @@
+ [clinic start generated code]*/
+ /*[clinic end generated code: output=da39a3ee5e6b4b0d input=d7cca0a2e4c0ceb3]*/
+ 
++/* dquickts: list items live in the JS array, not in a C array: the sift
++   loops read with PyList_GET_ITEM and swap or replace items through
++   PyList_SetItem (capi/modules/PATCHES). */
++static void
++heap_swap(PyListObject *heap, Py_ssize_t i, Py_ssize_t j)
++{
++    PyObject *a = Py_NewRef(PyList_GET_ITEM(heap, i));
++    PyObject *b = Py_NewRef(PyList_GET_ITEM(heap, j));
++    (void)PyList_SetItem((PyObject *)heap, i, b);
++    (void)PyList_SetItem((PyObject *)heap, j, a);
++}
++
+ static int
+ siftdown(PyListObject *heap, Py_ssize_t startpos, Py_ssize_t pos)
+ {
+-    PyObject *newitem, *parent, **arr;
++    PyObject *newitem, *parent;
+     Py_ssize_t parentpos, size;
+     int cmp;
+ 
+@@ -38,11 +50,10 @@
+ 
+     /* Follow the path to the root, moving parents down until finding
+        a place newitem fits. */
+-    arr = _PyList_ITEMS(heap);
+-    newitem = arr[pos];
++    newitem = PyList_GET_ITEM(heap, pos);
+     while (pos > startpos) {
+         parentpos = (pos - 1) >> 1;
+-        parent = arr[parentpos];
++        parent = PyList_GET_ITEM(heap, parentpos);
+         Py_INCREF(newitem);
+         Py_INCREF(parent);
+         cmp = PyObject_RichCompareBool(newitem, parent, Py_LT);
+@@ -57,12 +68,9 @@
+         }
+         if (cmp == 0)
+             break;
+-        arr = _PyList_ITEMS(heap);
+-        parent = arr[parentpos];
+-        newitem = arr[pos];
+-        FT_ATOMIC_STORE_PTR_RELAXED(arr[parentpos], newitem);
+-        FT_ATOMIC_STORE_PTR_RELAXED(arr[pos], parent);
++        heap_swap(heap, parentpos, pos);
+         pos = parentpos;
++        newitem = PyList_GET_ITEM(heap, pos);
+     }
+     return 0;
+ }
+@@ -71,7 +79,6 @@
+ siftup(PyListObject *heap, Py_ssize_t pos)
+ {
+     Py_ssize_t startpos, endpos, childpos, limit;
+-    PyObject *tmp1, *tmp2, **arr;
+     int cmp;
+ 
+     assert(PyList_Check(heap));
+@@ -83,14 +90,13 @@
+     }
+ 
+     /* Bubble up the smaller child until hitting a leaf. */
+-    arr = _PyList_ITEMS(heap);
+     limit = endpos >> 1;         /* smallest pos that has no child */
+     while (pos < limit) {
+         /* Set childpos to index of smaller child.   */
+         childpos = 2*pos + 1;    /* leftmost child position  */
+         if (childpos + 1 < endpos) {
+-            PyObject* a = arr[childpos];
+-            PyObject* b = arr[childpos + 1];
++            PyObject* a = PyList_GET_ITEM(heap, childpos);
++            PyObject* b = PyList_GET_ITEM(heap, childpos + 1);
+             Py_INCREF(a);
+             Py_INCREF(b);
+             cmp = PyObject_RichCompareBool(a, b, Py_LT);
+@@ -99,7 +105,6 @@
+             if (cmp < 0)
+                 return -1;
+             childpos += ((unsigned)cmp ^ 1);   /* increment when cmp==0 */
+-            arr = _PyList_ITEMS(heap);         /* arr may have changed */
+             if (endpos != PyList_GET_SIZE(heap)) {
+                 PyErr_SetString(PyExc_RuntimeError,
+                                 "list changed size during iteration");
+@@ -107,10 +112,7 @@
+             }
+         }
+         /* Move the smaller child up. */
+-        tmp1 = arr[childpos];
+-        tmp2 = arr[pos];
+-        FT_ATOMIC_STORE_PTR_RELAXED(arr[childpos], tmp2);
+-        FT_ATOMIC_STORE_PTR_RELAXED(arr[pos], tmp1);
++        heap_swap(heap, childpos, pos);
+         pos = childpos;
+     }
+     /* Bubble it up to its final resting place (by sifting its parents down). */
+@@ -172,9 +174,9 @@
+ 
+     if (!n)
+         return lastelt;
+-    returnitem = PyList_GET_ITEM(heap, 0);
++    returnitem = Py_NewRef(PyList_GET_ITEM(heap, 0));
+     PyListObject *list = _PyList_CAST(heap);
+-    FT_ATOMIC_STORE_PTR_RELAXED(list->ob_item[0], lastelt);
++    (void)PyList_SetItem(heap, 0, lastelt);
+     if (siftup_func(list, 0)) {
+         Py_DECREF(returnitem);
+         return NULL;
+@@ -209,9 +211,9 @@
+         return NULL;
+     }
+ 
+-    returnitem = PyList_GET_ITEM(heap, 0);
++    returnitem = Py_NewRef(PyList_GET_ITEM(heap, 0));
+     PyListObject *list = _PyList_CAST(heap);
+-    FT_ATOMIC_STORE_PTR_RELAXED(list->ob_item[0], Py_NewRef(item));
++    (void)PyList_SetItem(heap, 0, Py_NewRef(item));
+     if (siftup_func(list, 0)) {
+         Py_DECREF(returnitem);
+         return NULL;
+@@ -287,9 +289,9 @@
+         return NULL;
+     }
+ 
+-    returnitem = PyList_GET_ITEM(heap, 0);
++    returnitem = Py_NewRef(PyList_GET_ITEM(heap, 0));
+     PyListObject *list = _PyList_CAST(heap);
+-    FT_ATOMIC_STORE_PTR_RELAXED(list->ob_item[0], Py_NewRef(item));
++    (void)PyList_SetItem(heap, 0, Py_NewRef(item));
+     if (siftup(list, 0)) {
+         Py_DECREF(returnitem);
+         return NULL;
+@@ -408,7 +410,7 @@
+ static int
+ siftdown_max(PyListObject *heap, Py_ssize_t startpos, Py_ssize_t pos)
+ {
+-    PyObject *newitem, *parent, **arr;
++    PyObject *newitem, *parent;
+     Py_ssize_t parentpos, size;
+     int cmp;
+ 
+@@ -421,11 +423,10 @@
+ 
+     /* Follow the path to the root, moving parents down until finding
+        a place newitem fits. */
+-    arr = _PyList_ITEMS(heap);
+-    newitem = arr[pos];
++    newitem = PyList_GET_ITEM(heap, pos);
+     while (pos > startpos) {
+         parentpos = (pos - 1) >> 1;
+-        parent = Py_NewRef(arr[parentpos]);
++        parent = Py_NewRef(PyList_GET_ITEM(heap, parentpos));
+         Py_INCREF(newitem);
+         cmp = PyObject_RichCompareBool(parent, newitem, Py_LT);
+         Py_DECREF(parent);
+@@ -439,12 +440,9 @@
+         }
+         if (cmp == 0)
+             break;
+-        arr = _PyList_ITEMS(heap);
+-        parent = arr[parentpos];
+-        newitem = arr[pos];
+-        FT_ATOMIC_STORE_PTR_RELAXED(arr[parentpos], newitem);
+-        FT_ATOMIC_STORE_PTR_RELAXED(arr[pos], parent);
++        heap_swap(heap, parentpos, pos);
+         pos = parentpos;
++        newitem = PyList_GET_ITEM(heap, pos);
+     }
+     return 0;
+ }
+@@ -453,7 +451,6 @@
+ siftup_max(PyListObject *heap, Py_ssize_t pos)
+ {
+     Py_ssize_t startpos, endpos, childpos, limit;
+-    PyObject *tmp1, *tmp2, **arr;
+     int cmp;
+ 
+     assert(PyList_Check(heap));
+@@ -465,14 +462,13 @@
+     }
+ 
+     /* Bubble up the larger child until hitting a leaf. */
+-    arr = _PyList_ITEMS(heap);
+     limit = endpos >> 1;         /* smallest pos that has no child */
+     while (pos < limit) {
+         /* Set childpos to index of larger child.   */
+         childpos = 2*pos + 1;    /* leftmost child position  */
+         if (childpos + 1 < endpos) {
+-            PyObject* a = arr[childpos + 1];
+-            PyObject* b = arr[childpos];
++            PyObject* a = PyList_GET_ITEM(heap, childpos + 1);
++            PyObject* b = PyList_GET_ITEM(heap, childpos);
+             Py_INCREF(a);
+             Py_INCREF(b);
+             cmp = PyObject_RichCompareBool(a, b, Py_LT);
+@@ -481,7 +477,6 @@
+             if (cmp < 0)
+                 return -1;
+             childpos += ((unsigned)cmp ^ 1);   /* increment when cmp==0 */
+-            arr = _PyList_ITEMS(heap);         /* arr may have changed */
+             if (endpos != PyList_GET_SIZE(heap)) {
+                 PyErr_SetString(PyExc_RuntimeError,
+                                 "list changed size during iteration");
+@@ -489,10 +484,7 @@
+             }
+         }
+         /* Move the larger child up. */
+-        tmp1 = arr[childpos];
+-        tmp2 = arr[pos];
+-        FT_ATOMIC_STORE_PTR_RELAXED(arr[childpos], tmp2);
+-        FT_ATOMIC_STORE_PTR_RELAXED(arr[pos], tmp1);
++        heap_swap(heap, childpos, pos);
+         pos = childpos;
+     }
+     /* Bubble it up to its final resting place (by sifting its parents down). */
+@@ -625,9 +617,9 @@
+         return NULL;
+     }
+ 
+-    returnitem = PyList_GET_ITEM(heap, 0);
++    returnitem = Py_NewRef(PyList_GET_ITEM(heap, 0));
+     PyListObject *list = _PyList_CAST(heap);
+-    FT_ATOMIC_STORE_PTR_RELAXED(list->ob_item[0], Py_NewRef(item));
++    (void)PyList_SetItem(heap, 0, Py_NewRef(item));
+     if (siftup_max(list, 0) < 0) {
+         Py_DECREF(returnitem);
+         return NULL;
+
+# _lsprof: the interpreter does not fire sys.monitoring events
+# (python/instrumentation.c), so the profiler is driven by the profile hook
+# as in CPython 3.11: enable() still takes the PROFILER tool id (the "already
+# active" check) and installs profiler_callback with _PyEval_SetProfile
+# (python/capi_runtime.c), which feeds ptrace_enter_call/ptrace_leave_call;
+# disable() removes the hook and frees the tool id.  The monitoring callback
+# table is gone; the _pystart_callback, ... methods stay.
+--- a/_lsprof.c
++++ b/_lsprof.c
+@@ -779,21 +779,80 @@
+     Py_RETURN_NONE;
+ }
+ 
+-static const struct {
+-    int event;
+-    const char* callback_method;
+-} callback_table[] = {
+-    {PY_MONITORING_EVENT_PY_START, "_pystart_callback"},
+-    {PY_MONITORING_EVENT_PY_RESUME, "_pystart_callback"},
+-    {PY_MONITORING_EVENT_PY_THROW, "_pythrow_callback"},
+-    {PY_MONITORING_EVENT_PY_RETURN, "_pyreturn_callback"},
+-    {PY_MONITORING_EVENT_PY_YIELD, "_pyreturn_callback"},
+-    {PY_MONITORING_EVENT_PY_UNWIND, "_pyreturn_callback"},
+-    {PY_MONITORING_EVENT_CALL, "_ccall_callback"},
+-    {PY_MONITORING_EVENT_C_RETURN, "_creturn_callback"},
+-    {PY_MONITORING_EVENT_C_RAISE, "_creturn_callback"},
+-    {0, NULL}
+-};
++
++
++/* dquickts: the profile hook (PyEval_SetProfile) of CPython 3.11's
++   _lsprof, over the callbacks above */
++static int
++profiler_callback(PyObject *self, PyFrameObject *frame, int what,
++                  PyObject *arg)
++{
++    ProfilerObject *pObj = ProfilerObject_CAST(self);
++    switch (what) {
++
++    /* the 'frame' of a called function is about to start its execution */
++    case PyTrace_CALL:
++    {
++        PyCodeObject *code = PyFrame_GetCode(frame);
++        if (code == NULL) {
++            return -1;
++        }
++        ptrace_enter_call(self, (void *)code, (PyObject *)code);
++        Py_DECREF(code);
++        break;
++    }
++
++    /* the 'frame' of a called function is about to finish
++       (either normally or with an exception) */
++    case PyTrace_RETURN:
++    {
++        PyCodeObject *code = PyFrame_GetCode(frame);
++        if (code == NULL) {
++            return -1;
++        }
++        ptrace_leave_call(self, (void *)code);
++        Py_DECREF(code);
++        break;
++    }
++
++    /* case PyTrace_EXCEPTION:
++        If the exception results in the function exiting, a
++        PyTrace_RETURN event will be generated, so we don't need to
++        handle it. */
++
++    /* the Python function 'frame' is issuing a call to the built-in
++       function 'arg' */
++    case PyTrace_C_CALL:
++        if (pObj->flags & POF_BUILTINS) {
++            PyObject *cfunc = get_cfunc_from_callable(arg, pObj->missing,
++                                                      pObj->missing);
++            if (cfunc) {
++                ptrace_enter_call(self, ((PyCFunctionObject *)cfunc)->m_ml,
++                                  cfunc);
++                Py_DECREF(cfunc);
++            }
++        }
++        break;
++
++    /* the call to the built-in function 'arg' is returning into its
++       caller 'frame' */
++    case PyTrace_C_RETURN:              /* ...normally */
++    case PyTrace_C_EXCEPTION:           /* ...with an exception set */
++        if (pObj->flags & POF_BUILTINS) {
++            PyObject *cfunc = get_cfunc_from_callable(arg, pObj->missing,
++                                                      pObj->missing);
++            if (cfunc) {
++                ptrace_leave_call(self, ((PyCFunctionObject *)cfunc)->m_ml);
++                Py_DECREF(cfunc);
++            }
++        }
++        break;
++
++    default:
++        break;
++    }
++    return 0;
++}
+ 
+ 
+ /*[clinic input]
+@@ -816,7 +875,6 @@
+                              int builtins)
+ /*[clinic end generated code: output=1e747f9dc1edd571 input=0b88115b1c796173]*/
+ {
+-    int all_events = 0;
+     if (setSubcalls(self, subcalls) < 0 || setBuiltins(self, builtins) < 0) {
+         return NULL;
+     }
+@@ -829,43 +887,28 @@
+     PyObject *check = PyObject_CallMethod(monitoring,
+                                           "use_tool_id", "is",
+                                           self->tool_id, "cProfile");
++    Py_DECREF(monitoring);
+     if (check == NULL) {
+-        goto error;
++        return NULL;
+     }
+     Py_DECREF(check);
+ 
+-    for (int i = 0; callback_table[i].callback_method; i++) {
+-        int event = (1 << callback_table[i].event);
+-        PyObject* callback = PyObject_GetAttrString((PyObject*)self, callback_table[i].callback_method);
+-        if (!callback) {
+-            goto error;
+-        }
+-        PyObject *register_result = PyObject_CallMethod(monitoring, "register_callback",
+-                                                        "iiO", self->tool_id,
+-                                                        event, callback);
+-        Py_DECREF(callback);
+-        if (register_result == NULL) {
+-            goto error;
+-        }
+-        Py_DECREF(register_result);
+-        all_events |= event;
+-    }
+-
+-    PyObject *event_result = PyObject_CallMethod(monitoring, "set_events", "ii",
+-                                                 self->tool_id, all_events);
+-    if (event_result == NULL) {
+-        goto error;
+-    }
+-
+-    Py_DECREF(event_result);
+-    Py_DECREF(monitoring);
++    /* dquickts: the interpreter does not fire sys.monitoring events; the
++       events come from the profile hook (CPython 3.11's profiler) */
++    if (_PyEval_SetProfile(_PyThreadState_GET(), profiler_callback,
++                           (PyObject *)self) < 0) {
++        monitoring = PySys_GetAttrString("monitoring");
++        if (monitoring) {
++            PyObject *res = PyObject_CallMethod(monitoring, "free_tool_id", "i",
++                                                self->tool_id);
++            Py_XDECREF(res);
++            Py_DECREF(monitoring);
++        }
++        return NULL;
++    }
+ 
+     self->flags |= POF_ENABLED;
+     Py_RETURN_NONE;
+-
+-error:
+-    Py_DECREF(monitoring);
+-    return NULL;
+ }
+ 
+ static void
+@@ -909,22 +952,11 @@
+             return NULL;
+         }
+ 
+-        for (int i = 0; callback_table[i].callback_method; i++) {
+-            result = PyObject_CallMethod(monitoring, "register_callback", "iiO", self->tool_id,
+-                                         (1 << callback_table[i].event), Py_None);
+-            if (!result) {
+-                Py_DECREF(monitoring);
+-                return NULL;
+-            }
+-            Py_DECREF(result);
+-        }
+-
+-        result = PyObject_CallMethod(monitoring, "set_events", "ii", self->tool_id, 0);
+-        if (!result) {
++        /* dquickts: the profile hook of enable() */
++        if (_PyEval_SetProfile(_PyThreadState_GET(), NULL, NULL) < 0) {
+             Py_DECREF(monitoring);
+             return NULL;
+         }
+-        Py_DECREF(result);
+ 
+         result = PyObject_CallMethod(monitoring, "free_tool_id", "i", self->tool_id);
+         if (!result) {
+
+# _sre: expand_template filled the storage of a fresh list through
+# &PyList_GET_ITEM(list, 0); it now collects into a PyMem array and builds
+# the list from it.
+--- a/_sre/sre.c
++++ b/_sre/sre.c
+@@ -3032,14 +3032,18 @@
+     PyObject *buffer[10];
+     PyObject **out = buffer;
+     PyObject *list = NULL;
++    /* dquickts: list items are not a C array; collect into a heap array
++       and build the list from it (capi/modules/PATCHES). */
++    PyObject **heap = NULL;
+     if (self->chunks > (int)Py_ARRAY_LENGTH(buffer) ||
+         !PyUnicode_Check(self->literal))
+     {
+-        list = PyList_New(self->chunks);
+-        if (!list) {
++        heap = PyMem_New(PyObject *, self->chunks);
++        if (!heap) {
++            PyErr_NoMemory();
+             return NULL;
+         }
+-        out = &PyList_GET_ITEM(list, 0);
++        out = heap;
+     }
+ 
+     out[count++] = Py_NewRef(self->literal);
+@@ -3068,19 +3072,23 @@
+         result = _PyUnicode_JoinArray(&_Py_STR(empty), out, count);
+     }
+     else {
+-        Py_SET_SIZE(list, count);
++        list = PyList_New(count);
++        if (!list) {
++            goto cleanup;
++        }
++        for (Py_ssize_t i = 0; i < count; i++) {
++            PyList_SET_ITEM(list, i, out[i]);
++        }
++        count = 0;  /* the list owns the items */
+         result = PyBytes_Join((PyObject *)&_Py_SINGLETON(bytes_empty), list);
+     }
+ 
+ cleanup:
+-    if (list) {
+-        Py_DECREF(list);
+-    }
+-    else {
+-        for (Py_ssize_t i = 0; i < count; i++) {
+-            Py_DECREF(out[i]);
+-        }
+-    }
++    Py_XDECREF(list);
++    for (Py_ssize_t i = 0; i < count; i++) {
++        Py_DECREF(out[i]);
++    }
++    PyMem_Free(heap);
+     return result;
+ }
+ 
+# _ssl: SSLError_str read the PyOSErrorObject fields (strerror, args), which
+# live on the JS exception object: use the attribute protocol and
+# PyException_GetArgs().
+--- a/_ssl.c
++++ b/_ssl.c
+@@ -485,12 +485,28 @@
+ static PyObject *
+ SSLError_str(PyObject *op)
+ {
+-    PyOSErrorObject *self = (PyOSErrorObject*)op;
+-    if (self->strerror != NULL && PyUnicode_Check(self->strerror)) {
+-        return Py_NewRef(self->strerror);
+-    }
+-    else
+-        return PyObject_Str(self->args);
++    /* dquickts: the PyOSErrorObject fields live on the JS exception object
++       (capi/modules/PATCHES): read them through the attribute protocol. */
++    PyObject *strerror = PyObject_GetAttrString(op, "strerror");
++    if (strerror == NULL) {
++        if (!PyErr_ExceptionMatches(PyExc_AttributeError)) {
++            return NULL;
++        }
++        PyErr_Clear();
++    }
++    else if (PyUnicode_Check(strerror)) {
++        return strerror;
++    }
++    else {
++        Py_DECREF(strerror);
++    }
++    PyObject *args = PyException_GetArgs(op);
++    if (args == NULL) {
++        return NULL;
++    }
++    PyObject *res = PyObject_Str(args);
++    Py_DECREF(args);
++    return res;
+ }
+ 
+ static PyType_Slot sslerror_type_slots[] = {
+
+# _zstd: "internal/pycore_lock.h" is capi/compat/pycore_lock.h (no
+# internal/ directory: the compat headers are flat).
+--- a/_zstd/compressor.c
++++ b/_zstd/compressor.c
+@@ -16,7 +16,7 @@
+ 
+ #include "_zstdmodule.h"
+ #include "buffer.h"
+-#include "internal/pycore_lock.h" // PyMutex_IsLocked
++#include "pycore_lock.h"   // PyMutex_IsLocked (dquickts: capi/compat)
+ 
+ #include <stddef.h>               // offsetof()
+ #include <zstd.h>                 // ZSTD_*()
+
+--- a/_zstd/decompressor.c
++++ b/_zstd/decompressor.c
+@@ -16,7 +16,7 @@
+ 
+ #include "_zstdmodule.h"
+ #include "buffer.h"
+-#include "internal/pycore_lock.h" // PyMutex_IsLocked
++#include "pycore_lock.h"   // PyMutex_IsLocked (dquickts: capi/compat)
+ 
+ #include <stdbool.h>              // bool
+ #include <stddef.h>               // offsetof()
+
+--- a/_zstd/zstddict.c
++++ b/_zstd/zstddict.c
+@@ -16,7 +16,7 @@
+ 
+ #include "_zstdmodule.h"
+ #include "clinic/zstddict.c.h"
+-#include "internal/pycore_lock.h" // PyMutex_IsLocked
++#include "pycore_lock.h"   // PyMutex_IsLocked (dquickts: capi/compat)
+ 
+ #include <zstd.h>                 // ZSTD_freeDDict(), ZSTD_getDictID_fromDict()
+ 

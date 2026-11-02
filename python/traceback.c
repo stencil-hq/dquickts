@@ -69,7 +69,8 @@ typedef struct QPTraceback {
     JSValue frame;      /* frame facade; QP_NULL until tb_frame is read (func set) */
     JSValue self_hint;  /* the frame's `self` parameter at unwind time, or QP_NULL */
     JSValue locals;     /* locals mapping of code without CO_NEWLOCALS, or QP_NULL */
-    int lasti;          /* pc of the instruction */
+    int lasti;          /* byte offset inside the instruction (func set), else
+                           the Python offset given to traceback(...) */
     int lineno;         /* -1: computed from lasti */
 } QPTraceback;
 
@@ -166,16 +167,25 @@ static JSFunctionBytecode *qp_tb_bytecode(JSContext *ctx, QPTraceback *tb)
     return b;
 }
 
+/* Byte offset of tb's instruction in b (its bytecode), -1 if unknown. */
+static int qp_tb_pc(QPTraceback *tb, JSFunctionBytecode *b)
+{
+    if (!QP_IS_NULL(tb->func))
+        return tb->lasti;
+    return qp_code_lasti2pc(b, tb->lasti);
+}
+
 /* tb_lineno: the stored line, else PyCode_Addr2Line(code, lasti); QP_TB_NONE
    when unknown. */
 static int qp_tb_lineno(JSContext *ctx, QPTraceback *tb)
 {
     JSFunctionBytecode *b;
     QPLoc loc;
+    int pc;
     if (tb->lineno != -1)
         return tb->lineno;
     b = qp_tb_bytecode(ctx, tb);
-    if (b && tb->lasti >= 0 && qp_code_addr2loc(b, (uint32_t)tb->lasti, &loc) == 0 &&
+    if (b && (pc = qp_tb_pc(tb, b)) >= 0 && qp_code_addr2loc(b, (uint32_t)pc, &loc) == 0 &&
         loc.lineno >= 0)
         return loc.lineno;
     return QP_TB_NONE;
@@ -277,7 +287,12 @@ static JSValue qp_tb_get_frame(JSContext *ctx, JSValueConst self, int magic)
 
 static JSValue qp_tb_get_lasti(JSContext *ctx, JSValueConst self, int magic)
 {
-    return JS_NewInt32(ctx, qp_tb_data(self)->lasti);
+    QPTraceback *tb = qp_tb_data(self);
+    JSFunctionBytecode *b;
+
+    if (QP_IS_NULL(tb->func) || tb->lasti < 0 || !(b = qp_code_bytecode(tb->func)))
+        return JS_NewInt32(ctx, tb->lasti);
+    return JS_NewInt32(ctx, qp_code_pc2lasti(b, (uint32_t)tb->lasti));
 }
 
 static JSValue qp_tb_get_lineno(JSContext *ctx, JSValueConst self, int magic)
@@ -342,8 +357,8 @@ static const QPMethodDef qp_tb_methods[] = {
 
 static const QPGetSetDef qp_tb_getsets[] = {
     { "tb_next", qp_tb_get_next, qp_tb_set_next, 0, NULL },
-    { "tb_frame", qp_tb_get_frame, NULL, 0, NULL },
-    { "tb_lasti", qp_tb_get_lasti, NULL, 0, NULL },
+    { "tb_frame", qp_tb_get_frame, NULL, 0, NULL, QP_GETSET_MEMBER },
+    { "tb_lasti", qp_tb_get_lasti, NULL, 0, NULL, QP_GETSET_MEMBER },
     { "tb_lineno", qp_tb_get_lineno, NULL, 0, NULL },
     { NULL },
 };
@@ -352,7 +367,7 @@ static const QPTypeSpec qp_tb_spec = {
     .name = "traceback",
     .doc = "traceback(tb_next, tb_frame, tb_lasti, tb_lineno)\n--\n\n"
            "Create a new traceback object.",
-    .flags = QP_TPFLAGS_DEFAULT,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_IMMUTABLETYPE,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_TRACEBACK,
@@ -1294,8 +1309,8 @@ static BOOL qp_tb_parse(JSContext *ctx, QPTBParse *ps, const uint32_t *s, size_t
     }
     ps->arena = qp_arena_new(ctx, &ps->err);
     if (ps->arena)
-        ps->mod = qp_parse_string(ctx, ps->arena, src, len, "<unknown>", QP_INPUT_FILE,
-                                  QP_PF_SOURCE_IS_UTF8, &ps->err);
+        ps->mod = qp_parse_string(ctx, ps->arena, src, len, "<unknown>", JS_UNDEFINED,
+                                  QP_INPUT_FILE, QP_PF_SOURCE_IS_UTF8, &ps->err);
     js_free(ctx, src);
     qp_tb_clear_exc(ctx);
     return ps->mod != NULL && ps->mod->kind == Module_kind;
@@ -1868,7 +1883,8 @@ static int qp_tb_extract(QPTBState *st, JSValueConst tb, QPFrameSum **pframes)
             f->filename = qp_str_from_atom(ctx, b->has_debug ? b->debug.filename
                                                              : JS_ATOM_empty_string);
             f->name = qp_str_from_atom(ctx, b->func_name);
-            if (t->lasti >= 0 && qp_code_addr2loc(b, (uint32_t)t->lasti, &loc) < 0) {
+            int pc = qp_tb_pc(t, b);
+            if (pc >= 0 && qp_code_addr2loc(b, (uint32_t)pc, &loc) < 0) {
                 loc.lineno = loc.end_lineno = loc.col = loc.end_col = -1;
             }
         } else {

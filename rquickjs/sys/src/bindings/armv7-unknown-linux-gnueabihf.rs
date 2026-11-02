@@ -237,6 +237,11 @@ pub const JS_NEW_CTOR_NO_GLOBAL: u32 = 1;
 pub const JS_NEW_CTOR_PROTO_CLASS: u32 = 2;
 pub const JS_NEW_CTOR_PROTO_EXIST: u32 = 4;
 pub const JS_NEW_CTOR_READONLY: u32 = 8;
+pub const JS_PY_EVAL_EXEC: u32 = 0;
+pub const JS_PY_EVAL_EVAL: u32 = 1;
+pub const JS_PY_EVAL_SINGLE: u32 = 2;
+pub const JS_PY_EVAL_MODE_MASK: u32 = 3;
+pub const JS_PY_EVAL_FLAG_ASYNC: u32 = 4;
 pub type size_t = ::core::ffi::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -2872,6 +2877,60 @@ unsafe extern "C" {
         val: JSValue,
         options: *const JSPrintValueOptions,
     );
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct JSPythonConfig {
+    pub argc: ::core::ffi::c_int,
+    pub argv: *mut *mut ::core::ffi::c_char,
+    pub executable: *const ::core::ffi::c_char,
+    pub sys_path_0: *const ::core::ffi::c_char,
+    pub pythonpath: *const ::core::ffi::c_char,
+    pub hash_seed: *const ::core::ffi::c_char,
+    pub optimize: ::core::ffi::c_int,
+    pub isolated: ::core::ffi::c_int,
+    pub recursion_limit: ::core::ffi::c_int,
+    pub home: *const ::core::ffi::c_char,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of JSPythonConfig"][::core::mem::size_of::<JSPythonConfig>() - 40usize];
+    ["Alignment of JSPythonConfig"][::core::mem::align_of::<JSPythonConfig>() - 4usize];
+    ["Offset of field: JSPythonConfig::argc"]
+        [::core::mem::offset_of!(JSPythonConfig, argc) - 0usize];
+    ["Offset of field: JSPythonConfig::argv"]
+        [::core::mem::offset_of!(JSPythonConfig, argv) - 4usize];
+    ["Offset of field: JSPythonConfig::executable"]
+        [::core::mem::offset_of!(JSPythonConfig, executable) - 8usize];
+    ["Offset of field: JSPythonConfig::sys_path_0"]
+        [::core::mem::offset_of!(JSPythonConfig, sys_path_0) - 12usize];
+    ["Offset of field: JSPythonConfig::pythonpath"]
+        [::core::mem::offset_of!(JSPythonConfig, pythonpath) - 16usize];
+    ["Offset of field: JSPythonConfig::hash_seed"]
+        [::core::mem::offset_of!(JSPythonConfig, hash_seed) - 20usize];
+    ["Offset of field: JSPythonConfig::optimize"]
+        [::core::mem::offset_of!(JSPythonConfig, optimize) - 24usize];
+    ["Offset of field: JSPythonConfig::isolated"]
+        [::core::mem::offset_of!(JSPythonConfig, isolated) - 28usize];
+    ["Offset of field: JSPythonConfig::recursion_limit"]
+        [::core::mem::offset_of!(JSPythonConfig, recursion_limit) - 32usize];
+    ["Offset of field: JSPythonConfig::home"]
+        [::core::mem::offset_of!(JSPythonConfig, home) - 36usize];
+};
+unsafe extern "C" {
+    pub fn JS_InitPython(ctx: *mut JSContext, cfg: *const JSPythonConfig) -> ::core::ffi::c_int;
+}
+unsafe extern "C" {
+    pub fn JS_EvalPython(
+        ctx: *mut JSContext,
+        input: *const ::core::ffi::c_char,
+        input_len: size_t,
+        filename: *const ::core::ffi::c_char,
+        flags: ::core::ffi::c_int,
+    ) -> JSValue;
+}
+unsafe extern "C" {
+    pub fn JS_PythonImport(ctx: *mut JSContext, module: *const ::core::ffi::c_char) -> JSValue;
 }
 unsafe extern "C" {
     pub fn JS_GetVersion() -> *const ::core::ffi::c_char;

@@ -75,34 +75,14 @@ static int qp_descr_is_abstract(JSContext *ctx, JSValueConst v)
     return r;
 }
 
-/* Setter of read-only members (PyMember_SetOne with Py_READONLY). */
-static int qp_descr_readonly_set(JSContext *ctx, JSValueConst self, JSValueConst value, int magic)
-{
-    qp_raise(ctx, QP_EXC(ctx, AttributeError), "readonly attribute");
-    return -1;
-}
-
 /* _PyEval_GetBuiltin("getattr") */
 static JSValue qp_descr_builtin_getattr(JSContext *ctx)
 {
+    JSAtom atom = JS_NewAtom(ctx, "getattr");
     JSValue res;
-    JSAtom atom;
-    int r;
-
-    atom = JS_NewAtom(ctx, "getattr");
     if (atom == JS_ATOM_NULL)
         return JS_EXCEPTION;
-    r = qp_dict_get_item_atom(ctx, QP_STATE(ctx)->builtins_dict, atom, &res);
-    if (r == 0) {
-        JSValue name = qp_str_from_atom(ctx, atom);
-        if (!JS_IsException(name)) {
-            qp_raise_value(ctx, QP_EXC(ctx, AttributeError), name);
-            JS_FreeValue(ctx, name);
-        }
-        res = JS_EXCEPTION;
-    } else if (r < 0) {
-        res = JS_EXCEPTION;
-    }
+    res = qp_eval_get_builtin(ctx, atom);
     JS_FreeAtom(ctx, atom);
     return res;
 }
@@ -182,7 +162,7 @@ static JSValue qp_doc_from_internal(JSContext *ctx, const char *name, const char
 
 static const char *qp_signature_from_flags(int flags)
 {
-    switch (flags & ~QP_METH_COEXIST) {
+    switch (flags & ~(QP_METH_COEXIST | QP_METH_VARARGS)) {
     case QP_METH_NOARGS:
         return "($self, /)";
     case QP_METH_NOARGS | QP_METH_CLASS:
@@ -241,7 +221,7 @@ static QPCFunctionObject *qp_cfunction_payload(JSValueConst v)
     return p->u.opaque;
 }
 
-static void qp_cfunction_finalizer(JSRuntime *rt, JSValueConst val)
+static void qp_cfunction_finalizer(JSRuntime *rt, JSValue val)
 {
     QPCFunctionObject *f = JS_VALUE_GET_OBJ(val)->u.opaque;
 
@@ -407,6 +387,8 @@ static JSValue qp_cfunction_call(JSContext *ctx, JSValueConst callable, JSValueC
 
     if (!f)
         return qp_raise_system_error(ctx, "bad builtin function object");
+    if ((f->ml->flags & QP_METH_VARARGS) && qp_descr_kwcount(kwnames))
+        return qp_raise_type_error(ctx, "%.200s() takes no keyword arguments", f->ml->name);
     /* the call may drop the last reference to `callable` */
     self = JS_DupValue(ctx, f->self);
     res = qp_descr_call_cfunc(ctx, f->ml, self, args, (int)qp_nargs(nargsf), kwnames,
@@ -441,7 +423,10 @@ static JSValue qp_cfunction_richcompare(JSContext *ctx, JSValueConst a, JSValueC
     fb = qp_cfunction_payload(b);
     if ((op != QP_CMP_EQ && op != QP_CMP_NE) || !fa || !fb)
         return qp_not_implemented(ctx);
-    eq = qp_descr_same(fa->self, fb->self) && fa->ml->meth == fb->ml->meth;
+    /* CPython compares ml_meth; QP functions sharing one meth (C API
+       methods: qp_capi_meth_call) differ by magic */
+    eq = qp_descr_same(fa->self, fb->self) && fa->ml->meth == fb->ml->meth &&
+         fa->ml->magic == fb->ml->magic;
     return qp_bool_new(op == QP_CMP_EQ ? eq : !eq);
 }
 
@@ -453,7 +438,7 @@ static Py_hash_t qp_cfunction_hash(JSContext *ctx, JSValueConst self)
     x = qp_descr_identity_hash(ctx, f->self);
     if (x == -1)
         return -1;
-    y = (Py_hash_t)qp_hash_pointer((uintptr_t)f->ml->meth);
+    y = (Py_hash_t)qp_hash_pointer((uintptr_t)f->ml->meth ^ ((uintptr_t)(uint32_t)f->ml->magic << 32));
     x ^= y;
     if (x == -1)
         x = -2;
@@ -485,7 +470,7 @@ static JSValue qp_cfunction_getattr(JSContext *ctx, JSValueConst self, int magic
 
     switch (magic) {
     case 0:
-        return qp_doc_from_internal(ctx, f->ml->name, f->ml->doc);
+        return qp_doc_from_internal(ctx, f->ml->name, qp_capi_method_doc(f->ml));
     case 1:
         return qp_str_from_cstr(ctx, f->ml->name);
     case 2:
@@ -494,7 +479,8 @@ static JSValue qp_cfunction_getattr(JSContext *ctx, JSValueConst self, int magic
         s = qp_cfunction_get_self_raw(f);
         return QP_IS_NULL(s) ? JS_UNDEFINED : JS_DupValue(ctx, s);
     case 4:
-        return qp_text_signature_from_internal_flags(ctx, f->ml->name, f->ml->doc, f->ml->flags);
+        return qp_text_signature_from_internal_flags(ctx, f->ml->name, qp_capi_method_doc(f->ml),
+                                                     f->ml->flags);
     default:
         return QP_IS_NULL(f->module) ? JS_UNDEFINED : JS_DupValue(ctx, f->module);
     }
@@ -521,7 +507,7 @@ static const QPGetSetDef qp_cfunction_getsets[] = {
     { "__qualname__", qp_cfunction_getattr, NULL, 2, NULL },
     { "__self__", qp_cfunction_getattr, NULL, 3, NULL },
     { "__text_signature__", qp_cfunction_getattr, NULL, 4, NULL },
-    { "__module__", qp_cfunction_getattr, qp_cfunction_set_module, 5, NULL },
+    { "__module__", qp_cfunction_getattr, qp_cfunction_set_module, 5, NULL, QP_GETSET_MEMBER },
     { NULL }
 };
 
@@ -541,14 +527,7 @@ static QPDescr *qp_descr_get(JSValueConst v)
     return p->u.opaque;
 }
 
-static int qp_descr_kind(JSValueConst v)
-{
-    QPDescr *d = qp_descr_get(v);
-
-    return d ? d->kind : -1;
-}
-
-static void qp_descr_finalizer(JSRuntime *rt, JSValueConst val)
+static void qp_descr_finalizer(JSRuntime *rt, JSValue val)
 {
     QPDescr *d = JS_VALUE_GET_OBJ(val)->u.opaque;
 
@@ -689,8 +668,14 @@ static JSValue qp_descr_new_method(JSContext *ctx, QPType *t, const QPMethodDef 
         JSValue module, cfunc, sm;
 
         module = qp_type_module(ctx, t);
-        if (JS_IsException(module))
-            return module;
+        if (JS_IsException(module)) {
+            /* a heap type without __module__ (PyType_FromSpec of an
+               undotted name): no module */
+            if (!qp_exc_pending_matches(ctx, QP_EXC(ctx, AttributeError)))
+                return module;
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            module = JS_UNDEFINED;
+        }
         cfunc = qp_cfunction_new(ctx, ml, QP_TYPE_VALUE(t), module);
         JS_FreeValue(ctx, module);
         if (JS_IsException(cfunc))
@@ -1102,10 +1087,19 @@ static JSValue qp_wrapper_raw_call(JSContext *ctx, QPDescr *d, JSValueConst self
 {
     const QPSlotDef *sd = d->u.wrapper.slot;
     int nkw = qp_descr_kwcount(kwnames);
+    QPState *s = QP_STATE(ctx);
+    JSValue res;
 
     if (!(sd->flags & QP_SLOTDEF_KEYWORDS) && nkw)
         return qp_raise_type_error(ctx, "wrapper %s() takes no keyword arguments", sd->name);
-    return sd->wrapper(ctx, self, args, nargs, nkw ? kwnames : QP_NULL, d->u.wrapper.wrapped);
+    /* CPython calls the wrapped C function of the descriptor's type
+       (d_wrapped); a C-defined type's wrapped slot is a forward bridge
+       that otherwise resolves the C function from type(self) */
+    s->wrapper_type = qp_descr_objclass(d);
+    s->wrapper_slot = sd->offset;
+    res = sd->wrapper(ctx, self, args, nargs, nkw ? kwnames : QP_NULL, d->u.wrapper.wrapped);
+    s->wrapper_type = NULL;
+    return res;
 }
 
 static JSValue qp_wrapperdescr_call(JSContext *ctx, JSValueConst callable, JSValueConst *args,
@@ -1234,7 +1228,7 @@ static JSValue qp_descr_getattr(JSContext *ctx, JSValueConst self, int magic)
     case QP_DESCR_METHOD:
     case QP_DESCR_CLASSMETHOD:
         name = d->u.method->name;
-        doc = d->u.method->doc;
+        doc = qp_capi_method_doc(d->u.method);
         flags = d->u.method->flags;
         break;
     case QP_DESCR_WRAPPER:
@@ -1244,15 +1238,17 @@ static JSValue qp_descr_getattr(JSContext *ctx, JSValueConst self, int magic)
         break;
     case QP_DESCR_GETSET:
         /* getset_get_doc: raw doc string */
-        if (magic == QP_DESCR_ATTR_DOC && d->u.getset->doc)
-            return qp_str_from_cstr(ctx, d->u.getset->doc);
+        doc = qp_capi_getset_doc(d->u.getset);
+        if (magic == QP_DESCR_ATTR_DOC && doc)
+            return qp_str_from_cstr(ctx, doc);
         return JS_UNDEFINED;
     default:
         /* member_get_doc: members made by __slots__ have no doc; C-API
            members (D5 R2) have the PyMemberDef doc */
-        if (magic == QP_DESCR_ATTR_DOC && d->kind == QP_DESCR_MEMBER &&
-            d->u.member.getset && d->u.member.getset->doc)
-            return qp_str_from_cstr(ctx, d->u.member.getset->doc);
+        doc = d->kind == QP_DESCR_MEMBER && d->u.member.getset ?
+            qp_capi_getset_doc(d->u.member.getset) : NULL;
+        if (magic == QP_DESCR_ATTR_DOC && doc)
+            return qp_str_from_cstr(ctx, doc);
         return JS_UNDEFINED;
     }
     if (magic == QP_DESCR_ATTR_DOC)
@@ -1283,8 +1279,8 @@ static const QPMethodDef qp_descr_methods[] = {
 };
 
 #define QP_DESCR_MEMBERS_GETSETS                                                       \
-    { "__objclass__", qp_descr_getattr, qp_descr_readonly_set, QP_DESCR_ATTR_OBJCLASS, NULL }, \
-    { "__name__", qp_descr_getattr, qp_descr_readonly_set, QP_DESCR_ATTR_NAME, NULL }
+    { "__objclass__", qp_descr_getattr, NULL, QP_DESCR_ATTR_OBJCLASS, NULL, QP_GETSET_MEMBER }, \
+    { "__name__", qp_descr_getattr, NULL, QP_DESCR_ATTR_NAME, NULL, QP_GETSET_MEMBER }
 
 /* method_descriptor, classmethod_descriptor, wrapper_descriptor */
 static const QPGetSetDef qp_methoddescr_getsets[] = {
@@ -1304,7 +1300,7 @@ static const QPGetSetDef qp_attrdescr_getsets[] = {
 };
 
 static const QPGetSetDef qp_methodwrapper_getsets[] = {
-    { "__self__", qp_descr_getattr, qp_descr_readonly_set, QP_DESCR_ATTR_SELF, NULL },
+    { "__self__", qp_descr_getattr, NULL, QP_DESCR_ATTR_SELF, NULL, QP_GETSET_MEMBER },
     { "__objclass__", qp_descr_getattr, NULL, QP_DESCR_ATTR_OBJCLASS, NULL },
     { "__name__", qp_descr_getattr, NULL, QP_DESCR_ATTR_NAME, NULL },
     { "__qualname__", qp_descr_getattr, NULL, QP_DESCR_ATTR_QUALNAME, NULL },
@@ -1358,7 +1354,7 @@ static QPProperty *qp_property_payload(JSContext *ctx, JSValueConst self)
     return p->u.opaque;
 }
 
-static void qp_property_finalizer(JSRuntime *rt, JSValueConst val)
+static void qp_property_finalizer(JSRuntime *rt, JSValue val)
 {
     QPProperty *pp = JS_VALUE_GET_OBJ(val)->u.opaque;
 
@@ -1512,7 +1508,7 @@ static JSValue qp_property_copy(JSContext *ctx, JSValueConst old, JSValueConst g
     else
         argv[3] = QP_IS_NULL(pold->doc) ? JS_UNDEFINED : JS_DupValue(ctx, pold->doc);
     name = JS_DupValue(ctx, pold->name);
-    res = qp_vectorcall(ctx, QP_TYPE_VALUE(qp_type_of(ctx, old)), argv, 4, QP_NULL);
+    res = qp_vectorcall(ctx, QP_TYPE_VALUE(qp_type_of(ctx, old)), (JSValueConst *)argv, 4, QP_NULL);
     for (i = 0; i < 4; i++)
         JS_FreeValue(ctx, argv[i]);
     if (!JS_IsException(res) && qp_typecheck(ctx, res, QP_TYPE(ctx, property)) &&
@@ -1638,7 +1634,8 @@ static int qp_property_init(JSContext *ctx, JSValueConst self, JSValueConst *arg
     static const char *const keywords[] = { "fget", "fset", "fdel", "doc", NULL };
     static const QPArgSpec spec = { "property", keywords, 0, 4, 0 };
     JSValueConst out[4];
-    JSValue fget, fset, fdel, doc, prop_doc = QP_NULL;
+    JSValueConst fget, fset, fdel, doc;
+    JSValue prop_doc = QP_NULL;
     QPProperty *pp;
     int r, err;
 
@@ -1722,10 +1719,11 @@ static const QPMethodDef qp_property_methods[] = {
 };
 
 static const QPGetSetDef qp_property_getsets[] = {
-    { "fget", qp_property_getattr, qp_descr_readonly_set, 0, NULL },
-    { "fset", qp_property_getattr, qp_descr_readonly_set, 1, NULL },
-    { "fdel", qp_property_getattr, qp_descr_readonly_set, 2, NULL },
-    { "__doc__", qp_property_getattr, qp_property_setattr, 3, NULL },
+    /* property_members */
+    { "fget", qp_property_getattr, NULL, 0, NULL, QP_GETSET_MEMBER },
+    { "fset", qp_property_getattr, NULL, 1, NULL, QP_GETSET_MEMBER },
+    { "fdel", qp_property_getattr, NULL, 2, NULL, QP_GETSET_MEMBER },
+    { "__doc__", qp_property_getattr, qp_property_setattr, 3, NULL, QP_GETSET_MEMBER },
     { "__name__", qp_property_getattr, qp_property_setattr, 4, NULL },
     { "__isabstractmethod__", qp_property_getattr, NULL, 5, NULL },
     { NULL }
@@ -1782,16 +1780,6 @@ static BOOL qp_funcwrap_class_ok(JSValueConst v)
     return cid == JS_CLASS_PY_CLASSMETHOD || cid == JS_CLASS_PY_STATICMETHOD;
 }
 
-static JSValue qp_funcwrap_callable(JSValueConst v)
-{
-    QPFuncWrap *fw;
-
-    if (!qp_funcwrap_class_ok(v))
-        return QP_NULL;
-    fw = JS_VALUE_GET_OBJ(v)->u.opaque;
-    return fw ? fw->callable : QP_NULL;
-}
-
 static QPFuncWrap *qp_funcwrap_alloc_payload(JSContext *ctx)
 {
     QPFuncWrap *fw = js_malloc(ctx, sizeof(*fw));
@@ -1824,7 +1812,7 @@ static BOOL qp_funcwrap_is_static(JSValueConst v)
     return JS_VALUE_GET_OBJ(v)->class_id == JS_CLASS_PY_STATICMETHOD;
 }
 
-static void qp_funcwrap_finalizer(JSRuntime *rt, JSValueConst val)
+static void qp_funcwrap_finalizer(JSRuntime *rt, JSValue val)
 {
     QPFuncWrap *fw = JS_VALUE_GET_OBJ(val)->u.opaque;
 
@@ -2249,8 +2237,8 @@ static const QPMethodDef qp_funcwrap_methods[] = {
 };
 
 static const QPGetSetDef qp_funcwrap_getsets[] = {
-    { "__func__", qp_funcwrap_getattr, qp_descr_readonly_set, 0, NULL },
-    { "__wrapped__", qp_funcwrap_getattr, qp_descr_readonly_set, 0, NULL },
+    { "__func__", qp_funcwrap_getattr, NULL, 0, NULL, QP_GETSET_MEMBER },
+    { "__wrapped__", qp_funcwrap_getattr, NULL, 0, NULL, QP_GETSET_MEMBER },
     { "__isabstractmethod__", qp_funcwrap_getattr, NULL, 1, NULL },
     { "__dict__", qp_funcwrap_getattr, qp_funcwrap_setattr, 2, NULL },
     { "__annotations__", qp_funcwrap_getattr, qp_funcwrap_setattr, 3, NULL },
@@ -2445,6 +2433,7 @@ static const QPTypeSpec qp_classmethod_spec = {
     },
     .methods = qp_funcwrap_methods,
     .getsets = qp_funcwrap_getsets,
+    .generic_attr = QP_GENERIC_GETATTR | QP_GENERIC_SETATTR,
 };
 
 static const QPTypeSpec qp_staticmethod_spec = {
@@ -2465,6 +2454,7 @@ static const QPTypeSpec qp_staticmethod_spec = {
     },
     .methods = qp_funcwrap_methods,
     .getsets = qp_funcwrap_getsets,
+    .generic_attr = QP_GENERIC_GETATTR | QP_GENERIC_SETATTR,
 };
 
 static int qp_init_descr_types(JSContext *ctx)

@@ -61,6 +61,7 @@ static void qp_error_clear(qp_error *err)
 {
     qp_sys_free(err->msg);
     qp_sys_free(err->text);
+    qp_sys_free(err->metadata_source);
     memset(err, 0, sizeof(*err));
 }
 
@@ -91,6 +92,7 @@ struct qp_arena {
     size_t atom_count, atom_size;
     JSValue *values;
     size_t value_count, value_size;
+    int feature_version;    /* parser cf_feature_version (minor version), -1: current */
 };
 
 static void qp_arena_nomem(qp_arena *a)
@@ -112,6 +114,7 @@ static qp_arena *qp_arena_new(JSContext *ctx, qp_error *err)
     a->ctx = ctx;
     a->rt = rt;
     a->err = err;
+    a->feature_version = -1;
     return a;
 }
 
@@ -218,6 +221,16 @@ static JSContext *qp_arena_ctx(qp_arena *a)
 static qp_error *qp_arena_error(qp_arena *a)
 {
     return a->err;
+}
+
+static void qp_arena_set_feature_version(qp_arena *a, int minor)
+{
+    a->feature_version = minor;
+}
+
+static int qp_arena_feature_version(qp_arena *a)
+{
+    return a->feature_version;
 }
 
 /* ---- constants ---- */

@@ -16,24 +16,32 @@
  *    `tok->err->kind != QP_ERR_NONE` is the equivalent of PyErr_Occurred().
  *    The constructors take the error sink as an extra trailing argument
  *    (construction can fail with decoding errors before a caller could set
- *    it) and store it in tok->err.  There is no JSContext in tok_state: the
- *    lexer does not need one.
+ *    it) and store it in tok->err.  tok->ctx (given to _PyTokenizer_FromString
+ *    and set by the parser; NULL otherwise) is used to emit SyntaxWarnings and
+ *    to decode declared encodings through the codec registry.
  *  - Constructor failures are reported already converted the way
  *    _PyTokenizer_raise_init_error / _PyPegen_raise_tokenizer_init_error do:
  *    unknown encodings and codec decode errors become QP_ERR_SYNTAX with
  *    msg = str(exception), lineno 0, offset -1 (filename is the caller's);
  *    tokenizer SyntaxErrors ("Non-UTF-8 code ...", "encoding problem: X with
- *    BOM") keep their positions; OOM is QP_ERR_MEMORY.  Supported declared
- *    encodings: everything that resolves to the utf_8, latin_1 or ascii codecs;
- *    any other name reports "unknown encoding: <name>".
+ *    BOM") keep their positions; OOM is QP_ERR_MEMORY.  Declared encodings
+ *    that resolve to the utf_8, latin_1 or ascii codecs are decoded natively;
+ *    any other one goes through the codec registry (PyUnicode_Decode) when
+ *    tok->ctx is set, else reports "unknown encoding: <name>".  An exception
+ *    other than LookupError/ValueError/SyntaxError raised by a codec is
+ *    QP_ERR_PENDING.
  *  - struct token.metadata is a qp_sys_malloc'd NUL-terminated UTF-8 copy of the
  *    f-string debug / t-string expression text (CPython: a str object), with
  *    its byte length in metadata_len; NULL when absent.  _PyToken_Free frees
  *    it; a consumer may steal it by setting token.metadata = NULL.
- *  - tok->filename / tok->module are unowned `const char *` (may be NULL).
+ *  - tok->filename is an unowned `const char *` (may be NULL); tok->module
+ *    is a borrowed module name (QP_NULL: derived from the filename,
+ *    JS_UNDEFINED: warnings dropped).
  *  - Lexer warnings (invalid escape sequence, "invalid <kind> literal"
- *    SyntaxWarning) are not emitted; control flow is that of a run where the
- *    warning was emitted successfully.
+ *    SyntaxWarning) go through qp_syntax_warn when tok->ctx is set (else
+ *    they are dropped).  A warning raised as a SyntaxWarning exception
+ *    becomes the tokenizer SyntaxError; any other exception is reported as
+ *    QP_ERR_PENDING.
  *  - All tokenizer memory (tok_state, buffers, metadata) uses
  *    qp_sys_malloc/qp_sys_calloc/qp_sys_realloc/qp_sys_free (libc semantics;
  *    quickjs.c forbids the raw names).  A stolen metadata pointer must be
@@ -166,7 +174,7 @@ struct tok_state {
     int parenlinenostack[MAXLEVEL];
     int parencolstack[MAXLEVEL];
     const char *filename;   /* unowned, may be NULL */
-    const char *module;     /* unowned, may be NULL */
+    JSValueConst module;    /* borrowed; QP_NULL if absent, JS_UNDEFINED drops warnings */
     /* Stuff for checking on different tab sizes */
     int altindstack[MAXINDENT];         /* Stack of alternate indents */
     /* Stuff for PEP 0263 */
@@ -197,10 +205,13 @@ struct tok_state {
     int barry_as_bdfl;
 
     qp_error *err;          /* error sink (set by the constructors) */
+    JSContext *ctx;         /* SyntaxWarnings and codec-registry source decoding;
+                               NULL = warnings dropped, native codecs only */
 };
 
 static struct tok_state *_PyTokenizer_FromString(const char *str, int exec_input,
-                                                 int preserve_crlf, qp_error *err);
+                                                 int preserve_crlf, qp_error *err,
+                                                 JSContext *ctx);
 static struct tok_state *_PyTokenizer_FromUTF8(const char *str, int exec_input,
                                                int preserve_crlf, qp_error *err);
 static int _PyTokenizer_Get(struct tok_state *, struct token *);

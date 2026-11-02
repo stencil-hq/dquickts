@@ -25,6 +25,8 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #include <limits.h>
+#include <locale.h>
+#include <signal.h>
 
 #include "quickpy.h"
 #include "pythonrun_usage.h"
@@ -33,6 +35,12 @@
 static int qp_sys_flush_std_files(JSContext *ctx);
 static int qp_err_print_uncaught(JSContext *ctx, int *pkbint);
 static int qp_linecache_register(JSContext *ctx, const char *filename, const char *src, size_t len);
+/* provided by mod_misc.c */
+static void (*qp_signal_attach(JSContext *ctx))(int);
+static void qp_signal_apply_inherited(JSContext *ctx, const uint8_t *ignored, int nsig);
+/* provided by mod_time.c and mod_posix.c */
+static int qp_time_init_timezone(JSContext *ctx, JSValueConst m);
+static void qp_os_drepl_environ(JSContext *ctx, BOOL fill);
 
 #define QP_PY_VERSION "3.15.2"
 
@@ -73,10 +81,15 @@ static JSValue qp_run_source(JSContext *ctx, const char *src, size_t len, const 
                              int mode, int flags, JSValueConst globals, JSValueConst locals)
 {
     qp_error err;
-    JSValue bc;
+    JSValue bc, module = QP_NULL;
 
+    /* _PyRun_StringFlagsWithName: SyntaxWarnings are reported for
+       globals['__name__'] */
+    if (qp_dict_get_item_atom(ctx, globals, QP_ATOM(ctx, __name__), &module) < 0)
+        return JS_EXCEPTION;
     memset(&err, 0, sizeof(err));
-    bc = qp_compile_source(ctx, src, len, filename, mode, flags, -1, &err);
+    bc = qp_compile_source(ctx, src, len, filename, module, mode, flags, -1, &err);
+    JS_FreeValue(ctx, module);
     if (JS_IsException(bc)) {
         if (err.kind != QP_ERR_NONE)
             qp_raise_qp_error(ctx, &err, filename);
@@ -293,6 +306,8 @@ typedef struct QPMain {
     char *path0;                /* cfg.sys_path_0 storage */
     char *command;              /* -c text + "\n" */
     char *envwarn;              /* PYTHONWARNINGS copy split in place */
+    char *run_filename;         /* cfg.run_filename storage (made absolute) */
+    int use_frozen_modules;     /* -X frozen_modules / PYTHON_FROZEN_MODULES: start from the base snapshot embedded in qpy (qp_main_restore_base) */
 } QPMain;
 
 static int qp_main_err_print(JSContext *ctx, QPMain *m)
@@ -536,6 +551,36 @@ static int qp_main_run_file(JSContext *ctx, QPMain *m)
    (modname, True).  Without it only builtin modules exist, which have no
    code object: runpy's _get_module_details errors are reproduced
    (sys.exit("%s: %s" % (sys.executable, msg)) -> status 1). */
+/* -X tracemalloc / PYTHONTRACEMALLOC (init_interp_main):
+   _tracemalloc.start(nframe); -1 with the exception pending. */
+static int qp_main_start_tracemalloc(JSContext *ctx, int nframe)
+{
+#ifdef CONFIG_PYTHON_CAPI
+    JSValue mod, start, arg, res;
+    JSAtom a;
+
+    mod = qp_import_module(ctx, "_tracemalloc");
+    if (JS_IsException(mod))
+        return -1;
+    a = JS_NewAtom(ctx, "start");
+    start = qp_getattr(ctx, mod, a);
+    JS_FreeAtom(ctx, a);
+    JS_FreeValue(ctx, mod);
+    if (JS_IsException(start))
+        return -1;
+    arg = JS_NewInt32(ctx, nframe);
+    res = qp_vectorcall(ctx, start, (JSValueConst *)&arg, 1, QP_NULL);
+    JS_FreeValue(ctx, start);
+    if (JS_IsException(res))
+        return -1;
+    JS_FreeValue(ctx, res);
+#else
+    (void)ctx;
+    (void)nframe;
+#endif
+    return 0;
+}
+
 static int qp_main_run_module(JSContext *ctx, QPMain *m, const char *modname)
 {
     JSValue runpy, runmodule, args[2], res, name, parent, mod;
@@ -641,8 +686,16 @@ static void qp_repl_prompt(JSContext *ctx, JSAtom name, DynBuf *buf)
     JS_FreeCString(ctx, p);
 }
 
+#ifdef CONFIG_PYTHON_CAPI
+/* python/capi_runtime.c: PyOS_Readline once the readline module is loaded */
+static BOOL qp_capi_readline_hooked(JSContext *ctx);
+static int qp_capi_repl_readline(JSContext *ctx, const char *prompt, DynBuf *line);
+#endif
+
 /* PyOS_StdioReadline: prompt on stderr, one line (without '\n') appended
-   to line.  1 = line read, 0 = EOF before any character. */
+   to line.  1 = line read, 0 = EOF before any character, -1 = exception
+   (KeyboardInterrupt of the readline hook).  With the readline module
+   loaded (C API builds), PyOS_Readline and its line editing. */
 static int qp_repl_readline(JSContext *ctx, JSAtom prompt_name, DynBuf *line)
 {
     DynBuf prompt;
@@ -650,16 +703,28 @@ static int qp_repl_readline(JSContext *ctx, JSAtom prompt_name, DynBuf *line)
 
     dbuf_init(&prompt);
     qp_repl_prompt(ctx, prompt_name, &prompt);
+#ifdef CONFIG_PYTHON_CAPI
+    if (qp_capi_readline_hooked(ctx)) {
+        dbuf_putc(&prompt, '\0');
+        got = qp_capi_repl_readline(ctx, prompt.buf ? (const char *)prompt.buf : "", line);
+        dbuf_free(&prompt);
+        return got;
+    }
+#endif
     fwrite(prompt.buf ? (const char *)prompt.buf : "", 1, prompt.size, stderr);
     fflush(stderr);
     dbuf_free(&prompt);
+    /* PyOS_Readline releases the GIL (line is a libc-allocated DynBuf) */
+    QP_BEGIN_ALLOW_THREADS(ctx)
     while ((c = getc(stdin)) != EOF) {
         got = 1;
         if (c == '\n')
-            return 1;
+            break;
         dbuf_putc(line, c);
     }
-    clearerr(stdin);
+    if (c == EOF)
+        clearerr(stdin);
+    QP_END_ALLOW_THREADS(ctx)
     return got;
 }
 
@@ -694,7 +759,8 @@ static int qp_repl_try_parse(JSContext *ctx, const char *src, size_t len)
         qp_error_clear(&err);
         return -1;
     }
-    rc = qp_parse(ctx, arena, src, len, "<stdin>", QP_INPUT_SINGLE,
+    /* codeop._maybe_compile ignores SyntaxWarnings */
+    rc = qp_parse(ctx, arena, src, len, "<stdin>", JS_UNDEFINED, QP_INPUT_SINGLE,
                   QP_PF_IGNORE_COOKIE | QP_PF_DONT_IMPLY_DEDENT | QP_PF_ALLOW_INCOMPLETE_INPUT,
                   &mod, &err);
     qp_arena_free(arena);
@@ -724,58 +790,69 @@ static int qp_repl_input_complete(JSContext *ctx, DynBuf *src)
 }
 
 /* _PyRun_InteractiveOne for one complete input: parse as "<stdin>",
-   compile as "<stdin-N>" (source registered for tracebacks), run in
-   __main__ with print_expr.  0 or -1 with exception pending. */
-static int qp_repl_run_one(JSContext *ctx, const char *src, size_t len, int *pcount)
+   compile as "<stdin-N>" (N = *pcount, incremented, source registered for
+   tracebacks) with the compile flags, run in __main__ with print_expr.
+   Returns the result of the code (a coroutine with QP_PF_TOP_LEVEL_AWAIT
+   if the input awaits) or JS_EXCEPTION. */
+static JSValue qp_repl_exec(JSContext *ctx, const char *src, size_t len, int *pcount,
+                            int flags)
 {
     char filename[32];
     qp_error err;
     qp_arena *arena;
     mod_ty mod;
     JSValue main_module, d, bc, res;
-    const int flags = QP_PF_IGNORE_COOKIE;
 
     memset(&err, 0, sizeof(err));
     arena = qp_arena_new(ctx, &err);
     if (!arena) {
         qp_error_clear(&err);
         qp_raise_memory_error(ctx);
-        return -1;
+        return JS_EXCEPTION;
     }
-    if (qp_parse(ctx, arena, src, len, "<stdin>", QP_INPUT_SINGLE, flags, &mod, &err) < 0) {
+    if (qp_parse(ctx, arena, src, len, "<stdin>", QP_NULL, QP_INPUT_SINGLE, flags, &mod,
+                 &err) < 0) {
         qp_arena_free(arena);
         qp_raise_qp_error(ctx, &err, "<stdin>");
         qp_error_clear(&err);
-        return -1;
+        return JS_EXCEPTION;
     }
     snprintf(filename, sizeof(filename), "<stdin-%d>", (*pcount)++);
     if (qp_linecache_register(ctx, filename, src, len) < 0) {
         qp_arena_free(arena);
-        return -1;
+        return JS_EXCEPTION;
     }
-    bc = qp_compile_ast(ctx, mod, filename, QP_INPUT_SINGLE, flags, -1, arena, &err);
+    bc = qp_compile_ast(ctx, mod, filename, QP_NULL, QP_INPUT_SINGLE, flags, -1, arena, &err);
     qp_arena_free(arena);
     if (JS_IsException(bc)) {
         if (err.kind != QP_ERR_NONE)
             qp_raise_qp_error(ctx, &err, filename);
         qp_error_clear(&err);
-        return -1;
+        return JS_EXCEPTION;
     }
     qp_error_clear(&err);
     main_module = qp_run_main_module(ctx);
     if (JS_IsException(main_module)) {
         JS_FreeValue(ctx, bc);
-        return -1;
+        return JS_EXCEPTION;
     }
     d = qp_run_main_dict(ctx, main_module);
     if (JS_IsException(d)) {
         JS_FreeValue(ctx, bc);
         JS_FreeValue(ctx, main_module);
-        return -1;
+        return JS_EXCEPTION;
     }
     res = qp_run_code(ctx, bc, d, d);
     JS_FreeValue(ctx, d);
     JS_FreeValue(ctx, main_module);
+    return res;
+}
+
+/* the interactive loop's input: 0 or -1 with exception pending */
+static int qp_repl_run_one(JSContext *ctx, const char *src, size_t len, int *pcount)
+{
+    JSValue res = qp_repl_exec(ctx, src, len, pcount, QP_PF_IGNORE_COOKIE);
+
     if (JS_IsException(res))
         return -1;
     JS_FreeValue(ctx, res);
@@ -823,6 +900,8 @@ static int qp_repl_loop(JSContext *ctx, QPMain *m)
             rc = qp_repl_readline(ctx, more ? QP_ATOM(ctx, ps2) : QP_ATOM(ctx, ps1), &src);
             dbuf_putc(&src, '\0');
             src.size--;
+            if (rc < 0)
+                break;  /* KeyboardInterrupt while reading: drop the input */
             if (rc == 0) {
                 if (!more) {
                     dbuf_free(&src);
@@ -837,6 +916,10 @@ static int qp_repl_loop(JSContext *ctx, QPMain *m)
             if (qp_repl_input_complete(ctx, &src))
                 break;
             more = 1;
+        }
+        if (rc < 0) {
+            qp_main_err_print(ctx, m);
+            continue;
         }
         dbuf_putc(&src, '\n');
         dbuf_putc(&src, '\0');
@@ -1084,7 +1167,10 @@ static void qp_config_usage(int error, const char *program)
 static int qp_config_fatal(const char *func, const char *msg)
 {
     fflush(stdout);
-    fprintf(stderr, "Fatal Python error: %s: %s\nPython runtime state: preinitialized\n\n", func, msg);
+    if (func)
+        fprintf(stderr, "Fatal Python error: %s: %s\nPython runtime state: preinitialized\n\n", func, msg);
+    else
+        fprintf(stderr, "Fatal Python error: %s\nPython runtime state: preinitialized\n\n", msg);
     fflush(stderr);
     return 1;
 }
@@ -1225,6 +1311,20 @@ static const char *qp_xoption(const QPMain *m, const char *name)
     return res;
 }
 
+/* tracemalloc number of frames (_Py_str_to_int, >= 0) */
+static int qp_parse_nframe(const char *s, int *out)
+{
+    char *end;
+    long v;
+
+    errno = 0;
+    v = strtol(s, &end, 10);
+    if (!*s || *end || errno == ERANGE || v < 0 || v > INT_MAX)
+        return -1;
+    *out = (int)v;
+    return 0;
+}
+
 /* int_max_str_digits value check: 0 or >= 640. */
 static int qp_parse_max_digits(const char *s, int *out)
 {
@@ -1237,8 +1337,64 @@ static int qp_parse_max_digits(const char *s, int *out)
     return 0;
 }
 
+/* getpath's abspath(): `path` made absolute against the current directory
+   and normalized lexically ("." and ".." components, repeated '/'),
+   without resolving symbolic links.  Written to buf (PATH_MAX); NULL if
+   it does not fit or the directory is unknown. */
+static char *qp_main_abspath(const char *path, char *buf)
+{
+    char tmp[PATH_MAX];
+    size_t n = 0, len;
+    const char *s, *e;
+
+    if (path[0] == '/') {
+        if (strlen(path) >= sizeof(tmp))
+            return NULL;
+        strcpy(tmp, path);
+    } else {
+        if (!getcwd(tmp, sizeof(tmp)))
+            return NULL;
+        len = strlen(tmp);
+        if (len + 1 + strlen(path) >= sizeof(tmp))
+            return NULL;
+        tmp[len] = '/';
+        strcpy(tmp + len + 1, path);
+    }
+    buf[0] = '\0';
+    for (s = tmp; *s; s = e) {
+        while (*s == '/')
+            s++;
+        e = s;
+        while (*e && *e != '/')
+            e++;
+        len = e - s;
+        if (len == 0 || (len == 1 && s[0] == '.'))
+            continue;
+        if (len == 2 && s[0] == '.' && s[1] == '.') {
+            while (n > 0 && buf[n - 1] != '/')
+                n--;
+            if (n > 0)
+                n--;
+            buf[n] = '\0';
+            continue;
+        }
+        buf[n++] = '/';
+        memcpy(buf + n, s, len);
+        n += len;
+        buf[n] = '\0';
+    }
+    if (n == 0) {
+        buf[0] = '/';
+        buf[1] = '\0';
+    }
+    return buf;
+}
+
 /* Absolute program path (sys.executable): argv[0] if it holds a '/',
-   else the first match in $PATH. */
+   else the first match in $PATH.  Symbolic links are not resolved, so a
+   virtual environment's bin/python stays sys.executable (site.venv finds
+   pyvenv.cfg next to it); the stdlib is located from its real path
+   (importlib_boot.c). */
 static char *qp_main_executable(const char *argv0)
 {
     char buf[PATH_MAX], cand[PATH_MAX];
@@ -1249,7 +1405,7 @@ static char *qp_main_executable(const char *argv0)
     if (!argv0 || !*argv0)
         return NULL;
     if (strchr(argv0, '/')) {
-        if (realpath(argv0, buf))
+        if (qp_main_abspath(argv0, buf))
             argv0 = buf;
     } else if ((path = getenv("PATH"))) {
         for (p = path; *p; p = *q ? q + 1 : q) {
@@ -1263,7 +1419,7 @@ static char *qp_main_executable(const char *argv0)
             cand[n] = '/';
             strcpy(cand + n + 1, argv0);
             if (access(cand, X_OK) == 0) {
-                argv0 = realpath(cand, buf) ? buf : cand;
+                argv0 = qp_main_abspath(cand, buf) ? buf : cand;
                 break;
             }
         }
@@ -1329,6 +1485,7 @@ static int qp_main_parse(QPMain *m, int argc, char **argv)
     cfg->optimize = 0;
     cfg->int_max_str_digits = -1;
     cfg->lazy_imports = -1;
+    cfg->utf8_mode = 1;     /* PEP 686: UTF-8 mode is the default in 3.15 */
     cfg->orig_argc = argc;
     cfg->orig_argv = argv;
     cfg->xoptions = qp_sys_calloc(argc + 1, sizeof(char *));
@@ -1373,6 +1530,7 @@ static int qp_main_parse(QPMain *m, int argc, char **argv)
                 qp_sys_free(warn);
                 return 2;
             }
+            cfg->check_hash_based_pycs = g.optarg;
             break;
         case 1:
             qp_config_usage(0, m->program);
@@ -1468,8 +1626,24 @@ static int qp_main_parse(QPMain *m, int argc, char **argv)
         qp_sys_free(warn);
         return 0;
     }
-    if (!cfg->run_command && !cfg->run_module && g.optind < argc && strcmp(argv[g.optind], "-") != 0)
-        cfg->run_filename = argv[g.optind];
+    if (!cfg->run_command && !cfg->run_module && g.optind < argc && strcmp(argv[g.optind], "-") != 0) {
+        /* config_run_filename_abspath: on failure keep the relative path */
+        char cwd[PATH_MAX];
+        const char *fn = argv[g.optind];
+        cfg->run_filename = fn;
+        if (fn[0] != '/' && getcwd(cwd, sizeof(cwd))) {
+            size_t cl = strlen(cwd), fl = strlen(fn);
+            m->run_filename = qp_sys_malloc(cl + fl + 2);
+            if (!m->run_filename) {
+                qp_sys_free(warn);
+                return qp_config_fatal("config_run_filename_abspath", "memory allocation failed");
+            }
+            memcpy(m->run_filename, cwd, cl);
+            m->run_filename[cl] = '/';
+            memcpy(m->run_filename + cl + 1, fn, fl + 1);
+            cfg->run_filename = m->run_filename;
+        }
+    }
     if (cfg->run_command || cfg->run_module)
         g.optind--;
     opt_index = g.optind;
@@ -1541,6 +1715,81 @@ static int qp_main_parse(QPMain *m, int argc, char **argv)
                                "PYTHONINTMAXSTRDIGITS: invalid limit; must be >= 640 "
                                "or 0 for unlimited.");
     }
+    /* config_init_import_time */
+    if ((e = qp_env(m, "PYTHONPROFILEIMPORTTIME"))) {
+        char *end;
+        long v = strtol(e, &end, 10);
+        if (!*e || *end)
+            v = 1;
+        if (v < 0 || v > 2) {
+            qp_sys_free(warn);
+            return qp_config_fatal("config_init_import_time",
+                                   "PYTHONPROFILEIMPORTTIME: numeric values other than 1 and 2 "
+                                   "are reserved for future use.");
+        }
+        cfg->import_time = (int)v;
+    }
+    if ((x = qp_xoption(m, "importtime"))) {
+        char *end;
+        long v = strtol(x, &end, 10);
+        if (!*x || *end)
+            v = 1;
+        if (v < 0 || v > 2) {
+            qp_sys_free(warn);
+            return qp_config_fatal("config_init_import_time",
+                                   "-X importtime: values other than 1 and 2 "
+                                   "are reserved for future use.");
+        }
+        cfg->import_time = (int)v;
+    }
+    /* config_init_tracemalloc: the number is checked by
+       _PyTraceMalloc_Start() (qp_main_start_tracemalloc) */
+    if ((e = qp_env(m, "PYTHONTRACEMALLOC"))) {
+        if (qp_parse_nframe(e, &cfg->tracemalloc) < 0) {
+            qp_sys_free(warn);
+            return qp_config_fatal("config_init_tracemalloc",
+                                   "PYTHONTRACEMALLOC: invalid number of frames");
+        }
+    }
+    if ((x = qp_xoption(m, "tracemalloc"))) {
+        if (!*x) {
+            cfg->tracemalloc = 1;
+        } else if (qp_parse_nframe(x, &cfg->tracemalloc) < 0) {
+            qp_sys_free(warn);
+            return qp_config_fatal("config_init_tracemalloc",
+                                   "-X tracemalloc=NFRAME: invalid number of frames");
+        }
+    }
+    /* config_init_import: the frozen modules are the base snapshot */
+    m->use_frozen_modules = 1;
+    if ((e = qp_env(m, "PYTHON_FROZEN_MODULES"))) {
+        if (!strcmp(e, "on"))
+            m->use_frozen_modules = 1;
+        else if (!strcmp(e, "off"))
+            m->use_frozen_modules = 0;
+        else {
+            qp_sys_free(warn);
+            return qp_config_fatal(NULL, "bad value for PYTHON_FROZEN_MODULES "
+                                   "(expected \"on\" or \"off\")");
+        }
+    }
+    if ((x = qp_xoption(m, "frozen_modules"))) {
+        if (!strcmp(x, "on") || !*x)
+            m->use_frozen_modules = 1;
+        else if (!strcmp(x, "off"))
+            m->use_frozen_modules = 0;
+        else {
+            qp_sys_free(warn);
+            return qp_config_fatal(NULL, "bad value for option -X frozen_modules "
+                                   "(expected \"on\" or \"off\")");
+        }
+    }
+    /* config_init_pycache_prefix: "-X pycache_prefix=" (empty) ignores
+       PYTHONPYCACHEPREFIX */
+    if ((x = qp_xoption(m, "pycache_prefix")))
+        cfg->pycache_prefix = *x ? x : NULL;
+    else if ((e = qp_env(m, "PYTHONPYCACHEPREFIX")) && *e)
+        cfg->pycache_prefix = e;
     if ((e = qp_env(m, "PYTHON_LAZY_IMPORTS"))) {
         if (!strcmp(e, "all"))
             cfg->lazy_imports = 1;
@@ -1726,8 +1975,806 @@ static void qp_main_free(QPMain *m)
     qp_sys_free(m->path0);
     qp_sys_free(m->command);
     qp_sys_free(m->envwarn);
+    qp_sys_free(m->run_filename);
     qp_sys_free(m->cfg.xoptions);
     qp_sys_free(m->cfg.warnoptions);
+}
+
+/* ---- finalization (Py_FinalizeEx) ------------------------------------- */
+
+static JSValue qp_weakref_new(JSContext *ctx, JSValueConst obj, JSValueConst callback);
+static JSValue qp_weakref_get(JSContext *ctx, JSValueConst ref);
+static void qp_weakref_run_pending(JSContext *ctx);
+static void qp_gc_collect_at_exit(JSContext *ctx);   /* mod_misc.c */
+
+/* _PyGC_CollectNoFail: free the unreachable cycles and run the __del__
+   methods, finalizers and weakref callbacks of the garbage, again while
+   they leave garbage with finalizers */
+static void qp_finalize_collect(JSContext *ctx)
+{
+    QPState *s = QP_STATE(ctx);
+    int i;
+
+    for (i = 0; i < 16; i++) {
+        BOOL pending;
+        JS_RunGC(ctx->rt);
+        pending = JS_VALUE_GET_TAG(s->pending_del) == JS_TAG_OBJECT &&
+            qp_list_size(s->pending_del) > 0;
+        qp_run_pending_finalizers(ctx);
+        qp_weakref_run_pending(ctx);
+        if (!pending)
+            break;
+    }
+}
+
+/* sys.<name> = value (a new reference, freed) */
+static void qp_finalize_sys_set(JSContext *ctx, const char *name, JSValue value)
+{
+    QPState *s = QP_STATE(ctx);
+    JSAtom atom = JS_NewAtom(ctx, name);
+
+    if (atom == JS_ATOM_NULL ||
+        qp_dict_set_item_atom(ctx, s->sys_dict, atom, value) < 0)
+        qp_tw_clear_exc(ctx);
+    JS_FreeAtom(ctx, atom);
+    JS_FreeValue(ctx, value);
+}
+
+/* finalize_modules_delete_special and _PyImport_FiniExternal: builtins._,
+   the import machinery and the interactive state of sys are None, the
+   standard streams the original ones */
+static void qp_finalize_delete_special(JSContext *ctx)
+{
+    static const char * const sys_deletes[] = {
+        "path", "argv", "ps1", "ps2", "last_exc", "last_type", "last_value",
+        "last_traceback", "__interactivehook__", "meta_path",
+        "path_importer_cache", "path_hooks",
+    };
+    static const char * const sys_files[] = {
+        "stdin", "__stdin__", "stdout", "__stdout__", "stderr", "__stderr__",
+    };
+    QPState *s = QP_STATE(ctx);
+    JSAtom atom;
+    size_t i;
+
+    atom = JS_NewAtom(ctx, "_");
+    if (atom == JS_ATOM_NULL ||
+        qp_dict_set_item_atom(ctx, s->builtins_dict, atom, qp_none()) < 0)
+        qp_tw_clear_exc(ctx);
+    JS_FreeAtom(ctx, atom);
+    for (i = 0; i < countof(sys_deletes); i++)
+        qp_finalize_sys_set(ctx, sys_deletes[i], qp_none());
+    for (i = 0; i < countof(sys_files); i += 2) {
+        JSValue v;
+        int r;
+        atom = JS_NewAtom(ctx, sys_files[i + 1]);
+        if (atom == JS_ATOM_NULL) {
+            qp_tw_clear_exc(ctx);
+            continue;
+        }
+        r = qp_dict_get_item_atom(ctx, s->sys_dict, atom, &v);
+        JS_FreeAtom(ctx, atom);
+        if (r < 0)
+            qp_tw_clear_exc(ctx);
+        else if (r > 0)
+            qp_finalize_sys_set(ctx, sys_files[i], v);
+    }
+}
+
+/* _PyModule_ClearDict: the names starting with a single underscore, then
+   every name but __builtins__, are set to None. The values are not held
+   meanwhile: as in CPython, a value whose last reference goes is
+   finalized at once (its __del__ methods and weakref callbacks run before
+   the next name is cleared), while the modules cleared later, i.e.
+   imported earlier (those of sys.stderr), still work. */
+static void qp_finalize_clear_dict(JSContext *ctx, JSValueConst d)
+{
+    JSValue keys, value;
+    JSValue *names;
+    Py_ssize_t i, n;
+    int pass, r;
+
+    for (pass = 0; pass < 2; pass++) {
+        /* the names of the pass (a finalizer may add some) */
+        keys = qp_dict_keys_list(ctx, d);
+        if (JS_IsException(keys)) {
+            qp_tw_clear_exc(ctx);
+            return;
+        }
+        names = qp_list_items(keys, &n);
+        for (i = 0; i < n; i++) {
+            JSValueConst key = names[i];
+            const char *name;
+            BOOL clear;
+            if (!JS_IsString(key))
+                continue;
+            r = qp_dict_get_item(ctx, d, key, &value);
+            if (r < 0)
+                qp_tw_clear_exc(ctx);
+            if (r <= 0)
+                continue;
+            clear = !JS_IsUndefined(value);
+            JS_FreeValue(ctx, value);
+            if (!clear)
+                continue;
+            name = JS_ToCString(ctx, key);
+            if (!name) {
+                qp_tw_clear_exc(ctx);
+                continue;
+            }
+            if (pass == 0)
+                clear = name[0] == '_' && name[1] != '_';
+            else
+                clear = strcmp(name, "__builtins__") != 0;
+            JS_FreeCString(ctx, name);
+            if (!clear)
+                continue;
+            if (qp_dict_set_item(ctx, d, key, qp_none()) < 0)
+                qp_tw_clear_exc(ctx);
+            qp_run_pending_finalizers(ctx);
+            qp_weakref_run_pending(ctx);
+        }
+        JS_FreeValue(ctx, keys);
+    }
+}
+
+/* finalize_modules: the modules are removed from sys.modules and the
+   garbage is collected, so that the __del__ methods and finalizers of the
+   cyclic garbage run while the modules they use still work (asyncio's
+   "Task was destroyed but it is pending!"); then the globals of the
+   modules still alive, but sys and builtins, are cleared in the reverse
+   order of the imports and the garbage collected again. */
+static void qp_finalize_modules(JSContext *ctx)
+{
+    QPState *s = QP_STATE(ctx);
+    JSValue items, *refs = NULL;
+    JSValue *pairs;
+    Py_ssize_t i, n, nrefs = 0;
+
+    s->finalizing = 1;
+    qp_finalize_delete_special(ctx);
+    /* finalize_remove_modules and finalize_clear_modules_dict */
+    items = qp_dict_check(ctx, s->modules) ?
+        qp_dict_items_list(ctx, s->modules) : JS_EXCEPTION;
+    if (JS_IsException(items)) {
+        qp_tw_clear_exc(ctx);
+    } else {
+        pairs = qp_list_items(items, &n);
+        refs = js_malloc(ctx, sizeof(refs[0]) * max_int(n, 1));
+        if (!refs)
+            qp_tw_clear_exc(ctx);
+        for (i = 0; i < n && refs; i++) {
+            JSValueConst mod = QP_TUPLE_ITEMS(pairs[i])[1];
+            JSValue ref;
+            if (!qp_module_check(ctx, mod))
+                continue;
+            ref = qp_weakref_new(ctx, mod, QP_NULL);
+            if (JS_IsException(ref))
+                qp_tw_clear_exc(ctx);
+            else
+                refs[nrefs++] = ref;
+        }
+        for (i = 0; i < n; i++) {
+            if (qp_dict_set_item(ctx, s->modules, QP_TUPLE_ITEMS(pairs[i])[0],
+                                 qp_none()) < 0)
+                qp_tw_clear_exc(ctx);
+        }
+        JS_FreeValue(ctx, items);
+        qp_dictcore_clear(ctx, &QP_DICT(s->modules)->core);
+    }
+    qp_finalize_collect(ctx);
+    /* finalize_modules_clear_weaklist */
+    for (i = nrefs - 1; i >= 0; i--) {
+        JSValue mod = qp_weakref_get(ctx, refs[i]);
+        if (JS_IsException(mod)) {
+            qp_tw_clear_exc(ctx);
+        } else if (qp_module_check(ctx, mod)) {
+            JSValueConst d = qp_module_get_dict(mod);
+            if (qp_dict_check(ctx, d) &&
+                JS_VALUE_GET_PTR(d) != JS_VALUE_GET_PTR(s->sys_dict) &&
+                JS_VALUE_GET_PTR(d) != JS_VALUE_GET_PTR(s->builtins_dict))
+                qp_finalize_clear_dict(ctx, d);
+        }
+        JS_FreeValue(ctx, mod);
+        JS_FreeValue(ctx, refs[i]);
+    }
+    js_free(ctx, refs);
+    qp_finalize_collect(ctx);
+}
+
+/* Py_FinalizeEx up to the release of the state: threading._shutdown(),
+   atexit, the other threads stopped (they hang when they try to take the
+   GIL), the standard streams flushed, the modules finalized and what
+   their finalizers printed flushed.  Runs once per context.  *pnthreads
+   gets the number of other threads still existing.  Returns -1 when a
+   flush of the standard streams failed. */
+static int qp_finalize(JSContext *ctx, int *pnthreads)
+{
+    QPState *s = QP_STATE(ctx);
+    int ret = 0;
+
+    *pnthreads = 0;
+    if (s->finalized)
+        return 0;
+    s->finalized = 1;
+    qp_main_thread_shutdown(ctx);
+    qp_atexit_run(ctx);
+    *pnthreads = qp_threads_finalize(ctx);
+    if (qp_sys_flush_std_files(ctx) < 0)
+        ret = -1;
+    /* a collection before the modules (Py_FinalizeEx's _PyGC_CollectNoFail) */
+    qp_gc_collect_at_exit(ctx);
+    qp_finalize_modules(ctx);
+    if (qp_sys_flush_std_files(ctx) < 0)
+        ret = -1;
+    fflush(stdout);
+    fflush(stderr);
+    /* nothing is left pending for the teardown */
+    if (JS_HasException(ctx))
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    return ret;
+}
+
+/* JS_FreeRuntime, before the C API teardown and the final collection:
+   qp_finalize for every context with a Python state that was not
+   finalized (an embedder that used Python through JS_InitPython /
+   JS_EvalPython / JS_PythonImport, contexts already released with
+   JS_FreeContext included), so that the modules are finalized, their C
+   state released and the garbage collected while the interpreter still
+   works, as at the exit of qpy. */
+static void qp_runtime_finalize(JSRuntime *rt)
+{
+    struct list_head *el;
+    int nthreads;
+
+ again:
+    list_for_each(el, &rt->context_list) {
+        JSContext *ctx = list_entry(el, JSContext, link);
+        if (ctx->py && !ctx->py->finalized) {
+            /* the finalizers may release the last references of ctx */
+            JS_DupContext(ctx);
+            qp_finalize(ctx, &nthreads);
+            JS_FreeContext(ctx);
+            goto again;
+        }
+    }
+}
+
+/* ---- the base snapshot (plan section 1) ------------------------------- */
+
+/* qpy embeds the interpreter state after the part of the startup that
+   does not depend on the process: qp_importlib_boot_core (importlib,
+   zipimport, encodings, _signal), the _io classes (_pyio and the modules
+   it imports: os, abc, codecs, stat...) and the UTF-8 codec, i.e. every
+   module of a `python -S` start but __main__.  The build writes it with
+   `qpy --write-base-snapshot FILE DIR` (qp_write_base_snapshot, DIR being
+   the directory of the qpy that embeds it) and qpy.c hands it to
+   qp_set_base_snapshot().  qp_main then restores it instead of building
+   the state and compiling these modules, and applies what depends on the
+   process like a normal start does (qp_main_attach_base): the
+   configuration and the sys attributes it gives, the getpath paths, the
+   hash key (the hash tables of the snapshot are rehashed with it), the
+   signals inherited ignored, posix.environ, the time zone of the time
+   module, the standard streams, the -W options and site.
+
+   The snapshot is only used when the configuration gives the same state
+   (qp_main_base_eligible: no -O, -v, -X importtime, dev mode, -X options
+   other than utf8 and frozen_modules...), when every source file of its
+   modules still has the size and modification time it had at build time
+   (a stale base is never used), when the stdlib of the process is the one
+   of the base, and unless -X frozen_modules=off / PYTHON_FROZEN_MODULES=off
+   (CPython's switch for its frozen stdlib modules).  Otherwise qp_main
+   starts normally.
+
+   Blob layout (host byte order, read by the build that wrote it):
+     "QPYBASE1"
+     u32 number of source files, then for each: u32 length and absolute
+         path (UTF-8, surrogateescape), i64 mtime seconds, i64 mtime
+         nanoseconds, i64 size
+     u32 length and sys._stdlib_dir of the base
+     u64 length and the JS_WriteSnapshot() data (self-contained) */
+
+#define QP_BASE_MAGIC "QPYBASE1"
+#define QP_BASE_MAGIC_LEN 8
+#ifdef NSIG
+#define QP_MAIN_NSIG NSIG
+#else
+#define QP_MAIN_NSIG 65
+#endif
+#ifdef __APPLE__
+#define QP_BASE_ST_MTIM(st) ((st).st_mtimespec)
+#else
+#define QP_BASE_ST_MTIM(st) ((st).st_mtim)
+#endif
+
+/* python/mod_codecs.c */
+static JSValue qp_codec_lookup(JSContext *ctx, const char *encoding);
+
+static const uint8_t *qp_base_data;
+static size_t qp_base_size;
+
+void qp_set_base_snapshot(const uint8_t *data, size_t size)
+{
+    qp_base_data = data;
+    qp_base_size = size;
+}
+
+typedef struct QPBaseBlob {
+    const uint8_t *files, *files_end;   /* the file records */
+    uint32_t nfiles;
+    const char *stdlib;
+    uint32_t stdlib_len;
+    const uint8_t *snap;
+    size_t snap_len;
+} QPBaseBlob;
+
+typedef struct QPBaseReader {
+    const uint8_t *p, *end;
+} QPBaseReader;
+
+static int qp_base_get(QPBaseReader *r, void *dst, size_t n)
+{
+    if ((size_t)(r->end - r->p) < n)
+        return -1;
+    memcpy(dst, r->p, n);
+    r->p += n;
+    return 0;
+}
+
+static int qp_base_skip(QPBaseReader *r, size_t n)
+{
+    if ((size_t)(r->end - r->p) < n)
+        return -1;
+    r->p += n;
+    return 0;
+}
+
+/* a file record: path (not NUL-terminated), mtime and size */
+static int qp_base_get_file(QPBaseReader *r, const char **path, uint32_t *len,
+                            int64_t *sec, int64_t *nsec, int64_t *size)
+{
+    if (qp_base_get(r, len, 4) < 0)
+        return -1;
+    *path = (const char *)r->p;
+    if (qp_base_skip(r, *len) < 0 || qp_base_get(r, sec, 8) < 0 ||
+        qp_base_get(r, nsec, 8) < 0 || qp_base_get(r, size, 8) < 0)
+        return -1;
+    return 0;
+}
+
+static int qp_base_parse(QPBaseBlob *b)
+{
+    QPBaseReader r = { qp_base_data, qp_base_data + qp_base_size };
+    const char *path;
+    uint32_t i, len;
+    int64_t sec, nsec, size;
+    uint64_t snap_len;
+
+    if (!qp_base_data || qp_base_size < QP_BASE_MAGIC_LEN ||
+        memcmp(qp_base_data, QP_BASE_MAGIC, QP_BASE_MAGIC_LEN))
+        return -1;
+    r.p += QP_BASE_MAGIC_LEN;
+    if (qp_base_get(&r, &b->nfiles, 4) < 0)
+        return -1;
+    b->files = r.p;
+    for (i = 0; i < b->nfiles; i++) {
+        if (qp_base_get_file(&r, &path, &len, &sec, &nsec, &size) < 0)
+            return -1;
+    }
+    b->files_end = r.p;
+    if (qp_base_get(&r, &b->stdlib_len, 4) < 0)
+        return -1;
+    b->stdlib = (const char *)r.p;
+    if (qp_base_skip(&r, b->stdlib_len) < 0 || qp_base_get(&r, &snap_len, 8) < 0 ||
+        snap_len != (uint64_t)(r.end - r.p))
+        return -1;
+    b->snap = r.p;
+    b->snap_len = (size_t)snap_len;
+    return 0;
+}
+
+/* every source file of the base is unchanged */
+static BOOL qp_base_files_current(const QPBaseBlob *b)
+{
+    QPBaseReader r = { b->files, b->files_end };
+    char buf[PATH_MAX];
+    const char *path;
+    uint32_t i, len;
+    int64_t sec, nsec, size;
+    struct stat st;
+
+    for (i = 0; i < b->nfiles; i++) {
+        if (qp_base_get_file(&r, &path, &len, &sec, &nsec, &size) < 0 || len >= sizeof(buf))
+            return FALSE;
+        memcpy(buf, path, len);
+        buf[len] = '\0';
+        if (stat(buf, &st) < 0 || (int64_t)st.st_size != size ||
+            (int64_t)QP_BASE_ST_MTIM(st).tv_sec != sec ||
+            (int64_t)QP_BASE_ST_MTIM(st).tv_nsec != nsec)
+            return FALSE;
+    }
+    return TRUE;
+}
+
+/* x is the -X option `name` or `name=value` */
+static BOOL qp_xoption_is(const char *x, const char *name)
+{
+    size_t n = strlen(name);
+    return !strncmp(x, name, n) && (x[n] == '\0' || x[n] == '=');
+}
+
+/* the configuration gives the state of the base (see qp_base_init) */
+static BOOL qp_main_base_eligible(const QPMain *m)
+{
+    const QPConfig *c = &m->cfg;
+    int i;
+
+    if (!qp_base_data || !m->use_frozen_modules)
+        return FALSE;
+    if (c->optimize || c->verbose || c->import_time || c->dev_mode ||
+        c->warn_default_encoding || c->int_max_str_digits != -1 || c->lazy_imports != -1 ||
+        c->recursion_limit || !c->utf8_mode || c->home || c->pycache_prefix ||
+        (c->check_hash_based_pycs && strcmp(c->check_hash_based_pycs, "default")))
+        return FALSE;
+    for (i = 0; i < c->nxoptions; i++) {
+        if (!qp_xoption_is(c->xoptions[i], "utf8") &&
+            !qp_xoption_is(c->xoptions[i], "frozen_modules"))
+            return FALSE;
+    }
+    return TRUE;
+}
+
+/* The state of the base: like a start with -I -S -B (no environment, no
+   site, no bytecode written at build time), a fixed hash seed, an empty
+   posix.environ (QPConfig.detached), the stdlib of `home`/pylib, then the
+   _io classes and the UTF-8 codec that the standard streams need.  The
+   state that depends on the working directory (sys.path_importer_cache)
+   is dropped and the garbage of the startup freed.  0, or -1 with an
+   exception pending. */
+static int qp_base_init(JSContext *ctx, const char *home)
+{
+    static char *argv[] = { (char *)"", NULL };
+    QPConfig cfg;
+    JSValue m, v;
+    JSAtom name;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.hash_seed = "0";
+    cfg.ignore_environment = 1;
+    cfg.detached = 1;
+    cfg.utf8_mode = 1;
+    cfg.no_user_site = 1;
+    cfg.no_site = 1;
+    cfg.dont_write_bytecode = 1;
+    cfg.int_max_str_digits = -1;
+    cfg.lazy_imports = -1;
+    cfg.argc = cfg.orig_argc = 1;
+    cfg.argv = cfg.orig_argv = argv;
+    cfg.home = home;
+    if (qp_state_init(ctx, &cfg) < 0)
+        return -1;
+    if (qp_importlib_boot_core(ctx) < 0)
+        return -1;
+    /* the _io classes (_pyio) */
+    m = qp_import_module(ctx, "_io");
+    if (JS_IsException(m))
+        return -1;
+    name = JS_NewAtom(ctx, "TextIOWrapper");
+    v = name == JS_ATOM_NULL ? JS_EXCEPTION : qp_getattr(ctx, m, name);
+    JS_FreeAtom(ctx, name);
+    JS_FreeValue(ctx, m);
+    if (JS_IsException(v))
+        return -1;
+    JS_FreeValue(ctx, v);
+    v = qp_codec_lookup(ctx, "utf-8");
+    if (JS_IsException(v))
+        return -1;
+    JS_FreeValue(ctx, v);
+    /* the finders of the sys.path entries of the build */
+    name = JS_NewAtom(ctx, "path_importer_cache");
+    if (name == JS_ATOM_NULL)
+        return -1;
+    v = qp_sys_get(ctx, name);
+    JS_FreeAtom(ctx, name);
+    if (qp_dict_check(ctx, v))
+        qp_dictcore_clear(ctx, &QP_DICT(v)->core);
+    JS_FreeValue(ctx, v);
+    JS_RunGC(JS_GetRuntime(ctx));
+    qp_run_pending_finalizers(ctx);
+    qp_weakref_run_pending(ctx);
+    return 0;
+}
+
+static void qp_base_put(DynBuf *d, const void *data, size_t n)
+{
+    dbuf_put(d, data, n);
+}
+
+/* `'\0'.join([sys._stdlib_dir] + the sorted __file__ of sys.modules)` as
+   UTF-8 bytes */
+static JSValue qp_base_file_list(JSContext *ctx)
+{
+    static const char src[] =
+        "(lambda sys: '\\0'.join([sys._stdlib_dir] + sorted({m.__file__ for m in "
+        "list(sys.modules.values()) if isinstance(getattr(m, '__file__', None), str)}))"
+        ".encode('utf-8', 'surrogateescape'))(__import__('sys'))";
+    JSValue d = qp_dict_new(ctx), r;
+
+    if (JS_IsException(d))
+        return d;
+    r = qp_run_string(ctx, src, sizeof(src) - 1, "<base snapshot>", QP_INPUT_EVAL, d, d);
+    JS_FreeValue(ctx, d);
+    return r;
+}
+
+/* make dependency rule of the base: `target: files` */
+static int qp_base_write_deps(const char *path, const char *list, size_t len)
+{
+    char *dpath = qp_sys_malloc(strlen(path) + 3);
+    const char *p, *end = list + len, *e;
+    FILE *f;
+
+    if (!dpath)
+        return -1;
+    strcpy(dpath, path);
+    strcat(dpath, ".d");
+    f = fopen(dpath, "w");
+    qp_sys_free(dpath);
+    if (!f)
+        return -1;
+    fprintf(f, "%s:", path);
+    p = memchr(list, '\0', len);   /* skip the stdlib entry */
+    p = p ? p + 1 : end;
+    for (; p < end; p = e + 1) {
+        e = memchr(p, '\0', end - p);
+        if (!e)
+            e = end;
+        fputs(" \\\n ", f);
+        for (; p < e; p++) {
+            if (*p == ' ' || *p == '#' || *p == '$')
+                fputc(*p == '$' ? '$' : '\\', f);
+            fputc(*p, f);
+        }
+    }
+    fputc('\n', f);
+    return fclose(f) == 0 ? 0 : -1;
+}
+
+/* `qpy --write-base-snapshot FILE DIR`: write the base snapshot of the
+   qpy in DIR (whose stdlib is DIR/pylib) and the make dependencies of
+   FILE on its source files (FILE.d).  Returns the exit status. */
+int qp_write_base_snapshot(const char *path, const char *dir)
+{
+    char home[PATH_MAX];
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSValue list = JS_UNDEFINED;
+    uint8_t *snap = NULL;
+    size_t snap_len = 0, list_len, n;
+    const uint8_t *list_data;
+    const char *p, *end, *e;
+    DynBuf d;
+    uint32_t nfiles = 0, u32;
+    uint64_t u64;
+    struct stat st;
+    FILE *f;
+    int i, ret = 1;
+
+    if (!realpath(dir, home)) {
+        perror(dir);
+        return 1;
+    }
+    /* every signal with its default action, as qp_drepl_init (the base
+       must not record the dispositions of the build) */
+    for (i = 1; i < QP_MAIN_NSIG; i++) {
+        struct sigaction sa;
+        if (sigaction(i, NULL, &sa) == 0 && sa.sa_handler == SIG_IGN)
+            signal(i, SIG_DFL);
+    }
+    rt = JS_NewRuntime();
+    if (!rt)
+        return 1;
+    qp_main_set_stack(rt);
+    ctx = JS_NewContext(rt);
+    if (!ctx) {
+        JS_FreeRuntime(rt);
+        return 1;
+    }
+    dbuf_init(&d);
+    if (qp_base_init(ctx, home) < 0)
+        goto fail;
+    snap = JS_WriteSnapshot(ctx, &snap_len, NULL, NULL, 0, 0);
+    if (!snap)
+        goto fail;
+    list = qp_base_file_list(ctx);
+    if (JS_IsException(list))
+        goto fail;
+    list_data = qp_bytes_data(list, (Py_ssize_t *)&list_len);
+    if (!list_data)
+        goto fail;
+
+    qp_base_put(&d, QP_BASE_MAGIC, QP_BASE_MAGIC_LEN);
+    qp_base_put(&d, &nfiles, 4);   /* patched below */
+    end = (const char *)list_data + list_len;
+    e = memchr(list_data, '\0', list_len);
+    if (!e)
+        e = end;
+    for (p = e + 1; p < end; p = e + 1) {
+        char fpath[PATH_MAX];
+        int64_t v;
+        e = memchr(p, '\0', end - p);
+        if (!e)
+            e = end;
+        n = e - p;
+        if (n >= sizeof(fpath))
+            continue;
+        memcpy(fpath, p, n);
+        fpath[n] = '\0';
+        if (stat(fpath, &st) < 0) {
+            perror(fpath);
+            goto done;
+        }
+        u32 = (uint32_t)n;
+        qp_base_put(&d, &u32, 4);
+        qp_base_put(&d, fpath, n);
+        v = (int64_t)QP_BASE_ST_MTIM(st).tv_sec;
+        qp_base_put(&d, &v, 8);
+        v = (int64_t)QP_BASE_ST_MTIM(st).tv_nsec;
+        qp_base_put(&d, &v, 8);
+        v = (int64_t)st.st_size;
+        qp_base_put(&d, &v, 8);
+        nfiles++;
+    }
+    p = memchr(list_data, '\0', list_len);
+    u32 = (uint32_t)(p ? (size_t)(p - (const char *)list_data) : list_len);
+    qp_base_put(&d, &u32, 4);
+    qp_base_put(&d, list_data, u32);
+    u64 = snap_len;
+    qp_base_put(&d, &u64, 8);
+    qp_base_put(&d, snap, snap_len);
+    if (d.error) {
+        fprintf(stderr, "qpy: %s: out of memory\n", path);
+        goto done;
+    }
+    memcpy(d.buf + QP_BASE_MAGIC_LEN, &nfiles, 4);
+    f = fopen(path, "wb");
+    if (!f || fwrite(d.buf, 1, d.size, f) != d.size || fclose(f) != 0) {
+        perror(path);
+        goto done;
+    }
+    if (qp_base_write_deps(path, (const char *)list_data, list_len) < 0) {
+        perror(path);
+        goto done;
+    }
+    ret = 0;
+    goto done;
+ fail:
+    qp_handle_uncaught(ctx);
+ done:
+    dbuf_free(&d);
+    JS_FreeValue(ctx, list);
+    if (snap)
+        js_free(ctx, snap);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    return ret;
+}
+
+/* The process half of the start of a state restored from the base (see
+   above).  0, -1 with an exception pending (reported like an error of a
+   normal start), or 1 when the base does not apply (the stdlib of this
+   process is not the base's). */
+static int qp_main_attach_base(JSContext *ctx, QPMain *m, const QPBaseBlob *b,
+                               const uint8_t *ignored)
+{
+    QPState *s = QP_STATE(ctx);
+    const uint8_t *data;
+    Py_ssize_t len;
+    JSValue v, enc;
+    JSAtom name;
+    int r;
+
+    s->config = m->cfg;
+    js_random_init(ctx);
+    js_performance_init(ctx);
+    if (qp_importlib_boot_paths(ctx) < 0)
+        return -1;
+    name = JS_NewAtom(ctx, "_stdlib_dir");
+    if (name == JS_ATOM_NULL)
+        return -1;
+    v = qp_sys_get(ctx, name);
+    JS_FreeAtom(ctx, name);
+    if (!qp_str_check(ctx, v)) {
+        JS_FreeValue(ctx, v);
+        return 1;
+    }
+    enc = qp_str_encode(ctx, v, "utf-8", "surrogateescape");
+    JS_FreeValue(ctx, v);
+    if (JS_IsException(enc))
+        return -1;
+    data = qp_bytes_data(enc, &len);
+    r = !data || (size_t)len != b->stdlib_len || memcmp(data, b->stdlib, len);
+    JS_FreeValue(ctx, enc);
+    if (r)
+        return 1;
+    if (qp_sys_set_config_attrs(ctx, s->sys_dict, TRUE) < 0)
+        return -1;
+    qp_signal_attach(ctx);
+    qp_signal_apply_inherited(ctx, ignored, QP_MAIN_NSIG);
+    qp_os_drepl_environ(ctx, TRUE);
+    name = JS_NewAtom(ctx, "time");
+    if (name == JS_ATOM_NULL)
+        return -1;
+    r = qp_dict_get_item_atom(ctx, s->modules, name, &v);
+    JS_FreeAtom(ctx, name);
+    if (r < 0)
+        return -1;
+    if (r > 0) {
+        r = qp_time_init_timezone(ctx, v);
+        JS_FreeValue(ctx, v);
+        if (r < 0)
+            return -1;
+    }
+    return qp_importlib_boot_process(ctx);
+}
+
+/* Start from the base snapshot: 1 with *pctx the restored context, 2
+   likewise with an exception pending (the start failed like a normal one
+   would), 0 when the base is not used (rt is untouched), -1 when the
+   base did not apply after rt was used (rt must be freed; the signal
+   dispositions are restored). */
+static int qp_main_restore_base(QPMain *m, JSRuntime *rt, JSContext **pctx)
+{
+    struct sigaction saved[QP_MAIN_NSIG];
+    uint8_t ignored[QP_MAIN_NSIG], have[QP_MAIN_NSIG];
+    uint8_t key[16];
+    QPBaseBlob b;
+    JSSnapshotResult res;
+    char errbuf[256];
+    JSContext *ctx;
+    qp_error err;
+    int i, r;
+
+    if (!qp_main_base_eligible(m) || qp_base_parse(&b) < 0 || !qp_base_files_current(&b))
+        return 0;
+    memset(&err, 0, sizeof(err));
+    if (qp_hash_key_init(m->cfg.hash_seed, key, &err) < 0) {
+        /* the normal start reports it */
+        qp_error_clear(&err);
+        return 0;
+    }
+    for (i = 1; i < QP_MAIN_NSIG; i++) {
+        have[i] = sigaction(i, NULL, &saved[i]) == 0;
+        ignored[i] = have[i] && saved[i].sa_handler == SIG_IGN;
+    }
+    ignored[0] = 0;
+    errbuf[0] = '\0';
+    rt->py_snap_hash_key = key;
+    r = JS_ReadSnapshot(rt, b.snap, b.snap_len, NULL, 0, NULL, &res, errbuf, sizeof(errbuf));
+    rt->py_snap_hash_key = NULL;
+    if (r < 0)
+        goto fail;
+    if (res.context_count != 1 || !res.contexts[0]->py) {
+        for (i = 0; i < res.context_count; i++)
+            JS_FreeContext(res.contexts[i]);
+        JS_FreeSnapshotResult(rt, &res);
+        goto fail;
+    }
+    ctx = res.contexts[0];
+    JS_FreeSnapshotResult(rt, &res);
+    r = qp_main_attach_base(ctx, m, &b, ignored);
+    if (r > 0) {
+        JS_FreeContext(ctx);
+        goto fail;
+    }
+    *pctx = ctx;
+    return r < 0 ? 2 : 1;
+ fail:
+    for (i = 1; i < QP_MAIN_NSIG; i++) {
+        if (have[i])
+            sigaction(i, &saved[i], NULL);
+    }
+    return -1;
 }
 
 int qp_main(int argc, char **argv)
@@ -1736,9 +2783,11 @@ int qp_main(int argc, char **argv)
     JSRuntime *rt;
     JSContext *ctx;
     JSValue main_module;
-    int exitcode = 0, rc;
+    int exitcode = 0, rc, nthreads;
 
     memset(&m, 0, sizeof(m));
+    /* _Py_SetLocaleFromEnv(LC_CTYPE) (pymain_init) */
+    setlocale(LC_CTYPE, "");
     rc = qp_main_parse(&m, argc, argv);
     if (rc >= 0) {
         qp_main_free(&m);
@@ -1752,23 +2801,49 @@ int qp_main(int argc, char **argv)
         return 1;
     }
     qp_main_set_stack(rt);
-    ctx = JS_NewContext(rt);
-    if (!ctx) {
-        fprintf(stderr, "Fatal Python error: init: cannot allocate the context\n");
-        qp_main_free(&m);
-        return 1;
+    ctx = NULL;
+    rc = qp_main_restore_base(&m, rt, &ctx);
+    if (rc < 0) {
+        /* a fresh runtime for the normal start */
+        JS_FreeRuntime(rt);
+        rt = JS_NewRuntime();
+        if (!rt) {
+            fprintf(stderr, "Fatal Python error: init: cannot allocate the runtime\n");
+            qp_main_free(&m);
+            return 1;
+        }
+        qp_main_set_stack(rt);
     }
-    if (qp_state_init(ctx, &m.cfg) < 0) {
-        fprintf(stderr, "Fatal Python error: init: Python state initialization failed\n");
-        qp_main_free(&m);
-        return 1;
-    }
-#ifdef QP_IMPORTLIB_BOOT
-    if (qp_importlib_boot(ctx) < 0) {
+    if (rc == 2) {
         exitcode = qp_main_err_print(ctx, &m);
         goto done;
     }
+    if (rc <= 0) {
+        ctx = JS_NewContext(rt);
+        if (!ctx) {
+            fprintf(stderr, "Fatal Python error: init: cannot allocate the context\n");
+            JS_FreeRuntime(rt);
+            qp_main_free(&m);
+            return 1;
+        }
+        if (qp_state_init(ctx, &m.cfg) < 0) {
+            fprintf(stderr, "Fatal Python error: init: Python state initialization failed\n");
+            JS_FreeContext(ctx);
+            JS_FreeRuntime(rt);
+            qp_main_free(&m);
+            return 1;
+        }
+#ifdef QP_IMPORTLIB_BOOT
+        if (qp_importlib_boot(ctx) < 0) {
+            exitcode = qp_main_err_print(ctx, &m);
+            goto done;
+        }
 #endif
+    }
+    if (m.cfg.tracemalloc > 0 && qp_main_start_tracemalloc(ctx, m.cfg.tracemalloc) < 0) {
+        exitcode = qp_main_err_print(ctx, &m);
+        goto done;
+    }
     main_module = qp_run_main_module(ctx);
     if (JS_IsException(main_module)) {
         exitcode = qp_main_err_print(ctx, &m);
@@ -1792,16 +2867,465 @@ int qp_main(int argc, char **argv)
     qp_main_repl(ctx, &m, &exitcode);
 
  done:
-    /* Py_FinalizeEx order: threads, atexit, then the standard streams
-       (a failed flush gives status 120) */
-    qp_main_thread_shutdown(ctx);
-    qp_atexit_run(ctx);
-    if (qp_sys_flush_std_files(ctx) < 0)
+    /* Py_FinalizeEx (a failed flush of the standard streams gives status
+       120); the remaining (daemon) threads hang when they try to take the
+       GIL */
+    if (qp_finalize(ctx, &nthreads) < 0)
         exitcode = 120;
-    fflush(stdout);
-    fflush(stderr);
     if (m.kb)
         exitcode = 130;
+    /* daemon threads still reference the runtime: no teardown (CPython
+       does not free their thread states either) */
+    if (nthreads > 0)
+        return exitcode;
+    /* like qjs: release everything (the state keeps pointers into m.cfg),
+       so that leaks and teardown bugs are visible */
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
     qp_main_free(&m);
     return exitcode;
+}
+
+/* ---- durable REPL (qjs --drepl FILE --python) ------------------------- */
+
+/* qjs keeps the line editor in its own runtime and runs the inputs in the
+   session context through these functions.  The session is saved with
+   JS_WriteSnapshot() as a delta of its base, a new session, which qjs
+   rebuilds in each process: the base must be the same bytes in every
+   process of the build, so qp_drepl_init() does not depend on the
+   environment. */
+
+/* "<stdin-N>" counter of the session: a hidden property of the global
+   object, so that it survives the restarts like the sources registered
+   for the tracebacks */
+#define QP_DREPL_COUNT "\x01qp_drepl_count"
+
+/* A new session: Python like the interactive `python`, with options that
+   make the state reproducible: the hash seed of the session file,
+   ignore_environment (PYTHONPATH, PYTHONHOME... would change the base),
+   an empty posix.environ (qp_drepl_attach() fills it), the UTF-8 mode
+   (the encodings would otherwise depend on the locale), no user site,
+   unbuffered standard streams (their buffering would otherwise depend on
+   isatty()), sys.argv == [''] and every signal recorded with its default
+   action (a signal ignored by the parent process is ignored again
+   afterwards, except SIGINT: the state says SIG_DFL).  The state that
+   depends on the working directory (sys.path_importer_cache) is dropped
+   and the garbage of the startup freed.  Returns 0, or -1 after printing
+   the error. */
+int qp_drepl_init(JSContext *ctx, const char *argv0, uint32_t hash_seed)
+{
+    static char *argv[] = { (char *)"", NULL };
+    static char seed[16];
+    static char *exe;
+#ifdef NSIG
+    enum { nsig = NSIG };
+#else
+    enum { nsig = 65 };
+#endif
+    BOOL ignored[nsig];
+    struct sigaction sa;
+    QPConfig cfg;
+    JSValue m;
+    int i, ret = -1;
+
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(seed, sizeof(seed), "%u", (unsigned)hash_seed);
+    if (!exe)
+        exe = qp_main_executable(argv0);
+    cfg.executable = exe ? exe : argv0;
+    cfg.hash_seed = seed;
+    cfg.ignore_environment = 1;
+    cfg.detached = 1;
+    cfg.utf8_mode = 1;
+    cfg.no_user_site = 1;
+    cfg.unbuffered = 1;
+    cfg.dont_write_bytecode = 1;
+    cfg.int_max_str_digits = -1;
+    cfg.lazy_imports = -1;
+    cfg.argc = cfg.orig_argc = 1;
+    cfg.argv = cfg.orig_argv = argv;
+    cfg.sys_path_0 = "";
+
+    for (i = 1; i < nsig; i++) {
+        ignored[i] = sigaction(i, NULL, &sa) == 0 && sa.sa_handler == SIG_IGN;
+        if (ignored[i])
+            signal(i, SIG_DFL);
+    }
+    if (qp_state_init(ctx, &cfg) < 0) {
+        fprintf(stderr, "Fatal Python error: init: Python state initialization failed\n");
+        goto done;
+    }
+    /* the base of a session is rebuilt in every process and must be the
+       same bytes: modules are always compiled from source, no bytecode
+       cache is read or written (sys.implementation.cache_tag = None) */
+    {
+        JSAtom a = JS_NewAtom(ctx, "implementation"), tag;
+        JSValue impl = a == JS_ATOM_NULL ? JS_EXCEPTION : qp_sys_get(ctx, a);
+        int r = -1;
+        JS_FreeAtom(ctx, a);
+        if (!JS_IsException(impl) && !QP_IS_NULL(impl)) {
+            tag = JS_NewAtom(ctx, "cache_tag");
+            if (tag != JS_ATOM_NULL) {
+                r = qp_setattr(ctx, impl, tag, JS_UNDEFINED);
+                JS_FreeAtom(ctx, tag);
+            }
+        }
+        if (!JS_IsException(impl))
+            JS_FreeValue(ctx, impl);
+        if (r < 0)
+            goto fail;
+    }
+#ifdef QP_IMPORTLIB_BOOT
+    if (qp_importlib_boot(ctx) < 0)
+        goto fail;
+#endif
+    /* install_signal_handlers: SIGINT raises KeyboardInterrupt */
+    m = qp_import_module(ctx, "_signal");
+    if (JS_IsException(m))
+        goto fail;
+    JS_FreeValue(ctx, m);
+    m = qp_run_main_module(ctx);
+    if (JS_IsException(m))
+        goto fail;
+    JS_FreeValue(ctx, m);
+    if (qp_main_add_path0(ctx, cfg.sys_path_0) < 0)
+        goto fail;
+    qp_repl_default_prompt(ctx, QP_ATOM(ctx, ps1), ">>> ");
+    qp_repl_default_prompt(ctx, QP_ATOM(ctx, ps2), "... ");
+    if (JS_DefinePropertyValueStr(ctx, ctx->global_obj, QP_DREPL_COUNT, JS_NewInt32(ctx, 0),
+                                  JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE) < 0)
+        goto fail;
+    /* the finders of sys.path entries: '' is the working directory */
+    {
+        JSAtom name = JS_NewAtom(ctx, "path_importer_cache");
+        if (name == JS_ATOM_NULL)
+            goto fail;
+        m = qp_sys_get(ctx, name);
+        JS_FreeAtom(ctx, name);
+        if (qp_dict_check(ctx, m))
+            qp_dictcore_clear(ctx, &QP_DICT(m)->core);
+        JS_FreeValue(ctx, m);
+    }
+    /* the garbage of the startup: its amount depends on the process (not
+       gc.collect(), whose statistics are part of the state) */
+    JS_RunGC(JS_GetRuntime(ctx));
+    qp_run_pending_finalizers(ctx);
+    qp_weakref_run_pending(ctx);
+    ret = 0;
+    goto done;
+ fail:
+    qp_handle_uncaught(ctx);
+ done:
+    for (i = 1; i < nsig; i++) {
+        if (ignored[i] && i != SIGINT)
+            signal(i, SIG_IGN);
+    }
+    return ret;
+}
+
+/* The session ctx, new (after writing its base) or restored: -1 if it has
+   no Python state (not a Python session), else 0 after making it the
+   context of the signal handlers and filling posix.environ from the
+   environment of the process. */
+int qp_drepl_attach(JSContext *ctx)
+{
+    if (!ctx->py)
+        return -1;
+    qp_signal_attach(ctx);
+    qp_os_drepl_environ(ctx, TRUE);
+    /* a durable session does not end with the process: no Py_FinalizeEx
+       (atexit...) when qjs frees the runtime */
+    QP_STATE(ctx)->finalized = 1;
+    return 0;
+}
+
+/* posix.environ of the session ctx: emptied before the session is saved
+   ('fill' FALSE), so that the session file never holds the values of the
+   environment, then filled again ('fill' TRUE) */
+void qp_drepl_environ(JSContext *ctx, int fill)
+{
+    qp_os_drepl_environ(ctx, fill);
+}
+
+/* Install the C handler of SIGINT of the session (Ctrl-C raises
+   KeyboardInterrupt in the running input) and return the previous one. */
+void (*qp_drepl_signals(JSContext *ctx))(int)
+{
+    return qp_signal_attach(ctx);
+}
+
+/* the stack size of `python` for the session runtime */
+void qp_drepl_set_stack(JSRuntime *rt)
+{
+    qp_main_set_stack(rt);
+}
+
+/* pymain_header */
+void qp_drepl_banner(char *buf, size_t size)
+{
+    snprintf(buf, size, "Python " QP_PY_VERSION " (main) [dquickts " CONFIG_VERSION "] on %s\n"
+             "Type \"help\", \"copyright\", \"credits\" or \"license\" for more information.\n",
+#if defined(__APPLE__)
+             "darwin"
+#elif defined(__linux__)
+             "linux"
+#else
+             "unknown"
+#endif
+             );
+}
+
+/* str(sys.ps1), or str(sys.ps2) if 'more', as UTF-8 (free with
+   JS_FreeCString(ctx, ...)); NULL on failure */
+const char *qp_drepl_prompt(JSContext *ctx, int more)
+{
+    DynBuf buf;
+    JSValue str;
+    const char *s;
+
+    dbuf_init(&buf);
+    qp_repl_prompt(ctx, more ? QP_ATOM(ctx, ps2) : QP_ATOM(ctx, ps1), &buf);
+    if (dbuf_error(&buf)) {
+        dbuf_free(&buf);
+        return NULL;
+    }
+    str = JS_NewStringLen(ctx, buf.buf ? (const char *)buf.buf : "", buf.size);
+    dbuf_free(&buf);
+    if (JS_IsException(str)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return NULL;
+    }
+    s = JS_ToCString(ctx, str);
+    JS_FreeValue(ctx, str);
+    if (!s)
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    return s;
+}
+
+/* codeop's decision on the accumulated lines src (src[len] == '\0'): 1 if
+   the input is complete (or has an error that more lines cannot fix), 0
+   if it needs more lines */
+int qp_drepl_input_complete(JSContext *ctx, const char *src, size_t len)
+{
+    DynBuf buf;
+    int rc;
+
+    dbuf_init(&buf);
+    dbuf_put(&buf, (const uint8_t *)src, len);
+    dbuf_putc(&buf, '\0');
+    if (dbuf_error(&buf)) {
+        dbuf_free(&buf);
+        return 1;   /* the compilation reports the MemoryError */
+    }
+    buf.size--;
+    rc = qp_repl_input_complete(ctx, &buf);
+    dbuf_free(&buf);
+    return rc;
+}
+
+/* Wait for y, a value yielded by the top-level coroutine (asyncio.Task
+   __step rules).  Sets *pvalue to the value to send: None after a bare
+   yield (once the pending jobs ran), the result of a JS promise once the
+   jobs settled it.  Returns 1 if *pvalue is an exception to throw
+   instead: the rejection reason, or RuntimeError for a promise that no
+   job settles or for any other value.  -1 if a job failed (exception
+   pending). */
+static int qp_drepl_wait(JSContext *ctx, JSValueConst y, JSValue *pvalue)
+{
+    JSContext *ctx1;
+    int state, r;
+
+    *pvalue = JS_UNDEFINED;
+    if (JS_IsUndefined(y) || JS_IsNull(y)) {
+        while ((r = JS_ExecutePendingJob(ctx->rt, &ctx1)) > 0)
+            continue;
+        return r < 0 ? -1 : 0;
+    }
+    /* JS_PromiseState / JS_PromiseResult take a borrowed (non-consumed) value */
+    if ((int)JS_PromiseState(ctx, (JSValue)y) < 0) {
+        qp_raise_runtime_error(ctx, "Task got bad yield: %R", y);
+    } else {
+        while ((state = JS_PromiseState(ctx, (JSValue)y)) == JS_PROMISE_PENDING &&
+               (r = JS_ExecutePendingJob(ctx->rt, &ctx1)) != 0) {
+            if (r < 0)
+                return -1;
+        }
+        if (state == JS_PROMISE_FULFILLED) {
+            *pvalue = JS_PromiseResult(ctx, (JSValue)y);
+            return 0;
+        }
+        if (state == JS_PROMISE_REJECTED) {
+            *pvalue = qp_exc_normalize(ctx, JS_PromiseResult(ctx, (JSValue)y));
+            return 1;
+        }
+        qp_raise_runtime_error(ctx, "the awaited promise is never settled (no pending job)");
+    }
+    *pvalue = qp_exc_fetch(ctx);
+    return 1;
+}
+
+/* Run the coroutine of an input with top-level await (consumed) to its
+   end with the job queue: its result, or JS_EXCEPTION */
+static JSValue qp_drepl_await(JSContext *ctx, JSValue coro)
+{
+    JSValue value = JS_UNDEFINED, y = JS_UNDEFINED, exc;
+    int r, is_throw = 0;
+
+    for (;;) {
+        if (!is_throw) {
+            r = qp_iter_send(ctx, coro, value, &y);
+        } else {
+            y = qp_call_method(ctx, coro, QP_ATOM(ctx, throw), (JSValueConst *)&value, 1,
+                               QP_NULL);
+            if (!JS_IsException(y)) {
+                r = QP_SEND_NEXT;
+            } else if (qp_exc_pending_matches(ctx, QP_EXC(ctx, StopIteration))) {
+                exc = qp_exc_fetch(ctx);
+                y = qp_exc_stopiteration_value(ctx, exc);
+                JS_FreeValue(ctx, exc);
+                r = QP_SEND_RETURN;
+            } else {
+                r = QP_SEND_ERROR;
+            }
+        }
+        JS_FreeValue(ctx, value);
+        if (r != QP_SEND_NEXT)
+            break;
+        is_throw = qp_drepl_wait(ctx, y, &value);
+        JS_FreeValue(ctx, y);
+        if (is_throw < 0) {
+            r = QP_SEND_ERROR;
+            break;
+        }
+    }
+    JS_FreeValue(ctx, coro);
+    return r == QP_SEND_RETURN ? y : JS_EXCEPTION;
+}
+
+/* Run the complete input src (src[len] == '\0') like the interactive
+   loop, with top-level await (PyCF_ALLOW_TOP_LEVEL_AWAIT: the coroutine
+   runs to its end with the job queue), then the pending jobs.  The
+   results go to sys.displayhook, the exceptions to sys.excepthook.
+   Returns 0, 1 if an exception was reported, or 2 with *pstatus for
+   SystemExit (the exit status of `python`; the message of a code that is
+   not an int is printed). */
+int qp_drepl_exec(JSContext *ctx, const char *src, size_t len, int *pstatus)
+{
+    JSContext *ctx1;
+    JSValue v, res;
+    int count = 0, kb, r;
+
+    v = JS_GetPropertyStr(ctx, ctx->global_obj, QP_DREPL_COUNT);
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_INT)
+        count = JS_VALUE_GET_INT(v);
+    JS_FreeValue(ctx, v);
+    res = qp_repl_exec(ctx, src, len, &count, QP_PF_IGNORE_COOKIE | QP_PF_TOP_LEVEL_AWAIT);
+    if (JS_DefinePropertyValueStr(ctx, ctx->global_obj, QP_DREPL_COUNT, JS_NewInt32(ctx, count),
+                                  JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE) < 0) {
+        JS_FreeValue(ctx, res);
+        res = JS_EXCEPTION;
+    }
+    if (!JS_IsException(res) && qp_coro_check(res))
+        res = qp_drepl_await(ctx, res);
+    if (!JS_IsException(res)) {
+        JS_FreeValue(ctx, res);
+        while ((r = JS_ExecutePendingJob(ctx->rt, &ctx1)) > 0)
+            continue;
+        if (r < 0)
+            res = JS_EXCEPTION;
+    }
+    /* the __del__ methods and weakref callbacks queued by the collections
+       of the input run now, as CPython runs them during the collection
+       (the eval breaker would run them at the next input): the session
+       is saved with an empty queue */
+    qp_run_pending_finalizers(ctx);
+    qp_weakref_run_pending(ctx);
+    qp_run_flush_io(ctx);
+    if (!JS_IsException(res))
+        return 0;
+    r = 1;
+    if (!QP_STATE(ctx)->config.inspect && qp_exc_pending_matches(ctx, QP_EXC(ctx, SystemExit)))
+        r = 2;
+    *pstatus = qp_err_print_uncaught(ctx, &kb);
+    qp_run_flush_io(ctx);
+    return r;
+}
+
+/* Completion of the word 'prefix' at the end of a line: the attributes of
+   the value of the dotted name 'expr' (evaluated in __main__ like
+   rlcompleter does), or for an empty 'expr' the keywords, the globals of
+   __main__ and the builtins.  Sorted and separated by newlines (free with
+   JS_FreeCString(ctx, ...)), NULL on failure. */
+const char *qp_drepl_names(JSContext *ctx, const char *expr, const char *prefix)
+{
+    static const char code[] =
+        "r = []\n"
+        "try:\n"
+        "    if expr:\n"
+        "        if all(p.isidentifier() for p in expr.split('.')):\n"
+        "            r = dir(eval(expr, ns))\n"
+        "    else:\n"
+        "        r = [*kw.split(), *ns, *dir(__builtins__)]\n"
+        "except BaseException:\n"
+        "    pass\n"
+        "r = '\\n'.join(sorted({n for n in r if n.startswith(prefix) and\n"
+        "                       (prefix[:1] == '_' or n[:1] != '_')}))\n";
+    static const char keywords[] =
+        "False None True and as assert async await break class continue def del "
+        "elif else except finally for from global if import in is lambda nonlocal "
+        "not or pass raise return try while with yield";
+    static const char *const names[] = { "expr", "prefix", "kw" };
+    const char *values[3];
+    const char *s = NULL;
+    JSValue main_module, d = JS_UNDEFINED, ns = JS_UNDEFINED, k, v, res;
+    int i, rc;
+
+    values[0] = expr;
+    values[1] = prefix;
+    values[2] = keywords;
+    main_module = qp_run_main_module(ctx);
+    if (JS_IsException(main_module))
+        goto done;
+    ns = qp_run_main_dict(ctx, main_module);
+    JS_FreeValue(ctx, main_module);
+    if (JS_IsException(ns))
+        goto done;
+    d = qp_dict_new(ctx);
+    if (JS_IsException(d))
+        goto done;
+    k = qp_str_from_cstr(ctx, "ns");
+    if (JS_IsException(k))
+        goto done;
+    rc = qp_dict_set_item(ctx, d, k, ns);
+    JS_FreeValue(ctx, k);
+    if (rc < 0)
+        goto done;
+    for (i = 0; i < 3; i++) {
+        k = qp_str_from_cstr(ctx, names[i]);
+        v = qp_str_from_cstr(ctx, values[i]);
+        rc = (JS_IsException(k) || JS_IsException(v)) ? -1 : qp_dict_set_item(ctx, d, k, v);
+        JS_FreeValue(ctx, k);
+        JS_FreeValue(ctx, v);
+        if (rc < 0)
+            goto done;
+    }
+    res = qp_run_string(ctx, code, sizeof(code) - 1, "<completion>", QP_INPUT_FILE, d, d);
+    if (JS_IsException(res))
+        goto done;
+    JS_FreeValue(ctx, res);
+    k = qp_str_from_cstr(ctx, "r");
+    if (JS_IsException(k))
+        goto done;
+    rc = qp_dict_get_item(ctx, d, k, &v);
+    JS_FreeValue(ctx, k);
+    if (rc > 0) {
+        s = qp_str_utf8(ctx, v, NULL);
+        JS_FreeValue(ctx, v);
+    }
+ done:
+    if (JS_HasException(ctx))
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    JS_FreeValue(ctx, d);
+    JS_FreeValue(ctx, ns);
+    return s;
 }

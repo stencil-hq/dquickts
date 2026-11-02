@@ -789,11 +789,14 @@ static const QPMethodDef qp_exc_base_methods[] = {
 };
 
 static const QPGetSetDef qp_exc_base_getsets[] = {
+    /* PyObject_GenericGetDict / PyObject_GenericSetDict */
+    { "__dict__", qp_subtype_dict_get, qp_subtype_dict_set, 0, NULL },
     { "args", qp_exc_base_get, qp_exc_base_set, QP_EXC_GS_ARGS, NULL },
     { "__traceback__", qp_exc_base_get, qp_exc_base_set, QP_EXC_GS_TRACEBACK, NULL },
     { "__context__", qp_exc_base_get, qp_exc_base_set, QP_EXC_GS_CONTEXT, NULL },
     { "__cause__", qp_exc_base_get, qp_exc_base_set, QP_EXC_GS_CAUSE, NULL },
-    { "__suppress_context__", qp_exc_base_get, qp_exc_base_set, QP_EXC_GS_SUPPRESS, NULL },
+    { "__suppress_context__", qp_exc_base_get, qp_exc_base_set, QP_EXC_GS_SUPPRESS, NULL,
+      QP_GETSET_MEMBER },
     { NULL },
 };
 
@@ -1356,7 +1359,7 @@ static JSValue qp_exc_prep_reraise_star(JSContext *ctx, JSValueConst orig, JSVal
     reraised_tup = qp_list_as_tuple(ctx, reraised_list);
     if (JS_IsException(reraised_tup))
         goto done;
-    reraised_eg = qp_exc_eg_projection(ctx, orig, QP_TUPLE_ITEMS(reraised_tup),
+    reraised_eg = qp_exc_eg_projection(ctx, orig, (JSValueConst *)QP_TUPLE_ITEMS(reraised_tup),
                                        (int)QP_TUPLE_SIZE(reraised_tup));
     if (JS_IsException(reraised_eg))
         goto done;
@@ -1949,19 +1952,21 @@ static const QPGetSetDef qp_exc_oserror_getsets[] = {
 /* PyErr_SetFromErrnoWithFilenameObject */
 static JSValue qp_raise_os_error(JSContext *ctx, int errnum, JSValueConst filename)
 {
-    JSValue items[3], exc;
+    JSValueConst items[3];
+    JSValue msg, exc;
     int n = 2;
 
-    items[0] = JS_NewInt32(ctx, errnum);
-    items[1] = qp_str_from_cstr(ctx, errnum != 0 ? strerror(errnum) : "Error");
-    if (JS_IsException(items[1]))
+    msg = qp_str_from_cstr(ctx, errnum != 0 ? strerror(errnum) : "Error");
+    if (JS_IsException(msg))
         return JS_EXCEPTION;
+    items[0] = JS_NewInt32(ctx, errnum);
+    items[1] = msg;
     if (!QP_IS_NULL(filename) && !JS_IsUndefined(filename) && !JS_IsNull(filename)) {
         items[2] = filename;
         n = 3;
     }
     exc = qp_exc_new(ctx, QP_EXC(ctx, OSError), n, items);
-    JS_FreeValue(ctx, items[1]);
+    JS_FreeValue(ctx, msg);
     if (JS_IsException(exc))
         return exc;
     return qp_raise_object(ctx, exc);
@@ -2440,7 +2445,7 @@ static JSValue qp_raise_unicode_decode(JSContext *ctx, const char *encoding, con
             goto done;
         }
     }
-    exc = qp_exc_new(ctx, QP_EXC(ctx, UnicodeDecodeError), 5, v);
+    exc = qp_exc_new(ctx, QP_EXC(ctx, UnicodeDecodeError), 5, (JSValueConst *)v);
 done:
     for (i = 0; i < 5; i++)
         JS_FreeValue(ctx, v[i]);
@@ -2465,7 +2470,7 @@ static JSValue qp_raise_unicode_encode(JSContext *ctx, const char *encoding, JSV
             goto done;
         }
     }
-    exc = qp_exc_new(ctx, QP_EXC(ctx, UnicodeEncodeError), 5, v);
+    exc = qp_exc_new(ctx, QP_EXC(ctx, UnicodeEncodeError), 5, (JSValueConst *)v);
 done:
     for (i = 0; i < 5; i++)
         JS_FreeValue(ctx, v[i]);
@@ -2548,7 +2553,7 @@ static JSValue qp_exc_decode_error_from_msg(JSContext *ctx, const char *msg)
             exc = JS_EXCEPTION;
     }
     if (!JS_IsException(exc))
-        exc = qp_exc_new(ctx, QP_EXC(ctx, UnicodeDecodeError), 5, v);
+        exc = qp_exc_new(ctx, QP_EXC(ctx, UnicodeDecodeError), 5, (JSValueConst *)v);
     for (i = 0; i < 5; i++)
         JS_FreeValue(ctx, v[i]);
     return exc;
@@ -2560,7 +2565,7 @@ static JSValue qp_exc_raise_msg(JSContext *ctx, QPType *type, const char *msg)
     JSValue m = qp_str_from_cstr(ctx, msg ? msg : ""), exc;
     if (JS_IsException(m))
         return m;
-    exc = qp_exc_new(ctx, type, 1, &m);
+    exc = qp_exc_new(ctx, type, 1, (JSValueConst *)&m);
     JS_FreeValue(ctx, m);
     if (JS_IsException(exc))
         return exc;
@@ -2597,6 +2602,8 @@ static JSValue qp_raise_qp_error(JSContext *ctx, const qp_error *err, const char
         return qp_exc_raise_msg(ctx, QP_EXC(ctx, RecursionError), err->msg);
     case QP_ERR_OVERFLOW:
         return qp_exc_raise_msg(ctx, QP_EXC(ctx, OverflowError), err->msg);
+    case QP_ERR_PENDING:
+        return JS_EXCEPTION;
     case QP_ERR_UNICODE_DECODE:
         exc = err->msg ? qp_exc_decode_error_from_msg(ctx, err->msg) : QP_NULL;
         if (JS_IsException(exc))
@@ -2610,8 +2617,21 @@ static JSValue qp_raise_qp_error(JSContext *ctx, const qp_error *err, const char
 
     info[0] = filename ? qp_str_from_cstr(ctx, filename) : JS_UNDEFINED;
     info[1] = JS_NewInt32(ctx, err->lineno);
-    info[2] = err->offset > 0 ? JS_NewInt32(ctx, err->offset) : JS_UNDEFINED;
-    info[3] = err->text ? qp_str_from_utf8(ctx, err->text, strlen(err->text)) : JS_UNDEFINED;
+    /* 0 without an end position = unknown (None); a negative offset (-1 of
+       _PyTokenizer_raise_init_error) or 0 with an end position (a
+       tokenizer error at column 0) is the value CPython reports */
+    info[2] = err->offset != 0 || err->end_lineno > 0 ? JS_NewInt32(ctx, err->offset) :
+        JS_UNDEFINED;
+    if (err->text) {
+        info[3] = qp_str_from_utf8(ctx, err->text, strlen(err->text));
+    } else {
+        /* errors located by the compiler (_PyErr_RaiseSyntaxError,
+           PyErr_RangedSyntaxLocationObject) read the line back from the
+           source file, if `filename` names one */
+        info[3] = qp_err_program_text(ctx, filename, err->lineno);
+        if (QP_IS_NULL(info[3]))
+            info[3] = JS_UNDEFINED;
+    }
     if (err->end_lineno > 0) {
         info[4] = JS_NewInt32(ctx, err->end_lineno);
         info[5] = JS_NewInt32(ctx, err->end_offset);
@@ -2637,11 +2657,31 @@ static JSValue qp_raise_qp_error(JSContext *ctx, const qp_error *err, const char
         JS_FreeValue(ctx, args[1]);
         return JS_EXCEPTION;
     }
-    exc = qp_exc_new(ctx, type, 2, args);
+    exc = qp_exc_new(ctx, type, 2, (JSValueConst *)args);
     JS_FreeValue(ctx, args[0]);
     JS_FreeValue(ctx, args[1]);
     if (JS_IsException(exc))
         return exc;
+    if (err->has_metadata) {
+        /* _PyPegen_set_syntax_error_metadata: (lineno, col_offset, source) */
+        JSValue meta[3], tup;
+        meta[0] = JS_NewInt32(ctx, err->metadata_lineno);
+        meta[1] = JS_NewInt32(ctx, err->metadata_col_offset);
+        meta[2] = err->metadata_source
+            ? qp_str_from_utf8(ctx, err->metadata_source, strlen(err->metadata_source))
+            : JS_UNDEFINED;
+        if (JS_IsException(meta[2])) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            meta[2] = JS_UNDEFINED;
+        }
+        tup = qp_tuple_new_steal(ctx, 3, meta);
+        if (JS_IsException(tup)) {
+            JS_FreeValue(ctx, exc);
+            return tup;
+        }
+        qp_exc_field_set(ctx, exc, tup, QP_EXC_F_SE_METADATA);
+        JS_FreeValue(ctx, tup);
+    }
     return qp_raise_object(ctx, exc);
 }
 
@@ -2650,7 +2690,8 @@ static JSValue qp_raise_qp_error(JSContext *ctx, const qp_error *err, const char
 /* ========================================================================= */
 
 #define QP_EXC_TPFLAGS \
-    (QP_TPFLAGS_BASETYPE | QP_TPFLAGS_MANAGED_DICT | QP_TPFLAGS_BASE_EXC_SUBCLASS)
+    (QP_TPFLAGS_BASETYPE | QP_TPFLAGS_MANAGED_DICT | QP_TPFLAGS_BASE_EXC_SUBCLASS | \
+     QP_TPFLAGS_IMMUTABLETYPE)
 
 #define QP_EXC_SPEC(NAME, TPNAME, BASE, DOC, NEW, INIT, STR, REPR, METHODS, GETSETS) \
     [QP_EXC_ ## NAME] = {                                                    \

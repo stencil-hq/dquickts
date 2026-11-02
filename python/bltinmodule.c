@@ -557,6 +557,14 @@ static JSValue qp_lazy_import_module_level(JSContext *ctx, JSValueConst name,
 static JSValue qp_eval_code_closure(JSContext *ctx, JSValueConst code, JSValueConst globals,
                                     JSValueConst locals, JSValueConst closure);
 
+/* Implemented by python/mod_ast.c (the _ast module). */
+static int qp_ast_check(JSContext *ctx, JSValueConst obj);
+static JSValue qp_ast2obj(JSContext *ctx, mod_ty mod);
+static mod_ty qp_obj2ast(JSContext *ctx, JSValueConst obj, qp_arena *arena, int mode);
+static int qp_ast_validate(JSContext *ctx, mod_ty mod);
+static int qp_ast_preprocess(JSContext *ctx, mod_ty mod, const char *filename, int flags,
+                             int optimize, qp_arena *arena, int syntax_check_only);
+
 /* PyCF_* (Include/cpython/compile.h) */
 #define QP_BI_PyCF_MASK (CO_FUTURE_DIVISION | CO_FUTURE_ABSOLUTE_IMPORT | \
                          CO_FUTURE_WITH_STATEMENT | CO_FUTURE_PRINT_FUNCTION | \
@@ -1227,46 +1235,12 @@ static JSValue qp_bi_delattr(JSContext *ctx, JSValueConst self, JSValueConst *ar
     return r < 0 ? JS_EXCEPTION : JS_UNDEFINED;
 }
 
-/* _dir_locals(): sorted keys of the caller's locals. */
-static JSValue qp_bi_dir_locals(JSContext *ctx)
-{
-    JSStackFrame *sf = qp_bi_caller_frame(ctx);
-    JSValue locals, names;
-
-    if (!sf)
-        return qp_raise_system_error(ctx, "frame does not exist");
-    locals = qp_frame_locals(ctx, sf);
-    if (JS_IsException(locals))
-        return JS_EXCEPTION;
-    if (qp_dict_check(ctx, locals)) {
-        names = qp_dict_keys_list(ctx, locals);
-    } else {
-        JSValue keys = qp_call_method(ctx, locals, QP_ATOM(ctx, keys), NULL, 0, QP_NULL);
-        if (JS_IsException(keys)) {
-            names = JS_EXCEPTION;
-        } else {
-            names = qp_list_from_iterable(ctx, keys);
-            JS_FreeValue(ctx, keys);
-        }
-    }
-    JS_FreeValue(ctx, locals);
-    if (JS_IsException(names))
-        return JS_EXCEPTION;
-    if (qp_list_sort(ctx, names, QP_NULL, 0) < 0) {
-        JS_FreeValue(ctx, names);
-        return JS_EXCEPTION;
-    }
-    return names;
-}
-
 static JSValue qp_bi_dir(JSContext *ctx, JSValueConst self, JSValueConst *args,
                          int nargs, JSValueConst kwnames, int magic)
 {
     if (qp_arg_check_positional(ctx, "dir", nargs, 0, 1) < 0)
         return JS_EXCEPTION;
-    if (nargs == 0)
-        return qp_bi_dir_locals(ctx);
-    return qp_dir(ctx, args[0]);
+    return qp_dir(ctx, nargs == 0 ? QP_NULL : args[0]);
 }
 
 /* PyNumber_Divmod: binary_op1 over nb_divmod. */
@@ -1404,13 +1378,14 @@ static int qp_bi_source_as_string(JSContext *ctx, JSValueConst cmd, const char *
 
 /* Compile source text to a code object (_Py_CompileString). */
 static JSValue qp_bi_compile_text(JSContext *ctx, const char *src, size_t len,
-                                  const char *filename, int mode, int flags, int optimize)
+                                  const char *filename, JSValueConst module, int mode,
+                                  int flags, int optimize)
 {
     qp_error err;
     JSValue bc, code;
 
     memset(&err, 0, sizeof(err));
-    bc = qp_compile_source(ctx, src, len, filename, mode, flags, optimize, &err);
+    bc = qp_compile_source(ctx, src, len, filename, module, mode, flags, optimize, &err);
     if (JS_IsException(bc)) {
         if (err.kind != QP_ERR_NONE) {
             qp_raise_qp_error(ctx, &err, filename);
@@ -1422,6 +1397,89 @@ static JSValue qp_bi_compile_text(JSContext *ctx, const char *src, size_t len,
     code = qp_code_new(ctx, bc);
     JS_FreeValue(ctx, bc);
     return code;
+}
+
+/* compile() of an AST object (builtin_compile_impl, is_ast branch):
+   PyAST_obj2mod + _PyAST_Validate, then either _PyCompile_AstPreprocess +
+   PyAST_mod2obj (PyCF_ONLY_AST) or _PyAST_Compile.  ast_mode is the
+   obj2mod mode (0 exec, 1 eval, 2 single, 3 func_type). */
+static JSValue qp_bi_compile_ast_object(JSContext *ctx, JSValueConst source, const char *filename,
+                                        JSValueConst module, int ast_mode, int input_mode,
+                                        int flags, int cf_flags, int optimize)
+{
+    qp_error err;
+    qp_arena *arena;
+    mod_ty mod;
+    JSValue result = JS_EXCEPTION;
+
+    memset(&err, 0, sizeof(err));
+    arena = qp_arena_new(ctx, &err);
+    if (!arena) {
+        qp_error_clear(&err);
+        return qp_raise_memory_error(ctx);
+    }
+    mod = qp_obj2ast(ctx, source, arena, ast_mode);
+    if (!mod || !qp_ast_validate(ctx, mod))
+        goto done;
+    if (flags & QP_BI_PyCF_ONLY_AST) {
+        /* unoptimized AST unless PyCF_OPTIMIZED_AST */
+        int syntax_check_only = (flags & QP_BI_PyCF_OPTIMIZED_AST) == QP_BI_PyCF_ONLY_AST;
+        if (qp_ast_preprocess(ctx, mod, filename, cf_flags, optimize, arena,
+                              syntax_check_only) < 0)
+            goto done;
+        result = qp_ast2obj(ctx, mod);
+    } else {
+        JSValue bc = qp_compile_ast(ctx, mod, filename, module, input_mode,
+                                    cf_flags & ~QP_BI_PyCF_OPTIMIZED_AST, optimize, arena, &err);
+        if (JS_IsException(bc)) {
+            if (err.kind != QP_ERR_NONE)
+                qp_raise_qp_error(ctx, &err, filename);
+            goto done;
+        }
+        result = qp_code_new(ctx, bc);
+        JS_FreeValue(ctx, bc);
+    }
+done:
+    qp_arena_free(arena);
+    qp_error_clear(&err);
+    return result;
+}
+
+/* compile(source, ..., PyCF_ONLY_AST) of source text (_Py_CompileString
+   with PyCF_ONLY_AST): parse, _PyCompile_AstPreprocess, PyAST_mod2obj. */
+static JSValue qp_bi_parse_to_ast(JSContext *ctx, const char *src, size_t len,
+                                  const char *filename, JSValueConst module, int input_mode,
+                                  int flags, int cf_flags, int optimize, int feature_version)
+{
+    qp_error err;
+    qp_arena *arena;
+    mod_ty mod;
+    JSValue result = JS_EXCEPTION;
+    int syntax_check_only = (flags & QP_BI_PyCF_OPTIMIZED_AST) == QP_BI_PyCF_ONLY_AST;
+
+    memset(&err, 0, sizeof(err));
+    arena = qp_arena_new(ctx, &err);
+    if (!arena) {
+        qp_error_clear(&err);
+        return qp_raise_memory_error(ctx);
+    }
+    qp_arena_set_feature_version(arena, feature_version);
+    mod = qp_parse_string(ctx, arena, src, len, filename, module, input_mode,
+                          cf_flags & ~QP_BI_PyCF_OPTIMIZED_AST, &err);
+    if (!mod) {
+        if (err.kind != QP_ERR_NONE)
+            qp_raise_qp_error(ctx, &err, filename);
+        else
+            qp_raise_memory_error(ctx);
+        goto done;
+    }
+    if (qp_ast_preprocess(ctx, mod, filename, cf_flags, optimize, arena, syntax_check_only) < 0)
+        goto done;
+    result = qp_ast2obj(ctx, mod);
+done:
+    qp_arena_free(arena);
+    qp_error_clear(&err);
+    return result;
 }
 
 /* PyUnicode_FSDecoder for compile()'s filename: str, bytes or
@@ -1478,9 +1536,11 @@ static JSValue qp_bi_compile(JSContext *ctx, JSValueConst self, JSValueConst *ar
     static const QPArgSpec spec = { "compile", kw, 3, 6, 0 };
     JSValueConst a[8];
     JSValue filename = JS_UNDEFINED, mode_s = JS_UNDEFINED, result = JS_EXCEPTION;
+    JSValueConst modname = QP_NULL;     /* module=None: NULL */
     const char *fname_utf8 = NULL, *mode = NULL;
     size_t mode_len;
-    int flags = 0, dont_inherit = 0, optimize = -1, feature_version = -1, compile_mode;
+    int flags = 0, dont_inherit = 0, optimize = -1, feature_version = -1, compile_mode, ast_mode;
+    int is_ast;
     char *src = NULL;
     size_t srclen;
     int cf_flags;
@@ -1512,7 +1572,6 @@ static JSValue qp_bi_compile(JSContext *ctx, JSValueConst self, JSValueConst *ar
         goto done;
     if (!QP_IS_NULL(a[7]) && qp_arg_int(ctx, a[7], &feature_version) < 0)
         goto done;
-    (void)feature_version; /* only meaningful with PyCF_ONLY_AST */
 
     cf_flags = flags;
     if (flags & ~(QP_BI_PyCF_MASK | QP_BI_PyCF_MASK_OBSOLETE | QP_BI_PyCF_COMPILE_MASK)) {
@@ -1523,25 +1582,33 @@ static JSValue qp_bi_compile(JSContext *ctx, JSValueConst self, JSValueConst *ar
         qp_raise_value_error(ctx, "compile(): invalid optimize value");
         goto done;
     }
-    if (!QP_IS_NULL(a[6]) && !qp_bi_is_none(a[6]) && !qp_str_check(ctx, a[6])) {
-        qp_raise_type_error(ctx, "compile() argument 'module' must be str or None, not %T", a[6]);
-        goto done;
+    if (!QP_IS_NULL(a[6]) && !qp_bi_is_none(a[6])) {
+        if (!qp_str_check(ctx, a[6])) {
+            qp_raise_type_error(ctx, "compile() argument 'module' must be str or None, not %T",
+                                a[6]);
+            goto done;
+        }
+        modname = a[6];
     }
     if (!dont_inherit)
         cf_flags = qp_bi_merge_flags(ctx, cf_flags);
 
     if (strcmp(mode, "exec") == 0) {
         compile_mode = QP_INPUT_FILE;
+        ast_mode = 0;
     } else if (strcmp(mode, "eval") == 0) {
         compile_mode = QP_INPUT_EVAL;
+        ast_mode = 1;
     } else if (strcmp(mode, "single") == 0) {
         compile_mode = QP_INPUT_SINGLE;
+        ast_mode = 2;
     } else if (strcmp(mode, "func_type") == 0) {
         if (!(flags & QP_BI_PyCF_ONLY_AST)) {
             qp_raise_value_error(ctx, "compile() mode 'func_type' requires flag PyCF_ONLY_AST");
             goto done;
         }
         compile_mode = QP_INPUT_FUNC_TYPE;
+        ast_mode = 3;
     } else {
         if (flags & QP_BI_PyCF_ONLY_AST)
             qp_raise_value_error(ctx, "compile() mode must be 'exec', 'eval', 'single' or 'func_type'");
@@ -1550,27 +1617,29 @@ static JSValue qp_bi_compile(JSContext *ctx, JSValueConst self, JSValueConst *ar
         goto done;
     }
 
-    /* AST objects (PyAST_Check) only exist once the _ast module is
-       available (M3); without it every non-text source is rejected here
-       exactly like a non-AST object. */
+    is_ast = qp_ast_check(ctx, a[0]);
+    if (is_ast < 0)
+        goto done;
+    if (is_ast) {
+        fname_utf8 = qp_str_utf8(ctx, filename, NULL);
+        if (!fname_utf8)
+            goto done;
+        result = qp_bi_compile_ast_object(ctx, a[0], fname_utf8, modname, ast_mode,
+                                          compile_mode, flags, cf_flags, optimize);
+        goto done;
+    }
     if (qp_bi_source_as_string(ctx, a[0], "compile", "string, bytes or AST", &cf_flags,
                                &src, &srclen) < 0)
         goto done;
-    if (flags & QP_BI_PyCF_ONLY_AST) {
-        /* PyAST_mod2obj needs the _ast module state: import it so a
-           missing module raises like CPython would without it. */
-        JSValue m = qp_import_module(ctx, "_ast");
-        if (JS_IsException(m))
-            goto done;
-        JS_FreeValue(ctx, m);
-        qp_raise_system_error(ctx, "compile(): PyCF_ONLY_AST requires the _ast object converter");
-        goto done;
-    }
     fname_utf8 = qp_str_utf8(ctx, filename, NULL);
     if (!fname_utf8)
         goto done;
-    result = qp_bi_compile_text(ctx, src, srclen, fname_utf8, compile_mode,
-                                cf_flags & ~QP_BI_PyCF_ONLY_AST, optimize);
+    if (flags & QP_BI_PyCF_ONLY_AST)
+        result = qp_bi_parse_to_ast(ctx, src, srclen, fname_utf8, modname, compile_mode, flags,
+                                    cf_flags & ~QP_BI_PyCF_ONLY_AST, optimize, feature_version);
+    else
+        result = qp_bi_compile_text(ctx, src, srclen, fname_utf8, modname, compile_mode,
+                                    cf_flags & ~QP_BI_PyCF_ONLY_AST, optimize);
 done:
     if (src)
         js_free(ctx, src);
@@ -1595,6 +1664,27 @@ static int qp_bi_code_nfree(JSValueConst code)
     return b ? b->closure_var_count : 0;
 }
 
+/* _PyEval_EnsureBuiltins: globals['__builtins__'] = the running frame's
+   builtins (PyEval_GetBuiltins) when missing. */
+static int qp_bi_ensure_builtins(JSContext *ctx, JSValueConst globals)
+{
+    JSValue builtins;
+    int r = qp_dict_get_item_atom(ctx, globals, QP_ATOM(ctx, __builtins__), &builtins);
+    if (r != 0) {
+        if (r > 0)
+            JS_FreeValue(ctx, builtins);
+        return r < 0 ? -1 : 0;
+    }
+    builtins = qp_frame_builtins(qp_bi_caller_frame(ctx));
+    if (QP_IS_NULL(builtins) || JS_IsUndefined(builtins))
+        builtins = QP_STATE(ctx)->builtins_dict;
+    if (qp_frozendict_check(globals)) {
+        qp_raise_type_error(ctx, "cannot assign __builtins__ to frozendict globals");
+        return -1;
+    }
+    return qp_dict_set_item_atom(ctx, globals, QP_ATOM(ctx, __builtins__), builtins);
+}
+
 /* Compile `source` text (str/bytes/buffer) for eval/exec and run it. */
 static JSValue qp_bi_run_source(JSContext *ctx, JSValueConst source, const char *funcname,
                                 const char *what, int mode, JSValueConst globals,
@@ -1604,7 +1694,7 @@ static JSValue qp_bi_run_source(JSContext *ctx, JSValueConst source, const char 
     char *src;
     size_t len;
     const char *p;
-    JSValue code, r;
+    JSValue code, r, module = QP_NULL;
 
     if (qp_bi_source_as_string(ctx, source, funcname, what, &flags, &src, &len) < 0)
         return JS_EXCEPTION;
@@ -1614,7 +1704,14 @@ static JSValue qp_bi_run_source(JSContext *ctx, JSValueConst source, const char 
             p++;
     }
     flags = qp_bi_merge_flags(ctx, flags);
-    code = qp_bi_compile_text(ctx, p, len - (size_t)(p - src), "<string>", mode, flags, -1);
+    /* PyRun_StringFlags: SyntaxWarnings are reported for globals['__name__'] */
+    if (qp_dict_get_item_atom(ctx, globals, QP_ATOM(ctx, __name__), &module) < 0) {
+        js_free(ctx, src);
+        return JS_EXCEPTION;
+    }
+    code = qp_bi_compile_text(ctx, p, len - (size_t)(p - src), "<string>", module, mode,
+                              flags, -1);
+    JS_FreeValue(ctx, module);
     js_free(ctx, src);
     if (JS_IsException(code))
         return JS_EXCEPTION;
@@ -1668,7 +1765,9 @@ static JSValue qp_bi_eval(JSContext *ctx, JSValueConst self, JSValueConst *args,
         locals = JS_DupValue(ctx, globals);
     }
 
-    if (qp_bi_code_check(source)) {
+    if (qp_bi_ensure_builtins(ctx, globals) < 0) {
+        result = JS_EXCEPTION;
+    } else if (qp_bi_code_check(source)) {
         if (qp_bi_code_nfree(source) > 0) {
             qp_raise_type_error(ctx, "code object passed to eval() may not contain free variables");
             result = JS_EXCEPTION;
@@ -1728,6 +1827,8 @@ static JSValue qp_bi_exec(JSContext *ctx, JSValueConst self, JSValueConst *args,
                        "locals must be a mapping or None, not %.100U", locals);
         goto error;
     }
+    if (qp_bi_ensure_builtins(ctx, globals) < 0)
+        goto error;
     closure = a[3];
     if (qp_bi_is_none(closure))
         closure = QP_NULL;
@@ -2281,9 +2382,17 @@ static JSValue qp_bi_file_getline(JSContext *ctx, JSValueConst f)
     return result;
 }
 
-/* input([prompt]): the non-interactive path of CPython (prompt written to
-   sys.stdout, line read with sys.stdin.readline()); line editing through
-   GNU readline is not available in this runtime. */
+#ifdef CONFIG_PYTHON_CAPI
+/* python/capi_runtime.c: PyOS_Readline once the readline module is loaded */
+static BOOL qp_capi_readline_hooked(JSContext *ctx);
+static JSValue qp_capi_input_tty(JSContext *ctx, JSValueConst fin, JSValueConst fout,
+                                 JSValueConst prompt, int *handled);
+#endif
+
+/* input([prompt]): CPython's non-interactive path (prompt written to
+   sys.stdout, line read with sys.stdin.readline()), and its console path
+   (PyOS_Readline: line editing) once the readline module has installed
+   its hook (C API builds). */
 static JSValue qp_bi_input(JSContext *ctx, JSValueConst self, JSValueConst *args,
                            int nargs, JSValueConst kwnames, int magic)
 {
@@ -2322,6 +2431,15 @@ static JSValue qp_bi_input(JSContext *ctx, JSValueConst self, JSValueConst *args
     /* First of all, flush stderr */
     if (qp_bi_file_flush(ctx, ferr) < 0)
         qp_bi_clear_exc(ctx);
+#ifdef CONFIG_PYTHON_CAPI
+    if (qp_capi_readline_hooked(ctx)) {
+        int handled;
+        r = qp_capi_input_tty(ctx, fin, fout, nargs > 0 ? args[0] : QP_NULL, &handled);
+        if (handled)
+            goto done;
+        r = JS_EXCEPTION;
+    }
+#endif
     if (nargs > 0) {
         if (qp_bi_file_write(ctx, args[0], fout) != 0)
             goto done;
@@ -3680,7 +3798,7 @@ static const QPTypeSpec qp_reversed_spec =
 
 static const QPTypeSpec qp_sentinel_spec = {
     .name = "sentinel", .doc = qp_bi_doc_sentinel,
-    .flags = QP_TPFLAGS_IMMUTABLETYPE,
+    .flags = QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_HAVE_GC,
     .base = -1, .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_OBJECT, .nslots = QP_SENTINEL_NSLOTS,
     .slots = { .tp_getattro = qp_generic_getattr, .tp_repr = qp_sentinel_repr,

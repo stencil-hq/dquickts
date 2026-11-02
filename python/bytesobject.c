@@ -30,11 +30,6 @@
 
 /* qp_hexdigits ("0123456789abcdef") is defined by unicodeobject.c (same TU) */
 
-static JSValue qp_bm_raise_memory(JSContext *ctx)
-{
-    return qp_raise_memory_error(ctx);
-}
-
 /* Py_TYPE(v)->tp_name as a str: the spec name of builtin types, __name__ of
    heap types. */
 static JSValue qp_bm_tpname(JSContext *ctx, JSValueConst v)
@@ -253,6 +248,23 @@ static JSValue qp_bm_new(JSContext *ctx, int bytearray, const void *data, Py_ssi
 
 #define QP_BM_IS_BA(self) (qp_bk_kind(self) == QP_BK_BYTEARRAY)
 
+/* bytearray self: hold an export while a method converts arguments that
+   may run Python code (__index__, __buffer__, __len__, __repr__), so that
+   resizing self raises BufferError (CPython's ob_exports++ in
+   _bytearray_with_buffer, bytearray_contains, split, hex, mod, ...).  No-op
+   for bytes. */
+static void qp_bm_export(JSValueConst self)
+{
+    if (QP_BM_IS_BA(self))
+        QP_BYTES_OBJ(self)->exports++;
+}
+
+static void qp_bm_unexport(JSValueConst self)
+{
+    if (QP_BM_IS_BA(self))
+        QP_BYTES_OBJ(self)->exports--;
+}
+
 /* stringlib return_self(): exact bytes -> self, else a new object of the
    base type with the same content. */
 static JSValue qp_bm_return_self(JSContext *ctx, JSValueConst self)
@@ -411,6 +423,12 @@ static void qp_buffer_release_rt(JSRuntime *rt, QPBuffer *view)
         if (mv->exports > 0)
             mv->exports--;
     }
+#ifdef CONFIG_PYTHON_CAPI
+    /* D5 (CapiD): C-extension exporters release through their C slot */
+    else if (JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_PY_NATIVE) {
+        qp_capi_bf_release_rt(rt, view);
+    }
+#endif
     view->obj = JS_UNDEFINED;
     JS_FreeValueRT(rt, obj);
 }
@@ -673,7 +691,7 @@ static JSValue qp_bytes_sq_repeat(JSContext *ctx, JSValueConst self, Py_ssize_t 
 }
 
 /* _Py_bytes_contains */
-static int qp_bm_contains(JSContext *ctx, JSValueConst self, JSValueConst arg)
+static int qp_bm_contains_held(JSContext *ctx, JSValueConst self, JSValueConst arg)
 {
     Py_ssize_t ival, len;
     const uint8_t *d;
@@ -699,6 +717,15 @@ static int qp_bm_contains(JSContext *ctx, JSValueConst self, JSValueConst arg)
     }
     d = qp_bytes_data(self, &len);
     return len > 0 && memchr(d, (int)ival, len) != NULL;
+}
+
+static int qp_bm_contains(JSContext *ctx, JSValueConst self, JSValueConst arg)
+{
+    int r;
+    qp_bm_export(self);
+    r = qp_bm_contains_held(ctx, self, arg);
+    qp_bm_unexport(self);
+    return r;
 }
 
 /* Slice of data with (start, step, slicelength) as a new object. */
@@ -1129,10 +1156,10 @@ static int qp_bm_parse_hex_args(JSContext *ctx, const char *fname, JSValueConst 
     static const char *const kw[] = { "sep", "bytes_per_sep", NULL };
     QPArgSpec spec = { fname, kw, 0, 2, 0 };
     JSValueConst a[2];
-    int bps = 1;
+    Py_ssize_t bps = 1;
     if (qp_arg_parse(ctx, &spec, args, nargs, kwnames, a) < 0)
         return -1;
-    if (!QP_IS_NULL(a[1]) && qp_arg_int(ctx, a[1], &bps) < 0)
+    if (!QP_IS_NULL(a[1]) && qp_arg_ssize(ctx, a[1], &bps) < 0)
         return -1;
     *psep = a[0];
     *pbps = bps;
@@ -1154,11 +1181,14 @@ static JSValue qp_bm_hex(JSContext *ctx, JSValueConst self, JSValueConst *args, 
 {
     JSValueConst sep;
     Py_ssize_t bps, len;
-    int sep_char;
+    int sep_char, r;
     const uint8_t *d;
     if (qp_bm_parse_hex_args(ctx, "hex", args, nargs, kwnames, &sep, &bps) < 0)
         return JS_EXCEPTION;
-    if (qp_bm_hex_sep(ctx, sep, &sep_char) < 0)
+    qp_bm_export(self);
+    r = qp_bm_hex_sep(ctx, sep, &sep_char);
+    qp_bm_unexport(self);
+    if (r < 0)
         return JS_EXCEPTION;
     d = qp_bytes_data(self, &len);
     return qp_bm_strhex_build(ctx, d, len, sep_char, bps);
@@ -1507,8 +1537,10 @@ static JSValue qp_bm_expandtabs(JSContext *ctx, JSValueConst self, JSValueConst 
 
 /* Shared parse of (sub[, start[, end]]) with the int-or-buffer first
    argument (parse_args_finds_byte).  On success the needle is in
-   (*psub, *psublen), backed by *pbuf (release it) or *pbyte. */
-static int qp_bm_parse_finds(JSContext *ctx, const char *fname, JSValueConst *args, int nargs,
+   (*psub, *psublen), backed by *pbuf (release it) or *pbyte, and self holds
+   an export (qp_bm_unexport) taken after start and end were converted. */
+static int qp_bm_parse_finds(JSContext *ctx, JSValueConst self, const char *fname,
+                             JSValueConst *args, int nargs,
                              Py_ssize_t *pstart, Py_ssize_t *pend, QPBuffer *pbuf,
                              uint8_t *pbyte, const uint8_t **psub, Py_ssize_t *psublen)
 {
@@ -1523,9 +1555,10 @@ static int qp_bm_parse_finds(JSContext *ctx, const char *fname, JSValueConst *ar
         return -1;
     if (nargs > 2 && qp_bm_slice_index(ctx, args[2], pend) < 0)
         return -1;
+    qp_bm_export(self);
     if (qp_buffer_check(ctx, subobj)) {
         if (qp_buffer_get(ctx, subobj, pbuf, QP_BUF_SIMPLE) < 0)
-            return -1;
+            goto fail;
         *psub = pbuf->buf;
         *psublen = pbuf->len;
         return 0;
@@ -1533,21 +1566,24 @@ static int qp_bm_parse_finds(JSContext *ctx, const char *fname, JSValueConst *ar
     if (!qp_index_check(ctx, subobj)) {
         qp_bm_raise_tpname(ctx, QP_EXC(ctx, TypeError),
                            "argument should be integer or bytes-like object, not '%U'", subobj);
-        return -1;
+        goto fail;
     }
     {
         Py_ssize_t ival;
         if (qp_as_ssize(ctx, subobj, NULL, &ival) < 0)
-            return -1;
+            goto fail;
         if (ival < 0 || ival > 255) {
             qp_raise_value_error(ctx, "byte must be in range(0, 256)");
-            return -1;
+            goto fail;
         }
         *pbyte = (uint8_t)ival;
         *psub = pbyte;
         *psublen = 1;
     }
     return 0;
+fail:
+    qp_bm_unexport(self);
+    return -1;
 }
 
 /* find_internal: index or -1; -2 on error.  magic: 0 find, 1 index,
@@ -1562,7 +1598,7 @@ static JSValue qp_bm_find(JSContext *ctx, JSValueConst self, JSValueConst *args,
     const uint8_t *sub, *str;
     int dir = magic < 2 ? 1 : -1;
 
-    if (qp_bm_parse_finds(ctx, names[magic], args, nargs, &start, &end, &buf, &byte,
+    if (qp_bm_parse_finds(ctx, self, names[magic], args, nargs, &start, &end, &buf, &byte,
                           &sub, &sublen) < 0)
         return JS_EXCEPTION;
     str = qp_bytes_data(self, &len);
@@ -1589,10 +1625,12 @@ static JSValue qp_bm_find(JSContext *ctx, JSValueConst self, JSValueConst *args,
                          start, end, dir);
         if (res == QP_SL_NOMEM) {
             qp_buffer_release(ctx, &buf);
+            qp_bm_unexport(self);
             return qp_raise_memory_error(ctx);
         }
     }
     qp_buffer_release(ctx, &buf);
+    qp_bm_unexport(self);
     if (res < 0 && (magic & 1))
         return qp_raise_value_error(ctx, "subsection not found");
     return qp_long_from_int64(ctx, res);
@@ -1606,12 +1644,14 @@ static JSValue qp_bm_count(JSContext *ctx, JSValueConst self, JSValueConst *args
     uint8_t byte;
     const uint8_t *sub, *str;
 
-    if (qp_bm_parse_finds(ctx, "count", args, nargs, &start, &end, &buf, &byte, &sub, &sublen) < 0)
+    if (qp_bm_parse_finds(ctx, self, "count", args, nargs, &start, &end, &buf, &byte, &sub,
+                          &sublen) < 0)
         return JS_EXCEPTION;
     str = qp_bytes_data(self, &len);
     res = qp_sl_count(ctx->rt, qp_strview_make(1, str, len), qp_strview_make(1, sub, sublen),
                       start, end);
     qp_buffer_release(ctx, &buf);
+    qp_bm_unexport(self);
     if (res < 0)
         return qp_raise_memory_error(ctx);
     return qp_long_from_int64(ctx, res);
@@ -1649,22 +1689,13 @@ done:
     return r;
 }
 
-/* startswith / endswith (magic 0 / 1) */
-static JSValue qp_bm_tailmatch(JSContext *ctx, JSValueConst self, JSValueConst *args, int nargs,
-                               JSValueConst kwnames, int magic)
+/* _Py_bytes_tailmatch after the start and end conversions */
+static JSValue qp_bm_tailmatch_held(JSContext *ctx, JSValueConst self, const char *fname,
+                                    JSValueConst subobj, Py_ssize_t start, Py_ssize_t end,
+                                    int direction)
 {
-    const char *fname = magic ? "endswith" : "startswith";
-    int direction = magic ? 1 : -1, r;
-    Py_ssize_t start = 0, end = PY_SSIZE_T_MAX;
-    JSValueConst subobj;
+    int r;
 
-    if (qp_arg_check_positional(ctx, fname, nargs, 1, 3) < 0)
-        return JS_EXCEPTION;
-    subobj = args[0];
-    if (nargs > 1 && qp_bm_slice_index(ctx, args[1], &start) < 0)
-        return JS_EXCEPTION;
-    if (nargs > 2 && qp_bm_slice_index(ctx, args[2], &end) < 0)
-        return JS_EXCEPTION;
     if (qp_tuple_check(ctx, subobj)) {
         Py_ssize_t i;
         for (i = 0; i < QP_TUPLE_SIZE(subobj); i++) {
@@ -1689,6 +1720,26 @@ static JSValue qp_bm_tailmatch(JSContext *ctx, JSValueConst self, JSValueConst *
         return JS_EXCEPTION;
     }
     return JS_NewBool(ctx, r);
+}
+
+/* startswith / endswith (magic 0 / 1) */
+static JSValue qp_bm_tailmatch(JSContext *ctx, JSValueConst self, JSValueConst *args, int nargs,
+                               JSValueConst kwnames, int magic)
+{
+    const char *fname = magic ? "endswith" : "startswith";
+    Py_ssize_t start = 0, end = PY_SSIZE_T_MAX;
+    JSValue r;
+
+    if (qp_arg_check_positional(ctx, fname, nargs, 1, 3) < 0)
+        return JS_EXCEPTION;
+    if (nargs > 1 && qp_bm_slice_index(ctx, args[1], &start) < 0)
+        return JS_EXCEPTION;
+    if (nargs > 2 && qp_bm_slice_index(ctx, args[2], &end) < 0)
+        return JS_EXCEPTION;
+    qp_bm_export(self);
+    r = qp_bm_tailmatch_held(ctx, self, fname, args[0], start, end, magic ? 1 : -1);
+    qp_bm_unexport(self);
+    return r;
 }
 
 static JSValue qp_bm_decode(JSContext *ctx, JSValueConst self, JSValueConst *args, int nargs,
@@ -1726,10 +1777,8 @@ done:
 }
 
 /* stringlib bytes_join */
-static JSValue qp_bm_join(JSContext *ctx, JSValueConst self, JSValueConst *args, int nargs,
-                          JSValueConst kwnames, int magic)
+static JSValue qp_bm_join_impl(JSContext *ctx, JSValueConst self, JSValueConst iterable)
 {
-    JSValueConst iterable = args[0];
     JSValue seq, r = JS_EXCEPTION;
     JSValue *items;
     Py_ssize_t seqlen, i, nbufs = 0, sz = 0, seplen;
@@ -1803,6 +1852,11 @@ static JSValue qp_bm_join(JSContext *ctx, JSValueConst self, JSValueConst *args,
             goto fail;
         }
         sz += buffers[i].len;
+        /* an item's __buffer__() may have mutated the list */
+        if (!qp_tuple_check_exact(ctx, seq) && qp_list_size(seq) != seqlen) {
+            qp_raise(ctx, QP_EXC(ctx, RuntimeError), "sequence changed size during iteration");
+            goto fail;
+        }
     }
     sep = qp_bytes_data(self, &seplen);
     if (seplen) {
@@ -1835,6 +1889,20 @@ fail:
     }
 out:
     JS_FreeValue(ctx, seq);
+    return r;
+}
+
+static JSValue qp_bm_join(JSContext *ctx, JSValueConst self, JSValueConst *args, int nargs,
+                          JSValueConst kwnames, int magic)
+{
+    JSValue r;
+    if (!QP_BM_IS_BA(self))
+        return qp_bm_join_impl(ctx, self, args[0]);
+    /* bytearray_join_impl: exported while a custom iterator runs, so that
+       it cannot clear/resize self */
+    QP_BYTES_OBJ(self)->exports++;
+    r = qp_bm_join_impl(ctx, self, args[0]);
+    QP_BYTES_OBJ(self)->exports--;
     return r;
 }
 
@@ -2076,9 +2144,12 @@ static JSValue qp_bm_split(JSContext *ctx, JSValueConst self, JSValueConst *args
         return JS_EXCEPTION;
     if (!QP_IS_NULL(a[1]) && qp_arg_ssize(ctx, a[1], &maxsplit) < 0)
         return JS_EXCEPTION;
+    qp_bm_export(self);
     if (!QP_IS_NULL(a[0]) && !JS_IsUndefined(a[0]) && !JS_IsNull(a[0])) {
-        if (qp_buffer_get(ctx, a[0], &v, QP_BUF_SIMPLE) < 0)
+        if (qp_buffer_get(ctx, a[0], &v, QP_BUF_SIMPLE) < 0) {
+            qp_bm_unexport(self);
             return JS_EXCEPTION;
+        }
         sepv = qp_strview_make(1, v.buf, v.len);
         has_sep = 1;
     }
@@ -2091,6 +2162,7 @@ static JSValue qp_bm_split(JSContext *ctx, JSValueConst self, JSValueConst *args
         st = qp_sl_split(ctx->rt, qp_strview_make(1, d, len), has_sep ? &sepv : NULL,
                          maxsplit, QP_SL_BYTES, &vec);
     qp_buffer_release(ctx, &v);
+    qp_bm_unexport(self);
     if (st < 0) {
         qp_spanvec_free(&vec);
         return qp_bm_sl_error(ctx, st, "");
@@ -2262,7 +2334,7 @@ static void qp_bm_format_error(JSContext *ctx, QPType *exc, JSValueConst key, Py
     JS_FreeValue(ctx, msg);
 }
 
-static JSValue qp_bm_getnextarg(JSContext *ctx, JSValueConst args, Py_ssize_t arglen,
+static JSValueConst qp_bm_getnextarg(JSContext *ctx, JSValueConst args, Py_ssize_t arglen,
                                 Py_ssize_t *p_argidx, int allowone)
 {
     Py_ssize_t argidx = *p_argidx;
@@ -2486,7 +2558,7 @@ static JSValue qp_bytes_format(JSContext *ctx, const uint8_t *format, Py_ssize_t
             int prec = -1;
             int c = '\0';
             int fill, sign;
-            JSValue v = JS_UNDEFINED;
+            JSValueConst v = JS_UNDEFINED;
             JSValue temp = JS_UNDEFINED;
             char *tempbuf = NULL;
             const uint8_t *pbuf = NULL;
@@ -2963,10 +3035,15 @@ static JSValue qp_bm_mod(JSContext *ctx, JSValueConst self, JSValueConst arg)
     int k = qp_bk_kind(self);
     Py_ssize_t len;
     const uint8_t *d;
+    JSValue r;
     if (k != QP_BK_BYTES && k != QP_BK_BYTEARRAY)
         return qp_not_implemented(ctx);
+    /* the format runs __repr__/__format__...: d stays valid */
+    qp_bm_export(self);
     d = qp_bytes_data(self, &len);
-    return qp_bytes_format(ctx, d, len, arg, k == QP_BK_BYTEARRAY);
+    r = qp_bytes_format(ctx, d, len, arg, k == QP_BK_BYTEARRAY);
+    qp_bm_unexport(self);
+    return r;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -3044,7 +3121,7 @@ static const QPTypeSpec qp_bytes_spec = {
            "  - any object implementing the buffer API.\n"
            "  - an integer",
     .flags = QP_TPFLAGS_BASETYPE | QP_TPFLAGS_BYTES_SUBCLASS | QP_TPFLAGS_MATCH_SELF |
-             QP_TPFLAGS_IMMUTABLETYPE,
+             QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_PRIV_VARSIZE,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_BYTES,

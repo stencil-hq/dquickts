@@ -36,7 +36,17 @@
    (QP_ERR_SYNTAX for CPython's SyntaxErrors; QP_ERR_MEMORY,
    QP_ERR_RECURSION, QP_ERR_VALUE for the non-SyntaxError failures CPython
    can hit on the same path).  `st` must be the symbol table built for
-   `mod`. */
-static int qp_validate(struct symtable *st, mod_ty mod, int flags, qp_error *err);
+   `mod`.  The code generator's SyntaxWarnings (_PyCompile_Warn) are emitted
+   for `filename` / `module` (qp_syntax_warn; JS_UNDEFINED drops them); one
+   raised as an error is the SyntaxError (QP_ERR_PENDING for another
+   exception). */
+static int qp_validate(struct symtable *st, mod_ty mod, int flags, const char *filename,
+                       JSValueConst module, qp_error *err);
+
+/* The SyntaxWarnings of _PyAST_Preprocess with enable_warnings = 1 (PEP
+   765 "'return'/'break'/'continue' in a 'finally' block"), run before the
+   symbol table as in compiler_setup.  0, or -1 with `err` set. */
+static int qp_preprocess_warnings(JSContext *ctx, mod_ty mod, const char *filename,
+                                  JSValueConst module, qp_error *err);
 
 #endif /* QP_VALIDATE_H */

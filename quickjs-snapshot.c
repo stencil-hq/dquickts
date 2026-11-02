@@ -57,7 +57,7 @@
  */
 
 static const uint8_t snap_magic[8] = { 'Q', 'J', 'S', 'S', 'N', 'A', 'P', '\n' };
-#define SNAP_FORMAT_VERSION 8
+#define SNAP_FORMAT_VERSION 10
 
 typedef enum {
     SNAP_KIND_FULL,
@@ -150,6 +150,8 @@ static int qp_snap_read_state(SnapReader *r, JSContext *ctx);
 static int qp_snap_write_code(SnapWriter *w, JSFunctionBytecode *b);
 static int qp_snap_read_code(SnapReader *r, JSFunctionBytecode *b);
 static int qp_snap_finish(SnapReader *r);
+static int qp_snap_write_record(SnapWriter *w, JSObject *p);
+static void qp_snap_writer_free(SnapWriter *w);
 static void qp_snap_reader_free(SnapReader *r);
 #endif
 /* module records (quickjs-snapshot-control.c) */
@@ -551,6 +553,10 @@ static int snap_natives_init(JSRuntime *rt, SnapNatives *n,
 typedef struct {
     void *ptr;
     SnapCellType type;
+    /* SNAP_CELL_OBJECT written as a Python C-API record (python/snapshot.c
+       qp_snap_write_record): its header names JS_CLASS_PY_NATIVE, the
+       class of the placeholder the reader allocates */
+    uint8_t py_record;
 } SnapCell;
 
 static void snap_cell_dup(SnapCell *c)
@@ -683,6 +689,10 @@ struct SnapWriter {
     DynBuf base_bodies;
     uint32_t *base_offsets;
     int base_offsets_size;
+    int cur_idx; /* cell whose body is being written */
+#ifdef QP_SNAPSHOT
+    void *py; /* python/snapshot.c writer state */
+#endif
 };
 
 static int snap_put_value(SnapWriter *w, JSValueConst val);
@@ -738,6 +748,7 @@ static int snap_put_ref(SnapWriter *w, SnapCellType type, void *ptr)
         c = &w->cells[w->cell_count++];
         c->ptr = ptr;
         c->type = type;
+        c->py_record = 0;
         snap_cell_dup(c);
         idx = w->base_cell_count + w->cell_count - 1;
         if (snap_queue(w, idx))
@@ -1277,6 +1288,13 @@ static int snap_write_object(SnapWriter *w, JSObject *p)
     JSProperty *pr;
     int i, flags;
 
+#ifdef QP_SNAPSHOT
+    /* C-extension objects (python/snapshot.c): a record instead of the
+       object (1 = not one) */
+    i = qp_snap_write_record(w, p);
+    if (i <= 0)
+        return i;
+#endif
     if (snap_put_obj(w, sh->proto))
         return -1;
     flags = 0;
@@ -1428,6 +1446,7 @@ static int snap_write_body(SnapWriter *w, int idx)
     /* the body is written in its own buffer to compare and measure it */
     w->bc.dbuf = w->scratch;
     w->bc.dbuf.size = 0;
+    w->cur_idx = idx;
     ret = snap_write_cell(w, &c);
     w->scratch = w->bc.dbuf;
     w->bc.dbuf = out;
@@ -1482,6 +1501,12 @@ static void snap_write_cell_header(SnapWriter *w, SnapCell *c)
     bc_put_u8(&w->bc, c->type);
     switch(c->type) {
     case SNAP_CELL_OBJECT:
+#ifdef QP_SNAPSHOT
+        if (c->py_record) {
+            bc_put_leb128(&w->bc, JS_CLASS_PY_NATIVE);
+            break;
+        }
+#endif
         bc_put_leb128(&w->bc, ((JSObject *)c->ptr)->class_id);
         break;
     case SNAP_CELL_FRAME:
@@ -1696,6 +1721,9 @@ static void snap_writer_free(SnapWriter *w)
     snap_natives_free(rt, &w->natives);
     js_free_rt(rt, w->bc.atom_to_idx);
     js_free_rt(rt, w->bc.idx_to_atom);
+#ifdef QP_SNAPSHOT
+    qp_snap_writer_free(w);
+#endif
 }
 
 uint8_t *JS_WriteSnapshot(JSContext *ctx, size_t *psize,
@@ -2975,6 +3003,7 @@ static JSContext *snap_new_context(JSRuntime *rt)
     ctx->regexp_ctor = JS_NULL;
     ctx->promise_ctor = JS_NULL;
     ctx->error_ctor = JS_NULL;
+    ctx->bigint_max_len = JS_BIGINT_MAX_SIZE;
     for(i = 0; i < JS_NATIVE_ERROR_COUNT; i++)
         ctx->native_error_proto[i] = JS_NULL;
     ctx->iterator_ctor = JS_NULL;
@@ -3593,6 +3622,11 @@ static int snap_attach_read_base(SnapReader *r)
         SnapCell *c = &base->cells[i];
         c->ptr = r->cells[i].ptr;
         c->type = r->cells[i].type;
+        c->py_record = 0;
+#ifdef QP_SNAPSHOT
+        c->py_record = c->type == SNAP_CELL_OBJECT &&
+            r->cells[i].u.class_id == JS_CLASS_PY_NATIVE;
+#endif
         snap_cell_dup(c);
         base->cell_count++;
         if (snap_map_add(rt, &base->cell_map, c->ptr, i))

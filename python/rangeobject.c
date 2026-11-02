@@ -155,8 +155,8 @@ static int qp_rg_cmp(JSValueConst a, JSValueConst b)
         return (x > y) - (x < y);
     }
     if (JS_VALUE_GET_TAG(a) == JS_TAG_BOOL || JS_VALUE_GET_TAG(b) == JS_TAG_BOOL) {
-        JSValue a1 = JS_VALUE_GET_TAG(a) == JS_TAG_BOOL ? JS_NewInt32(NULL, JS_VALUE_GET_BOOL(a)) : a;
-        JSValue b1 = JS_VALUE_GET_TAG(b) == JS_TAG_BOOL ? JS_NewInt32(NULL, JS_VALUE_GET_BOOL(b)) : b;
+        JSValueConst a1 = JS_VALUE_GET_TAG(a) == JS_TAG_BOOL ? JS_NewInt32(NULL, JS_VALUE_GET_BOOL(a)) : a;
+        JSValueConst b1 = JS_VALUE_GET_TAG(b) == JS_TAG_BOOL ? JS_NewInt32(NULL, JS_VALUE_GET_BOOL(b)) : b;
         return qp_long_compare(a1, b1);
     }
     return qp_long_compare(a, b);
@@ -503,7 +503,8 @@ static JSValue qp_range_subscript(JSContext *ctx, JSValueConst self, JSValueCons
 /* ob (exact int or bool) in r, without iterating (range_contains_long). */
 static int qp_range_contains_long(JSContext *ctx, QPRange *r, JSValueConst ob0)
 {
-    JSValue ob, tmp1, tmp2;
+    JSValueConst ob;
+    JSValue tmp1, tmp2;
     int res;
 
     ob = JS_VALUE_GET_TAG(ob0) == JS_TAG_BOOL ? JS_NewInt32(ctx, JS_VALUE_GET_BOOL(ob0)) : ob0;

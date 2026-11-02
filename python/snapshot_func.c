@@ -40,6 +40,11 @@ static int qp_snap_func_check_code(JSContext *ctx, JSObject *p)
         JS_ThrowInternalError(ctx, "snapshot: code object over non-Python bytecode");
         return -1;
     }
+    if (!QP_IS_NULL(c->fields) &&
+        (!qp_tuple_check(ctx, c->fields) || QP_TUPLE_SIZE(c->fields) != QP_CF__COUNT)) {
+        JS_ThrowInternalError(ctx, "snapshot: invalid code object fields");
+        return -1;
+    }
     return 0;
 }
 
@@ -145,6 +150,9 @@ static int qp_snap_write_func(SnapWriter *w, JSObject *p)
                 return -1;
             bc_put_sleb128(&w->bc, c->firstlineno);
             bc_put_u8(&w->bc, c->has_firstlineno != 0);
+            bc_put_leb128(&w->bc, c->flags_add);
+            if (snap_put_value(w, c->fields))
+                return -1;
         }
         return 0;
     default: /* JS_CLASS_PY_FRAME */
@@ -310,13 +318,16 @@ static int qp_snap_read_func(SnapReader *r, JSObject *p)
             c->name = QP_NULL;
             c->qualname = QP_NULL;
             c->filename = QP_NULL;
+            c->fields = QP_NULL;
             p->u.opaque = c;
             snap_payload_ready(r);
             if (snap_get_value(r, &c->name) ||
                 snap_get_value(r, &c->qualname) ||
                 snap_get_value(r, &c->filename) ||
                 bc_get_sleb128(&r->bc, &c->firstlineno) ||
-                bc_get_u8(&r->bc, &has_firstlineno))
+                bc_get_u8(&r->bc, &has_firstlineno) ||
+                bc_get_leb128(&r->bc, &c->flags_add) ||
+                snap_get_value(r, &c->fields))
                 return -1;
             if (has_firstlineno > 1)
                 return snap_error(r, "invalid code object");

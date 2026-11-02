@@ -54,7 +54,7 @@ typedef struct QPManagedBuffer {
 #define QP_MV_SCALAR     0x008
 
 #define QP_MV_MAX_NDIM   64     /* PyBUF_MAX_NDIM */
-#define QP_MV_FMT_MAX    16
+#define QP_MV_FMT_INLINE 16     /* formats shorter than this are stored inline */
 
 typedef struct QPMemoryView {
     uint8_t kind;               /* QP_BK_MEMORYVIEW */
@@ -68,7 +68,11 @@ typedef struct QPMemoryView {
     Py_ssize_t itemsize;
     int readonly;
     int ndim;
-    char format[QP_MV_FMT_MAX];
+    /* NUL-terminated struct format.  Heap memoryviews own it: format_inline
+       or js_malloc'd (qp_mv_set_format).  Stack descriptors of typed arrays
+       and QPBuffers borrow the exporter's string (qp_mv_borrow_format). */
+    const char *format;
+    char format_inline[QP_MV_FMT_INLINE];
     Py_ssize_t *shape;          /* ndim entries: dims1 or js_malloc'd */
     Py_ssize_t *strides;
     Py_ssize_t dims1[2];        /* inline shape[0], strides[0] for ndim <= 1 */
@@ -107,7 +111,6 @@ static BOOL qp_buffer_check(JSContext *ctx, JSValueConst v);
 static BOOL qp_index_check(JSContext *ctx, JSValueConst v);
 static int qp_bm_exc_clear_if(JSContext *ctx, QPType *type);
 static void qp_buffer_release_rt(JSRuntime *rt, QPBuffer *view);
-static JSValue qp_bm_raise_memory(JSContext *ctx);
 static JSValue qp_bytes_strhex(JSContext *ctx, const uint8_t *data, Py_ssize_t len,
                                JSValueConst sep, Py_ssize_t bytes_per_sep);
 static JSValue qp_bytes_from_hex(JSContext *ctx, JSValueConst string, int use_bytearray);

@@ -52,7 +52,11 @@ $(OBJDIR)/test_python_snapshot: $(OBJDIR)/test_python_snapshot.o $(PY_ENGINE_OBJ
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS) -ldl
 
 python-check: $(OBJDIR)/test_python_snapshot
-	./$(OBJDIR)/test_python_snapshot
+	QPYHOME=$(abspath $(Q)) ./$(OBJDIR)/test_python_snapshot
+
+# C-extension state: needs the top-level build (libqpcapi.a)
+python-capi-check:
+	$(MAKE) -C $(Q) test-snapshot-capi
 
 $(OBJDIR):
 	mkdir -p $@
@@ -92,7 +96,7 @@ stress:
 clean:
 	rm -rf build build-asan build-stress build-asan-stress
 
-.PHONY: all check python-check stress clean
+.PHONY: all check python-check python-capi-check stress clean
 .SECONDARY:
 
 -include $(wildcard $(OBJDIR)/*.d)

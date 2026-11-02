@@ -1,8 +1,9 @@
 # Expected-failing L0 golden scripts: one `group/NNN_name` per line, sorted.
 # Rewritten by `python3.15 tests/py/run.py l0 -u` (header comment lines are kept).
-# types/032-034: documented deviation (doc/python-plan.md §8 "str and UTF-16"):
+# types/031-034: documented deviation (doc/python-plan.md §8 "str and UTF-16"):
 # a str holding a lone-surrogate pair is stored as UTF-16 and reads as one
-# astral character.
+# astral character (031: "\ud83d\ude00".encode("utf-8", "surrogatepass")).
+types/031_str_encode
 types/032_str_ops_ordchr
 types/033_str_nonbmp
 types/034_str_repr

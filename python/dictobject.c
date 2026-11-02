@@ -28,7 +28,7 @@
 
 /* setobject.c (same unit (f)) */
 static int qp_init_sets(JSContext *ctx);
-static void qp_setiter_finalizer(JSRuntime *rt, JSValueConst val);
+static void qp_setiter_finalizer(JSRuntime *rt, JSValue val);
 static void qp_setiter_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 
 /* View / iterator kinds */
@@ -1729,7 +1729,7 @@ static const QPTypeSpec qp_dict_spec = {
            "dict(**kwargs) -> new dictionary initialized with the name=value pairs\n"
            "    in the keyword argument list.  For example:  dict(one=1, two=2)",
     .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_BASETYPE | QP_TPFLAGS_DICT_SUBCLASS |
-             QP_TPFLAGS_MATCH_SELF | QP_TPFLAGS_MAPPING,
+             QP_TPFLAGS_MATCH_SELF | QP_TPFLAGS_MAPPING | QP_TPFLAGS_IMMUTABLETYPE,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_DICT,
@@ -1770,7 +1770,7 @@ static const QPTypeSpec qp_frozendict_spec = {
            "frozendict(**kwargs) -> new immutable dictionary initialized with the name=value\n"
            "    pairs in the keyword argument list.  For example:  frozendict(one=1, two=2)",
     .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_BASETYPE | QP_TPFLAGS_MATCH_SELF |
-             QP_TPFLAGS_MAPPING,
+             QP_TPFLAGS_MAPPING | QP_TPFLAGS_IMMUTABLETYPE,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_FROZENDICT,
@@ -1929,10 +1929,9 @@ static JSValue qp_dictiter_m_reduce(JSContext *ctx, JSValueConst self, JSValueCo
         }
         JS_FreeValue(ctx, dict);
     }
-    if (qp_dict_get_item_atom(ctx, QP_STATE(ctx)->builtins_dict, QP_ATOM(ctx, iter), &iter_fn) <= 0) {
+    iter_fn = qp_eval_get_builtin(ctx, QP_ATOM(ctx, iter));
+    if (JS_IsException(iter_fn)) {
         JS_FreeValue(ctx, list);
-        if (!JS_HasException(ctx))
-            qp_raise(ctx, QP_EXC(ctx, AttributeError), "iter");
         return JS_EXCEPTION;
     }
     tup = qp_tuple_new_steal(ctx, 1, &list);
@@ -1959,7 +1958,8 @@ static const QPMethodDef qp_dictiter_methods[] = {
 #define QP_DICTITER_SPEC(cname, tpname)                                       \
 static const QPTypeSpec cname = {                                             \
     .name = tpname,                                                           \
-    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_DISALLOW_INSTANTIATION,          \
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_DISALLOW_INSTANTIATION |         \
+             QP_TPFLAGS_IMMUTABLETYPE,                                        \
     .base = -1,                                                               \
     .exc_base = -1,                                                           \
     .instance_class_id = JS_CLASS_PY_DICT_ITER,                               \
@@ -2439,7 +2439,7 @@ static const QPGetSetDef qp_dictview_getsets[] = {
 
 static const QPTypeSpec qp_dict_keys_spec = {
     .name = "dict_keys",
-    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_DISALLOW_INSTANTIATION,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_DISALLOW_INSTANTIATION | QP_TPFLAGS_IMMUTABLETYPE,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_DICT_VIEW,
@@ -2465,7 +2465,7 @@ static const QPTypeSpec qp_dict_keys_spec = {
 
 static const QPTypeSpec qp_dict_items_spec = {
     .name = "dict_items",
-    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_DISALLOW_INSTANTIATION,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_DISALLOW_INSTANTIATION | QP_TPFLAGS_IMMUTABLETYPE,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_DICT_VIEW,
@@ -2491,7 +2491,7 @@ static const QPTypeSpec qp_dict_items_spec = {
 
 static const QPTypeSpec qp_dict_values_spec = {
     .name = "dict_values",
-    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_DISALLOW_INSTANTIATION,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_DISALLOW_INSTANTIATION | QP_TPFLAGS_IMMUTABLETYPE,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_DICT_VIEW,
@@ -2677,7 +2677,7 @@ static const QPMethodDef qp_mappingproxy_methods[] = {
 static const QPTypeSpec qp_mappingproxy_spec = {
     .name = "mappingproxy",
     .doc = "mappingproxy(mapping)\n--\n\nRead-only proxy of a mapping.",
-    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_MAPPING,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_MAPPING | QP_TPFLAGS_IMMUTABLETYPE,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_DICT_VIEW,

@@ -15,9 +15,24 @@ Modes:
 ``selfcontained``
     Replay each self-contained, side-effect-free cell in a fresh kernel pair.
 
-Per cell the responses are compared after replacing each side's scratch and
-TMP paths with ``<SCRATCH>`` / ``<TMP>``: ``stdout``, ``display`` and the
-exception type must be equal; a differing exception message alone is "soft".
+Per cell the responses are compared after replacing, on each side, strings
+that are environmental rather than behavioural with placeholders:
+
+- the kernel's scratch and TMP paths (``<SCRATCH>`` / ``<TMP>``);
+- ``sys.version`` (``<SYS.VERSION>``): it embeds the build date and compiler;
+- ``sys.executable`` (``<EXECUTABLE>``): where each interpreter is installed;
+- the stdlib directory, i.e. the directory of ``os.py`` and its realpath
+  (``<STDLIB>``): ``pylib/`` vs. the CPython install's ``lib/python3.15``,
+  so module ``__file__`` paths compare equal.
+
+The kernel reports the last three in its ``info`` reply at start; the
+strings of both interpreters are replaced in both outputs (a cell may run
+either interpreter by path).  Both
+kernels also hide third-party packages (``kernel.drop_site_packages``): the
+packages pip-installed for each interpreter are host state, so ``sys.path``
+ends before the first site-packages directory on both sides.  Then
+``stdout``, ``display`` and the exception type must be equal; a differing
+exception message alone is "soft".
 After the first divergence in a session the remaining cells still run but
 are reported as "after-divergence" and excluded from the match percentage.
 A kernel crash or timeout restarts both kernels and counts as a divergence.
@@ -212,21 +227,14 @@ class Kernel:
         # Real paths: the sandbox matches resolved paths (/private/var/..., not /var/...).
         self.scratch = os.path.realpath(scratch)
         self.tmp = os.path.realpath(tmp)
+        self.info: dict[str, Any] = {}
         self._replacements = self._path_replacements()
         self.proc: subprocess.Popen[bytes] | None = None
         self._buf = bytearray()
         self._stderr: collections.deque[str] = collections.deque(maxlen=40)
 
-    def _path_replacements(self) -> list[tuple[str, str]]:
-        pairs = []
-        for real, placeholder in ((self.scratch, "<SCRATCH>"), (self.tmp, "<TMP>")):
-            pairs.append((real, placeholder))
-            if real.startswith("/private/"):
-                pairs.append((real[len("/private"):], placeholder))
-        return sorted(pairs, key=lambda pair: len(pair[0]), reverse=True)
-
     def normalize(self, text: str | None) -> str | None:
-        """Replace this kernel's scratch/TMP paths with placeholders."""
+        """Replace this kernel's scratch/TMP paths and interpreter strings with placeholders."""
         if text is None:
             return None
         for path, placeholder in self._replacements:
@@ -267,6 +275,49 @@ class Kernel:
         if response != {"ok": True}:
             self.stop()
             raise KernelCrash(f"kernel failed to start: unexpected reply {response!r}")
+        try:
+            self.send({"op": "info"})
+            info = self.receive(time.monotonic() + STARTUP_TIMEOUT)
+        except (KernelCrash, KernelTimeout) as e:
+            self.stop()
+            raise KernelCrash(f"kernel info request failed ({e}): {self.stderr_tail()}") from e
+        self.info = info if isinstance(info, dict) else {}
+        self._replacements = self._path_replacements(self.info)
+
+    def share_info(self, other: Kernel) -> None:
+        """Also replace the other kernel's interpreter strings (a cell may run
+        either interpreter by path, e.g. a hardcoded python3.15 under the IUT)."""
+        merged = {key: [] for key in ("version", "executable", "stdlib")}
+        for info in (self.info, other.info):
+            for key in ("version", "executable"):
+                if isinstance(info.get(key), str):
+                    merged[key].append(info[key])
+            merged["stdlib"].extend(info.get("stdlib") or ())
+        self._replacements = self._path_replacements(merged)
+
+    def _path_replacements(self, info: dict[str, Any] | None = None) -> list[tuple[str, str]]:
+        """(text, placeholder) pairs, longest text first.
+
+        Scratch/TMP paths always; with the kernel's ``info`` reply also the
+        interpreter strings that differ between hosts and builds: the full
+        ``sys.version`` (build date, compiler), ``sys.executable`` and the
+        stdlib directory (the directory of ``os.py`` and its realpath).
+        """
+        pairs = []
+        for real, placeholder in ((self.scratch, "<SCRATCH>"), (self.tmp, "<TMP>")):
+            pairs.append((real, placeholder))
+            if real.startswith("/private/"):
+                pairs.append((real[len("/private"):], placeholder))
+        if info:
+            for key, placeholder in (("version", "<SYS.VERSION>"), ("executable", "<EXECUTABLE>")):
+                values = info.get(key)
+                for value in values if isinstance(values, list) else [values]:
+                    if isinstance(value, str) and value:
+                        pairs.append((value, placeholder))
+            for path in info.get("stdlib") or ():
+                if isinstance(path, str) and len(path) > 1:
+                    pairs.append((path, "<STDLIB>"))
+        return sorted(pairs, key=lambda pair: len(pair[0]), reverse=True)
 
     def _drain_stderr(self, proc: subprocess.Popen[bytes]) -> None:
         for line in proc.stderr:
@@ -524,6 +575,8 @@ def _start_pair(a: Kernel, b: Kernel) -> str | None:
         a.stop()
         b.stop()
         return str(e)
+    a.share_info(b)
+    b.share_info(a)
     return None
 
 

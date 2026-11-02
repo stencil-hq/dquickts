@@ -832,10 +832,15 @@
                 }
                 JS_FreeValue(ctx, sp[-1]);
                 sp[-1] = res;
-                if (r == QP_SEND_RETURN)
+                if (r == QP_SEND_RETURN) {
+                    /* M6: sys.settrace 'exception' StopIteration (END_SEND) */
+                    if (unlikely(ctx->py->trace_active) &&
+                        qp_trace_send_return(ctx, sf, sp[-4], res) < 0)
+                        goto exception;
                     pc += (int32_t)get_u32(pc);
-                else
+                } else {
                     pc += 4;
+                }
             }
             PY_NEXT;
         PYCASE(yield_value):
