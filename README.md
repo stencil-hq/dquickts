@@ -47,10 +47,11 @@ fork adds:
 
 | Feature | API |
 | --- | --- |
-| In-process suspension of running code | `JS_RequestSuspend()`, `JS_IsSuspended()`, `JS_Resume()`, `JS_GetProgramBranchCount()` |
+| In-process suspension of running code | `JS_RequestSuspend()`, `JS_IsSuspended()`, `JS_Resume()` |
 | Durable host calls: a C function parks its JS caller until the host supplies a result | `JS_SuspendCall()`, `JS_ResumeWith()` |
 | Heap snapshots of a whole runtime, including a suspended call stack | `JS_WriteSnapshot()`, `JS_ReadSnapshot()` |
 | Incremental snapshots: a delta holds only what changed since a base | `JS_SNAPSHOT_BASE`, `JS_SNAPSHOT_DELTA`, `JS_DropSnapshotBase()` |
+| Branch metering that stays exact across suspensions and snapshots | `JS_GetProgramBranchCount()` |
 | TypeScript: types erased at parse time; enums, namespaces and parameter properties compiled to bytecode | `JS_EVAL_FLAG_TYPESCRIPT`, `qjs --typescript`, `.ts`/`.mts`/`.cts` |
 | Standard decorators (2023-05), auto-accessors, `Symbol.metadata`; TypeScript legacy decorators and decorator metadata | `JS_EVAL_FLAG_TS_LEGACY_DECORATORS`, `JS_EVAL_FLAG_TS_DECORATOR_METADATA` |
 | Explicit resource management (ES2026) | `using`, `await using`, `DisposableStack`, `AsyncDisposableStack` |
@@ -355,7 +356,7 @@ The implementation is in `quickjs-snapshot.c` (format, writer, reader, frames),
 `quickjs-snapshot-control.c` (generators, promises, iterators, Proxy, disposable stacks,
 modules). `quickjs.c` `#include`s all three, so embedders compile nothing extra.
 
-**Suspension.** QuickJS already polls an interrupt counter at backward and conditional branches.
+**Suspension.** QuickJS already polls an interrupt counter at every goto and conditional jump.
 The counter fires every 10,000 branches by default (`JS_INTERRUPT_COUNTER_INIT`). When a
 suspension is pending and the counter fires, the engine checks whether the whole call stack is
 suspendable. That holds when:
@@ -376,9 +377,12 @@ safepoint. That includes getters and setters, `valueOf`/`toString` conversions, 
 `forEach`/`JSON.stringify` callbacks, `eval` code and promise jobs. Because of this rule, the
 engine never has to save a C stack.
 
-`JS_GetProgramBranchCount(ctx)` returns the number of backward and conditional branches executed in
-`ctx`. It increments unconditionally at every safepoint and is not saved in snapshots (a restored
-context starts at zero), so summing it across hibernated slices equals an uninterrupted run.
+`JS_GetProgramBranchCount(ctx)` returns the number of branch instructions (gotos and conditional
+jumps, forward or backward, taken or not) executed by the functions of the realm `ctx`; a function
+counts in its own realm even when another context calls it. Snapshots do not save the count (a
+restored context starts at zero), so summing it across hibernated slices equals an uninterrupted
+run. Work done inside native functions (RegExp matching, BigInt arithmetic, sorting) adds nothing,
+so the count does not bound CPU time: the interrupt handler does.
 
 **Writing.** The writer walks the heap from the roots:
 

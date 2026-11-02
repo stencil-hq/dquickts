@@ -1534,7 +1534,7 @@ It is used by the command line interpreter to implement a
 A running synchronous execution can be suspended in-process and
 resumed later. @code{JS_RequestSuspend()}, typically called from the
 interrupt handler, asks for a suspension at the next safepoint (a
-backward or conditional branch reached when the interrupt counter
+goto or conditional jump reached when the interrupt counter
 expires). The host call which started the execution (@code{JS_Eval()}
 of a script, @code{JS_Call()}, @code{JS_CallConstructor()}...) then
 returns @code{JS_EXCEPTION} and @code{JS_IsSuspended()} returns
@@ -1570,11 +1570,15 @@ a result that only exists after a hibernation. The caller must call
 the C function directly from a suspendable stack, otherwise
 @code{JS_SuspendCall()} throws a @code{TypeError}.
 
-@code{JS_GetProgramBranchCount(ctx)} returns the number of bytecode
-branch safepoints (backward and conditional branches) executed in
-@code{ctx}. It increments unconditionally and is not saved in snapshots
-(a context restored with @code{JS_ReadSnapshot()} starts at zero), so
-summing it across hibernated slices equals an uninterrupted execution.
+@code{JS_GetProgramBranchCount(ctx)} returns the number of branch
+instructions (gotos and conditional jumps, forward or backward, taken
+or not) executed by the functions of the realm @code{ctx}; a function
+counts in its own realm even when another context calls it. Snapshots
+do not save the count (a context restored with @code{JS_ReadSnapshot()}
+starts at zero), so summing it across hibernated slices equals an
+uninterrupted execution. Work done inside native functions (RegExp
+matching, BigInt arithmetic, sorting) adds nothing, so the count does
+not bound CPU time: the interrupt handler does.
 
 @subsection Heap snapshots
 

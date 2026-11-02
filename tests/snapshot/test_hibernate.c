@@ -303,7 +303,7 @@ int main(int argc, char **argv)
             printf("FAIL %s\n--- expected:\n%s--- got:\n%s", argv[i], expected, got);
             failed++;
         } else if (plain.branches != st.branches) {
-            printf("FAIL %s: branch count %llu != %llu\n", argv[i],
+            printf("FAIL %s: %llu branches hibernated, %llu plain\n", argv[i],
                    (unsigned long long)st.branches,
                    (unsigned long long)plain.branches);
             failed++;

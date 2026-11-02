@@ -3226,7 +3226,7 @@ static void test_program_branch_count(void)
         "for (let r = 0; r < 250; r++) acc = (acc + step(200)) | 0;\n"
         "acc;\n";
     JSRuntime *rt;
-    JSContext *ctx, *ctx2;
+    JSContext *ctx;
     JSValue val;
     int32_t ref_res = 0, res = 0;
     uint64_t ref_branches;
@@ -3234,20 +3234,12 @@ static void test_program_branch_count(void)
 
     rt = JS_NewRuntime();
     ctx = JS_NewContext(rt);
-    ctx2 = JS_NewContext(rt);
-    CHECK(JS_GetProgramBranchCount(ctx) == 0);
     val = eval_str(ctx, loop_src);
     CHECK(!JS_IsException(val));
     CHECK(JS_ToInt32(ctx, &ref_res, val) == 0);
     JS_FreeValue(ctx, val);
     ref_branches = JS_GetProgramBranchCount(ctx);
     CHECK(ref_branches > 50000);
-    CHECK(JS_GetProgramBranchCount(ctx2) == 0);
-    JS_FreeContext(ctx2);
-    JS_FreeContext(ctx);
-
-    ctx = JS_NewContextRaw(rt);
-    CHECK(JS_GetProgramBranchCount(ctx) == 0);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 

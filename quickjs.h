@@ -1382,18 +1382,21 @@ JSInterruptHandler *JS_GetInterruptHandler(JSRuntime *rt, void **popaque);
    'ctx', e.g. in a native function. */
 void JS_TriggerInterruptHandler(JSContext *ctx);
 
-/* Return the number of executed bytecode branch safepoints (backward and
-   conditional branches) in 'ctx'. Incremented unconditionally and not
-   saved in snapshots (a restored context starts at zero), so summing it
-   over the slices of a suspended-and-restored run gives the count of the
-   uninterrupted run. */
+/* Return the number of branch instructions (gotos and conditional jumps,
+   forward or backward, taken or not) executed by the functions of the
+   realm 'ctx', including when another context calls them. Snapshots do
+   not save it (a restored context starts at zero), so summing it over
+   the slices of a suspended-and-restored run gives the count of the
+   uninterrupted run. Work done inside native functions (RegExp
+   matching, BigInt arithmetic, sorting) adds nothing: the count does
+   not bound CPU time, the interrupt handler does. */
 uint64_t JS_GetProgramBranchCount(JSContext *ctx);
 
 /* Suspension
 
    A running synchronous execution can be suspended in-process, then
    resumed (or saved with JS_WriteSnapshot()). The suspension happens at
-   a backward or conditional branch of the bytecode, when the interrupt
+   a goto or conditional jump of the bytecode, when the interrupt
    counter expires (i.e. at the next interrupt handler call), and only
    if the whole call stack is suspendable:
    - every frame is a normal (non generator, non async) JS function,
