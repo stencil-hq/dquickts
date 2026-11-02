@@ -692,3 +692,9 @@ benchmarks: run_sunspider_like run_octane
 	./run_octane $(BENCHMARKDIR)/
 
 -include $(wildcard $(OBJDIR)/*.d)
+
+# Pinned pure-Python stdlib subset (pylib/MANIFEST.txt) from cpython/Lib at
+# $(CPYTHON_TAG); `tools/pylib_sync.py --check` verifies, `--manifest` regenerates.
+.PHONY: pylib-sync
+pylib-sync:
+	$(HOST_PYTHON) tools/pylib_sync.py
