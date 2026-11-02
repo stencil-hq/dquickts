@@ -1,0 +1,80 @@
+# CPython 3.15.2 accelerator modules built into qpy (plan D5, Tier S).
+#
+# Read by capi/setup.awk (Makefile: $(CAPI_OBJDIR)/Setup.mk and
+# capi_inittab.c) and by tools/capi_sync.py (the sources to vendor from
+# cpython/Modules into capi/modules/).
+#
+# Line format (whitespace separated, `#` starts a comment):
+#
+#     name  [@cond ...]  source.c ...  [-flag ...]
+#     +     [@cond ...]  source.c ...  [-flag ...]
+#
+# - `name` registers the module `name` (inittab entry {"name", PyInit_name});
+#   `+` adds objects to the module of the previous `name` line.
+# - Sources are paths under capi/modules/ (the layout of cpython/Modules).
+#   An object shared by several modules is compiled once, with the flags
+#   of its first line.
+# - Flags apply to the sources of their line; $(VARS) are expanded by make
+#   (Makefile variables: CAPI_HACL_CFLAGS, CAPI_EXPAT_CFLAGS,
+#   CAPI_<COND>_CFLAGS, CAPI_BINASCII_CFLAGS: zlib's crc32 when zlib is on).
+# - `@cond` keeps the line only when the condition is enabled by the
+#   Makefile (CAPI_CONDS).  On a `name` line it disables the whole module.
+#   Conditions: zlib bz2 lzma sqlite3 ssl (OpenSSL >= 1.1.1 through
+#   pkg-config), expat (bundled capi/modules/expat, the default) and
+#   system_expat (CONFIG_PYTHON_CAPI_SYSTEM_EXPAT=y), x86_64 (SIMD HACL*).
+#
+# Not built from CPython: _decimal (needs the libmpdec sources; decimal
+# falls back to Lib/_pydecimal.py), _contextvars (our own module, the C API
+# bridges PyContext_* to it), _hmac and the other modules outside the D5
+# list.
+
+_sre            _sre/sre.c
+itertools       itertoolsmodule.c
+_collections    _collectionsmodule.c
+_functools      _functoolsmodule.c
+_struct         _struct.c
+math            mathmodule.c
+_math_integer   mathintegermodule.c
+cmath           cmathmodule.c
+_json           _json.c
+_datetime       _datetimemodule.c
+binascii        binascii.c $(CAPI_BINASCII_CFLAGS)
+_bisect         _bisectmodule.c
+_heapq          _heapqmodule.c
+_random         _randommodule.c
+unicodedata     unicodedata.c
+array           arraymodule.c
+_socket         socketmodule.c
+_csv            _csv.c
+_operator       _operator.c
+_pickle         _pickle.c
+_opcode         _opcode.c
+_statistics     _statisticsmodule.c
+_asyncio        _asynciomodule.c
+_queue          _queuemodule.c
+
+# HACL*-based hashes (Modules/_hacl, compiled with CPython's LIBHACL flags)
+_md5            md5module.c $(CAPI_HACL_CFLAGS)
++               _hacl/Hacl_Hash_MD5.c $(CAPI_HACL_CFLAGS)
+_sha1           sha1module.c $(CAPI_HACL_CFLAGS)
++               _hacl/Hacl_Hash_SHA1.c $(CAPI_HACL_CFLAGS)
+_sha2           sha2module.c $(CAPI_HACL_CFLAGS)
++               _hacl/Hacl_Hash_SHA2.c $(CAPI_HACL_CFLAGS)
+_sha3           sha3module.c $(CAPI_HACL_CFLAGS)
++               _hacl/Hacl_Hash_SHA3.c $(CAPI_HACL_CFLAGS)
+_blake2         blake2module.c $(CAPI_HACL_CFLAGS)
++               _hacl/Hacl_Hash_Blake2s.c _hacl/Hacl_Hash_Blake2b.c _hacl/Lib_Memzero0.c $(CAPI_HACL_CFLAGS)
++ @x86_64       _hacl/Hacl_Hash_Blake2s_Simd128.c $(CAPI_HACL_CFLAGS) -msse -msse2 -msse3 -msse4.1 -msse4.2 -DHACL_CAN_COMPILE_VEC128
++ @x86_64       _hacl/Hacl_Hash_Blake2b_Simd256.c $(CAPI_HACL_CFLAGS) -mavx2 -DHACL_CAN_COMPILE_VEC256
+
+# pyexpat: the bundled expat (Modules/expat) unless system_expat
+pyexpat         pyexpat.c $(CAPI_EXPAT_CFLAGS)
++ @expat        expat/xcs.c expat/xmlparse.c expat/xmlrole.c expat/xmltok.c $(CAPI_EXPAT_CFLAGS)
+
+# system libraries (pkg-config; optional, see the Makefile switches)
+zlib            @zlib    zlibmodule.c $(CAPI_ZLIB_CFLAGS)
+_bz2            @bz2     _bz2module.c $(CAPI_BZ2_CFLAGS)
+_lzma           @lzma    _lzmamodule.c $(CAPI_LZMA_CFLAGS)
+_sqlite3        @sqlite3 _sqlite/blob.c _sqlite/connection.c _sqlite/cursor.c _sqlite/microprotocols.c _sqlite/module.c _sqlite/prepare_protocol.c _sqlite/row.c _sqlite/statement.c _sqlite/util.c $(CAPI_SQLITE3_CFLAGS)
+_ssl            @ssl     _ssl.c $(CAPI_SSL_CFLAGS)
+_hashlib        @ssl     _hashopenssl.c $(CAPI_SSL_CFLAGS)
