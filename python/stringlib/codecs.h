@@ -273,7 +273,7 @@ InvalidContinuation3:
    dquickts: 'strict' error handling only.  Writes the encoding of
    data[0:size] to p, which must have room for size * max_char_size bytes
    (1: 2, 2: 3, 4: 4).  Returns the end of the written bytes.  When a
-   surrogate is met, stops and sets *err_start/*err_end to the run of
+   surrogate is met, stops and sets *err_start and *err_end to the run of
    consecutive surrogates (CPython's startpos/endpos for the "surrogates not
    allowed" UnicodeEncodeError) and returns NULL; *err_start is untouched on
    success. */

@@ -213,7 +213,7 @@
 #define BCinfo qp_dg_BCinfo
 
 #define MALLOC qp_sys_malloc
-#define FREE qp_sys_free
+#define QP_DTOA_FREE qp_sys_free
 
 /* This code should also work for ARM mixed-endian format on little-endian
    machines, where doubles have byte order 45670123 (in increasing address
@@ -416,7 +416,7 @@ static void
 Bfree(Bigint *v)
 {
     if (v) {
-        FREE((void*)v);
+        QP_DTOA_FREE((void*)v);
     }
 }
 
@@ -2786,7 +2786,7 @@ _Py_dg_dtoa(double dd, int mode, int ndigits,
 #undef Bigint
 #undef BCinfo
 #undef MALLOC
-#undef FREE
+#undef QP_DTOA_FREE
 #undef IEEE_8087
 #undef IEEE_MC68k
 #undef Bug
@@ -4680,7 +4680,8 @@ qp_fu_fill_number(DynBuf *out, const qp_fu_NumberFieldWidths *spec,
     }
 
     p = qp_fu_reserve(out, spec->n_grouped_digits);
-    if (!p)
+    /* p is NULL for an empty claim on an empty buffer ('c' formatting) */
+    if (!p && spec->n_grouped_digits)
         return;
     /* Only for type 'c' special case, it has no digits. */
     if (spec->n_digits != 0) {
@@ -5858,6 +5859,24 @@ qp_hash_buffer(const void *ptr, size_t len, const uint8_t key[16])
     qp_siphash13_init(&st, key);
     qp_siphash13_update(&st, ptr, len);
     return qp_hash_fix(qp_siphash13_final(&st));
+}
+
+/* _Py_KeyedHash(): raw siphash13(k0 = key, k1 = 0) of the buffer, no
+   empty-input or -1 adjustment (_imp.source_hash). */
+static uint64_t
+qp_keyed_hash(uint64_t key, const void *ptr, size_t len)
+{
+    qp_siphash13_state st;
+    uint8_t k[16];
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        k[i] = (uint8_t)(key >> (8 * i));
+        k[8 + i] = 0;
+    }
+    qp_siphash13_init(&st, k);
+    qp_siphash13_update(&st, ptr, len);
+    return qp_siphash13_final(&st);
 }
 
 /* hash(str) of an 8-bit string: the UCS1 representation. */

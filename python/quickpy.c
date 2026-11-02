@@ -13,7 +13,14 @@
  */
 #define QUICKPY_INTERNAL
 
+/* Headers (compat.h, ast.h, object.h, ceval.h are already included by
+   quickjs.c before the interpreter). */
 #include "compat.h"
+#include "unicodetype.h"
+#include "stringlib.h"
+#include "sort.h"
+#include "numfmt.h"
+#include "dictcore.h"
 #include "ast.h"
 #include "token.h"
 #include "lexer.h"
@@ -21,6 +28,8 @@
 #include "symtable.h"
 #include "validate.h"
 #include "quickpy.h"
+
+/* M1 front end */
 #include "ast.c"
 #include "ast_json.c"
 #include "token.c"
@@ -30,6 +39,79 @@
 #include "parser.c"
 #include "symtable.c"
 #include "validate.c"
+
+/* M2 leaf libraries */
+#include "unicodetype.c"
+#include "stringlib.c"
+#include "sort.c"
+#include "numfmt.c"
+#include "dictcore.c"
+
+/* M2 object model (python/object.h sections a..l) */
+#include "ceval.c"
+#include "funcobject.c"
+#include "codeobject.c"
+#include "frameobject.c"
+/* compile.h defines codegen-private VISIT/LOCATION macros that symtable.c
+   also defines and #undefs, so it must come after symtable.c. */
+#include "compile.h"
+#include "compile.c"
+#include "longobject.c"
+#include "floatobject.c"
+#include "complexobject.c"
+#include "unicodeobject.c"
+#include "unicode_format.c"
+#include "templateobject.c"
+#include "tupleobject.c"
+#include "listobject.c"
+#include "rangeobject.c"
+#include "sliceobject.c"
+#include "iterobject.c"
+#include "dictobject.c"
+#include "setobject.c"
+#include "bytesobject.c"
+#include "bytearrayobject.c"
+#include "memoryobject.c"
+#include "typeobject.c"
+#include "descrobject.c"
+#include "object.c"
+#include "abstract.c"
+#include "exceptions.c"
+#include "errors.c"
+#include "traceback.c"
+#include "genobject.c"
+#include "getargs.c"
+#include "bltinmodule.c"
+#include "sysmodule.c"
+#include "typevarobject.c"
+#include "genericaliasobject.c"
+#include "structseq.c"
+#include "moduleobject.c"
+#include "import.c"
+#include "pythonrun.c"
+
+/* native modules: inittab entries live in config.c */
+#include "modstate.h"
+#include "mod_misc.c"
+#include "mod_weakref.c"
+#include "mod_thread.c"
+#include "mod_time.c"
+#include "mod_errno.c"
+#include "mod_stat.c"
+#include "mod_posix.c"
+#include "mod_select.c"
+#include "mod_posixsubprocess.c"
+#include "mod_codecs.c"
+#include "mod_locale.c"
+#include "mod_io.c"
+#include "mod_imp.c"
+/* Boot is activated by including importlib_boot.h before pythonrun.c
+   (QP_IMPORTLIB_BOOT); enabled once the M2 core passes L0. */
+#include "importlib_boot.h"
+#include "importlib_boot.c"
+#include "config.c"
+/* heap snapshot hooks of quickjs-snapshot.c (M4Snapshot); after config.c */
+#include "snapshot.c"
 
 /* _Py_SourceAsString(): compile() rejects sources with embedded NUL bytes
    before parsing. */

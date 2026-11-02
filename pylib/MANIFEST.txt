@@ -20,7 +20,7 @@
 #   tokenize unittest doctest argparse logging weakref threading queue
 #   signal locale codecs encodings fnmatch posixpath genericpath stat errno
 #   numbers reprlib gettext selectors socket tarfile zipfile gzip bz2 lzma
-#   calendar email html http asyncio pdb site sysconfig platform uuid
+#   calendar email html http asyncio pdb site sysconfig platform uuid _pyio
 
 __future__.py
 _aix_support.py
@@ -36,6 +36,7 @@ _py_abc.py
 _py_warnings.py
 _pydatetime.py
 _pydecimal.py
+_pyio.py
 _pyrepl/__init__.py
 _pyrepl/_module_completer.py
 _pyrepl/_threading_handler.py
@@ -241,7 +242,7 @@ zipimport.py
 #   _string                      <- string
 #   _struct                      <- struct
 #   _sysconfig                   <- sysconfig
-#   _thread                      <- _py_warnings, _strptime, functools, reprlib, +2 more
+#   _thread                      <- _py_warnings, _pyio, _strptime, functools, +3 more
 #   _tokenize                    <- tokenize
 #   _tracemalloc                 <- tracemalloc
 #   _typing                      <- typing
@@ -252,7 +253,7 @@ zipimport.py
 #   atexit                       <- logging, multiprocessing.forkserver, multiprocessing.popen_fork, multiprocessing.util, +4 more
 #   binascii                     <- <root>, base64, email._encoded_words, email.base64mime, +8 more
 #   builtins                     <- _colorize, _py_warnings, _pyrepl.readline, _pyrepl.utils, +23 more
-#   errno                        <- <root>, _pyrepl.main, _pyrepl.terminfo, _pyrepl.unix_console, +22 more
+#   errno                        <- <root>, _pyio, _pyrepl.main, _pyrepl.terminfo, +23 more
 #   fcntl                        <- _pyrepl.unix_console, pathlib._os, subprocess
 #   gc                           <- weakref
 #   itertools                    <- <root>, _pydecimal, _pyrepl._module_completer, asyncio.base_events, +41 more
@@ -263,7 +264,7 @@ zipimport.py
 #   pyexpat                      <- xml.parsers.expat
 #   readline                     <- asyncio.__main__, cmd, code, pdb, +3 more
 #   select                       <- _pyrepl.unix_console, logging.config, pydoc, selectors, +1 more
-#   sys                          <- _aix_support, _ast_unparse, _collections_abc, _colorize, +150 more
+#   sys                          <- _aix_support, _ast_unparse, _collections_abc, _colorize, +151 more
 #   termios                      <- _pyrepl.fancy_termios, _pyrepl.pager, _pyrepl.unix_console, _pyrepl.unix_eventqueue, +1 more
 #   time                         <- <root>, _pydatetime, _pyrepl.commands, _pyrepl.unix_console, +37 more
 #   unicodedata                  <- <root>, _pyrepl.input, _pyrepl.utils, encodings.idna, +4 more
@@ -303,7 +304,7 @@ zipimport.py
 #   _overlapped                  <- asyncio.windows_events
 #   _winapi                      <- asyncio.windows_events, asyncio.windows_utils, logging.handlers, mimetypes, +11 more
 #   _wmi                         <- platform
-#   msvcrt                       <- asyncio.windows_events, asyncio.windows_utils, multiprocessing.popen_spawn_win32, multiprocessing.spawn, +1 more
+#   msvcrt                       <- _pyio, asyncio.windows_events, asyncio.windows_utils, multiprocessing.popen_spawn_win32, +2 more
 #   nt                           <- _colorize, _pyrepl.windows_console, ctypes, importlib._bootstrap_external, +3 more
 #   winreg                       <- importlib._bootstrap_external, logging.handlers, mimetypes, platform, +1 more
 

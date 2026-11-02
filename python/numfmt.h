@@ -334,6 +334,9 @@ static __maybe_unused qp_hash_t qp_hash_complex(double re, double im, uintptr_t 
    16 bytes of CPython's _Py_HashSecret).  Empty buffer -> 0; -1 -> -2.
    This is hash(bytes) (and memoryview/bytearray-derived hashes). */
 static __maybe_unused qp_hash_t qp_hash_buffer(const void *ptr, size_t len, const uint8_t key[16]);
+/* _Py_KeyedHash(): raw SipHash-1-3 with k0 = key, k1 = 0 (no empty-input
+   or -1 adjustment); _imp.source_hash. */
+static __maybe_unused uint64_t qp_keyed_hash(uint64_t key, const void *ptr, size_t len);
 
 /* hash(str).  CPython hashes the bytes of the string's canonical compact
    representation: UCS1 if every code point < 0x100, else UCS2 if every

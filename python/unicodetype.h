@@ -7,7 +7,7 @@
  * (PSF-2.0).
  *
  * This file is the single place the Py_UCS1/2/4 typedefs live. Everything is
- * `static` (python/*.c are #included into quickjs.c). Implementation is in
+ * `static` (the python/ .c files are #included into quickjs.c). Implementation is in
  * unicodetype.c; data in unicodetype_db.h (verbatim CPython 3.15.2 copy).
  *
  * Usage contract for the str type (mirrors Objects/unicodeobject.c):
@@ -37,6 +37,32 @@
 #define QP_UNICODETYPE_H
 
 #include <stdint.h>
+
+/* CPython exports these names (C API, D5): the static implementations are
+   renamed by macro so the exported wrappers of python/capi_unicode.c can
+   use the CPython names (capi-design.md P1; python/capi.h #undefs these
+   macros).  Users keep the CPython spelling. */
+#define _PyUnicode_IsAlpha qp_unicode_is_alpha
+#define _PyUnicode_IsDecimalDigit qp_unicode_is_decimal_digit
+#define _PyUnicode_IsDigit qp_unicode_is_digit
+#define _PyUnicode_IsLinebreak qp_unicode_is_linebreak
+#define _PyUnicode_IsLowercase qp_unicode_is_lowercase
+#define _PyUnicode_IsNumeric qp_unicode_is_numeric
+#define _PyUnicode_IsPrintable qp_unicode_is_printable
+#define _PyUnicode_IsTitlecase qp_unicode_is_titlecase
+#define _PyUnicode_IsUppercase qp_unicode_is_uppercase
+#define _PyUnicode_IsWhitespace qp_unicode_is_whitespace
+#define _PyUnicode_IsXidStart qp_unicode_is_xid_start
+#define _PyUnicode_IsXidContinue qp_unicode_is_xid_continue
+#define _PyUnicode_ToDecimalDigit qp_unicode_to_decimal_digit
+#define _PyUnicode_ToDigit qp_unicode_to_digit
+#define _PyUnicode_ToLowercase qp_unicode_to_lowercase
+#define _PyUnicode_ToNumeric qp_unicode_to_numeric
+#define _PyUnicode_ToTitlecase qp_unicode_to_titlecase
+#define _PyUnicode_ToUppercase qp_unicode_to_uppercase
+#define _Py_ctype_table qp_ctype_table
+#define _Py_ctype_tolower qp_ctype_tolower
+#define _Py_ctype_toupper qp_ctype_toupper
 
 typedef uint8_t Py_UCS1;
 typedef uint16_t Py_UCS2;

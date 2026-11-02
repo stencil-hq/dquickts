@@ -39,4 +39,6 @@ tests/test_qjsc_modules.c
 
 # Python harness
 /cpython/
-/build/testpy/
+/build/
+/qpy
+/fuzz_py_compile

@@ -169,6 +169,12 @@ enum {
     JS_CLASS_WEAK_REF,
     JS_CLASS_FINALIZATION_REGISTRY,
     JS_CLASS_DOM_EXCEPTION,     /* u.opaque (JSDOMExceptionData) */
+#ifdef CONFIG_PYTHON
+    /* Python classes (python/object.h) */
+#define QP_CLASS(id, finalizer, gc_mark) JS_CLASS_ ## id,
+#include "python/object.h"
+#undef QP_CLASS
+#endif
     
     JS_CLASS_INIT_COUNT, /* last entry for predefined classes */
 };
@@ -475,6 +481,9 @@ typedef enum {
     JS_GC_OBJ_TYPE_ASYNC_FUNCTION,
     JS_GC_OBJ_TYPE_JS_CONTEXT,
     JS_GC_OBJ_TYPE_MODULE,
+#ifdef CONFIG_PYTHON_CAPI
+    JS_GC_OBJ_TYPE_PY_CAPI, /* C API mirror head (python/capi_mirror.c) */
+#endif
 } JSGCObjectTypeEnum;
 
 /* header for GC objects. GC objects are C data structures with a
@@ -637,6 +646,9 @@ struct JSContext {
                              int scope_idx);
     const JSLocaleCallbacks *locale_callbacks;
     void *user_opaque;
+    /* Python per-context state (python/object.h), NULL until Python is
+       used in this context */
+    struct QPState *py;
 };
 
 typedef union JSFloat64Union {
@@ -784,7 +796,8 @@ typedef struct JSFunctionBytecode {
     uint8_t has_debug : 1;
     uint8_t read_only_bytecode : 1;
     uint8_t is_direct_or_indirect_eval : 1; /* used by JS_GetScriptOrModuleName() */
-    /* XXX: 10 bits available */
+    uint8_t is_py : 1; /* Python code (python/interp.c): py_code != NULL */
+    /* XXX: 9 bits available */
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
     JSAtom func_name;
@@ -799,6 +812,8 @@ typedef struct JSFunctionBytecode {
     JSValue *cpool; /* constant pool (self pointer) */
     int cpool_count;
     int closure_var_count;
+    /* Python code metadata (python/object.h), owned; NULL for JS code */
+    struct QPCodeInfo *py_code;
     struct {
         /* debug info, move to separate structure to save memory? */
         JSAtom filename;
@@ -1155,6 +1170,11 @@ struct JSObject {
     uint8_t has_immutable_prototype : 1; /* cannot modify the prototype */
     uint8_t tmp_mark : 1; /* used in JS_WriteObjectRec() */
     uint8_t is_HTMLDDA : 1; /* specific annex B IsHtmlDDA behavior */
+    uint8_t py_dict_mode : 1; /* Python instance: __dict__ materialized */
+    uint8_t py_finalized : 1; /* Python instance: __del__ already run */
+#ifdef CONFIG_PYTHON_CAPI
+    uint8_t py_has_mirror : 1; /* C API: a PyObject mirror exists (qp_capi.obj_map) */
+#endif
     uint16_t class_id; /* see JS_CLASS_x */
     /* count the number of weak references to this object. The object
        structure is freed only if header.ref_count = 0 and
@@ -1321,6 +1341,18 @@ enum OPCodeEnum {
 #undef FMT
     OP_TEMP_END,
 };
+
+/* Python subopcodes of OP_py (qp_subop_info[], qp_subop_flow[]) */
+#include "python/opcode.h"
+#ifdef CONFIG_PYTHON
+/* Python object model declarations (definitions in python/, included at
+   the end of this file) */
+#define QUICKPY_INTERNAL
+#include "python/compat.h"
+#include "python/ast.h"
+#include "python/object.h"
+#include "python/ceval.h"
+#endif
 
 static int JS_InitAtoms(JSRuntime *rt);
 static JSAtom __JS_NewAtomInit(JSRuntime *rt, const char *str, int len,
@@ -3199,6 +3231,10 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
     JS_MarkValue(rt, ctx->regexp_ctor, mark_func);
     JS_MarkValue(rt, ctx->function_ctor, mark_func);
     JS_MarkValue(rt, ctx->function_proto, mark_func);
+#ifdef CONFIG_PYTHON
+    if (ctx->py)
+        qp_state_mark(rt, ctx->py, mark_func);
+#endif
 
     if (ctx->array_shape)
         mark_func(rt, &ctx->array_shape->header);
@@ -3262,6 +3298,16 @@ void __JS_FreeContext(JSContext *ctx)
     }
 #endif
 
+#ifdef CONFIG_PYTHON
+#ifdef CONFIG_PYTHON_CAPI
+    if (ctx->py)
+        qp_capi_context_free(ctx);
+#endif
+    if (ctx->py) {
+        qp_state_free(ctx);
+        ctx->py = NULL;
+    }
+#endif
     js_free_modules(ctx, JS_FREE_MODULE_ALL);
 
     JS_FreeValue(ctx, ctx->global_obj);
@@ -6740,6 +6786,11 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     p->has_immutable_prototype = 0;
     p->tmp_mark = 0;
     p->is_HTMLDDA = 0;
+    p->py_dict_mode = 0;
+    p->py_finalized = 0;
+#ifdef CONFIG_PYTHON_CAPI
+    p->py_has_mirror = 0;
+#endif
     p->weakref_count = 0;
     p->u.opaque = NULL;
     p->shape = sh;
@@ -7602,6 +7653,15 @@ static void free_object(JSRuntime *rt, JSObject *p)
     JSShape *sh;
     JSShapeProperty *pr;
 
+#ifdef CONFIG_PYTHON
+    /* __del__ resurrects the object until the finalizer queue runs */
+    if (QP_IS_PY_CLASS(p->class_id) && !p->py_finalized &&
+        rt->gc_phase != JS_GC_PHASE_REMOVE_CYCLES && qp_del_hook(rt, p))
+        return;
+    /* clear the Python weak references to the object */
+    if (p->weakref_count != 0)
+        qp_weakref_object_freed(rt, p);
+#endif
     p->free_mark = 1; /* used to tell the object is invalid when
                          freeing cycles */
     /* free all the fields */
@@ -7620,6 +7680,10 @@ static void free_object(JSRuntime *rt, JSObject *p)
     p->shape = NULL;
     p->prop = NULL;
 
+#ifdef CONFIG_PYTHON_CAPI
+    if (p->py_has_mirror)
+        qp_capi_object_freed(rt, p);
+#endif
     finalizer = rt->class_array[p->class_id].finalizer;
     if (finalizer)
         (*finalizer)(rt, JS_MKPTR(JS_TAG_OBJECT, p));
@@ -7795,6 +7859,17 @@ static void gc_remove_weak_objects(JSRuntime *rt)
     free_zero_refcount(rt);
 }
 
+#ifdef CONFIG_PYTHON_CAPI
+/* C API hooks (python/capi_mirror.c, capi-design R7) */
+static void qp_capi_gc_sync(JSRuntime *rt);
+static void qp_capi_mark_node(JSRuntime *rt, JSGCObjectHeader *gp, JS_MarkFunc *mark_func);
+static void qp_capi_mark_object(JSRuntime *rt, JSObject *p, JS_MarkFunc *mark_func);
+static void qp_capi_free_cycle_node(JSRuntime *rt, JSGCObjectHeader *gp);
+static void qp_capi_object_freed(JSRuntime *rt, JSObject *p);
+static void qp_capi_context_free(JSContext *ctx);
+static void qp_capi_leak_node(JSRuntime *rt, JSGCObjectHeader *gp);
+#endif
+
 static void add_gc_object(JSRuntime *rt, JSGCObjectHeader *h,
                           JSGCObjectTypeEnum type)
 {
@@ -7866,6 +7941,10 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
                 if (gc_mark)
                     gc_mark(rt, JS_MKPTR(JS_TAG_OBJECT, p), mark_func);
             }
+#ifdef CONFIG_PYTHON_CAPI
+            if (p->py_has_mirror)
+                qp_capi_mark_object(rt, p, mark_func);
+#endif
         }
         break;
     case JS_GC_OBJ_TYPE_FUNCTION_BYTECODE:
@@ -7878,6 +7957,10 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
             }
             if (b->realm)
                 mark_func(rt, &b->realm->header);
+#ifdef CONFIG_PYTHON
+            if (b->py_code)
+                qp_code_info_mark(rt, b->py_code, mark_func);
+#endif
         }
         break;
     case JS_GC_OBJ_TYPE_VAR_REF:
@@ -7940,6 +8023,11 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
             js_mark_module_def(rt, m, mark_func);
         }
         break;
+#ifdef CONFIG_PYTHON_CAPI
+    case JS_GC_OBJ_TYPE_PY_CAPI:
+        qp_capi_mark_node(rt, gp, mark_func);
+        break;
+#endif
     default:
         abort();
     }
@@ -7960,6 +8048,9 @@ static void gc_decref(JSRuntime *rt)
     struct list_head *el, *el1;
     JSGCObjectHeader *p;
 
+#ifdef CONFIG_PYTHON_CAPI
+    qp_capi_gc_sync(rt);
+#endif
     init_list_head(&rt->tmp_obj_list);
 
     /* decrement the refcount of all the children of all the GC
@@ -8059,6 +8150,12 @@ static void gc_free_cycles(JSRuntime *rt)
 #endif
             free_gc_object(rt, p);
             break;
+#ifdef CONFIG_PYTHON_CAPI
+        case JS_GC_OBJ_TYPE_PY_CAPI:
+            /* moves the node out of tmp_obj_list */
+            qp_capi_free_cycle_node(rt, p);
+            break;
+#endif
         default:
             list_del(&p->link);
             list_add_tail(&p->link, &rt->gc_zero_ref_count_list);
@@ -8069,6 +8166,13 @@ static void gc_free_cycles(JSRuntime *rt)
 
     list_for_each_safe(el, el1, &rt->gc_zero_ref_count_list) {
         p = list_entry(el, JSGCObjectHeader, link);
+#ifdef CONFIG_PYTHON_CAPI
+        if (js_rc(p)->gc_obj_type == JS_GC_OBJ_TYPE_PY_CAPI) {
+            /* tp_traverse misreported a reference: unlink and leak */
+            qp_capi_leak_node(rt, p);
+            continue;
+        }
+#endif
         assert(js_rc(p)->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT ||
                js_rc(p)->gc_obj_type == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE ||
                js_rc(p)->gc_obj_type == JS_GC_OBJ_TYPE_ASYNC_FUNCTION ||
@@ -9890,6 +9994,11 @@ static JSValue JS_ThrowReferenceErrorUninitialized2(JSContext *ctx,
         if (b->vardefs)
             atom = b->vardefs[b->arg_count + idx].var_name;
     }
+#ifdef CONFIG_PYTHON
+    /* UnboundLocalError / NameError for free variables */
+    if (b->is_py)
+        return qp_raise_unbound(ctx, atom, is_ref);
+#endif
     return JS_ThrowReferenceErrorUninitialized(ctx, atom);
 }
 
@@ -9963,6 +10072,11 @@ static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
     }
     if (js_call_interrupt_handler(ctx))
         return -1;
+#ifdef CONFIG_PYTHON
+    /* Python signal handlers and weakref callbacks */
+    if (ctx->py && qp_signal_check(ctx) < 0)
+        return -1;
+#endif
     if (unlikely(rt->suspend_requested)) {
         /* Poll again at the next instruction instead of waiting for the
            counter to expire: in a periodic loop, it could always expire
@@ -17251,6 +17365,11 @@ static __maybe_unused void JS_DumpGCObject(JSRuntime *rt, JSGCObjectHeader *p)
         case JS_GC_OBJ_TYPE_MODULE:
             printf("[module]");
             break;
+#ifdef CONFIG_PYTHON_CAPI
+        case JS_GC_OBJ_TYPE_PY_CAPI:
+            printf("[py_capi]");
+            break;
+#endif
         default:
             printf("[unknown %d]", js_rc(p)->gc_obj_type);
             break;
@@ -20230,6 +20349,24 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
     JSAtom name_atom;
 
     b = JS_VALUE_GET_PTR(bfunc);
+#ifdef CONFIG_PYTHON
+    if (b->is_py) {
+        /* Python function: always a plain bytecode function object (the
+           generator kind is decided by co_flags at call time); its
+           Python data comes from the running Python function */
+        func_obj = JS_NewObjectClass(ctx, JS_CLASS_BYTECODE_FUNCTION);
+        if (JS_IsException(func_obj)) {
+            JS_FreeValue(ctx, bfunc);
+            return JS_EXCEPTION;
+        }
+        func_obj = js_closure2(ctx, func_obj, b, cur_var_refs, sf, is_eval, NULL);
+        if (JS_IsException(func_obj))
+            return JS_EXCEPTION;
+        if (qp_function_init(ctx, func_obj, sf ? sf->cur_func : JS_UNDEFINED) < 0)
+            goto fail;
+        return func_obj;
+    }
+#endif
     func_obj = JS_NewObjectClass(ctx, func_kind_to_class_id[b->func_kind]);
     if (JS_IsException(func_obj)) {
         JS_FreeValue(ctx, bfunc);
@@ -20719,6 +20856,10 @@ static no_inline __exception int js_poll_safepoint(JSContext *ctx,
     } else if (js_call_interrupt_handler(ctx)) {
         return -1;
     }
+#ifdef CONFIG_PYTHON
+    if (ctx->py && qp_signal_check(ctx) < 0)
+        return -1;
+#endif
     if (unlikely(rt->suspend_requested) && js_can_suspend(rt)) {
         rt->suspend_requested = FALSE;
         JS_Throw(ctx, JS_SUSPEND_MARKER);
@@ -20747,6 +20888,12 @@ static int js_call_opcode_argc(int opcode, const uint8_t *pc)
     case OP_call_constructor:
     case OP_apply:
         return get_u16(pc - 2);
+    case OP_py:
+        /* call_method / call_kw (4 bytes: OP_py subop u16) */
+        if (pc[-4] == OP_py &&
+            (pc[-3] == QP_OP_call_method || pc[-3] == QP_OP_call_kw))
+            return get_u16(pc - 2);
+        return -1;
     default:
         return -1;
     }
@@ -21720,6 +21867,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
     JSVarRef **var_refs;
     size_t alloca_size;
+#ifdef CONFIG_PYTHON
+    BOOL py_bind;
+    JSValueConst py_kwnames = QP_NULL;
+#endif
 
 #if !DIRECT_DISPATCH
 #define SWITCH(pc)      switch (opcode = *pc++)
@@ -21820,6 +21971,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     case OP_apply:
                         n_pop = 3;
                         break;
+                    case OP_py:
+                        /* call_method: callable, self, args;
+                           call_kw: + kwnames */
+                        n_pop = s->pending_argc + 2 +
+                            (pc[-3] == QP_OP_call_kw);
+                        break;
                     default: /* OP_call0-3, OP_call */
                         n_pop = s->pending_argc + 1;
                         break;
@@ -21842,9 +21999,31 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     p = JS_VALUE_GET_OBJ(func_obj);
     if (unlikely(p->class_id != JS_CLASS_BYTECODE_FUNCTION)) {
         JSClassCall *call_func;
+#ifdef CONFIG_PYTHON
+        /* Python objects: tp_call with the vectorcall keyword names */
+        if (QP_IS_PY_CLASS(p->class_id))
+            return qp_call_object(caller_ctx, func_obj, (JSValueConst *)argv, argc,
+                                  (flags & JS_CALL_FLAG_PY_KW) ? new_target : QP_NULL,
+                                  flags);
+        if (unlikely(flags & JS_CALL_FLAG_PY_KW))
+            return qp_call_js_kw(caller_ctx, func_obj, this_obj, argc,
+                                 (JSValueConst *)argv, new_target, flags);
+        flags &= ~JS_CALL_FLAG_PY_ARGS_OFFSET;
+#endif
         call_func = rt->class_array[p->class_id].call;
         if (!call_func) {
         not_a_function:
+#ifdef CONFIG_PYTHON
+            {
+                /* called from Python code: Python message */
+                JSStackFrame *csf = rt->current_stack_frame;
+                if (csf && JS_IsObject(csf->cur_func) &&
+                    JS_VALUE_GET_OBJ(csf->cur_func)->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+                    JS_VALUE_GET_OBJ(csf->cur_func)->u.func.function_bytecode->is_py)
+                    return qp_raise_type_error(caller_ctx, "'%T' object is not callable",
+                                               func_obj);
+            }
+#endif
             return JS_ThrowTypeError(caller_ctx, "not a function");
         }
         {
@@ -21861,6 +22040,57 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     }
     b = p->u.func.function_bytecode;
 
+#ifdef CONFIG_PYTHON
+    py_bind = FALSE;
+    if (unlikely(b->is_py)) {
+        QPCodeInfo *ci = b->py_code;
+        QPState *qs = b->realm->py;
+        JSValueConst kwnames = QP_NULL;
+        int nargs = argc;
+        if (flags & JS_CALL_FLAG_PY_KW) {
+            kwnames = new_target;
+            nargs = argc - (int)QP_TUPLE_SIZE(kwnames);
+        }
+        py_bind = (!JS_IsUninitialized(kwnames) || argc != b->arg_count ||
+                   (ci->co_flags & (CO_VARARGS | CO_VARKEYWORDS)) != 0 ||
+                   ci->kwonlyargcount != 0);
+        if (ci->co_flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)) {
+            /* generator function: bind the arguments and create the
+               generator without running the frame (lazy start) */
+            JSValue *gen_args;
+            if (js_check_stack_overflow(rt, sizeof(JSValue) * b->arg_count))
+                return JS_ThrowStackOverflow(caller_ctx);
+            gen_args = alloca(sizeof(JSValue) * (b->arg_count + 1));
+            if (py_bind) {
+                if (qp_bind_args(caller_ctx, func_obj, b, (JSValueConst *)argv, nargs,
+                                 kwnames, gen_args))
+                    return JS_EXCEPTION;
+            } else {
+                for(i = 0; i < b->arg_count; i++)
+                    gen_args[i] = JS_DupValue(caller_ctx, argv[i]);
+            }
+            return qp_gen_new(b->realm, func_obj, gen_args);
+        }
+        if (unlikely(qs->recursion_depth >= qs->recursion_limit))
+            return qp_raise_recursion_error(caller_ctx);
+        qs->recursion_depth++;
+        if (py_bind) {
+            arg_allocated_size = b->arg_count;
+            argc = nargs; /* positional count for qp_bind_args */
+        } else if (flags & JS_CALL_FLAG_COPY_ARGV) {
+            arg_allocated_size = b->arg_count;
+        } else {
+            arg_allocated_size = 0;
+        }
+        py_kwnames = kwnames;
+        /* new_target is not a JS new.target for Python frames */
+        new_target = JS_UNDEFINED;
+    } else if (unlikely(flags & JS_CALL_FLAG_PY_KW)) {
+        /* JS callee: keywords as a trailing plain object */
+        return qp_call_js_kw(caller_ctx, func_obj, this_obj, argc,
+                             (JSValueConst *)argv, new_target, flags);
+    } else
+#endif
     if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
         arg_allocated_size = b->arg_count;
     } else {
@@ -21870,8 +22100,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     alloca_size = sizeof(JSValue) * (arg_allocated_size + b->var_count +
                                      b->stack_size) +
         sizeof(JSVarRef *) * b->var_ref_count;
-    if (js_check_stack_overflow(rt, alloca_size))
+    if (js_check_stack_overflow(rt, alloca_size)) {
+#ifdef CONFIG_PYTHON
+        if (b->is_py)
+            b->realm->py->recursion_depth--;
+#endif
         return JS_ThrowStackOverflow(caller_ctx);
+    }
 
     sf->js_mode = b->js_mode;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
@@ -21881,6 +22116,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     var_refs = p->u.func.var_refs;
 
     local_buf = alloca(alloca_size);
+#ifdef CONFIG_PYTHON
+    if (unlikely(py_bind)) {
+        /* CPython initialize_locals() */
+        arg_buf = local_buf;
+        if (qp_bind_args(caller_ctx, func_obj, b, (JSValueConst *)argv, argc,
+                         py_kwnames, arg_buf)) {
+            b->realm->py->recursion_depth--;
+            return JS_EXCEPTION;
+        }
+        sf->arg_count = b->arg_count;
+        /* the frame owns its arguments from now on */
+        argc = b->arg_count;
+        argv = arg_buf;
+    } else
+#endif
     if (unlikely(arg_allocated_size)) {
         int n = min_int(argc, b->arg_count);
         arg_buf = local_buf;
@@ -21894,6 +22144,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->var_buf = var_buf;
     sf->arg_buf = arg_buf;
 
+#ifdef CONFIG_PYTHON
+    if (b->is_py) {
+        /* Python locals start unbound (get_loc_check raises
+           UnboundLocalError / NameError) */
+        for(i = 0; i < b->var_count; i++)
+            var_buf[i] = JS_UNINITIALIZED;
+    } else
+#endif
     for(i = 0; i < b->var_count; i++)
         var_buf[i] = JS_UNDEFINED;
 
@@ -24751,6 +25009,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, sp[-1]);
             sp[-1] = JS_FALSE;
             BREAK;
+        CASE(OP_py):
+#ifdef CONFIG_PYTHON
+            /* Python subop dispatch (python/opcode.h) */
+#include "python/ceval_ops.h"
+#else
+            JS_ThrowInternalError(ctx, "Python bytecode is not supported");
+            goto exception;
+#endif
         CASE(OP_invalid):
         DEFAULT:
             JS_ThrowInternalError(ctx, "invalid opcode: pc=%u opcode=0x%02x",
@@ -24762,10 +25028,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     if (unlikely(js_is_suspending(rt))) {
         /* save the frame instead of freeing it */
         if (!js_suspend_frame(ctx, sf, b, pc, sp, this_obj, new_target,
-                              argc, (JSValueConst *)argv, opcode))
+                              argc, (JSValueConst *)argv, opcode)) {
+#ifdef CONFIG_PYTHON
+            if (b->is_py && !(flags & JS_CALL_FLAG_GENERATOR))
+                ctx->py->recursion_depth--;
+#endif
             return JS_EXCEPTION;
+        }
         /* the suspension is aborted: unwind as an uncatchable error */
     }
+#ifdef CONFIG_PYTHON
+    if (b->is_py && !rt->current_exception_is_uncatchable) {
+        /* Python traceback entry (pc - 1 is inside the instruction that
+           raised), except for re-raising subops */
+        if (ctx->py->reraise)
+            ctx->py->reraise = 0;
+        else
+            qp_exc_frame_unwind(ctx, sf->cur_func, (uint32_t)(pc - b->byte_code_buf - 1));
+    } else
+#endif
     if (is_backtrace_needed(ctx, rt->current_exception)) {
         /* add the backtrace information now (it is not done
            before if the exception happens in a bytecode
@@ -24819,6 +25100,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
     rt->current_stack_frame = sf->prev_frame;
+#ifdef CONFIG_PYTHON
+    if (b->is_py && !(flags & JS_CALL_FLAG_GENERATOR))
+        ctx->py->recursion_depth--;
+#endif
     return ret_val;
 #undef SAFEPOINT
 }
@@ -25202,6 +25487,13 @@ static JSAsyncFunctionState *async_func_init(JSContext *ctx,
     n = arg_buf_len + b->var_count;
     for(i = argc; i < n; i++)
         sf->arg_buf[i] = JS_UNDEFINED;
+#ifdef CONFIG_PYTHON
+    if (b->is_py) {
+        /* Python locals start unbound */
+        for(i = 0; i < b->var_count; i++)
+            sf->var_buf[i] = JS_UNINITIALIZED;
+    }
+#endif
     s->resolving_funcs[0] = JS_UNDEFINED;
     s->resolving_funcs[1] = JS_UNDEFINED;
     s->new_target = JS_UNDEFINED;
@@ -26456,6 +26748,11 @@ typedef struct JSFunctionDef {
     int *ts_elidable_reqs; /* req_module_entries of import declarations */
     int ts_elidable_req_count;
     int ts_elidable_req_size;
+
+    /* Python code (python/codegen): variable ops are final (no
+       resolve_variables), py_code is moved to the JSFunctionBytecode */
+    BOOL is_py;
+    struct QPCodeInfo *py_code;
 } JSFunctionDef;
 
 typedef struct JSToken {
@@ -26626,6 +26923,63 @@ static const JSOpCode opcode_info[OP_COUNT + (OP_TEMP_END - OP_TEMP_START)] = {
 #else
 #define short_opcode_info(op) opcode_info[op]
 #endif
+
+/* Python subop of the OP_py at bc_buf[pos] (QP_OP_invalid if truncated or
+   out of range). */
+static inline int qp_subop_at(const uint8_t *bc_buf, int bc_len, int pos)
+{
+    int subop;
+    if (pos + 1 >= bc_len)
+        return QP_OP_invalid;
+    subop = bc_buf[pos + 1];
+    if (subop >= QP_OP_COUNT)
+        return QP_OP_invalid;
+    return subop;
+}
+
+/* Opcode description of the instruction at bc_buf[pos] for bytecode
+   walkers: OP_py is resolved through qp_subop_info[] (python/opcode.h).
+   '*popnd' receives the offset of the first operand (pos + 1, or pos + 2
+   for OP_py).  PY-only formats (>= QP_PYFMT_FIRST) are plain data. */
+static inline const JSOpCode *js_get_op_info(const uint8_t *bc_buf, int bc_len,
+                                             int pos, BOOL use_short_opcodes,
+                                             JSOpCode *tmp, int *popnd)
+{
+    int op = bc_buf[pos];
+    if (op == OP_py) {
+        const QPSubopInfo *si = &qp_subop_info[qp_subop_at(bc_buf, bc_len, pos)];
+#ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_*
+        tmp->name = si->name;
+#endif
+        tmp->size = si->size;
+        tmp->n_pop = si->n_pop;
+        tmp->n_push = si->n_push;
+        tmp->fmt = si->fmt;
+        *popnd = pos + 2;
+        return tmp;
+    }
+    *popnd = pos + 1;
+    if (use_short_opcodes)
+        return &short_opcode_info(op);
+    else
+        return &opcode_info[op];
+}
+
+/* PYFLOW kind of a subop (QP_FLOW_*), target stack delta in '*pdelta' */
+static inline int qp_subop_flow_kind(int subop, int *pdelta)
+{
+    size_t i;
+    for(i = 0; i < countof(qp_subop_flow); i++) {
+        if (qp_subop_flow[i].subop == subop) {
+            if (pdelta)
+                *pdelta = qp_subop_flow[i].target_delta;
+            return qp_subop_flow[i].kind;
+        }
+    }
+    if (pdelta)
+        *pdelta = 0;
+    return QP_FLOW_NONE;
+}
 
 static __exception int next_token(JSParseState *s);
 
@@ -42116,13 +42470,14 @@ static void free_bytecode_atoms(JSRuntime *rt,
     JSAtom atom;
     const JSOpCode *oi;
 
+    JSOpCode tmp;
+    int opnd;
+
     pos = 0;
     while (pos < bc_len) {
         op = bc_buf[pos];
-        if (use_short_opcodes)
-            oi = &short_opcode_info(op);
-        else
-            oi = &opcode_info[op];
+        oi = js_get_op_info(bc_buf, bc_len, pos, use_short_opcodes, &tmp, &opnd);
+        (void)op;
 
         len = oi->size;
         switch(oi->fmt) {
@@ -42131,9 +42486,9 @@ static void free_bytecode_atoms(JSRuntime *rt,
         case OP_FMT_atom_u16:
         case OP_FMT_atom_label_u8:
         case OP_FMT_atom_label_u16:
-            if ((pos + 1 + 4) > bc_len)
+            if ((opnd + 4) > bc_len)
                 break; /* may happen if there is not enough memory when emiting bytecode */
-            atom = get_u32(bc_buf + pos + 1);
+            atom = get_u32(bc_buf + opnd);
             JS_FreeAtomRT(rt, atom);
             break;
         default:
@@ -42199,6 +42554,12 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
     js_free(ctx, fd->cpool);
 
     JS_FreeAtom(ctx, fd->func_name);
+#ifdef CONFIG_PYTHON
+    if (fd->py_code) {
+        qp_code_info_free(ctx->rt, fd->py_code);
+        fd->py_code = NULL;
+    }
+#endif
 
     for(i = 0; i < fd->var_count; i++) {
         JS_FreeAtom(ctx, fd->vars[i].var_name);
@@ -42273,7 +42634,9 @@ static void dump_byte_code(JSContext *ctx, int pass,
                            const LabelSlot *label_slots, JSFunctionBytecode *b)
 {
     const JSOpCode *oi;
+    JSOpCode oi_tmp;
     int pos, pos_next, op, size, idx, addr, line, line1, in_source, line_num;
+    int opnd, pos0;
     uint8_t *bits = js_mallocz(ctx, len * sizeof(*bits));
     BOOL use_short_opcodes = (b != NULL), dump_pc;
 
@@ -42285,11 +42648,9 @@ static void dump_byte_code(JSContext *ctx, int pass,
     /* scan for jump targets */
     for (pos = 0; pos < len; pos = pos_next) {
         op = tab[pos];
-        if (use_short_opcodes)
-            oi = &short_opcode_info(op);
-        else
-            oi = &opcode_info[op];
+        oi = js_get_op_info(tab, len, pos, use_short_opcodes, &oi_tmp, &opnd);
         pos_next = pos + oi->size;
+        pos = opnd - 1;
         if (op < OP_COUNT) {
             switch (oi->fmt) {
 #if SHORT_OPCODES
@@ -42359,10 +42720,7 @@ static void dump_byte_code(JSContext *ctx, int pass,
             pos++;
             continue;
         }
-        if (use_short_opcodes)
-            oi = &short_opcode_info(op);
-        else
-            oi = &opcode_info[op];
+        oi = js_get_op_info(tab, len, pos, use_short_opcodes, &oi_tmp, &opnd);
         size = oi->size;
         if (pos + size > len) {
             printf("truncated opcode (0x%02x)\n", op);
@@ -42387,9 +42745,19 @@ static void dump_byte_code(JSContext *ctx, int pass,
         } else {
             printf("        ");
         }
+        if (op == OP_py)
+            printf("py.");
         printf("%s", oi->name);
-        pos++;
+        pos0 = pos;
+        pos = opnd;
         switch(oi->fmt) {
+        case OP_FMT_npop2:
+        case OP_FMT_npush:
+            printf(" %u", get_u16(tab + pos));
+            break;
+        case OP_FMT_unpack_ex:
+            printf(" %u,%u", get_u16(tab + pos) & 0xff, get_u16(tab + pos) >> 8);
+            break;
         case OP_FMT_none_int:
             printf(" %d", op - OP_push_0);
             break;
@@ -42531,7 +42899,7 @@ static void dump_byte_code(JSContext *ctx, int pass,
             break;
         }
         printf("\n");
-        pos += oi->size - 1;
+        pos = pos0 + oi->size;
     }
     if (source) {
         if (!in_source)
@@ -44604,11 +44972,14 @@ static void instantiate_hoisted_definitions(JSContext *ctx, JSFunctionDef *s, Dy
 static int skip_dead_code(JSFunctionDef *s, const uint8_t *bc_buf, int bc_len,
                           int pos, int *linep)
 {
-    int op, len, label;
+    int op, len, label, opnd;
+    const JSOpCode *oi;
+    JSOpCode oi_tmp;
 
     for (; pos < bc_len; pos += len) {
         op = bc_buf[pos];
-        len = opcode_info[op].size;
+        oi = js_get_op_info(bc_buf, bc_len, pos, FALSE, &oi_tmp, &opnd);
+        len = oi->size;
         if (op == OP_line_num) {
             *linep = get_u32(bc_buf + pos + 1);
         } else
@@ -44626,21 +44997,21 @@ static int skip_dead_code(JSFunctionDef *s, const uint8_t *bc_buf, int bc_len,
         } else {
             /* XXX: output a warning for unreachable code? */
             JSAtom atom;
-            switch(opcode_info[op].fmt) {
+            switch(oi->fmt) {
             case OP_FMT_label:
             case OP_FMT_label_u16:
-                label = get_u32(bc_buf + pos + 1);
+                label = get_u32(bc_buf + opnd);
                 update_label(s, label, -1);
                 break;
             case OP_FMT_atom_label_u8:
             case OP_FMT_atom_label_u16:
-                label = get_u32(bc_buf + pos + 5);
+                label = get_u32(bc_buf + opnd + 4);
                 update_label(s, label, -1);
                 /* fall thru */
             case OP_FMT_atom:
             case OP_FMT_atom_u8:
             case OP_FMT_atom_u16:
-                atom = get_u32(bc_buf + pos + 1);
+                atom = get_u32(bc_buf + opnd);
                 JS_FreeAtom(s->ctx, atom);
                 break;
             default:
@@ -45220,8 +45591,90 @@ static void add_pc2line_info(JSFunctionDef *s, uint32_t pc, uint32_t source_pos)
    bytes. Alternatively, get_line_col_cached() could be issued in
    emit_source_pos() so that the deltas are more likely to be
    small. */
+#ifdef CONFIG_PYTHON
+/* Python code: the line number slots hold indexes in py_code->locs[]
+   (OP_line_num operands).  Build the sorted pc -> loc map and the JS
+   pc2line table (lines/columns of the locations). */
+static void qp_compute_pc2line_info(JSFunctionDef *s)
+{
+    QPCodeInfo *ci = s->py_code;
+    int i, last_line_num, last_col_num, line_num, col_num;
+    uint32_t last_pc = 0;
+
+    js_dbuf_init(s->ctx, &s->pc2line);
+    if (!ci)
+        return;
+    js_free(s->ctx, ci->pcloc);
+    ci->pcloc = NULL;
+    ci->pcloc_count = 0;
+    if (s->line_number_count > 0) {
+        ci->pcloc = js_malloc(s->ctx, sizeof(ci->pcloc[0]) * s->line_number_count);
+        if (!ci->pcloc) {
+            /* reported by the caller through the pc2line buffer */
+            s->pc2line.error = TRUE;
+            return;
+        }
+    }
+    for (i = 0; i < s->line_number_count; i++) {
+        uint32_t pc = s->line_number_slots[i].pc;
+        uint32_t idx = s->line_number_slots[i].source_pos;
+        if (idx >= ci->loc_count)
+            continue;
+        if (ci->pcloc_count > 0 && ci->pcloc[ci->pcloc_count - 1].pc == pc) {
+            ci->pcloc[ci->pcloc_count - 1].loc = idx;
+        } else {
+            ci->pcloc[ci->pcloc_count].pc = pc;
+            ci->pcloc[ci->pcloc_count].loc = idx;
+            ci->pcloc_count++;
+        }
+    }
+    if (s->strip_debug)
+        return;
+    last_line_num = max_int(ci->firstlineno - 1, 0);
+    last_col_num = 0;
+    dbuf_put_leb128(&s->pc2line, last_line_num);
+    dbuf_put_leb128(&s->pc2line, last_col_num);
+    for (i = 0; i < ci->pcloc_count; i++) {
+        uint32_t pc = ci->pcloc[i].pc;
+        const QPLoc *loc = &ci->locs[ci->pcloc[i].loc];
+        int diff_pc, diff_line, diff_col;
+        if (loc->lineno <= 0)
+            continue;
+        diff_pc = pc - last_pc;
+        if (diff_pc < 0)
+            continue;
+        line_num = loc->lineno - 1;
+        col_num = max_int(loc->col, 0);
+        diff_line = line_num - last_line_num;
+        diff_col = col_num - last_col_num;
+        if (diff_line == 0 && diff_col == 0)
+            continue;
+        if (diff_line >= PC2LINE_BASE &&
+            diff_line < PC2LINE_BASE + PC2LINE_RANGE &&
+            diff_pc <= PC2LINE_DIFF_PC_MAX) {
+            dbuf_putc(&s->pc2line, (diff_line - PC2LINE_BASE) +
+                      diff_pc * PC2LINE_RANGE + PC2LINE_OP_FIRST);
+        } else {
+            dbuf_putc(&s->pc2line, 0);
+            dbuf_put_leb128(&s->pc2line, diff_pc);
+            dbuf_put_sleb128(&s->pc2line, diff_line);
+        }
+        dbuf_put_sleb128(&s->pc2line, diff_col);
+        last_pc = pc;
+        last_line_num = line_num;
+        last_col_num = col_num;
+    }
+}
+#endif
+
 static void compute_pc2line_info(JSFunctionDef *s)
 {
+#ifdef CONFIG_PYTHON
+    if (s->is_py) {
+        qp_compute_pc2line_info(s);
+        return;
+    }
+#endif
     if (!s->strip_debug) {
         int last_line_num, last_col_num;
         uint32_t last_pc = 0;
@@ -45465,10 +45918,46 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     label_slots = s->label_slots;
 
     line_num = s->source_pos;
+    if (s->is_py)
+        line_num = -1; /* line numbers are py_code->locs[] indexes */
 
     cc.bc_buf = bc_buf = s->byte_code.buf;
     cc.bc_len = bc_len = s->byte_code.size;
     js_dbuf_bytecode_init(ctx, &bc_out);
+
+    if (s->is_py) {
+        /* Python code does not go through resolve_variables(), which
+           counts the jumps and line numbers and records the label
+           positions (pos2): do it here */
+        const JSOpCode *oi;
+        JSOpCode oi_tmp;
+        int opnd;
+        s->jump_size = 0;
+        s->line_number_size = 0;
+        for (pos = 0; pos < bc_len; pos += oi->size) {
+            oi = js_get_op_info(bc_buf, bc_len, pos, FALSE, &oi_tmp, &opnd);
+            if (bc_buf[pos] == OP_line_num) {
+                s->line_number_size++;
+                continue;
+            }
+            if (bc_buf[pos] == OP_label) {
+                int lab = get_u32(bc_buf + pos + 1);
+                assert(lab >= 0 && lab < s->label_count);
+                label_slots[lab].pos2 = pos + oi->size;
+                continue;
+            }
+            switch(oi->fmt) {
+            case OP_FMT_label:
+            case OP_FMT_label_u16:
+            case OP_FMT_atom_label_u8:
+            case OP_FMT_atom_label_u16:
+                s->jump_size++;
+                break;
+            default:
+                break;
+            }
+        }
+    }
 
 #if SHORT_OPCODES
     if (s->jump_size) {
@@ -45478,11 +45967,11 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     }
 #endif
     /* XXX: Should skip this phase if not generating SHORT_OPCODES */
-    if (s->line_number_size && !s->strip_debug) {
+    if (s->line_number_size && (!s->strip_debug || s->is_py)) {
         s->line_number_slots = js_mallocz(s->ctx, sizeof(*s->line_number_slots) * s->line_number_size);
         if (s->line_number_slots == NULL)
             return -1;
-        s->line_number_last = s->source_pos;
+        s->line_number_last = s->is_py ? -1 : s->source_pos;
         s->line_number_last_pc = 0;
     }
 
@@ -45556,6 +46045,28 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         op = bc_buf[pos];
         len = opcode_info[op].size;
         pos_next = pos + len;
+        if (s->is_py) {
+            /* Python code: only label resolution, goto chaining and dead
+               code removal (the JS peepholes assume JS semantics) */
+            switch(op) {
+            case OP_line_num:
+            case OP_label:
+            case OP_goto:
+            case OP_gosub:
+            case OP_catch:
+            case OP_if_false:
+            case OP_if_true:
+            case OP_return:
+            case OP_return_undef:
+            case OP_return_async:
+            case OP_throw:
+            case OP_throw_error:
+            case OP_py:
+                break;
+            default:
+                goto no_change;
+            }
+        }
         switch(op) {
         case OP_line_num:
             /* line number info (for debug). We put it in a separate
@@ -46241,6 +46752,37 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             goto no_change;
 #endif
 
+        case OP_py:
+            {
+                const QPSubopInfo *si = &qp_subop_info[qp_subop_at(bc_buf, bc_len, pos)];
+                len = si->size;
+                pos_next = pos + len;
+                add_pc2line_info(s, bc_out.size, line_num);
+                if (si->fmt != OP_FMT_label) {
+                    dbuf_put(&bc_out, bc_buf + pos, len);
+                    break;
+                }
+                label = get_u32(bc_buf + pos + 2);
+                if (OPTIMIZE)
+                    label = find_jump_target(s, label, &op1, NULL);
+                assert(label >= 0 && label < s->label_count);
+                ls = &label_slots[label];
+                dbuf_put(&bc_out, bc_buf + pos, 2);
+#if SHORT_OPCODES
+                jp = &s->jump_slots[s->jump_count++];
+                jp->op = OP_py;
+                jp->size = 4;
+                jp->pos = bc_out.size;
+                jp->label = label;
+#endif
+                dbuf_put_u32(&bc_out, ls->addr - bc_out.size);
+                if (ls->addr == -1) {
+                    if (!add_reloc(ctx, ls, bc_out.size - 4, 4))
+                        goto fail;
+                }
+            }
+            break;
+
         default:
         no_change:
             add_pc2line_info(s, bc_out.size, line_num);
@@ -46448,6 +46990,97 @@ static __exception int compute_stack_size(JSContext *ctx,
         if (op == 0 || op >= OP_COUNT) {
             JS_ThrowInternalError(ctx, "invalid opcode (op=%d, pc=%d)", op, pos);
             goto fail;
+        }
+        if (op == OP_py) {
+            /* Python subop (python/opcode.h) */
+            const QPSubopInfo *si;
+            int subop, n_push, cnt, depth, kind, tdelta;
+            if (pos + 1 >= s->bc_len || bc_buf[pos + 1] >= QP_OP_COUNT ||
+                bc_buf[pos + 1] == QP_OP_invalid) {
+                JS_ThrowInternalError(ctx, "invalid python subop (pc=%d)", pos);
+                goto fail;
+            }
+            subop = bc_buf[pos + 1];
+            si = &qp_subop_info[subop];
+#ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STACK
+            if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_STACK))
+                printf("%5d: py.%-7s %5d %5d\n", pos, si->name, stack_len, catch_pos);
+#endif
+            pos_next = pos + si->size;
+            if (pos_next > s->bc_len) {
+                JS_ThrowInternalError(ctx, "bytecode buffer overflow (op=%d, pc=%d)", op, pos);
+                goto fail;
+            }
+            n_pop = si->n_pop;
+            n_push = si->n_push;
+            cnt = 0;
+            switch(si->fmt) {
+            case OP_FMT_npop:
+                n_pop += get_u16(bc_buf + pos + 2);
+                break;
+            case OP_FMT_npop2:
+                n_pop += 2 * get_u16(bc_buf + pos + 2);
+                break;
+            case OP_FMT_npush:
+                n_push += get_u16(bc_buf + pos + 2);
+                break;
+            case OP_FMT_unpack_ex:
+                cnt = get_u16(bc_buf + pos + 2);
+                n_push += (cnt & 0xff) + (cnt >> 8);
+                break;
+            default:
+                break;
+            }
+            /* depth read below the popped values */
+            depth = n_pop;
+            switch(subop) {
+            case QP_OP_copy:
+            case QP_OP_swap:
+                depth = bc_buf[pos + 2];
+                if (depth < 1) {
+                    JS_ThrowInternalError(ctx, "invalid python copy/swap depth (pc=%d)", pos);
+                    goto fail;
+                }
+                break;
+            case QP_OP_list_append:
+            case QP_OP_list_extend:
+            case QP_OP_set_add:
+            case QP_OP_set_update:
+            case QP_OP_dict_update:
+                depth = get_u16(bc_buf + pos + 2) + 1;
+                break;
+            case QP_OP_map_add:
+                depth = get_u16(bc_buf + pos + 2) + 2;
+                break;
+            case QP_OP_dict_merge:
+                depth = get_u16(bc_buf + pos + 2) + 1 + 3;
+                break;
+            default:
+                break;
+            }
+            if (stack_len < n_pop || stack_len < depth) {
+                JS_ThrowInternalError(ctx, "stack underflow (op=%d, pc=%d)", op, pos);
+                goto fail;
+            }
+            stack_len += n_push - n_pop;
+            if (stack_len > s->stack_len_max) {
+                s->stack_len_max = stack_len;
+                if (s->stack_len_max > JS_STACK_SIZE_MAX) {
+                    JS_ThrowInternalError(ctx, "stack overflow (op=%d, pc=%d)", op, pos);
+                    goto fail;
+                }
+            }
+            kind = qp_subop_flow_kind(subop, &tdelta);
+            if (kind == QP_FLOW_EXIT)
+                goto done_insn;
+            if (kind == QP_FLOW_BRANCH) {
+                diff = get_u32(bc_buf + pos + 2);
+                if (ss_check(ctx, s, pos + 2 + diff, op, stack_len + tdelta, catch_pos))
+                    goto fail;
+            }
+            if (ss_check(ctx, s, pos_next, op, stack_len, catch_pos))
+                goto fail;
+            continue;
         }
         oi = &short_opcode_info(op);
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STACK
@@ -46824,7 +47457,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     }
 #endif
 
-    if (resolve_variables(ctx, fd))
+    /* Python codegen emits final variable opcodes */
+    if (!fd->is_py && resolve_variables(ctx, fd))
         goto fail;
 
     if (fd->module && fd->is_ts && ts_elide_imports(ctx, fd))
@@ -46990,9 +47624,23 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     b->arguments_allowed = fd->arguments_allowed;
     b->is_direct_or_indirect_eval = (fd->eval_type == JS_EVAL_TYPE_DIRECT ||
                                      fd->eval_type == JS_EVAL_TYPE_INDIRECT);
+    b->is_py = fd->is_py;
+    b->py_code = fd->py_code;
+    fd->py_code = NULL;
     b->realm = JS_DupContext(ctx);
 
     add_gc_object(ctx->rt, &b->header, JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
+
+#ifdef CONFIG_PYTHON
+    if (b->is_py && qp_code_info_setup_ic(ctx, b) < 0) {
+        JS_FreeValue(ctx, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b));
+        if (fd->parent)
+            list_del(&fd->link);
+        js_free_function_def_ts(ctx, fd);
+        js_free(ctx, fd);
+        return JS_EXCEPTION;
+    }
+#endif
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_FINAL
     if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_FINAL) && !fd->strip_debug) {
@@ -47026,6 +47674,12 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
 #endif
     if (b->byte_code_buf)
         free_bytecode_atoms(rt, b->byte_code_buf, b->byte_code_len, TRUE);
+#ifdef CONFIG_PYTHON
+    if (b->py_code) {
+        qp_code_info_free(rt, b->py_code);
+        b->py_code = NULL;
+    }
+#endif
 
     if (b->vardefs) {
         for(i = 0; i < b->arg_count + b->var_count; i++) {
@@ -48585,13 +49239,18 @@ static uint32_t bc_csum(const uint8_t *p, size_t n)
 
 static void bc_byte_swap(uint8_t *bc_buf, int bc_len)
 {
-    int pos, len, op, fmt;
+    int pos0, pos, len, op, fmt;
+    const JSOpCode *oi;
+    JSOpCode oi_tmp;
 
-    pos = 0;
-    while (pos < bc_len) {
-        op = bc_buf[pos];
-        len = short_opcode_info(op).size;
-        fmt = short_opcode_info(op).fmt;
+    pos0 = 0;
+    while (pos0 < bc_len) {
+        op = bc_buf[pos0];
+        oi = js_get_op_info(bc_buf, bc_len, pos0, TRUE, &oi_tmp, &pos);
+        (void)op;
+        len = oi->size;
+        fmt = oi->fmt;
+        pos--; /* operands at pos + 1 */
         switch(fmt) {
         case OP_FMT_u16:
         case OP_FMT_i16:
@@ -48600,6 +49259,9 @@ static void bc_byte_swap(uint8_t *bc_buf, int bc_len)
         case OP_FMT_loc:
         case OP_FMT_arg:
         case OP_FMT_var_ref:
+        case OP_FMT_npop2:
+        case OP_FMT_npush:
+        case OP_FMT_unpack_ex:
             put_u16(bc_buf + pos + 1,
                     bswap16(get_u16(bc_buf + pos + 1)));
             break;
@@ -48639,17 +49301,19 @@ static void bc_byte_swap(uint8_t *bc_buf, int bc_len)
         default:
             break;
         }
-        pos += len;
+        pos0 += len;
     }
 }
 
 static int JS_WriteFunctionBytecode(BCWriterState *s,
                                     const uint8_t *bc_buf1, int bc_len)
 {
-    int pos, len, op;
+    int pos, len, op, opnd;
     JSAtom atom;
     uint8_t *bc_buf;
     uint32_t val;
+    const JSOpCode *oi;
+    JSOpCode oi_tmp;
 
     bc_buf = js_malloc(s->ctx, bc_len);
     if (!bc_buf)
@@ -48659,17 +49323,19 @@ static int JS_WriteFunctionBytecode(BCWriterState *s,
     pos = 0;
     while (pos < bc_len) {
         op = bc_buf[pos];
-        len = short_opcode_info(op).size;
-        switch(short_opcode_info(op).fmt) {
+        oi = js_get_op_info(bc_buf, bc_len, pos, TRUE, &oi_tmp, &opnd);
+        (void)op;
+        len = oi->size;
+        switch(oi->fmt) {
         case OP_FMT_atom:
         case OP_FMT_atom_u8:
         case OP_FMT_atom_u16:
         case OP_FMT_atom_label_u8:
         case OP_FMT_atom_label_u16:
-            atom = get_u32(bc_buf + pos + 1);
+            atom = get_u32(bc_buf + opnd);
             if (bc_atom_to_idx(s, &val, atom))
                 goto fail;
-            put_u32(bc_buf + pos + 1, val);
+            put_u32(bc_buf + opnd, val);
             break;
         default:
             break;
@@ -48931,21 +49597,25 @@ int JS_EnumCodeNames(JSContext *ctx, JSValueConst obj,
             for(i = 0; i < b->closure_var_count; i++)
                 js_enum_code_name(ctx, b->closure_var[i].var_name,
                                   func, opaque);
-            for(pos = 0; pos < b->byte_code_len;
-                pos += short_opcode_info(op).size) {
+            JSOpCode oi_tmp;
+            const JSOpCode *oi = NULL;
+            int opnd;
+            for(pos = 0; pos < b->byte_code_len; pos += oi->size) {
                 op = b->byte_code_buf[pos];
+                oi = js_get_op_info(b->byte_code_buf, b->byte_code_len, pos,
+                                    TRUE, &oi_tmp, &opnd);
                 if (op == OP_regexp) {
                     func(ctx, JS_ATOM_RegExp, opaque);
                 } else if (op == OP_import) {
                     func(ctx, JS_ATOM_import, opaque);
                 } else {
-                    switch(short_opcode_info(op).fmt) {
+                    switch(oi->fmt) {
                     case OP_FMT_atom:
                     case OP_FMT_atom_u8:
                     case OP_FMT_atom_u16:
                     case OP_FMT_atom_label_u8:
                     case OP_FMT_atom_label_u16:
-                        js_enum_code_name(ctx, get_u32(b->byte_code_buf + pos + 1),
+                        js_enum_code_name(ctx, get_u32(b->byte_code_buf + opnd),
                                           func, opaque);
                         break;
                     default:
@@ -49735,15 +50405,20 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
 
     pos = 0;
     while (pos < bc_len) {
+        JSOpCode oi_tmp;
+        const JSOpCode *oi;
+        int opnd;
         op = bc_buf[pos];
-        len = short_opcode_info(op).size;
-        switch(short_opcode_info(op).fmt) {
+        (void)op;
+        oi = js_get_op_info(bc_buf, bc_len, pos, TRUE, &oi_tmp, &opnd);
+        len = oi->size;
+        switch(oi->fmt) {
         case OP_FMT_atom:
         case OP_FMT_atom_u8:
         case OP_FMT_atom_u16:
         case OP_FMT_atom_label_u8:
         case OP_FMT_atom_label_u16:
-            idx = get_u32(bc_buf + pos + 1);
+            idx = get_u32(bc_buf + opnd);
             if (s->is_rom_data) {
                 /* just increment the reference count of the atom */
                 JS_DupAtom(s->ctx, (JSAtom)idx);
@@ -49753,10 +50428,10 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
                     b->byte_code_len = pos;
                     return -1;
                 }
-                put_u32(bc_buf + pos + 1, atom);
+                put_u32(bc_buf + opnd, atom);
 #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
                 if (check_dump_flag(s->ctx->rt, JS_DUMP_READ_OBJECT)) {
-                    bc_read_trace(s, "at %d, fixup atom: ", pos + 1); print_atom(s->ctx, atom); printf("\n");
+                    bc_read_trace(s, "at %d, fixup atom: ", opnd); print_atom(s->ctx, atom); printf("\n");
                 }
 #endif
             }
@@ -76822,7 +77497,8 @@ int JS_AddPerformance(JSContext *ctx)
 /* heap snapshots (JS_WriteSnapshot(), JS_ReadSnapshot()) */
 #include "quickjs-snapshot.c"
 
-#ifdef CONFIG_PYTHON
-/* Python front end (python/quickpy.h) */
+#if defined(CONFIG_PYTHON) && !defined(QP_UNIT_CHECK)
+/* Python front end (python/quickpy.h); QP_UNIT_CHECK is set by
+   build/check/unit.sh, which compiles python files one unit at a time. */
 #include "python/quickpy.c"
 #endif

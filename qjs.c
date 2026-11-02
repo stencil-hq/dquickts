@@ -43,6 +43,9 @@
 
 #include "cutils.h"
 #include "quickjs-libc.h"
+#ifdef CONFIG_PYTHON
+#include "python/quickpy.h"
+#endif
 
 extern const uint8_t qjsc_repl[];
 extern const uint32_t qjsc_repl_size;
@@ -981,6 +984,10 @@ void help(int exit_status)
            "    --experimental    enable experimental Temporal and Intl support\n"
 #endif
            "-q  --quit         just instantiate the interpreter and quit\n"
+#ifdef CONFIG_PYTHON
+           "    --python [python options] [args]  run Python 3.15 with the\n"
+           "                   'qpy' command line (also implied by a .py file)\n"
+#endif
            "The values of the long options can also be given as --option=value.\n");
     exit(exit_status);
 }
@@ -1197,6 +1204,10 @@ int main(int argc, char **argv)
                 strip_flags = JS_STRIP_SOURCE;
                 continue;
             }
+#ifdef CONFIG_PYTHON
+            if (!strcmp(longopt, "python"))
+                goto run_python;
+#endif
             if (opt) {
                 fprintf(stderr, "qjs: unknown option '-%c'\n", opt);
             } else {
@@ -1205,6 +1216,19 @@ int main(int argc, char **argv)
             help(1);
         }
     }
+
+#ifdef CONFIG_PYTHON
+    /* a .py script runs with the Python launcher; the slot before the
+       Python arguments receives the program name (CPython's argv[0]) */
+    if (optind < argc && !expr) {
+        size_t len = strlen(argv[optind]);
+        if (len > 3 && !strcmp(argv[optind] + len - 3, ".py")) {
+        run_python:
+            argv[optind - 1] = argv[0];
+            return qp_main(argc - optind + 1, argv + optind - 1);
+        }
+    }
+#endif
 
     if (trace_memory) {
         js_trace_malloc_init(&trace_data);

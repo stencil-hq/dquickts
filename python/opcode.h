@@ -96,7 +96,7 @@ PYDEF(push_null,                 2, 0, 1, none)
 PYDEF(copy,                      3, 0, 1, u8)
 /* SWAP n (n >= 3; SWAP 2 is QuickJS swap): exchange TOS and the n-th item */
 PYDEF(swap,                      3, 0, 0, u8)
-/* [] -> [v]   LOAD_COMMON_CONSTANT; u8 = QP_CONST_* (CPython CONSTANT_*).
+/* [] -> [v]   LOAD_COMMON_CONSTANT; u8 = QP_COMMON_CONST_* (CPython CONSTANT_*).
    The builtin objects (AssertionError, tuple, all, ...) are the real
    builtins, never looked up by name. */
 PYDEF(load_common_const,         3, 0, 1, u8)
@@ -502,19 +502,19 @@ enum {
 
 /* load_common_const: CONSTANT_* (pycore_opcode_utils.h) */
 enum {
-    QP_CONST_ASSERTIONERROR = 0,
-    QP_CONST_NOTIMPLEMENTEDERROR = 1,
-    QP_CONST_BUILTIN_TUPLE = 2,
-    QP_CONST_BUILTIN_ALL = 3,
-    QP_CONST_BUILTIN_ANY = 4,
-    QP_CONST_BUILTIN_LIST = 5,
-    QP_CONST_BUILTIN_SET = 6,
-    QP_CONST_NONE = 7,
-    QP_CONST_EMPTY_STR = 8,
-    QP_CONST_TRUE = 9,
-    QP_CONST_FALSE = 10,
-    QP_CONST_MINUS_ONE = 11,
-    QP_CONST_COUNT = 12,
+    QP_COMMON_CONST_ASSERTIONERROR = 0,
+    QP_COMMON_CONST_NOTIMPLEMENTEDERROR = 1,
+    QP_COMMON_CONST_BUILTIN_TUPLE = 2,
+    QP_COMMON_CONST_BUILTIN_ALL = 3,
+    QP_COMMON_CONST_BUILTIN_ANY = 4,
+    QP_COMMON_CONST_BUILTIN_LIST = 5,
+    QP_COMMON_CONST_BUILTIN_SET = 6,
+    QP_COMMON_CONST_NONE = 7,
+    QP_COMMON_CONST_EMPTY_STR = 8,
+    QP_COMMON_CONST_TRUE = 9,
+    QP_COMMON_CONST_FALSE = 10,
+    QP_COMMON_CONST_MINUS_ONE = 11,
+    QP_COMMON_CONST_COUNT = 12,
 };
 
 /* intrinsic1: INTRINSIC_* (pycore_intrinsics.h); 5 (UNARY_POSITIVE) is

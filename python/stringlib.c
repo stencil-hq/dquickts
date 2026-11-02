@@ -6,7 +6,7 @@
  * v3.15.2.  See python/stringlib.h for the API and conventions.
  *
  * The search/split/partition/count/replace/find_max_char/UTF-8 kernels are
- * CPython's stringlib templates (python/stringlib/*.h), instantiated for
+ * CPython's stringlib templates (python/stringlib/ *.h), instantiated for
  * UCS1, UCS2 and UCS4 exactly as unicodeobject.c does (plus a bytes flavour
  * of the whitespace/line-break functions).  The kind dispatchers below are
  * ports of the unicodeobject.c drivers.  The only systematic difference:

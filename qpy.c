@@ -1,11 +1,14 @@
 /*
- * qpy: Python front end of dquickts.
+ * qpy: Python 3.15 front end of dquickts.
  *
- * Currently exposes the Python 3.15 parser only:
+ *   qpy [option] ... [-c cmd | -m mod | file | -] [arg] ...
+ *
+ * The CPython command line (Modules/main.c, Python/initconfig.c) is
+ * implemented by qp_main() (python/pythonrun.c) so that `qjs file.py` and
+ * `qjs --python` share it.  One extra option is kept for the test harness:
+ *
  *   qpy --dump-ast-json-batch   serve the JSON-lines AST protocol on
  *                               stdin/stdout (see python/quickpy.h)
- * Running Python code is not available yet; any other invocation reports
- * that and exits with status 2.
  */
 #include <stdio.h>
 #include <string.h>
@@ -13,16 +16,12 @@
 #include "quickjs.h"
 #include "python/quickpy.h"
 
-int main(int argc, char **argv)
+static int dump_ast_json_batch(void)
 {
     JSRuntime *rt;
     JSContext *ctx;
     int ret;
 
-    if (argc != 2 || strcmp(argv[1], "--dump-ast-json-batch") != 0) {
-        fprintf(stderr, "qpy: running Python code is not implemented yet\n");
-        return 2;
-    }
     rt = JS_NewRuntime();
     if (!rt) {
         fprintf(stderr, "qpy: cannot allocate JS runtime\n");
@@ -38,4 +37,11 @@ int main(int argc, char **argv)
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     return ret < 0 ? 1 : 0;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 2 && strcmp(argv[1], "--dump-ast-json-batch") == 0)
+        return dump_ast_json_batch();
+    return qp_main(argc, argv);
 }

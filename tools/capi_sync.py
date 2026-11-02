@@ -27,7 +27,8 @@ tree, so local edits or patches in cpython/ never leak into capi/.
 
 Usage:
   tools/capi_sync.py              create missing files; refuse to overwrite
-                                  files that differ from tag + PATCHES
+                                  files that differ from tag + PATCHES or to
+                                  remove stale ones
   tools/capi_sync.py --force      also overwrite differing files and remove
                                   stale ones (after a tag change)
   tools/capi_sync.py --check      exit 1 if capi/ differs from tag + PATCHES
@@ -528,14 +529,18 @@ def main():
             ok = ok and not (missing or differing or stale)
             continue
         if (differing or stale) and not args.force:
+            # Creating missing files never loses work: do it anyway.
+            for p in missing:
+                write_disk(area, p, want[p])
             for p in differing:
                 print("capi_sync: local change not in PATCHES: capi/%s/%s"
                       % (area.name, p), file=sys.stderr)
             for p in stale:
                 print("capi_sync: stale: capi/%s/%s" % (area.name, p),
                       file=sys.stderr)
-            die("refusing to overwrite capi/%s (use --record to keep the "
-                "changes, --force to discard them)" % area.name)
+            die("refusing to overwrite capi/%s (%d missing file(s) written; "
+                "use --record to keep the changes, --force to discard them)"
+                % (area.name, len(missing)))
         for p in missing + differing:
             write_disk(area, p, want[p])
         for p in stale:

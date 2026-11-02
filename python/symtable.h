@@ -360,6 +360,12 @@ static __maybe_unused int _PySymtable_LookupOptional(struct symtable *st, void *
 /* Free the symtable, its entries and every atom it owns.  NULL is allowed. */
 static __maybe_unused void _PySymtable_Free(struct symtable *st);
 
+/* CPython exports _Py_Mangle/_Py_IsPrivateName (C API, D5): the static
+   implementations here are renamed by macro so the exported wrappers of
+   python/capi_unicode.c can use the CPython names (capi-design.md P1;
+   python/capi.h #undefs these macros). */
+#define _Py_Mangle qp_symtable_mangle
+#define _Py_IsPrivateName qp_symtable_is_private_name
 /* Mangling (new atom reference or JS_ATOM_NULL + err on OOM/overflow). */
 static __maybe_unused JSAtom _Py_MaybeMangle(JSAtom privateobj, PySTEntryObject *ste, JSAtom name,
                               JSContext *ctx, qp_error *err);

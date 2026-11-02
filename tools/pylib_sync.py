@@ -58,7 +58,7 @@ traceback inspect dis linecache tokenize unittest doctest argparse logging
 weakref threading queue signal locale codecs encodings fnmatch posixpath
 genericpath stat errno numbers reprlib gettext selectors socket tarfile
 zipfile gzip bz2 lzma calendar email html http asyncio pdb site sysconfig
-platform uuid
+platform uuid _pyio
 """.split()
 
 # Exception names whose handler makes a `try:` body an optional import.

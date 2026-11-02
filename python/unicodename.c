@@ -452,6 +452,111 @@ static int qp_unicode_lookup_name(const char *name, size_t len, uint32_t *cp)
     return 1;
 }
 
+
+static int
+_inverse_dawg_lookup(char* buffer, unsigned int buflen, unsigned int pos)
+{
+    unsigned int node_offset = 0;
+    unsigned int bufpos = 0;
+    for (;;) {
+        bool final;
+        unsigned int edge_offset = _dawg_decode_node(node_offset, &final);
+
+        if (final) {
+            if (pos == 0) {
+                if (bufpos + 1 == buflen) {
+                    return 0;
+                }
+                buffer[bufpos] = '\0';
+                return 1;
+            }
+            pos--;
+        }
+        unsigned int prev_target_node_offset = edge_offset;
+        bool is_first_edge = true;
+        for (;;) {
+            unsigned int size;
+            unsigned int label_offset, target_node_offset;
+            int last_edge = _dawg_decode_edge(
+                    is_first_edge, prev_target_node_offset, edge_offset,
+                    &size, &label_offset, &target_node_offset);
+            if (last_edge == -1) {
+                return 0;
+            }
+            is_first_edge = false;
+            prev_target_node_offset = target_node_offset;
+
+            unsigned int descendant_count = _dawg_node_descendant_count(target_node_offset);
+            if (pos < descendant_count) {
+                if (bufpos + size >= buflen) {
+                    return 0; // buffer overflow
+                }
+                for (unsigned int i = 0; i < size; i++) {
+                    buffer[bufpos++] = packed_name_dawg[label_offset++];
+                }
+                node_offset = target_node_offset;
+                break;
+            } else if (!last_edge) {
+                pos -= descendant_count;
+                edge_offset = label_offset + size;
+            } else {
+                return 0;
+            }
+        }
+    }
+}
+
+/* Name of code point `code` (unicodedata.name() without default): writes a
+   NUL-terminated ASCII name into buffer (buflen >= NAME_MAXLEN is always
+   enough) and returns 1, or returns 0 if the code point has no name. */
+static int qp_unicode_get_name(uint32_t code, char *buffer, int buflen)
+{
+    int offset;
+
+    if (code >= 0x110000)
+        return 0;
+    if (IS_ALIAS(code) || IS_NAMED_SEQ(code))
+        return 0;
+
+    int prefixid = find_prefix_id(code);
+    if (prefixid == 0) {
+        /* Hangul syllable. */
+        int SIndex = code - SBase;
+        int L = SIndex / NCount;
+        int V = (SIndex % NCount) / TCount;
+        int T = SIndex % TCount;
+
+        if (buflen < 27)
+            return 0;
+        strcpy(buffer, "HANGUL SYLLABLE ");
+        buffer += 16;
+        strcpy(buffer, hangul_syllables[L][0]);
+        buffer += strlen(hangul_syllables[L][0]);
+        strcpy(buffer, hangul_syllables[V][1]);
+        buffer += strlen(hangul_syllables[V][1]);
+        strcpy(buffer, hangul_syllables[T][2]);
+        buffer += strlen(hangul_syllables[T][2]);
+        *buffer = '\0';
+        return 1;
+    }
+
+    if (prefixid > 0) {
+        const char *prefix = derived_name_prefixes[prefixid];
+        if (snprintf(buffer, buflen, "%s%04X", prefix, (unsigned)code) >= buflen) {
+            return 0;
+        }
+        return 1;
+    }
+
+    offset = dawg_codepoint_to_pos_index1[(code>>DAWG_CODEPOINT_TO_POS_SHIFT)];
+    offset = dawg_codepoint_to_pos_index2[(offset<<DAWG_CODEPOINT_TO_POS_SHIFT) +
+                               (code&((1<<DAWG_CODEPOINT_TO_POS_SHIFT)-1))];
+    if (offset == DAWG_CODEPOINT_TO_POS_NOTFOUND)
+        return 0;
+
+    return _inverse_dawg_lookup(buffer, (unsigned int)buflen, offset);
+}
+
 #undef SBase
 #undef LBase
 #undef VBase

@@ -48,4 +48,15 @@ int qp_check(JSContext *ctx, const char *src, size_t len, const char *filename,
    I/O or fatal memory error. */
 int qp_dump_ast_json_batch(JSContext *ctx, FILE *in, FILE *out);
 
+/* CPython's `python` program (Py_BytesMain): parse the CPython command line
+   (argv[0] is the program name used in messages), honour the PYTHON*
+   environment variables unless -E/-I, create a runtime and a context with
+   the Python state, run `-c cmd`, `-m mod`, a script, stdin or the
+   interactive loop as __main__, flush sys.stdout/sys.stderr and return the
+   process exit status (CPython rules: 0, 1 for an uncaught exception,
+   SystemExit codes, 2 for usage errors and unopenable scripts, 120 when
+   flushing the standard streams fails, 130 for an unhandled
+   KeyboardInterrupt).  Used by qpy and by `qjs file.py` / `qjs --python`. */
+int qp_main(int argc, char **argv);
+
 #endif /* QUICKPY_H */

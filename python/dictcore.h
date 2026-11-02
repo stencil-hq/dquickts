@@ -226,7 +226,7 @@ static __maybe_unused void qp_dictcore_delitem_ix(JSContext *ctx, qp_dictcore *d
 static __maybe_unused int qp_dictcore_pop(JSContext *ctx, qp_dictcore *d, JSValueConst key,
                            Py_hash_t hash, qp_dictcore_eq_fn *eq, void *opaque,
                            JSValue *presult);
-/* dict.popitem: removes the last item (LIFO).  1 with *pkey/*pvalue OWNED,
+/* dict.popitem: removes the last item (LIFO).  1 with *pkey and *pvalue OWNED,
  * 0 if empty (caller raises KeyError("popitem(): dictionary is empty")). */
 static __maybe_unused int qp_dictcore_popitem(JSContext *ctx, qp_dictcore *d,
                                JSValue *pkey, JSValue *pvalue);
