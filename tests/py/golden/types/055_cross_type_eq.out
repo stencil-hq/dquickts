@@ -1,0 +1,60 @@
+eq row 0                =.............
+eq row 1                .===..........
+eq row 1.0              .===..........
+eq row True             .===..........
+eq row 1j               ....=.........
+eq row '1'              .....=........
+eq row b'1'             ......=.......
+eq row [1]              .......=......
+eq row (1,)             ........=.....
+eq row {1}              .........==...
+eq row frozenset({1})   .........==...
+eq row {1: 1}           ...........=..
+eq row None             ............=.
+eq row range(1, 2)      .............=
+1 == '1' False
+[] == () False
+[] == [] True
+'' == b'' False
+b'' == bytearray() True
+set() == frozenset() True
+{} == set() False
+range(0) == [] False
+0 == None False
+0 == '' False
+0 == [] False
+1 is True (True, False)
+2 == True False
+'a' == 'a' True
+[1, 2] == [1, 2.0] True
+{'a': 1} == {'a': True} True
+(1, [2]) == (1, [2]) True
+dict views eq True
+1 < '2' TypeError '<' not supported between instances of 'int' and 'str'
+'2' > 1 TypeError '>' not supported between instances of 'str' and 'int'
+[] < () TypeError '<' not supported between instances of 'list' and 'tuple'
+None < 0 TypeError '<' not supported between instances of 'NoneType' and 'int'
+None >= None TypeError '>=' not supported between instances of 'NoneType' and 'NoneType'
+1 <= 1j TypeError '<=' not supported between instances of 'int' and 'complex'
+b'a' < 'a' TypeError '<' not supported between instances of 'bytes' and 'str'
+{1} < [1, 2] TypeError '<' not supported between instances of 'set' and 'list'
+{} < {} TypeError '<' not supported between instances of 'dict' and 'dict'
+1.5 < True False
+False < 0.5 < True True
+object() < object() TypeError '<' not supported between instances of 'object' and 'object'
+chained mixed TypeError '<' not supported between instances of 'int' and 'str'
+chained short-circuit False
+1 != '1' True
+None != 0 True
+[] != () True
+in mixed list (False, False, True, True)
+list.index mixed 0
+dict key types distinct 5
+sorted mixed error TypeError '<' not supported between instances of 'str' and 'int'
+max mixed error TypeError '>' not supported between instances of 'str' and 'bytes'
+eq never raises [False, False, False, True]
+is vs == (False, True)
+str subclass eq True
+int subclass eq True
+tuple subclass eq True
+list vs list subclass True

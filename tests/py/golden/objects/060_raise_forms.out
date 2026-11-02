@@ -1,0 +1,18 @@
+bare raise ValueError invalid literal for int() with base 10: 'x'
+bare raise no active RuntimeError No active exception to reraise
+bare raise in function RuntimeError No active exception to reraise
+handler raises second context ValueError('first')
+bad except target TypeError catching classes that do not inherit from BaseException is not allowed
+bad tuple except target TypeError catching classes that do not inherit from BaseException is not allowed
+raise int -> TypeError exceptions must derive from BaseException
+raise str -> TypeError exceptions must derive from BaseException
+raise NoneType -> TypeError exceptions must derive from BaseException
+raise object -> TypeError exceptions must derive from BaseException
+raise type -> TypeError exceptions must derive from BaseException
+raise class instantiates ValueError() ()
+class needing args TypeError NeedsArgs.__init__() missing 2 required positional arguments: 'a' and 'b'
+class constructing non-exception TypeError calling <class '__main__.FactoryResult'> should have returned an instance of BaseException, not <class 'str'>
+raise stored later True KeyError('missing')
+bare raise after nested handler re-raises outer ValueError outer
+normal return through finally value
+traceback object present True traceback

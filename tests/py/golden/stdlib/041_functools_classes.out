@@ -1,0 +1,15 @@
+cached_property 12 12 1 True
+after del 12 2
+assignable 99 2
+class access cached_property area
+no __dict__ TypeError No '__dict__' attribute on 'Slotted' instance to cache 'area' property.
+total_ordering True True False False True
+sorted versions [V1.2, V1.10, V2]
+max/min V1.10 V1.2
+total_ordering needs one ValueError must define at least one ordering operation: < > <= >=
+singledispatch int 3 | bool True | object 's' | list of int 1, number 2.5
+union register number 1j | number 0.5
+dispatch _ True
+registry keys ['bool', 'complex', 'float', 'int', 'list', 'object']
+no args TypeError describe requires at least 1 positional argument
+singledispatchmethod int x3 named big generic 2.5

@@ -1,0 +1,35 @@
+created, nothing evaluated []
+type generator
+next 0 [0]
+next 10 [0, 1]
+rest [20] [0, 1, 2]
+exhausted []
+next on exhausted StopIteration None
+any short-circuit True [0, 1, 2]
+all short-circuit False [0, 1]
+sum genexpr 285
+max genexpr 3
+min with default empty
+join genexpr 0,1,2,3
+sorted genexpr [(0, 0), (0, 3), (1, 1), (1, 4), (2, 2), (2, 5)]
+tuple genexpr ('h', 'e', 'y')
+dict from genexpr {'aa': 2, 'b': 1}
+outermost eager ['src evaluated']
+values [1, 2]
+eager error TypeError 'int' object is not iterable
+created with undefined inner name
+lazy inner error NameError name 'undefined_inner' is not defined
+late binding element [0, 100, 200]
+early bound iterable [1, 2, 3]
+mutation visible [1, 2, 3]
+pipeline [0, 4, 16, 36, 64, 100, 144, 196, 256, 324]
+lazy infinite [0, 1, 4, 9, 16, 25, 36, 49]
+sole arg ['a', 'b']
+with other arg [3, 2, 1]
+syntax error f(x for x in y, 1) Generator expression must be parenthesized
+syntax error f(1, x for x in y) Generator expression must be parenthesized
+compiles f((x for x in y), 1)
+first ok 1
+lazy exception ZeroDivisionError division by zero
+after exception exhausted []
+closed []

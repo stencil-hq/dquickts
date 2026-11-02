@@ -1,0 +1,115 @@
+abs 0 0
+hex/oct/bin 0 0x0 0o0 0b0
+bit_length/bit_count 0 0 0
+abs 1 1
+hex/oct/bin 1 0x1 0o1 0b1
+bit_length/bit_count 1 1 1
+abs -1 1
+hex/oct/bin -1 -0x1 -0o1 -0b1
+bit_length/bit_count -1 1 1
+abs 7 7
+hex/oct/bin 7 0x7 0o7 0b111
+bit_length/bit_count 7 3 3
+abs -7 7
+hex/oct/bin -7 -0x7 -0o7 -0b111
+bit_length/bit_count -7 3 3
+abs 255 255
+hex/oct/bin 255 0xff 0o377 0b11111111
+bit_length/bit_count 255 8 8
+abs -256 256
+hex/oct/bin -256 -0x100 -0o400 -0b100000000
+bit_length/bit_count -256 9 1
+abs 2147483647 2147483647
+hex/oct/bin 2147483647 0x7fffffff 0o17777777777 0b1111111111111111111111111111111
+bit_length/bit_count 2147483647 31 31
+abs -2147483648 2147483648
+hex/oct/bin -2147483648 -0x80000000 -0o20000000000 -0b10000000000000000000000000000000
+bit_length/bit_count -2147483648 32 1
+abs 18446744073709551616 18446744073709551616
+hex/oct/bin 18446744073709551616 0x10000000000000000 0o2000000000000000000000 0b10000000000000000000000000000000000000000000000000000000000000000
+bit_length/bit_count 18446744073709551616 65 1
+abs -18446744073709551615 18446744073709551615
+hex/oct/bin -18446744073709551615 -0xffffffffffffffff -0o1777777777777777777777 -0b1111111111111111111111111111111111111111111111111111111111111111
+bit_length/bit_count -18446744073709551615 64 64
+abs 717897987691852588770249 717897987691852588770249
+hex/oct/bin 717897987691852588770249 0x980553f0db2fd09de3c9 0o230012517606662772047361711 0b10011000000001010101001111110000110110110010111111010000100111011110001111001001
+bit_length/bit_count 717897987691852588770249 80 41
+abs(-2**200) 1606938044258990275541962092341162602522202993782792835301376
+abs(-0) 0
+abs(False) 0
+abs('1') TypeError bad operand type for abs(): 'str'
+hex(1.0) TypeError 'float' object cannot be interpreted as an integer
+bin('1') TypeError 'str' object cannot be interpreted as an integer
+oct(-0) '0o0'
+hex(2**100) '0x10000000000000000000000000'
+bin(-2**40) '-0b10000000000000000000000000000000000000000'
+(0).bit_length() 0
+(2**1000).bit_length() 1001
+(2**1000-1).bit_count() 1000
+(-2**1000).bit_count() 1
+(5).is_integer() True
+(5).as_integer_ratio() (5, 1)
+(-5).as_integer_ratio() (-5, 1)
+True.as_integer_ratio() (1, 1)
+(7).numerator 7
+(7).denominator 1
+(7).real 7
+(7).imag 0
+(-7).conjugate() -7
+int.__trunc__(-7) -7
+(-7).__floor__() -7
+(-7).__ceil__() -7
+(17).__round__(-1) 20
+format(255, '') '255'
+format(255, 'd') '255'
+format(255, '5d') '  255'
+format(255, '<5d') '255  '
+format(255, '^5') ' 255 '
+format(255, '>5') '  255'
+format(255, '05d') '00255'
+format(255, '+d') '+255'
+format(255, ' d') ' 255'
+format(255, 'x') 'ff'
+format(255, 'X') 'FF'
+format(255, '#x') '0xff'
+format(255, '#X') '0XFF'
+format(255, 'o') '377'
+format(255, '#o') '0o377'
+format(255, 'b') '11111111'
+format(255, '#b') '0b11111111'
+format(255, '08b') '11111111'
+format(255, ',') '255'
+format(255, '_') '255'
+format(255, '_x') 'ff'
+format(255, '_b') '1111_1111'
+format(255, 'c') 'ÿ'
+format(255, 'e') '2.550000e+02'
+format(255, '.2f') '255.00'
+format(255, '%') '25500.000000%'
+format(255, 'n') '255'
+format(255, '=+8') '+    255'
+format(255, '*^9') '***255***'
+format(-255, 'd') '-255'
+format(-255, 'x') '-ff'
+format(-255, '#b') '-0b11111111'
+format(-255, '+') '-255'
+format(-255, '05') '-0255'
+format(-255, ',') '-255'
+format(-255, '_x') '-ff'
+format(10**20, ',') '100,000,000,000,000,000,000'
+format(-10**20, '_') '-100_000_000_000_000_000_000'
+format(1, 's') ValueError Unknown format code 's' for object of type 'int'
+format(1, '.2') ValueError Precision not allowed in integer format specifier
+format(1, ',d,') ValueError Invalid format specifier ',d,' for object of type 'int'
+format(0x110000, 'c') OverflowError %c arg not in range(0x110000)
+format(-1, 'c') OverflowError %c arg not in range(0x110000)
+format(65, 'c') 'A'
+'%d %i %x %X %o' % (...) '-255 255 ff FF 10'
+'%#x %#o %+d % d' % (...) '0xff 0o10 +5  5'
+'%5d|%-5d|%05d' % (...) '   42|42   |-0042'
+'%c' % 97 'a'
+'%d' % 2.9 '2'
+'%x' % 2.0 TypeError format argument: %x requires an integer, not float
+'%d' % '1' TypeError format argument: %d requires a real number, not str
+f'{12345678:,}' '12,345,678'
+f'{-42:=+10}' '-       42'

@@ -1,0 +1,37 @@
+range [0, 3, 6, 9, 12, 15, 18] 7
+range slice range(3, 12, 3) [3, 6, 9]
+range rev range(18, -3, -3) [18, 15, 12, 9, 6, 3, 0]
+range step slice range(0, 21, 6) [0, 6, 12, 18]
+range neg slice range(12, 21, 3) [12, 15, 18]
+range empty slice range(15, 6, 3) 0
+range index 0 18 9
+range of neg step range(8, 4, -2) [8, 6]
+empty range slice range(0, 0) range(-1, -1, -1)
+big range 99999999999999999999 range(10000000000000000000, 10000000000000000003)
+range index 7 IndexError range object index out of range
+range index -8 IndexError range object index out of range
+range step 0 ValueError slice step cannot be zero
+range str index TypeError range indices must be integers or slices, not str
+range() step 0 ValueError range() arg 3 must not be zero
+len huge range OverflowError Python int too large to convert to C ssize_t
+range eq True True True
+bytes slice b'hello' b'world' b'dlrow olleh' b'hlowrd'
+bytes index is int 104 100 int
+bytes slice is bytes b'h' bytes
+bytes empty b'' b''
+bytes neg step b'rwo'
+bytes index 11 IndexError index out of range
+bytes index -12 IndexError index out of range
+bytes setitem TypeError 'bytes' object does not support item assignment
+bytearray slice bytearray(b'bcd') bytearray(b'fedcba') 97
+bytearray setitem bytearray(b'Abcdef')
+bytearray slice assign grow bytearray(b'AXYZdef')
+bytearray extended assign bytearray(b'1X2Z3e4')
+bytearray del step bytearray(b'X23e')
+bytearray 256 ValueError byte must be in range(0, 256)
+bytearray bytes item TypeError 'bytes' object cannot be interpreted as an integer
+bytearray extended wrong len ValueError attempt to assign bytes of size 7 to extended slice of size 2
+memoryview b'bcd' 102 b'ace' 4
+subclass slice type str str
+list subclass slice type list
+getitem key 1 slice(1, 2, None) slice(None, None, 3) (slice(1, 2, None), 3) Ellipsis (slice(None, None, None), None)

@@ -1,0 +1,26 @@
+print uses str (1, 2.5)
+str (1, 2.5)
+repr Point(1, 2.5)
+in list uses repr [Point(1, 2.5), Point(1, 2.5)]
+in dict uses repr {'k': Point(1, 2.5)}
+format empty (1, 2.5)
+format spec (1.00, 2.50)
+format custom r2=7.25
+fstring (1, 2.5) Point(1, 2.5) (1, 2.5) (0001.000, 0002.500)
+str.format (1, 2.5) Point(1, 2.5)      x
+percent (1, 2.5) | Point(1, 2.5)
+str falls back to repr OnlyRepr() OnlyRepr() OnlyRepr()
+str only only str True
+format falls back to str only str only str
+TypeError unsupported format string passed to OnlyStr.__format__
+TypeError BadRepr.__repr__() must return a str, not int
+TypeError BadStr.__str__() must return a str, not NoneType
+TypeError BadFormat.__format__() must return a str, not int
+non-ascii repr Ünï(é) \xdcn\xef(\xe9)
+str returns subclass sub StrSub
+money [123.45] [    123.45] [123.45****] Money(12345)
+nested format spec [      123.45]
+builtin formats ff 3.14   ab   1,234,567
+format of int subclass 1 True True
+repr of tuple (R, R) 0
+type repr <class '__main__.Point'> <class '__main__.Point'> <class 'int'>

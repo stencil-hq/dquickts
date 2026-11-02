@@ -1,0 +1,40 @@
+token Token(kind='IF', value='IF', line=1, column=0)
+token Token(kind='ID', value='quantity', line=1, column=3)
+token Token(kind='THEN', value='THEN', line=1, column=12)
+token Token(kind='ID', value='total', line=2, column=4)
+token Token(kind='ASSIGN', value=':=', line=2, column=10)
+token Token(kind='ID', value='total', line=2, column=13)
+token Token(kind='OP', value='+', line=2, column=19)
+token Token(kind='ID', value='price', line=2, column=21)
+token Token(kind='OP', value='*', line=2, column=27)
+token Token(kind='ID', value='quantity', line=2, column=29)
+token Token(kind='END', value=';', line=2, column=37)
+token Token(kind='ID', value='tax', line=3, column=4)
+token Token(kind='ASSIGN', value=':=', line=3, column=8)
+token Token(kind='ID', value='price', line=3, column=11)
+token Token(kind='OP', value='*', line=3, column=17)
+token Token(kind='NUMBER', value=0.05, line=3, column=19)
+token Token(kind='END', value=';', line=3, column=23)
+token Token(kind='ENDIF', value='ENDIF', line=4, column=0)
+token Token(kind='END', value=';', line=4, column=5)
+tokenize error '$' unexpected on line 1
+pattern groups 8 ['NUMBER', 'ASSIGN', 'END']
+log GET /apache_pb.gif 200 2326 (48, 62)
+log POST /api/v1/items?id=3 201 - (48, 66)
+log skip 'garbage line here'
+log DELETE /x 404 0 (54, 56)
+status counts [('200', 1), ('201', 1), ('404', 1)]
+render Hello Ann, you owe $12.50 by FRIDAY. <missing?>
+snake camelCaseString -> camel_case_string
+snake HTTPServerError -> http_server_error
+snake getHTTPResponseCode -> get_http_response_code
+snake simple -> simple
+snake already_snake -> already_snake
+emails ['a.b@example.com', 'x_y+z@sub.domain.org']
+ints and floats [-3, 4.25, 10]
+key values {'a': '1', 'b': 'two', 'c': '3', 'd': ''}
+collapse ws many spaces
+strip tags Hello world
+dedupe words the cat sat down
+reformat dates from 05/01/2024 to 31/12/2024
+split sentences ['One.', 'Two!', 'Three?', 'Four']

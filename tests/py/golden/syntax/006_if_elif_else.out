@@ -1,0 +1,40 @@
+classify -5 negative
+classify 0 zero
+classify 3 small
+classify 10 medium
+classify 99 medium
+classify 100 large
+classify 100000000000000000000 large
+classify -0.0 zero
+classify 0.5 small
+branch >1
+after if without else
+no branch taken
+grade pass+ pass rescued fail
+evaluated conditions ['a', 'b']
+or chain true
+or chain log ['x', 'y', 'z']
+and chain false
+and chain log ['p', 'q']
+falsy []
+truthy [0]
+falsy ''
+truthy ' '
+falsy {}
+truthy {0: 0}
+falsy None
+falsy 0
+truthy 1
+falsy 0.0
+truthy 1e-300
+single line if
+single line else
+odd and > 5
+bool raises ValueError no bool for you
+bool returns int TypeError WrongBool.__bool__() must return a bool, not int
+kind '' empty
+kind '123' digits
+kind 'abc' alpha
+kind '  ' space
+kind 'a1' mixed
+block scope visible

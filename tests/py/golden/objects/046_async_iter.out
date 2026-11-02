@@ -1,0 +1,9 @@
+async for [0, 1, 2, 3]
+async comprehension [0, 4, 16]
+async for else else ran after 1
+async for break 3
+TypeError 'async for' requires an object with __aiter__ method, got list
+TypeError 'async for' received an invalid object from __anext__: int
+manual anext 0 1
+manual exhaustion StopAsyncIteration
+aiter anext builtins 0 default

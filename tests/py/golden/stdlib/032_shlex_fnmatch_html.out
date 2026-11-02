@@ -1,0 +1,61 @@
+split 'ls -la /tmp' ['ls', '-la', '/tmp']
+split 'echo "hello world" \'single q\' plain' ['echo', 'hello world', 'single q', 'plain']
+split 'a\\ b c\\"d' ['a b', 'c"d']
+split 'mix"ed quo"tes' ['mixed quotes']
+split '  leading   spaces  ' ['leading', 'spaces']
+split 'x # comment here' ['x', '#', 'comment', 'here']
+split '' []
+split '\'it\'"\'"\'s\'' ["it's"]
+split '"esc \\" inside" "\\$HOME"' ['esc " inside', '\\$HOME']
+split comments ['x']
+split non-posix ['"a b"', 'c']
+split error '"unterminated' ValueError No closing quotation
+split error "'also" ValueError No closing quotation
+split error 'trailing\\' ValueError No escaped character
+quote 'simple' simple
+quote 'has space' 'has space'
+quote '' ''
+quote "it's" 'it'"'"'s'
+quote '$var' '$var'
+quote 'a;b' 'a;b'
+quote 'safe-chars_./@%+=:,' safe-chars_./@%+=:,
+quote 'ü' 'ü'
+join cp 'my file.txt' 'it'"'"'s here' -v
+join roundtrip True
+lexer tokens ['a', '=', 'b', '+', 'c d', ';']
+lexer ws split ['key=value', 'other=x']
+punctuation_chars ['a', '&&', 'b', '||', 'c', ';', 'd']
+filter *.py ['main.py', 'test_main.py']
+filter test_* ['test_main.py']
+filter data?.csv ['data1.csv']
+filter data[0-9]*.csv ['data1.csv', 'data22.csv']
+filter [!.]* ['main.py', 'test_main.py', 'README.md', 'setup.cfg', 'data1.csv', 'data22.csv', 'Main.PY']
+filter *.[ch]fg ['setup.cfg']
+filter * ['main.py', 'test_main.py', 'README.md', 'setup.cfg', 'data1.csv', 'data22.csv', '.hidden', 'Main.PY']
+filter [A-Z]* ['README.md', 'Main.PY']
+filter *.PY ['Main.PY']
+fnmatchcase False True
+fnmatch posix False True
+special chars True True True
+star matches slash True
+empty True False
+bad range False True
+translate (?s:.*\.py)\z (?s:a.[^0-9])\z
+filterfalse ['README.md', 'setup.cfg', 'data1.csv', 'data22.csv', '.hidden', 'Main.PY']
+escape &lt;a href=&quot;x?a=1&amp;b=2&quot;&gt;Tom&#x27;s &quot;quote&quot;&lt;/a&gt;
+escape no quote &lt;a href="x?a=1&amp;b=2"&gt;Tom's "quote"&lt;/a&gt;
+escape empty ''
+unescape '&lt;p&gt;' '<p>'
+unescape '&amp;amp;' '&amp;'
+unescape '&#65;&#x42;&#x43' 'ABC'
+unescape '&copy; &eacute; &euro;' '© é €'
+unescape '&nosuch;' '&nosuch;'
+unescape '&amp' '&'
+unescape '&#0;' '�'
+unescape '&#x110000;' '�'
+unescape '&lt' '<'
+unescape 'AT&T' 'AT&T'
+unescape '&notit;' '¬it;'
+unescape '&#128;' '€'
+roundtrip True
+entities 233 alpha >

@@ -1,0 +1,12 @@
+return in try from try ['try', 'finally']
+returned object mutated ['before', 'mutated in finally']
+rebinding does not change return 1
+finally return overrides finally
+finally return swallows swallowed
+loop break continue ['body 0', 'finally 0', 'finally 1', 'body 2', 'finally 2', 'finally 3']
+break in finally drops exception loop exited
+exception path ['finally ran during propagation', 'caught propagating']
+finally exception replaces replacement context ValueError('original')
+nested finally order ['inner', 'outer']
+while finally 3 ['iter 1', 'iter 2', 'iter 3']
+else return then finally ['try', 'else', 'finally']

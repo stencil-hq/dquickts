@@ -1,0 +1,64 @@
+decimal 0 7 1234567890 -42 42 0 0
+hex 255 255 3735928559 255 0 -16
+octal 15 511 63 0
+binary 10 3 2 0 -1
+underscores 1000000 65535 240 123
+big 123456789012345678901234567890
+big hex 79228162514264337593543950335
+powers 9223372036854775808 18446744073709551616 -9223372036854775808 1000000000000000000000000000000
+big repr type int 101
+boundaries 2147483647 2147483648 4294967296 9007199254740993 4611686018427387904
+hex() 0xff -0xff 0x0 0x400000000000000000
+oct() 0o377 -0o377 0o0
+bin() 0b11111111 -0b11111111 0b0
+str/repr -17 100000000000000000000
+plain ('42',) 42
+spaces ('  -17  ',) -17
+plus ('+5',) 5
+underscore ('1_000',) 1000
+hex base 16 ('ff', 16) 255
+hex prefix base 16 ('0xff', 16) 255
+hex prefix base 0 ('0xff', 0) 255
+octal base 0 ('0o17', 0) 15
+binary base 0 ('0b101', 0) 5
+base 0 leading zero ('010', 0) ValueError invalid literal for int() with base 0: '010'
+base 0 zero ('000', 0) 0
+base 36 ('zz', 36) 1295
+base 2 ('1101', 2) 13
+base 2 invalid ('102', 2) ValueError invalid literal for int() with base 2: '102'
+empty ('',) ValueError invalid literal for int() with base 10: ''
+float str ('1.5',) ValueError invalid literal for int() with base 10: '1.5'
+double underscore ('1__0',) ValueError invalid literal for int() with base 10: '1__0'
+trailing underscore ('10_',) ValueError invalid literal for int() with base 10: '10_'
+leading underscore ('_10',) ValueError invalid literal for int() with base 10: '_10'
+base 1 ('1', 1) ValueError int() base must be >= 2 and <= 36, or 0
+base 37 ('1', 37) ValueError int() base must be >= 2 and <= 36, or 0
+unicode digits ('٣٤',) 34
+fullwidth ('１２',) 12
+bytes (b'12',) 12
+none (None,) TypeError int() argument must be a string, a bytes-like object or a real number, not 'NoneType'
+from float (3.99,) 3
+from neg float (-3.99,) -3
+from bool (True,) 1
+no args () 0
+base without str (12, 16) TypeError int() can't convert non-string with explicit base
+inf (inf,) OverflowError cannot convert float infinity to integer
+nan (nan,) ValueError cannot convert float NaN to integer
+syntax '012' leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers
+syntax '0x' invalid hexadecimal literal
+syntax '0b2' invalid digit '2' in binary literal
+syntax '0o8' invalid digit '8' in octal literal
+syntax '1__0' invalid decimal literal
+syntax '1_' invalid decimal literal
+syntax '0_x1' invalid decimal literal
+syntax '0xg' invalid hexadecimal literal
+syntax '08' leading zeros in decimal integer literals are not permitted; use an 0o prefix for octal integers
+big arith 1 2 4 -535646014752996758513987364113720867507400997927597611767126 2
+big compare True True True
+int bit_length 0 8 9 201
+bit_count 8 1
+to_bytes b'\x04\x00' b'\x00\x04\x00\x00' 256
+signed bytes b'\xff\xff' -2
+as_integer_ratio (10, 1)
+int attrs 5 0 5 1 5
+digit limit ValueError Exceeds the limit (4300 digits) for integer string conversio

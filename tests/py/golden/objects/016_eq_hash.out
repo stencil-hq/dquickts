@@ -1,0 +1,27 @@
+default eq identity True False True
+default hashable True 1
+default __hash__ present True
+eq only __hash__ is None True
+eq only compares True True
+hash() TypeError unhashable type: 'EqOnly'
+set member TypeError cannot use 'EqOnly' as a set element (unhashable type: 'EqOnly')
+dict key TypeError cannot use 'EqOnly' as a dict key (unhashable type: 'EqOnly')
+hash equal values True 5
+set dedup 2
+dict overwrite {H('a'): 2}
+lookup 2 False
+eq NotImplemented False True
+child eq resets hash True
+explicit keep hash True
+TypeError unhashable type: 'Unhashable'
+TypeError __hash__ method should return an integer
+big hash reduced True
+hash -1 becomes -2 -2
+both NotImplemented falls back to identity False True True
+eq calls ['a==b', 'b==a', 'a==a', 'a==a', 'a==b', 'b==a']
+list contains uses eq True 0
+list count 3
+reflected eq True False
+identity shortcut in containers True False True
+int float hash True {1: 'c'}
+tuple hash True True

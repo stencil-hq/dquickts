@@ -1,0 +1,46 @@
+mul before add 14 20
+pow right assoc 512 64
+unary minus vs pow -4 4 0.5 -0.25
+pow vs unary on right 0.0625 0.1
+unary chain 3 3 5 2 4 False
+sub left assoc 3 9
+div left assoc 2.0 50.0
+floordiv/mod left assoc 2 100 9 7
+mixed mul div 3.0 3.0 6
+shift vs add 8 5 16 24
+and vs or bitwise 3 3 7 5 1
+bitwise vs compare True True True
+shift vs bitwise 9 8 3
+not vs compare True False True
+not vs and/or 0 True 1
+and before or 1 0 2
+compare vs arith True True True
+in vs arith True True
+is vs not False False
+ternary lowest 1 12
+ternary vs or 2 1
+lambda lowest 3 -1
+unary vs mul 9 9 -18
+matmul-free mod pow 2 -1 3 8
+power of negative literal True False
+subscript/call binds tightest -1 -1 8
+attribute on literal 3 -1 -2.5
+await-free primary 2 9
+chain mixed True True False False
+string ops abbb ababab 3x 2
+walrus groups whole expr 5 10
+syntax '1 + not 2' 'not' after an operator must be parenthesized
+syntax 'a == not b' invalid syntax
+syntax '- not 1' 'not' after an operator must be parenthesized
+compiles 'not - 1'
+pow eval order 8 ['a', 'b', 'c']
+arith eval order 7 ['a', 'b', 'c']
+call eval order (1, 2) ['f', 'x', 'y']
+dict eval order ['k1', 'v1', 'k2', 'v2']
+assignment eval order ['val', 'obj', 'idx']
+divmod 7 2 3 1 (3, 1) 3.5
+divmod -7 2 -4 1 (-4, 1) -3.5
+divmod 7 -2 -4 -1 (-4, -1) -3.5
+divmod -7 -2 3 -1 (3, -1) 3.5
+float divmod 7.5 2 3.0 1.5
+float divmod -7.5 2 -4.0 0.5

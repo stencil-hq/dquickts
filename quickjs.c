@@ -76821,3 +76821,8 @@ int JS_AddPerformance(JSContext *ctx)
 
 /* heap snapshots (JS_WriteSnapshot(), JS_ReadSnapshot()) */
 #include "quickjs-snapshot.c"
+
+#ifdef CONFIG_PYTHON
+/* Python front end (python/quickpy.h) */
+#include "python/quickpy.c"
+#endif

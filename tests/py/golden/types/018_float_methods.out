@@ -1,0 +1,97 @@
+is_integer 0.0 True
+is_integer -0.0 True
+is_integer 1.0 True
+is_integer -1.0 True
+is_integer 1.5 False
+is_integer 2.0 True
+is_integer 0.1 False
+is_integer 1e+16 True
+is_integer 1e+300 True
+is_integer 5e-324 False
+is_integer 123.0 True
+is_integer -2.5 False
+is_integer 4503599627370496.0 True
+as_integer_ratio 0.0 (0, 1)
+as_integer_ratio 1.0 (1, 1)
+as_integer_ratio -1.0 (-1, 1)
+as_integer_ratio 0.5 (1, 2)
+as_integer_ratio 0.1 (3602879701896397, 36028797018963968)
+as_integer_ratio -0.75 (-3, 4)
+as_integer_ratio 2.5 (5, 2)
+as_integer_ratio 1e+16 (10000000000000000, 1)
+as_integer_ratio 1e-10 (7737125245533627, 77371252455336267181195264)
+as_integer_ratio 3.0 (3, 1)
+as_integer_ratio 5e-324 (1, 202402253307310618352495346718917307049556649764142118356901358027430339567995346891960383701437124495187077864316811911389808737385793476867013399940738509921517424276566361364466907742093216341239767678472745068562007483424692698618103355649159556340810056512358769552333414615230502532186327508646006263307707741093494784)
+as_integer_ratio 1.7976931348623157e+308 (179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368, 1)
+hex 0.0 0x0.0p+0
+hex -0.0 -0x0.0p+0
+hex 1.0 0x1.0000000000000p+0
+hex -1.0 -0x1.0000000000000p+0
+hex 0.5 0x1.0000000000000p-1
+hex 2.0 0x1.0000000000000p+1
+hex 0.1 0x1.999999999999ap-4
+hex 3.14 0x1.91eb851eb851fp+1
+hex 1e+16 0x1.1c37937e08000p+53
+hex 5e-324 0x0.0000000000001p-1022
+hex 2.2250738585072014e-308 0x1.0000000000000p-1022
+hex 1.7976931348623157e+308 0x1.fffffffffffffp+1023
+hex 0.3333333333333333 0x1.5555555555555p-2
+hex -1e-300 -0x1.56e1fc2f8f359p-997
+fromhex('0x1p0') 1.0
+fromhex('0x1.8p1') 3.0
+fromhex('-0x1p-1') -0.5
+fromhex('0x.8p1') 1.0
+fromhex('0x1.') 1.0
+fromhex('1p4') 16.0
+fromhex('0X1P4') 16.0
+fromhex('  0x1p0  ') 1.0
+fromhex('0x1.fffffffffffffp+1023') 1.7976931348623157e+308
+fromhex('0x1p+1024') OverflowError hexadecimal value too large to represent as a float
+fromhex('0x1p-1074') 5e-324
+fromhex('0x1p-1075') 0.0
+fromhex('0x1.0000000000001p-1075') 5e-324
+fromhex('0x3p-1076') 5e-324
+fromhex('0x0p0') 0.0
+fromhex('-0x0p0') -0.0
+fromhex('inf') inf
+fromhex('-Infinity') -inf
+fromhex('nan') nan
+fromhex('0x1.0000000000000800p0') 1.0
+fromhex('0x1.0000000000000801p0') 1.0000000000000002
+fromhex('0x1.0000000000001800p0') 1.0000000000000004
+fromhex('0xffffffffffffffffp0') 1.8446744073709552e+19
+fromhex('0x1_0p0') ValueError invalid hexadecimal floating-point string
+fromhex('') ValueError invalid hexadecimal floating-point string
+fromhex('0x') ValueError invalid hexadecimal floating-point string
+fromhex('0xg') ValueError invalid hexadecimal floating-point string
+fromhex('0x1p') ValueError invalid hexadecimal floating-point string
+fromhex('1.5.p0') ValueError invalid hexadecimal floating-point string
+fromhex('0x1p0x') ValueError invalid hexadecimal floating-point string
+fromhex('0x1p99999999999999999999') OverflowError hexadecimal value too large to represent as a float
+roundtrip hex True
+fromhex type 'float'
+fromhex(5) TypeError bad argument type for built-in operation
+(1.5).real 1.5
+(1.5).imag 0.0
+(1.5).conjugate() 1.5
+(-2.5).__trunc__() -2
+(-2.5).__floor__() -3
+(-2.5).__ceil__() -2
+(2.5).__floor__() 2
+(2.5).__ceil__() 3
+(1e300).__floor__() bits 997
+float('inf').__floor__() OverflowError cannot convert float infinity to integer
+float('nan').__ceil__() ValueError cannot convert float NaN to integer
+(2.5).__round__() 2
+(2.567).__round__(2) 2.57
+float.from_number(3) 3.0
+float.from_number(2.5) 2.5
+float.from_number('3') TypeError must be real number, not str
+float.__getformat__('double') 'IEEE, little-endian'
+(0.1).__abs__() 0.1
+(3.0).__neg__() -3.0
+(7.0).__divmod__(2) (3.0, 1.0)
+(7.0).__rsub__(1) -6.0
+(7.0).__add__('a') NotImplemented
+float.__add__(1.0, 2) 3.0
+float.__add__(1, 2.0) TypeError descriptor '__add__' requires a 'float' object but received a 'int'

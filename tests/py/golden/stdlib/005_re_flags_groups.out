@@ -1,0 +1,55 @@
+I ['ABC', 'abc', 'AbC']
+M ['one', 'two', 'three']
+no M []
+S <re.Match object; span=(0, 3), match='a\nb'> None
+combined ['X\nY', 'x-y']
+flag values 2 8 16 64 256
+flags repr re.IGNORECASE|re.MULTILINE
+pattern flags True
+verbose {'year': '2024', 'month': '05', 'day': '17'}
+verbose no day {'year': '2024', 'month': '05', 'day': None}
+verbose fail None
+inline i ['Hello', 'HELLO', 'hello']
+scoped i ['Hello', 'hello']
+scoped off ['ab', 'Ab']
+inline s True
+inline m ['1', '2', '3']
+inline x <re.Match object; span=(0, 3), match='abc'>
+global flag not at start PatternError global flags not at the start of the expression at position 1
+named backref hello hello
+numbered backref ['a', 'b']
+non-capturing ('c',)
+nested groups ('abc', 'a', 'bc', 'c')
+alternation group dog
+conditional [True, True, False, False]
+lookahead ['a', 'bb']
+neg lookahead ['20']
+lookbehind ['10', '30']
+neg lookbehind ['2', '4']
+password [False, True, False]
+variable lookbehind PatternError look-behind requires fixed-width pattern
+digits unicode ['٣', '5']
+digits ascii ['5']
+words unicode ['x٣5', 'café_ß', 'Ω', 'z']
+words ascii ['x', '5', 'caf', '_', 'z']
+spaces unicode ['0x20', '0x20', '0xa0', '0x2003']
+spaces ascii ['0x20', '0x20']
+ignorecase unicode ['Σ', 'σ', 'ς']
+ignorecase k ['K', 'k', 'K'] ['K', 'k']
+inline a ['caf']
+bytes pattern [b'caf', b'ok']
+str/bytes mix TypeError cannot use a string pattern on a bytes-like object
+bytes unicode flag ValueError cannot use UNICODE flag with a bytes pattern
+error '(' -> missing ), unterminated subpattern | pos 0
+error ')' -> unbalanced parenthesis | pos 0
+error '[a-' -> unterminated character set | pos 0
+error 'a**' -> multiple repeat | pos 2
+error '*a' -> nothing to repeat | pos 0
+error '(?P<1>x)' -> bad character in group name '1' | pos 4
+error '(?P<n>a)(?P<n>b)' -> redefinition of group name 'n' as group 2; was group 1 | pos 12
+error '\\p' -> bad escape \p | pos 0
+error 'a{3,1}' -> min repeat greater than max repeat | pos 2
+error '(?P=missing)' -> unknown group name 'missing' | pos 4
+error '[z-a]' -> bad character range z-a | pos 1
+error '\\1' -> invalid group reference 1 | pos 1
+error is PatternError True

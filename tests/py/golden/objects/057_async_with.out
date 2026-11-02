@@ -1,0 +1,9 @@
+async with done ['aenter r1', 'aenter r2', 'body r1-handle r2-handle', 'aexit r2 None', 'aexit r1 None']
+async with suppress after suppression ['aenter s', 'aexit s ValueError']
+async with propagate KeyError 'propagates' ['aenter p', 'aexit p KeyError']
+return inside async with returned inside ['aenter ret', 'aexit ret None']
+suspends to driver paused in aenter
+after resume entered with 'resume value'
+TypeError 'SyncOnly' object does not support the asynchronous context manager protocol (missed __aexit__ method) but it supports the context manager protocol. Did you mean to use 'with'?
+TypeError 'AsyncResource' object does not support the context manager protocol (missed __exit__ method) but it supports the asynchronous context manager protocol. Did you mean to use 'async with'?
+TypeError 'async with' received an object from __aenter__ that does not implement __await__: str

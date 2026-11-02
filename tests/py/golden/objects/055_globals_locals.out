@@ -1,0 +1,25 @@
+module dunders present ['__builtins__', '__doc__', '__name__']
+__name__ __main__
+module globals start ['user_keys']
+after assignments ['alpha', 'beta', 'user_keys']
+globals is locals at module True
+injected global via globals()
+removed False
+function locals (['a', 'args', 'b', 'c', 'kw'], 3)
+locals snapshots (1, 2, False)
+writing locals() no effect 1
+free vars appear in locals ['inner_var', 'outer_var', 'outer']
+globals in function (True, True, True)
+created via dict 123
+class body locals ['a', 'b'] 2
+comprehension scope [['_']]
+genexp scope [['_']]
+lambda locals ['p', 'q']
+builtins not in globals False False
+get missing not shadowed
+shadowed builtin shadowed len
+restored builtin 2
+global keyword updates dict 2 2
+vars() no arg is locals True
+loop var leaks to module True 1 []
+final user globals ['Body', 'alpha', 'beta', 'closure_locals', 'created_in_function', 'for_loop_var_check', 'gen_locals', 'globals_from_function', 'i', 'lambda_locals', 'len_shadow_check', 'locals_snapshot', 'locals_write', 'set_global_via_dict', 'show_locals', 'user_keys', 'uses_global_counter']

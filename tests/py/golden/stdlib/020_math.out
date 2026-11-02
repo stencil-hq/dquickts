@@ -1,0 +1,66 @@
+consts 3.141592653589793 2.718281828459045 6.283185307179586 inf -inf nan
+floor 2 -3 5 int
+ceil 3 -2 100000000000000000000
+trunc 2 -2
+floor big float 100000000000000000000
+floor inf OverflowError cannot convert float infinity to integer
+floor nan ValueError cannot convert float NaN to integer
+ceil inf OverflowError cannot convert float infinity to integer
+ceil nan ValueError cannot convert float NaN to integer
+trunc inf OverflowError cannot convert float infinity to integer
+trunc nan ValueError cannot convert float NaN to integer
+isclose True False True
+isclose abs False True
+isclose inf/nan True False
+gcd 6 0 2 0 3
+lcm 12 105 1 0
+factorial 50 30414093201713378043612608166064768844377641568960512000000000000
+factorial 0 1
+factorial -1 ValueError factorial() not defined for negative values
+factorial 2.0 TypeError 'float' object cannot be interpreted as an integer
+factorial 2.5 TypeError 'float' object cannot be interpreted as an integer
+comb 120 1 0 100891344545564193334812497256
+perm 20 120 1 0
+comb neg ValueError n must be a non-negative integer
+sqrt 4.0 1.4142135623730951 0.0 -0.0
+isqrt 3 4 100000000000000000000
+domain ValueError expected a nonnegative input, got -1.0
+domain ValueError isqrt() argument must be nonnegative
+domain ValueError expected a positive input
+domain ValueError expected a positive input
+domain ValueError expected a positive input
+domain ValueError expected a number in range from -1 up to 1, got 2.0
+domain OverflowError math range error
+domain ValueError math domain error
+log 1.0 3.0 2.0 0.0
+log big int 921.0340371976182 1000.0 500.0
+log2/log10 10.0 -3.0 0.0 0.0
+exp 1.0 2.718281828459045 0.0 1024.0
+pow 1024.0 1.4142135623730951 -512.0 0.5
+nan True False False
+inf True True False
+fsum 1.0 1.0
+fsum cancel 1.0
+prod 24 1 1.0 1200
+dist 5.0 1.7320508075688772
+dist mismatch ValueError both points must have the same number of dimensions
+hypot 5.0 0.0 3.0 5.0
+copysign -3.0 2.0 True
+fabs 3.0 1.0 -2 1.0
+modf (0.25, 3.0) (-0.25, -3.0)
+frexp/ldexp (0.5, 4) 8.0
+trig 0.0 1.0 0.0 1.0
+atan2 True 3.141592653589793 -3.141592653589793
+degrees 180.0 3.141592653589793
+hyperbolic 0.0 1.0 1.0
+nextafter 1.0000000000000002 -5e-324
+ulp 2.220446049250313e-16 5e-324
+sumprod 32
+cbrt 3.0 -2.0
+fma 7.0
+erf 0.0 1.0 24.0 0.0
+int ops -1 2 4 -2 2.67
+float info (3602879701896397, 36028797018963968) False 3.0
+type error TypeError must be real number, not str
+big int float conv inf
+int too large OverflowError int too large to convert to float

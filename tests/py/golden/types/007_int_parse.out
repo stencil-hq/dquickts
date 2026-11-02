@@ -1,0 +1,94 @@
+int('0') 0
+int('42') 42
+int('-42') -42
+int('+42') 42
+int('  17  ') 17
+int('\t\n 8 \r\n') 8
+int('007') 7
+int('-0') 0
+int('1_000_000') 1000000
+int('123456789012345678901234567890') 123456789012345678901234567890
+int('٣٤') 34
+int('１２') 12
+int('\xa012\u2003') 12
+int('') ValueError invalid literal for int() with base 10: ''
+int(' ') ValueError invalid literal for int() with base 10: ' '
+int('1.5') ValueError invalid literal for int() with base 10: '1.5'
+int('1e3') ValueError invalid literal for int() with base 10: '1e3'
+int('abc') ValueError invalid literal for int() with base 10: 'abc'
+int('1__0') ValueError invalid literal for int() with base 10: '1__0'
+int('_1') ValueError invalid literal for int() with base 10: '_1'
+int('1_') ValueError invalid literal for int() with base 10: '1_'
+int('--1') ValueError invalid literal for int() with base 10: '--1'
+int('+-1') ValueError invalid literal for int() with base 10: '+-1'
+int('1 2') ValueError invalid literal for int() with base 10: '1 2'
+int('0x10') ValueError invalid literal for int() with base 10: '0x10'
+int('²') ValueError invalid literal for int() with base 10: '²'
+int('1\x00') ValueError invalid literal for int() with base 10: '1\x00'
+int('١_٢') 12
+int('ff', 16) 255
+int('FF', 16) 255
+int('-ff', 16) -255
+int('0xff', 16) 255
+int('0XfF', 16) 255
+int('777', 8) 511
+int('0o777', 8) 511
+int('101', 2) 5
+int('0b101', 2) 5
+int('z', 36) 35
+int('ZZ', 36) 1295
+int('10', 36) 36
+int('1_0', 2) 2
+int('0x_ff', 16) 255
+int('12', 3) 5
+int('  -1a  ', 11) -21
+int('2', 2) ValueError invalid literal for int() with base 2: '2'
+int('8', 8) ValueError invalid literal for int() with base 8: '8'
+int('g', 16) ValueError invalid literal for int() with base 16: 'g'
+int('0b1', 10) ValueError invalid literal for int() with base 10: '0b1'
+int('0x1', 10) ValueError invalid literal for int() with base 10: '0x1'
+int('10', 37) ValueError int() base must be >= 2 and <= 36, or 0
+int('10', 1) ValueError int() base must be >= 2 and <= 36, or 0
+int('10', -1) ValueError int() base must be >= 2 and <= 36, or 0
+int('0o8', 8) ValueError invalid literal for int() with base 8: '0o8'
+int('0x1f', 0) 31
+int('0o17', 0) 15
+int('0b11', 0) 3
+int('0X1F', 0) 31
+int('0O17', 0) 15
+int('0B11', 0) 3
+int('42', 0) 42
+int('0', 0) 0
+int('00', 0) 0
+int('000', 0) 0
+int('-0x10', 0) -16
+int('0_0', 0) 0
+int('0x_1', 0) 1
+int('010', 0) ValueError invalid literal for int() with base 0: '010'
+int('0_7', 0) ValueError invalid literal for int() with base 0: '0_7'
+int('1_0', 0) 10
+int('  0b1_1  ', 0) 3
+int(b'12') 12
+int(b'ff', 16) 255
+int(bytearray(b'-7')) -7
+int(b' 1 ') 1
+int() 0
+int(x='5') TypeError int() got an unexpected keyword argument 'x'
+int('5', base=8) 5
+int(5, 10) TypeError int() can't convert non-string with explicit base
+int(None) TypeError int() argument must be a string, a bytes-like object or a real number, not 'NoneType'
+int([1]) TypeError int() argument must be a string, a bytes-like object or a real number, not 'list'
+int('1', '2') TypeError 'str' object cannot be interpreted as an integer
+int(True) 1
+type(int(True)) 'int'
+int('9' * 50) 99999999999999999999999999999999999999999999999999
+int('-' + '1' * 40, 2) -1099511627775
+int('1' * 5000) ValueError Exceeds the limit (4300 digits) for integer string conversion: value has 5000 digits; use sys.set_int_max_str_digits() to increase the limit
+int('1' * 5000, 16) bits 19997
+int('1' * 4300) digits 4300
+int(' 0x10 ', 0) 16
+int('0x', 0) ValueError invalid literal for int() with base 0: '0x'
+int('0x', 16) ValueError invalid literal for int() with base 16: '0x'
+int('-0b101', 0) -5
+int('Infinity') ValueError invalid literal for int() with base 10: 'Infinity'
+int('nan') ValueError invalid literal for int() with base 10: 'nan'

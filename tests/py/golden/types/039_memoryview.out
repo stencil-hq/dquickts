@@ -1,0 +1,54 @@
+len 6
+m[0] 97
+m[-1] 102
+m[10] IndexError index out of bounds on dimension 1
+type slice 'memoryview'
+slice tobytes b'bc'
+step slice tobytes b'ace'
+reverse slice tolist [102, 101, 100, 99, 98, 97]
+tobytes b'abcdef'
+tolist [97, 98, 99, 100, 101, 102]
+hex '616263646566'
+hex sep '61:62:63'
+bytes(m) b'abcdef'
+readonly True
+format 'B'
+itemsize 1
+nbytes 6
+ndim 1
+shape (6,)
+strides (1,)
+contiguous True
+obj is source True
+write readonly TypeError cannot modify read-only memory
+eq bytes True
+eq slice True
+eq list False
+eq memoryview True
+lt TypeError '<' not supported between instances of 'memoryview' and 'bytes'
+in True
+iter [97, 98, 99]
+hash readonly True
+write through bytearray(b'Jello')
+slice write bytearray(b'JEElo')
+slice write size mismatch ValueError memoryview assignment: lvalue and rvalue have different structures
+write out of range ValueError memoryview: invalid value for format 'B'
+readonly bytearray view False
+sub view write bytearray(b'JE!lo')
+hash writable ValueError cannot hash writable memoryview object
+resize while exported BufferError Existing exports of data: object cannot be re-sized
+toreadonly True
+after release len ValueError operation forbidden on released memoryview object
+after release tobytes ValueError operation forbidden on released memoryview object
+resize after release bytearray(b'JE!lo!')
+context manager b'ctx'
+context released ValueError operation forbidden on released memoryview object
+memoryview(str) TypeError memoryview: a bytes-like object is required, not 'str'
+memoryview(int) TypeError memoryview: a bytes-like object is required, not 'int'
+memoryview(memoryview) b'xy'
+cast B->c [b'a', b'b']
+cast B->H len 2
+cast bad TypeError memoryview: length is not a multiple of itemsize
+int.from_bytes(mv) 1
+bytearray(mv) bytearray(b'q')
+empty (0, [])

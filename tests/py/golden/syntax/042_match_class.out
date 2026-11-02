@@ -1,0 +1,35 @@
+where Point(0, 0) origin
+where Point(0, 5) on y axis at 5
+where Point(3, 0) on x axis at 3
+where Point(2, 2) diagonal 2
+where Point(1, 9) somewhere Point(1, 9)
+where Point(1, 2) 3d (1, 2, 3)
+where Point(0, 0) origin
+where NoArgs noargs v=7
+where (0, 0) not a point
+where None not a point
+no-arg class pattern ok
+positional without __match_args__ TypeError NoArgs() accepts 0 positional sub-patterns (1 given)
+too many positional TypeError Point() accepts 2 positional sub-patterns (3 given)
+missing attribute is no match
+builtin True bool True
+builtin 7 int 7
+builtin 2.5 float 2.5
+builtin 'hello' long str hello
+builtin 'hi' short str
+builtin b'x' bytes b'x'
+builtin [9, 8] list starting 9
+builtin [] empty list
+builtin (1, 2) pair (1, 2)
+builtin (1, 2, 3) other tuple
+builtin {'k': 0} dict with k=0
+builtin {'j': 0} other dict
+builtin {1} some set of size 1
+builtin frozenset() some set of size 0
+builtin None other NoneType
+builtin 1j other complex
+subclass int 4
+not a type TypeError class pattern must refer to a class
+bad __match_args__ TypeError BadArgs.__match_args__ must be a tuple (got list)
+duplicate attr TypeError Point() got multiple sub-patterns for attribute 'x'
+nested class 3 4 Point(3, 4)

@@ -1,0 +1,25 @@
+  found at 1
+find hit 1
+  not found
+find miss -1
+  not found
+find empty -1
+body 0
+body 1
+else ran, i = 1
+else on empty
+continue body 0
+continue body 2
+else after continue
+multiples of 3 [0, 3, 6, 9]
+break at 2
+nested break [(0, 0), (1, 0), (1, 1), (2, 0), (2, 1), (2, 2), ('inner-else', 2)]
+inner continue [1, 2, 10, 12, 20, 21]
+break finally [('try', 0), ('finally', 0), ('finally', 1)]
+continue finally [('fin', 0), ('odd', 1), ('fin', 1), ('fin', 2)]
+first prime > 10 11
+primes [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
+exception escapes ValueError boom at 1
+consumed until break [0, 1, 2]
+first even 4
+first even none None

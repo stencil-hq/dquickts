@@ -1,0 +1,58 @@
+a | b ['a', 'b', 'c', 'd', 'e']
+a & b ['c', 'd']
+a - b ['a', 'b']
+b - a ['e']
+a ^ b ['a', 'b', 'e']
+union ['a', 'b', 'c', 'd', 'e', 'x', 'y', 'z']
+intersection ['c', 'd']
+intersection none ['a', 'b', 'c', 'd']
+difference ['b']
+symmetric_difference ['b', 'c', 'd', 'q']
+union no args copy ['a', 'b', 'c', 'd']
+operator with list TypeError unsupported operand type(s) for |: 'set' and 'list'
+operator with frozenset ['c']
+type set|frozenset 'set'
+type frozenset|set 'frozenset'
+type frozenset.union(set) 'frozenset'
+type set.union(frozenset) 'set'
+{1} <= s True
+{1} < s True
+s <= s True
+s < s False
+s >= {1, 2} True
+s > s False
+{4} <= s False
+{1, 4} < s False
+{1, 4} > s False
+set() <= s True
+set() < set() False
+issubset iterable True
+issuperset iterable True
+<= with list TypeError '<=' not supported between instances of 'set' and 'list'
+isdisjoint True
+isdisjoint false False
+isdisjoint empty True
+isdisjoint str True
+set == frozenset True
+set != different True
+set == list False
+numeric merging True
+min/max (1, 3)
+sum 6
+len 5
+in (True, False, True)
+in unhashable TypeError cannot use 'list' as a set element (unhashable type: 'list')
+in set-of-set True
+|= in place ([1, 2, 3, 4], True)
+&=  [1, 2, 4]
+-=  [2, 4]
+^=  ([4, 7], True)
+frozenset |= rebinds ([1, 2, 3], False, [1, 2])
+|= with list NotImplemented
+set + set TypeError unsupported operand type(s) for +: 'set' and 'set'
+set * 2 TypeError unsupported operand type(s) for *: 'set' and 'int'
+chained ops True
+de morgan-ish True
+comprehension [0, 1, 2, 3]
+small int set repr {1, 2, 3}
+empty set ops (set(), set(), frozenset())

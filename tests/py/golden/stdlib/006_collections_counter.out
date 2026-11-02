@@ -1,0 +1,39 @@
+counter Counter({'a': 5, 'b': 2, 'r': 2, 'c': 1, 'd': 1})
+most_common [('a', 5), ('b', 2), ('r', 2), ('c', 1), ('d', 1)]
+most_common 2 [('a', 5), ('b', 2)]
+ties keep insertion order [('b', 2), ('a', 2), ('c', 2)]
+missing key 0 False
+total 11
+elements ['a', 'a', 'a', 'a', 'a', 'b', 'b', 'c', 'd', 'r', 'r']
+elements order bba
+keys order ['a', 'b', 'r', 'c', 'd']
+add Counter({'a': 4, 'd': 4, 'b': 3})
+sub Counter({'a': 2})
+and Counter({'a': 1, 'b': 1})
+or Counter({'d': 4, 'a': 3, 'b': 2})
+unary + Counter({'a': 3, 'b': 1})
+unary - Counter({'c': 2})
+eq ignores zero True
+le True False
+update Counter({'a': 13, 'c': 5, 'b': 1})
+subtract Counter({'a': 13, 'b': 1, 'z': -1, 'c': -2})
+mutated Counter({'b': 2, 'z': -1, 'c': -2})
+from dict Counter({'x': 2, 'y': 0})
+from list [(3, 3)]
+word counts [('the', 3), ('and', 2), ('cat', 1)]
+sorted items [('and', 2), ('bat', 1), ('cat', 1), ('hat', 1), ('the', 3)]
+repr empty Counter()
+fromkeys NotImplementedError Counter.fromkeys() is undefined.  Use Counter(iterable) instead.
+is dict True
+dd list defaultdict(<class 'list'>, {'a': [1, 3], 'b': [2]})
+dd list dict {'a': [1, 3], 'b': [2]}
+dd int [('i', 4), ('m', 1), ('p', 2), ('s', 4)]
+default_factory <class 'int'>
+access creates 0 True
+get does not create None False
+nested {'x': {'a': 1, 'b': 2}, 'y': {'a': 3}}
+dd set [1, 3]
+no factory KeyError 'missing'
+copy defaultdict(<class 'int'>, {'a': 1})
+or defaultdict defaultdict(<class 'int'>, {'a': 1, 'b': 2})
+bad factory TypeError first argument must be callable or None

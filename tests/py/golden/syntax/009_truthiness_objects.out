@@ -1,0 +1,27 @@
+plain object True
+bool True True
+bool False False
+len 0 False
+len 3 True
+bool wins over len True
+not len 0 True
+if len 3 yes
+bool returns int TypeError BoolReturnsInt.__bool__() must return a bool, not int
+bool returns None TypeError BoolReturnsNone.__bool__() must return a bool, not NoneType
+len negative ValueError __len__() should return >= 0
+len float TypeError 'float' object cannot be interpreted as an integer
+len huge OverflowError cannot fit 'int' into an index-sized integer
+len bool True
+__bool__ None TypeError 'BoolNone' cannot be interpreted as a boolean
+instance attrs ignored True
+inherited len False True
+overridden bool False True
+list subclass False True
+str subclass False True
+int subclass False True
+list subclass len override False
+int subclass bool override False 6
+calls in if-or ['a', 'b']
+calls in expr-or ['a'] True
+calls in not-and ['a', 'a'] True
+calls in while ['b', 'a']

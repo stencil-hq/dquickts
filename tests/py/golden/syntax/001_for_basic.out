@@ -1,0 +1,61 @@
+range5 [0, 1, 2, 3, 4]
+range3 acc [0, 10, 20]
+loop var after 2
+empty range keeps old i 2
+char 'a'
+char 'b'
+char 'c'
+last char 'c'
+item 1
+item 2.5
+item 's'
+item None
+item (1, 2)
+tuple item 10
+tuple item 20
+dict key one 1
+dict key two 2
+dict key three 3
+dict item one 1
+dict item two 2
+dict item three 3
+dict value 1
+dict value 2
+dict value 3
+sorted set 1
+sorted set 2
+sorted set 3
+range step -3 10
+range step -3 7
+range step -3 4
+range step -3 1
+range neg start -2
+range neg start 0
+range neg start 2
+bytes item 65
+bytes item 90
+enumerate 0 x
+enumerate 1 y
+enumerate 2 z
+enumerate start 5 x
+enumerate start 6 y
+zip 1 a
+zip 2 b
+reversed 3
+reversed 2
+reversed 1
+iter 7
+iter 8
+mutate append [1, 2, 3, 11, 12] [1, 2, 3, 11, 12]
+rebind loop var [0, 1, 2] 100
+gen item g1
+gen item g2
+attr target 3
+subscript target [0, 'q']
+non-iterable TypeError 'int' object is not iterable
+none iterable TypeError 'NoneType' object is not iterable
+custom iterable [0, 1, 2, 3]
+getitem protocol 0
+getitem protocol 1
+getitem protocol 4
+sum 1..100 5050

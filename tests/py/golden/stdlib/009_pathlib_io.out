@@ -1,0 +1,37 @@
+root exists True True False
+not yet False
+write_text returns 12
+read_text 'héllo\nworld\n'
+read_bytes b'h\xc3\xa9llo\nworld\n'
+size 13
+exists True True False
+write_bytes returns 8
+read back [0, 1, 2, 3, 4, 5, 6, 7]
+mkdir parents True
+exist_ok ok
+mkdir exists FileExistsError EEXIST
+mkdir no parent FileNotFoundError ENOENT
+iterdir root ['a', 'data.bin', 'hello.txt']
+iterdir a ['a/b', 'a/one.py']
+glob *.txt ['hello.txt']
+glob a/*/*.py ['a/b/two.py']
+glob **/*.py ['a/b/two.py', 'a/one.py']
+rglob *.txt ['a/b/c/three.txt', 'hello.txt']
+rglob * ['a', 'a/b', 'a/b/c', 'a/b/c/three.txt', 'a/b/notes.md', 'a/b/two.py', 'a/one.py', 'data.bin', 'hello.txt']
+glob none []
+rename result renamed.txt False True
+replace content other
+appended other+more
+open rb b'other'
+touch size 0
+unlinked False
+unlink missing FileNotFoundError ENOENT
+missing_ok ok
+read missing FileNotFoundError ENOENT
+read dir IsADirectoryError EISDIR
+rmdir False
+rmdir nonempty OSError ENOTEMPTY
+resolve rel renamed.txt
+samefile True
+absolute True
+final tree ['a', 'a/b', 'a/b/c', 'a/b/c/three.txt', 'a/b/notes.md', 'a/b/two.py', 'a/one.py', 'data.bin', 'renamed.txt']

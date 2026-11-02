@@ -1,0 +1,11 @@
+registry ['on_start', 'on_stop'] stopped started
+decorator expression value
+subscript decorator 1 call via_subscript
+method decorators pong svc call ping
+classmethod over wrapper Service call build
+property doc from wrapper Service name.
+decorator returning None None
+decorator returning str SHOUT
+class decorator wraps init 2 ['a', 'b']
+TypeError decorator refused refused
+name not bound after failed decoration False

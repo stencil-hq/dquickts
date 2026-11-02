@@ -1,0 +1,54 @@
+1<2<3 True
+1<3<2 False
+3>2>1 True
+1<2>0 True
+1==1==1 True
+1==1!=2 True
+1<=1<=1<2 True
+0<1>2 False
+a<b<c str True
+chain not transitive True
+parenthesised True False
+bool compare True
+chain once True ['a', 'b', 'c']
+chain short-circuit False ['a', 'b']
+long chain False ['a', 'b', 'c', 'd']
+int float eq True True True
+int complex eq True True
+bool int True True True
+big int float False True
+nan compare False True False
+inf compare True True
+neg zero True False
+list lex True True True
+tuple lex True True True
+str lex True True True True
+bytes lex True False
+list tuple eq False
+dict eq order True
+set compare True True True True
+int < str TypeError '<' not supported between instances of 'int' and 'str'
+str >= list TypeError '>=' not supported between instances of 'str' and 'list'
+None < None TypeError '<' not supported between instances of 'NoneType' and 'NoneType'
+dict < dict TypeError '<' not supported between instances of 'dict' and 'dict'
+complex < complex TypeError '<' not supported between instances of 'complex' and 'complex'
+list < tuple TypeError '<' not supported between instances of 'list' and 'tuple'
+eq mixed is fine False
+ne mixed is fine True
+mixed list elements TypeError '<' not supported between instances of 'str' and 'int'
+is None True False
+not x is None False
+True is True True True
+False is not True True
+same list True False True True
+empty tuple eq True True False
+type is True True False
+Ellipsis is True
+NotImplemented is True
+is chain True
+non-bool lt 'less!'
+non-bool eq 0
+non-bool in chain 'less!'
+chain with weird True
+reflected 'Ten.__gt__'
+max chain 3 a [1, 3]

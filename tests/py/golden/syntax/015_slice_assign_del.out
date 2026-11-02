@@ -1,0 +1,34 @@
+shrink [0, 1, 'x', 5, 6, 7, 8, 9]
+grow [0, 1, 'x', 'y', 'z', 3, 4, 5, 6, 7, 8, 9]
+insert at 3 [0, 1, 2, 'ins1', 'ins2', 3, 4, 5, 6, 7, 8, 9]
+out-of-range slice assign appends [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 'far']
+clear tail [0, 1, 2, 3, 4, 5, 6]
+replace all with str iterable ['a', 'b', 'c']
+assign range [0, 0, 1, 2, 4, 5, 6, 7, 8, 9]
+assign generator [0, 1, 'g', 'e', 'n', 6, 7, 8, 9]
+reversed bounds insert [0, 1, 2, 3, 4, 'between', 5, 6, 7, 8, 9]
+self slice assign [1, 1, 2, 3]
+extended assign ['e', 1, 'e', 3, 'e', 5, 'e', 7, 'e', 9]
+extended reverse assign ['Z', 1, 2, 'Y', 4, 5, 'X', 7, 8, 'W']
+extended wrong len ValueError attempt to assign sequence of size 3 to extended slice of size 5
+step 1 is not extended [7]
+assign non-iterable TypeError must assign iterable to extended slice
+extended non-iterable TypeError must assign iterable to extended slice
+item assign ['first', 1, 2, 3, 4, 5, 6, 7, 8, 'last']
+item assign 10 IndexError list assignment index out of range
+item assign -11 IndexError list assignment index out of range
+del [2:5] [0, 1, 5, 6, 7, 8, 9]
+del [::2] [1, 3, 5, 7, 9]
+del [::-3] [1, 2, 4, 5, 7, 8]
+del [:] []
+del out of range slice [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+del items [1, 2, 3, 4, 5, 6, 7, 8]
+del item out of range IndexError list assignment index out of range
+del two targets [2, 3, 4, 5, 6, 7, 8, 9]
+dict assign/del {'b': 2}
+dict del missing KeyError 'zz'
+  setitem slice(1, 2, None) 'v'
+  setitem slice(None, None, -1) []
+  setitem (1, slice(2, 3, None)) 0
+  delitem slice(None, 5, None)
+  delitem (Ellipsis, 0)

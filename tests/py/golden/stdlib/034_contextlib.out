@@ -1,0 +1,13 @@
+contextmanager ['enter a', 'body A', 'exit a']
+swallowed ['enter b', "handled 'k'", 'exit b']
+propagated ValueError('v') ['enter c', 'exit c']
+no yield RuntimeError generator didn't yield
+two yields RuntimeError generator didn't stop
+as decorator ['enter deco', 'in function', 'exit deco']
+suppress ok
+suppress other IndexError
+suppress group remainder ['TypeError']
+redirect_stdout 'captured line\nsecond 2\n'
+redirect_stderr 'to stderr\n'
+stdout restored True
+chdir is a context manager True

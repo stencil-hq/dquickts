@@ -1,0 +1,61 @@
+bytearray() bytearray(b'')
+bytearray(3) bytearray(b'\x00\x00\x00')
+bytearray(b'abc') bytearray(b'abc')
+bytearray([1, 2]) bytearray(b'\x01\x02')
+bytearray('é', 'utf-8') bytearray(b'\xc3\xa9')
+bytearray('x') TypeError string argument without an encoding
+bytearray([300]) ValueError byte must be in range(0, 256)
+append bytearray(b'hello!')
+extend bytes bytearray(b'hello! xy')
+extend list bytearray(b'hello! xyAB')
+extend range bytearray(b'hello! xyAB01')
+insert bytearray(b'>hello! xyAB01')
+insert neg bytearray(b'>hello! xyAB0_1')
+insert past end bytearray(b'>hello! xyAB0_1.')
+pop 46
+pop(0) 62
+after pops bytearray(b'hello! xyAB0_1')
+remove first l bytearray(b'helo! xyAB0_1')
+remove missing ValueError value not found in bytearray
+append 256 ValueError byte must be in range(0, 256)
+append -1 ValueError byte must be in range(0, 256)
+append bytes TypeError 'bytes' object cannot be interpreted as an integer
+extend str TypeError expected iterable of integers; got: 'str'
+extend bad ints ValueError byte must be in range(0, 256)
+after failed extend bytearray(b'helo! xyAB0_1')
+setitem bytearray(b'Helo! xyAB0_1')
+setitem 256 ValueError byte must be in range(0, 256)
+setitem bytes TypeError 'bytes' object cannot be interpreted as an integer
+slice same size bytearray(b'HEEo! xyAB0_1')
+slice shrink bytearray(b'Ho! xyAB0_1')
+slice insert bytearray(b'[[Ho! xyAB0_1')
+slice grow list bytearray(b'[[Ho! xyAB0]]]')
+extended slice bytearray(b'\x00[\x00o\x00 \x00y\x00B\x00]\x00]')
+extended slice wrong size ValueError attempt to assign bytes of size 1 to extended slice of size 7
+del item bytearray(b'[\x00o\x00 \x00y\x00B\x00]\x00]')
+del extended slice bytearray(b'\x00o \x00\x00B]\x00')
+del slice bytearray(b' \x00\x00B]\x00')
++= in place (bytearray(b'abcd'), True)
+*= in place (bytearray(b'abcdabcd'), True)
++ new object (bytearray(b'abcdabcd!'), False, 'bytearray')
+bytes + bytearray type 'bytes'
+reverse (None, bytearray(b'dcbadcba'))
+copy bytearray(b'dcbadcba')
+copy independent True
+clear (None, bytearray(b''))
+pop empty IndexError pop from empty bytearray
+eq bytes True
+lt bytes True
+hash TypeError unhashable type: 'bytearray'
+repr quotes bytearray(b"it's")
+repr escapes bytearray(b'\x00\xff\n')
+str() "bytearray(b'q')"
+methods return bytearray 'bytearray'
+split returns bytearrays [bytearray(b'a'), bytearray(b'b')]
+upper bytearray(b'ABC')
+fromhex bytearray(b'\n\x0b')
+in int True
+index int 2
+iterate yields ints [97, 98]
+len after ops 10
+as dict key TypeError cannot use 'bytearray' as a dict key (unhashable type: 'bytearray')

@@ -1,0 +1,37 @@
+two from 3 ValueError too many values to unpack (expected 2, got 3)
+two from 1 ValueError not enough values to unpack (expected 2, got 1)
+two from 0 ValueError not enough values to unpack (expected 2, got 0)
+two from str 3 ValueError too many values to unpack (expected 2)
+two from str 1 ValueError not enough values to unpack (expected 2, got 1)
+two from int TypeError cannot unpack non-iterable int object
+two from None TypeError cannot unpack non-iterable NoneType object
+two from float TypeError cannot unpack non-iterable float object
+two from dict 3 ValueError too many values to unpack (expected 2, got 3)
+two from set 1 ValueError not enough values to unpack (expected 2, got 1)
+two from gen 3 ValueError too many values to unpack (expected 2)
+two from gen 1 ValueError not enough values to unpack (expected 2, got 1)
+two from range 5 ValueError too many values to unpack (expected 2)
+three from 2 ValueError not enough values to unpack (expected 3, got 2)
+three from 5 ValueError too many values to unpack (expected 3, got 5)
+three from big list ValueError too many values to unpack (expected 3, got 100)
+starred from 1 ValueError not enough values to unpack (expected at least 2, got 1)
+starred from 0 ValueError not enough values to unpack (expected at least 2, got 0)
+starred from int TypeError cannot unpack non-iterable int object
+starred ok ok (1, [], 2)
+nested inner short ValueError not enough values to unpack (expected 2, got 1)
+nested inner long ValueError too many values to unpack (expected 2, got 3)
+nested inner non-iterable TypeError cannot unpack non-iterable int object
+nested ok ok (1, 'b', 'c')
+single from 2 ValueError too many values to unpack (expected 1, got 2)
+single from 0 ValueError not enough values to unpack (expected 1, got 0)
+custom iterable too many ValueError too many values to unpack (expected 2)
+custom iterable ok ok ('x', 'y', 'z')
+generator raises RuntimeError generator failed
+after failed unpack ValueError unset unset
+midway target failure IndexError list assignment index out of range ['a']
+syntax 'a, *b, *c = [1, 2, 3]' SyntaxError multiple starred expressions in assignment
+syntax '*a = [1]' SyntaxError starred assignment target must be in a list or tuple
+syntax 'a, b = *c' SyntaxError can't use starred expression here
+syntax 'del *a' SyntaxError cannot delete starred
+loop unpack fail [3] ValueError not enough values to unpack (expected 2, got 1)
+infinite into two ValueError too many values to unpack (expected 2)

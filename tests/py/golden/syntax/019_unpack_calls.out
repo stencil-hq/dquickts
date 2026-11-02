@@ -1,0 +1,41 @@
+star list (1, 2, 3)
+star tuple full (1, 2, 30)
+star str ('x', 'y', 3)
+star range (0, 1, 2)
+star generator (0, 1, 4)
+mixed positional (1, 2, 3)
+star then positional (1, 2, 3)
+two stars (1, 2, 3)
+kw unpack (1, 2, 3)
+kw and star (1, 8, 9)
+kw after star (1, 2, 'kw')
+show plain args=(1, 2) kwargs={'x': 3}
+show stars args=(1, 2, 'a', 'b') kwargs={'k': 1, 'j': 2}
+show kw between args=(1, 2) kwargs={'z': 0, 'y': 1}
+show empty args=() kwargs={}
+show dict keys star args=('p', 'q') kwargs={}
+kw order args=() kwargs={'b': 1, 'a': 2, 'c': 3}
+too many via star TypeError abc() takes from 2 to 3 positional arguments but 4 were given
+too few via star TypeError abc() missing 1 required positional argument: 'b'
+duplicate kw TypeError abc() got multiple values for argument 'a'
+duplicate kw two dicts TypeError __main__.show() got multiple values for keyword argument 'x'
+unexpected kw TypeError abc() got an unexpected keyword argument 'd'
+non-str kw key TypeError keywords must be strings
+star non-iterable TypeError Value after * must be an iterable, not int
+star None TypeError Value after * must be an iterable, not NoneType
+kw non-mapping TypeError Value after ** must be a mapping, not list
+kw None TypeError Value after ** must be a mapping, not NoneType
+custom mapping ('aa', 'bb', 3)
+custom iterable ('i1', 'i2', 3)
+max star 3
+print star: 3 1 2
+print star sep:-3-1-2
+zip star transpose [(1, 2, 3), ('a', 'b', 'c')]
+dict from kw {'a': 1, 'b': 2}
+format kw 1-2
+str.join star a+b+c
+fresh objects tuple (1, 2) {'k': 1} {'k': 1, 'new': True}
+forwarding args=(1, 2) kwargs={'extra': True, 'mode': 'x'}
+eval order ['p1', 's', 'kw', 'ds']
+method star 7 4
+unbound star 5

@@ -1,0 +1,51 @@
+deque deque([0, 1, 2, 3, 4])
+pop 4 0 deque([1, 2, 3])
+extend deque([-2, -1, 1, 2, 3, 5, 6])
+rotate 2 deque([5, 6, -2, -1, 1, 2, 3])
+rotate -3 deque([-1, 1, 2, 3, 5, 6, -2])
+index/count 4 1 -1 -2
+remove/reverse deque([-2, 6, 3, 2, 1, -1]) 6
+insert deque([-2, 99, 6, 3, 2, 1, -1])
+del deque([99, 6, 3, 2, 1, -1])
+contains True False
+maxlen deque([3, 4, 5], maxlen=3) 3
+maxlen left deque([-1, 3, 4], maxlen=3)
+maxlen extend deque([4, 'a', 'b'], maxlen=3)
+maxlen 0 deque([], maxlen=0)
+empty pop IndexError pop from an empty deque
+empty popleft IndexError pop from an empty deque
+eq True False
+add deque([1, 2]) deque([1, 2, 1, 2])
+copy deque(['x', 'y'], maxlen=5)
+move_to_end ['b', 'c', 'a']
+move_to_end first ['c', 'b', 'a']
+popitem ('a', 1) ['c', 'b']
+popitem first ('c', 3) ['b']
+repr OrderedDict({'x': 1, 'y': 2})
+od eq order-sensitive False
+od eq dict True True
+reversed ['b', 'a']
+empty popitem KeyError 'dictionary is empty'
+move missing KeyError 'zz'
+nt Point(x=1, y=2) 1 2 (1, 2)
+nt _fields ('x', 'y')
+nt _asdict {'x': 1, 'y': 2}
+nt _replace Point(x=10, y=2)
+nt _make Point(x=5, y=6)
+nt eq tuple True True
+nt unpack 1 2
+nt defaults Emp(name='ann', dept='eng', salary=100) {'dept': 'eng', 'salary': 100}
+nt rename ('a', '_1', '_2', '_3')
+nt missing TypeError Point.__new__() missing 1 required positional argument: 'y'
+nt immutable AttributeError can't set attribute
+nt keyword ValueError Type names and field names cannot be a keyword: 'class'
+nt replace bad TypeError Got unexpected field names: ['z']
+nt subclass Point3(x=1, y=-2, z=3) 6
+chain lookup admin red 2 ['color', 'user']
+chain repr ChainMap({'user': 'admin'}, {'color': 'red', 'user': 'guest'})
+chain write first {'user': 'admin', 'color': 'blue'} {'color': 'red', 'user': 'guest'}
+new_child child admin
+maps 3 {'user': 'child'}
+after del red
+del missing KeyError "Key not found in the first mapping: 'missing'"
+chain dict {'a': 1, 'b': 3}

@@ -1,0 +1,36 @@
+insert order {'b': 1, 'a': 2, 'c': 3}
+overwrite keeps position {'b': 10, 'a': 2, 'c': 3}
+del + reinsert moves to end {'a': 2, 'c': 3, 'b': 20}
+update overwrite + append {'a': 0, 'c': 3, 'b': 20, 'z': 26}
+update pairs {'a': 0, 'c': 33, 'b': 20, 'z': 26, 'y': 25}
+update kwargs {'a': 1, 'c': 33, 'b': 20, 'z': 26, 'y': 25, 'x': 24}
+keys ['a', 'c', 'b', 'z', 'y', 'x']
+values [1, 33, 20, 26, 25, 24]
+items [('a', 1), ('c', 33), ('b', 20), ('z', 26), ('y', 25), ('x', 24)]
+popitem ('x', 24)
+popitem ('y', 25)
+after popitem {'a': 1, 'c': 33, 'b': 20, 'z': 26}
+setdefault appends only new {'a': 1, 'c': 33, 'b': 20, 'z': 26, 'q': 0}
+pop + reinsert {'a': 1, 'b': 20, 'z': 26, 'q': 0, 'c': 3}
+int keys keep insertion order {5: 25, 3: 9, 9: 81, 1: 1, 7: 49}
+sorted keys [1, 3, 5, 7, 9]
+int overwrite {5: 25, 3: -1, 9: 81, 1: 1, 7: 49}
+reversed [7, 1, 9, 3, 5]
+reversed items [(7, 49), (1, 1), (9, 81), (3, -1), (5, 25)]
+reversed values [49, 1, 81, -1, 25]
+eq ignores order True
+list(keys) order differs False
+items eq True
+merge | {'x': 0, 'y': 2, 'z': 3}
+merge | right wins position left {'x': 1, 'z': 3, 'y': 2}
+|=  {'x': 1, 'y': 20, 'w': 4}
+dict(zip) {'c': 0, 'a': 1, 'b': 2}
+fromkeys order {'h': None, 'e': None, 'l': None, 'o': None}
+comprehension order {'z': 122, 'y': 121, 'x': 120}
+dict(dict) order {'b': 1, 'a': 2}
+dict(pairs, **kw) order {'b': 3, 'a': 2}
+copy order {'q': 1, 'p': 2}
+after churn first 10 ['1', '3', '5', '7', '9', '11', '13', '15', '17', '19']
+after churn last 10 ['91', '93', '95', '97', '99', '0', '2', '4', '6', '8']
+after churn len 55
+after mass delete {999: None, 'new': 1}

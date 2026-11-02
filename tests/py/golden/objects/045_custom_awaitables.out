@@ -1,0 +1,12 @@
+first request ('tick', 'a')
+second request ('tick', 'b')
+result ['reply to a: 100', 'reply to b: 200', 'no suspension']
+TypeError BadAwait.__await__() must return an iterator, not int
+TypeError AwaitReturnsCoroutine.__await__() must return an iterator, not coroutine
+yielded about to fail
+failure result handled awaitable failed
+throw into suspended coroutine coroutine handled thrown 'injected'
+  awaitable finally on close
+closed suspended coroutine
+gather suspends ('tick', 't')
+gather result [1, 2, "reply to t: 'x'"]

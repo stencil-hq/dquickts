@@ -1,0 +1,24 @@
+add Vec(11, 22) Vec(2, 3) Vec(2, 3)
+sum uses radd Vec(11, 22) Vec(11, 22)
+sub Vec(9, 18)
+mul rmul Vec(3, 6) Vec(3, 6)
+pow Vec(1, 4) Vec(1, 8) Vec(4, 1)
+vec + str TypeError unsupported operand type(s) for +: 'Vec' and 'str'
+str + vec TypeError can only concatenate str (not "Vec") to str
+vec - int TypeError unsupported operand type(s) for -: 'Vec' and 'int'
+vec * vec TypeError unsupported operand type(s) for *: 'Vec' and 'Vec'
+vec @ vec TypeError unsupported operand type(s) for @: 'Vec' and 'Vec'
+vec << 1 TypeError unsupported operand type(s) for <<: 'Vec' and 'int'
+int + None TypeError unsupported operand type(s) for +: 'int' and 'NoneType'
+list + tuple TypeError can only concatenate list (not "tuple") to list
+str * float TypeError can't multiply sequence by non-int of type 'float'
+iadd in place [1, 2] True
+iadd falls back to add Vec(6,) False
+iadd NotImplemented add after iadd NotImplemented
+list iadd extends [1, 2, 3] True
+tuple iadd rebinds (1, 2) (1,)
+TypeError can only concatenate list (not "tuple") to list
+subclass reflected priority Derived.__radd__ Base.__add__
+subclass without override Base.__add__
+divmod dunder (3, 1) (3, 1) (4, 2)
+NotImplemented truthiness TypeError NotImplemented should not be used in a boolean context

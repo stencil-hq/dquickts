@@ -1,0 +1,15 @@
+throw delegated to inner inner handled 'k'
+throw not handled by inner outer handled v
+outer exhausted after exhausted
+  inner finally on close
+  outer finally on close
+closed both
+  inner saw GeneratorExit
+  outer saw GeneratorExit
+GeneratorExit passes through both
+TypeError 'int' object is not iterable
+send to list iterator AttributeError 'list_iterator' object has no attribute 'send'
+delegating generator finished exhausted
+throw into plain iterator raises at yield from KeyError 'into plain'
+inner exception propagates to outer [1, 'outer caught from inner']
+send delegated inner returned ['a', 'b']

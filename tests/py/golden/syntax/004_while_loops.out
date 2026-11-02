@@ -1,0 +1,26 @@
+while n 0
+while n 1
+while n 2
+after while n 3
+while else n 2
+while else on false
+break while true at 4
+odds [1, 3, 5, 7, 9]
+pop until empty [3, 2, 1] []
+shrink str 'abc'
+shrink str 'bc'
+shrink str 'c'
+popitem b 2
+popitem a 1
+multi cond 4 3
+nested while [(0, 0), (1, 0), (1, 1), (2, 0), (2, 1), (2, 2)]
+collatz 27 111
+collatz 1 0
+gcd 48 18 6
+gcd 17 5 1
+gcd 0 5 5
+index_of hit 2
+index_of miss -1
+while finally [1, 2, 3]
+cond raises RuntimeError bad condition
+cond calls [0, 1, 2, 3]

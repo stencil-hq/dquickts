@@ -1,0 +1,53 @@
+%s text 42 None [1, 'a']
+%r 'text' 42 "it's"
+%a 'caf\xe9'
+%d 42 -7 3 -3 1 5
+%5d [   42] [42   ] [00042] [+42] [ 42] [-0042]
+%x ff FF 0xff 0XFF -ff 00000bee
+%o 10 0o10 0o0
+%f 3.141590 3.14  3.14 2.500   | -002.500
+%.0f 0 2 2 0.1
+%e 1.234568e+04 1.23E-04 0.0001 1e-05 1E+20
+%f int 3.000000 1000.000
+%c A z ☃
+%% 100% 50%
+%-5s [ab   ] [   ab] [a] [    a]
+%s float 0.1 1e+16 1.0
+%s special inf -inf nan
+tuple a and b
+tuple mixed 1-two-3.0
+tuple as single value (1, 2)
+list is a single value [1, 2]
+star width [    42] [42    ] [3.14] [   2.500]
+dict Al is 30
+dict reuse v 'v'     v|
+dict with spec 0003.142
+dict extra keys ok 1
+dict %% 5%
+objects Obj-str Obj-repr
+index obj 1a 26 32
+not enough args TypeError not enough arguments for format string (got 1)
+too many args TypeError not all arguments converted during string formatting (required 1, got 2)
+no args for format TypeError not enough arguments for format string (got 0)
+d with str TypeError format argument: %d requires a real number, not str
+x with float TypeError format argument: %x requires an integer, not float
+f with str TypeError format argument: %f requires a real number, not str
+c with long str TypeError format argument: %c requires an integer or a unicode character, not a string of length 2
+c out of range OverflowError format argument: %c argument not in range(0x110000)
+unsupported char ValueError unsupported format %y at position 0
+incomplete format ValueError stray % at position 0
+incomplete at end ValueError stray % at position 4
+dict key missing KeyError 'missing'
+mapping required TypeError format requires a mapping, not tuple
+star with dict ValueError * cannot be used with a parenthesised mapping key at position 0
+star width not int TypeError format argument 1: * requires int, not str
+str without specs and args TypeError not all arguments converted during string formatting (required 0, got 1)
+str without specs and empty tuple 'plain'
+str without specs and dict 'plain'
+unmatched paren ValueError stray % or incomplete format key at position 0
+bytes b'raw|10|ff|  1.2'
+bytes %c b'Az' b'%'
+bytes %a %r b"'\\xe9' 'x'"
+bytes %s with str TypeError format argument: %b requires a bytes-like object, or an object that implements __bytes__, not str
+bytes %c too big OverflowError format argument: %c argument not in range(256)
+tuple subclass 1-2

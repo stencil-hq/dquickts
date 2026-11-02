@@ -1,0 +1,49 @@
+construct Decimal('1.10') Decimal('5') Decimal('-0') Decimal('0')
+from float Decimal('0.1000000000000000055511151231257827021181583404541015625')
+from_float Decimal('0.5') Decimal('3.14')
+special Decimal('NaN') Decimal('-Infinity') Decimal('sNaN')
+str/sci 1E+3 0.000001 1E-7 1.23E-8
+add 0.3 0.30000000000000004
+sub/mul 0.10 3.000
+div 0.3333333333333333333333333333 2.5 4
+floordiv/mod neg -3 -1 -4 1
+divmod (Decimal('3'), Decimal('1.5'))
+pow 1024 1.21 1.414213562373095048801688724
+int mix 2.5 0.50
+float mix TypeError unsupported operand type(s) for +: 'decimal.Decimal' and 'float'
+compare float True False True
+trailing zeros eq True True
+sqrt/exp/ln 1.414213562373095048801688724 2.718281828459045235360287471 2.302585092994045684017991455 3
+normalize 1.23 1E+2 0
+as_tuple DecimalTuple(sign=1, digits=(3, 1, 4, 0), exponent=-3)
+exponent -3 0
+as_integer_ratio (3, 4)
+int/float -3 2.5 2 4
+round ndigits 2.68 1.234
+predicates True True True True
+quantize half even 20.00
+quantize half up 20.00
+quantize down 19.99
+quantize int 2 4
+quantize pad 7.000
+quantize too big InvalidOperation
+default prec 28 ROUND_HALF_EVEN 999999 -999999
+prec 5 0.14286 1.2346E+8
+prec 5 down 0.66666
+restored 0.1428571428571428571428571429
+prec 50 1.4142135623730950488016887242096980785696718753769
+context ops 2.23 3.33 3.14
+plus applies context 10.0
+signal div by zero DivisionByZero True
+signal invalid op InvalidOperation True
+signal conversion InvalidOperation True
+signal sqrt neg InvalidOperation True
+signal inf - inf InvalidOperation True
+untrapped Infinity -Infinity NaN
+flags set True True
+inexact/rounded 0.33 True True
+trap inexact Inexact
+sum 1.0 True
+format 1234.57 1,234.5 50% 1000
+hash eq True True
+sorted [Decimal('-2'), Decimal('1.01'), Decimal('1.1')]

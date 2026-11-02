@@ -1,0 +1,19 @@
+class decorator ['Widget'] hello
+init_subclass ['Alpha', 'x-Beta', 'Gamma']
+full names Alpha x-Beta Gamma
+base untouched False
+TypeError Wrong.__init_subclass__() takes no keyword arguments
+TypeError NoHook.__init_subclass__() takes no keyword arguments
+TypeError Bad lacks 'required'
+init_subclass is classmethod classmethod
+class_getitem Box[<class 'int'>] Box['x'] Box[(<class 'int'>, <class 'str'>)]
+class_getitem implicit classmethod classmethod
+TypeError 'Box' object is not subscriptable
+builtin generic alias list[int] dict[str, list[int]] tuple[int, ...]
+alias origin args True (<class 'str'>, <class 'int'>)
+TypeError type 'int' is not subscriptable
+creation order ['body start', 'body end', 'f1->first', 'f2->second', 'init_subclass Model', 'decorator Model']
+namespace order ['first', 'second']
+dunder module qualname __main__ Model
+firstlineno is int int
+static attributes () ('tag',)

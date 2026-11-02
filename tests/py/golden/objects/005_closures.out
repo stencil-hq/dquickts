@@ -1,0 +1,20 @@
+late binding [2, 2, 2]
+default trick [0, 1, 2]
+comprehension late [2, 2, 2]
+comprehension trick [0, 1, 2]
+adders [11, 12, 13]
+factory 10 15
+closure cells 1
+cell contents 2
+freevars ('n',)
+no closure None
+shared before 0
+shared after 42
+assigned after def late
+free var unbound NameError cannot access free variable 'y' where it is not associated with a value in enclosing scope
+then bound 1
+three levels 3
+enclosing wins enclosing
+class scope skipped ('func', ['func'])
+genexp closure [10, 11, 12]
+closure eq True

@@ -1,0 +1,26 @@
+sorted by __lt__ [v0.9.9, v1.2, v1.2.0, v1.10]
+sorted reverse [v1.10, v1.2.0, v1.2, v0.9.9]
+min max v0.9.9 v1.10
+gt reflects to lt True False
+TypeError '<=' not supported between instances of 'Version' and 'Version'
+TypeError '<' not supported between instances of 'Version' and 'int'
+TypeError '<' not supported between instances of 'int' and 'Version'
+eq other type False
+list.sort stable [v1, v0]
+< TypeError '<' not supported between instances of 'Plain' and 'Plain'
+>= TypeError '>=' not supported between instances of 'Plain' and 'Plain'
+sort plain TypeError '<' not supported between instances of 'Plain' and 'Plain'
+TypeError '<' not supported between instances of 'int' and 'str'
+TypeError '<' not supported between instances of 'list' and 'tuple'
+both NotImplemented TypeError '<' not supported between instances of 'Loud' and 'Loud'
+try order ['a.__lt__', 'b.__gt__']
+subclass reflected first Sub.__gt__
+same class no priority Base.__lt__
+non-bool result yes
+non-bool in sort True
+eq ne results maybe maybe not
+ne inverts eq False True
+chained True True False
+tuple compare elementwise True False
+key compare ['Apple', 'banana', 'cherry'] ['Apple', 'banana', 'cherry'] banana
+sort by tuple key [(2, 'a'), (2, 'b'), (1, 'z')]

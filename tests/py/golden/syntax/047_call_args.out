@@ -1,0 +1,43 @@
+minimal a=1 b=2 args=() c=3 d=4 kwargs={}
+positional b a=1 b=20 args=() c=3 d=4 kwargs={}
+extra positional a=1 b=2 args=(3, 4) c=3 d=5 kwargs={}
+keyword everything a=10 b=20 args=() c=30 d=4 kwargs={}
+extra keywords a=1 b=2 args=() c=3 d=4 kwargs={'x': 1, 'y': 2}
+keyword order kept a=1 b=2 args=() c=3 d=0 kwargs={'zz': 1, 'aa': 2}
+pos-only (1, 2, 3, 4) (1, 2, 3, 4)
+empty ((), {})
+kwargs named like params ((), {'args': 1, 'kwargs': 2, 'self': 3})
+pos-only name in kwargs (1, {'a': 2})
+mutable default [1, 2] [1, 2]
+None default idiom [1] [2]
+default captured at def 10
+defaults tuple (10,) {'c': 3}
+missing required kw-only TypeError f() missing 1 required keyword-only argument: 'd'
+missing positional TypeError f() missing 1 required positional argument: 'a'
+multiple values TypeError f() got multiple values for argument 'a'
+pos-only passed as kw TypeError g() got some positional-only arguments passed as keyword arguments: 'y'
+kw-only passed positionally TypeError g() takes 3 positional arguments but 4 were given
+too many positional TypeError g() takes 3 positional arguments but 4 positional arguments (and 1 keyword-only argument) were given
+unexpected kw TypeError g() got an unexpected keyword argument 'q'
+two missing TypeError <lambda>.<locals>.<lambda>() missing 2 required positional arguments: 'b' and 'c'
+three missing kw-only TypeError <lambda>.<locals>.<lambda>() missing 3 required keyword-only arguments: 'a', 'b', and 'c'
+call non-callable TypeError 'int' object is not callable
+call None TypeError 'NoneType' object is not callable
+call str TypeError 'str' object is not callable
+args to zero-arg TypeError zero() takes 0 positional arguments but 1 was given
+kwargs to zero-arg TypeError zero() got an unexpected keyword argument 'x'
+syntax 'f(a=1, 2)' positional argument follows keyword argument
+syntax 'f(a=1, a=2)' keyword argument repeated: a
+syntax 'f(**k, *a)' iterable argument unpacking follows keyword argument unpacking
+syntax 'f(1=2)' expression cannot contain assignment, perhaps you meant "=="?
+syntax 'def h(a=1, b): pass' parameter without a default follows parameter with a default
+syntax 'def h(a, a): pass' duplicate parameter 'a' in function definition
+syntax 'def h(*, **k): pass' named parameters must follow bare *
+syntax 'def h(**k, a): pass' parameters cannot follow var-keyword parameter
+syntax 'f(a for a in b, c)' Generator expression must be parenthesized
+syntax 'def h(a, /, b, /): pass' / may appear only once
+syntax 'def h(/, a): pass' at least one parameter must precede /
+returns None (1, 'two', [3]) early late
+kw after varargs a-b a+b 
+recursive default 10
+arg order [1, 2, 4, 3]

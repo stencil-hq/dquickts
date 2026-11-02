@@ -1,0 +1,67 @@
+pack <I b'\x04\x03\x02\x01'
+pack >I b'\x01\x02\x03\x04'
+pack !H b'\x01\x02'
+pack <h b'\xfe\xff'
+pack q b'\xff\xff\xff\xff\xff\xff\xff\xff' b'\xff\xff\xff\xff\xff\xff\xff\xff'
+pack b/B b'\x80\xff'
+pack ? b'\x01\x00\x01'
+pack f b'\x00\x00\xc0?' b'\x80\x00\x00\x00\x00\x00\x00\x00'
+pack e b'\x008' (1.0,)
+pack s b'ab\x00\x00\x00' b'ab'
+pack p b'\x03abc\x00'
+pack c b'xyz'
+pack x b'\x01\x00\x00\x02\x00'
+pack count b'\x01\x00\x02\x00\x03\x00'
+pack mixed b'\x02\x01\xff\x01spam@\x02\x00\x00\x00\x00\x00\x00'
+unpack (16909060,)
+unpack >hh (-2, 1)
+unpack f (0.10000000149011612,)
+unpack d (0.1,)
+unpack s (b'abc', 1, 2)
+unpack p (b'abc',)
+unpack ? (False, True, True)
+unpack inf nan (inf, nan)
+calcsize '<b' 1
+calcsize '<h' 2
+calcsize '<i' 4
+calcsize '<l' 4
+calcsize '<q' 8
+calcsize '<f' 4
+calcsize '<d' 8
+calcsize '<e' 2
+calcsize '<?' 1
+calcsize '<5s' 5
+calcsize '<BxH' 4
+calcsize '>IH' 6
+calcsize '!3i' 12
+calcsize '=c' 1
+calcsize '<0s' 0
+calcsize '<' 0
+unpack_from (4, 5, 6)
+unpack_from offset 2 (2,)
+iter_unpack [(1, 2, 3), (4, 5, 6)]
+iter_unpack bytes [1, 2, 3]
+pack_into bytearray(b'\x00\x00\xbb\xaa\x07\x00\x00\x00\x00\x00')
+Struct >I2s 6
+Struct pack b'\x00\x00\x00\tok'
+Struct unpack (9, b'ok')
+Struct iter [(1, b'ab'), (2, b'cd')]
+error 0 error 'B' format requires 0 <= number <= 255
+error 1 error 'b' format requires -128 <= number <= 127
+error 2 error 'H' format requires 0 <= number <= 65535
+error 3 error 'i' format requires -2147483648 <= number <= 2147483647
+error 4 error required argument is not an integer
+error 5 error required argument is not an integer
+error 6 error pack expected 2 items for packing (got 1)
+error 7 error pack expected 1 items for packing (got 2)
+error 8 error argument for 's' must be a bytes object
+error 9 error char format requires a bytes object of length 1
+error 10 error unpack requires a buffer of 4 bytes
+error 11 error unpack_from requires a buffer of at least 6 bytes for unpacking 4 bytes at offset 2 (actual buffer size is 4)
+error 12 error iterative unpacking requires a buffer of a multiple of 4 bytes
+error 13 error bad char in struct format
+error 14 OverflowError float too large to pack with e format
+error 15 OverflowError float too large to pack with f format
+no error 16 0
+error class error True
+roundtrip (-123456789012, 3.5)

@@ -1,0 +1,58 @@
+KeyError > LookupError > Exception > BaseException > object
+IndexError > LookupError > Exception > BaseException > object
+ZeroDivisionError > ArithmeticError > Exception > BaseException > object
+OverflowError > ArithmeticError > Exception > BaseException > object
+UnboundLocalError > NameError > Exception > BaseException > object
+ModuleNotFoundError > ImportError > Exception > BaseException > object
+FileNotFoundError > OSError > Exception > BaseException > object
+RecursionError > RuntimeError > Exception > BaseException > object
+NotImplementedError > RuntimeError > Exception > BaseException > object
+UnicodeDecodeError > UnicodeError > ValueError > Exception > BaseException > object
+StopIteration > Exception > BaseException > object
+StopAsyncIteration > Exception > BaseException > object
+GeneratorExit > BaseException > object
+KeyboardInterrupt > BaseException > object
+SystemExit > BaseException > object
+TimeoutError > OSError > Exception > BaseException > object
+IndentationError > SyntaxError > Exception > BaseException > object
+TabError > IndentationError > SyntaxError > Exception > BaseException > object
+DeprecationWarning > Warning > Exception > BaseException > object
+ExceptionGroup > BaseExceptionGroup > Exception > BaseException > object
+KeyError LookupError True
+IndexError LookupError True
+ZeroDivision Arithmetic True
+FloatingPointError Arithmetic True
+UnicodeError ValueError True
+IOError is OSError True True
+Warning Exception True True
+GeneratorExit not Exception False
+KeyboardInterrupt not Exception False
+SystemExit not Exception False
+StopIteration Exception True
+ExceptionGroup both True True
+BaseException bases True
+OSError family True True
+catch Exception caught ValueError
+catch BaseException caught KeyboardInterrupt
+catch BaseException caught SystemExit
+catch BaseException caught GeneratorExit
+catch Exception caught StopIteration
+SystemExit code 5 (5,)
+SystemExit default code None
+SystemExit multi args ('message', 2)
+KeyboardInterrupt via BaseException KeyboardInterrupt()
+parent caught LookupError generic lookup
+subclass caught by parent KeyError 'key'
+OSError mapping FileNotFoundError 2 No such file or directory [Errno 2] No such file or directory
+OSError single arg OSError None
+OSError errno 13 PermissionError
+UnicodeDecodeError utf-8 b'\xff' 0 1 invalid start byte
+str 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte
+SyntaxError attrs bad file.py 3 5 x = ( 3 6
+SyntaxError str bad (file.py, line 3)
+KeyError str repr 'k' KeyError('k')  ('a', 'b')
+StopIteration value 42 None
+NameError name nm msg
+AttributeError name obj n 5
+ImportError attrs mod p m
+TypeError BaseException.__new__(int): int is not a subtype of BaseException

@@ -1,0 +1,37 @@
+squares [0, 1, 4, 9, 16, 25]
+filter [0, 3, 6, 9, 12, 15, 18]
+two filters [1, 5, 7, 11, 13, 17, 19, 23, 25, 29]
+filter and [5, 15, 25]
+map str ['1', '2.5', 'None']
+from string ['A', 'B', 'C']
+ternary element [0, 0, 0, 1, 2]
+empty source []
+all filtered []
+constant element [0, 0, 0, 0]
+tuple element [(0, 0), (1, 1), (2, 4)]
+product [('a', 0), ('a', 1), ('b', 0), ('b', 1)]
+dependent inner [(1, 0), (2, 0), (2, 1), (3, 0), (3, 1), (3, 2)]
+filter between fors [(3, 1), (3, 2)]
+flatten [1, 2, 3]
+three fors ['xy1', 'xy2', 'xz1', 'xz2']
+matrix [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
+transpose [[1, 4], [2, 5], [3, 6]]
+identity [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+tuple target ['one', 'two']
+nested target [6, 15]
+starred target [['b', 'c'], ['e']]
+enumerate [0, 6, 14]
+zip [4, 10, 18]
+dict items ['x=1', 'y=2']
+fresh list True True
+outer var [0, 10, 20]
+call [0, 1, 4, 9]
+method ['a', 'b', 'c']
+exception ZeroDivisionError division by zero
+non-iterable source TypeError 'int' object is not iterable
+name error inside NameError name 'undefined_name' is not defined
+outermost once [0, 1, 2] ['src', 'body', 'body', 'body']
+inner each time [0, 0, 1] [0, 1, 2]
+class body [2, 4, 6] NameError: name 'vals' is not defined
+sum of comp 71071
+len of nested 435

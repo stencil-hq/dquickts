@@ -1,0 +1,38 @@
+list concat [1, 2, 3, 4]
+list mixed [0, 1, 2, 9, 3, 4, 'x', 'y']
+tuple star (1, 2, 3, 4) (1, 2) ('a', 'b', 5)
+empty star [] () [1, 2]
+from range [0, 1, 2, 5, 6]
+from dict keys ['k1', 'k2']
+from generator [0, 2, 4]
+from string ['h', 'e', 'y']
+from bytes [104, 105]
+from sorted set [1, 2, 3]
+set star [1, 2, 3]
+set star with items [0, 1, 2, 10]
+set star dedup [1, 2]
+set from str ['a', 'b', 'n']
+dict merge {'a': 1, 'b': 20, 'c': 30}
+dict merge reversed {'b': 2, 'c': 30, 'a': 1}
+dict merge with keys {'z': 0, 'a': 100, 'b': 2}
+dict key override order {'a': 1}
+dict empty merge {}
+dict merge copies True True
+dict union op {'a': 1, 'b': 20, 'c': 30} {'b': 2, 'c': 30, 'a': 1}
+dict star list TypeError 'list' object is not a mapping
+dict star None TypeError 'NoneType' object is not a mapping
+custom mapping {'p': 'P', 'q': 'Q'}
+int keys {1: 'one', 2: 'two'}
+star int TypeError Value after * must be an iterable, not int
+star None TypeError Value after * must be an iterable, not NoneType
+set star None TypeError 'NoneType' object is not iterable
+list eval order [1, 2, 3, 4] ['a', 'b', 'c']
+dict eval order {'x': 1, 'y': 2, 'z': 3} ['k1', 'v1', 'm', 'k2', 'v2']
+set unhashable TypeError cannot use 'list' as a set element (unhashable type: 'list')
+return star (1, 2, 'end')
+yield star [('a', 'b', 3)]
+subscript star {('a', 'b'): 1}
+for over star 1
+for over star 2
+for over star 3
+for over star 4

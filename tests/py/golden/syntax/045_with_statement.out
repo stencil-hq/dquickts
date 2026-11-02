@@ -1,0 +1,84 @@
+basic
+  enter a
+  body, as target is a
+  exit a None tb None
+as returns enter value
+  enter b
+  value 42
+  exit b None tb None
+no as target
+  enter c
+  body without as
+  exit c None tb None
+exception propagates
+  enter d
+  exit d ValueError(inner) tb set
+  caught outside ValueError inner
+exception suppressed
+  enter e
+  exit e KeyError('swallowed') tb set
+  continued after suppressed
+multiple items: enter in order, exit reversed
+  enter one
+  enter two
+  body one two
+  exit two None tb None
+  exit one None tb None
+parenthesized multiple items
+  enter p1
+  enter p2
+  enter p3
+  body p1 v2
+  exit p3 None tb None
+  exit p2 None tb None
+  exit p1 None tb None
+inner suppresses, outer sees nothing
+  enter outer
+  enter inner
+  exit inner RuntimeError(x) tb set
+  exit outer None tb None
+  after
+outer suppresses exception from inner exit chain
+  enter outer2
+  enter inner2
+  exit inner2 RuntimeError(y) tb set
+  exit outer2 RuntimeError(y) tb set
+  after
+return inside with still exits
+  enter r
+  exit r None tb None
+  result returned
+break/continue inside with
+  enter loop0
+  exit loop0 None tb None
+  enter loop1
+  exit loop1 None tb None
+exception in __enter__ skips __exit__
+  enter before
+  exit before OSError(enter failed) tb set
+  caught OSError enter failed
+exception in __exit__ replaces original
+  caught TypeError exit failed context: ValueError
+truthy non-bool from __exit__ suppresses
+  suppressed by truthy string
+missing protocol
+   TypeError 'object' object does not support the context manager protocol (missed __exit__ method)
+   TypeError 'int' object does not support the context manager protocol (missed __exit__ method)
+as with tuple and attribute targets
+  enter t
+  unpacked 1 2
+  exit t None tb None
+  enter u
+  attribute target attr
+  exit u None tb None
+nested with
+  enter n1
+  enter n2
+  innermost
+  exit n2 None tb None
+  exit n1 None tb None
+context manager reuse
+  enter reuse
+  exit reuse None tb None
+  enter reuse
+  exit reuse None tb None

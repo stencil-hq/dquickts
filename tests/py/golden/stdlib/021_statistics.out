@@ -1,0 +1,50 @@
+mean 5 3.5714285714285716 1.5 2.0
+mean fraction Fraction(1, 2)
+mean decimal Decimal('0.15')
+fmean 5.0 1.6666666666666667
+geometric_mean 4.0
+harmonic_mean 48.0 0
+median 4.5 3 2.0
+median_low/high 4 5 1 3
+median_grouped 3.7
+mode 4 b 1
+multimode [1, 2] ['c'] []
+pstdev 2.0
+stdev 2.138089935299
+pvariance 4 1.25
+variance 7.9523809523809526 7/3
+variance with mean 1
+quantiles [2.75, 5.5, 8.25]
+quantiles n=10 [1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8, 9.9]
+quantiles inclusive [2.75, 4.5, 6.25]
+quantiles n=2 [20.0]
+covariance 1.5
+correlation 0.774596669241
+correlation ranked 0.8
+linear_regression 0.6 2.2
+proportional LinearRegression(slope=2.0, intercept=0.0)
+mean empty StatisticsError mean requires at least one data point
+median empty StatisticsError no median for empty data
+mode empty StatisticsError no mode for empty data
+stdev one StatisticsError stdev requires at least two data points
+variance one StatisticsError variance requires at least two data points
+pstdev empty StatisticsError pstdev requires at least one data point
+quantiles n=0 StatisticsError n must be at least 1
+quantiles one point -> [1, 1, 1]
+harmonic negative StatisticsError harmonic mean does not support negative values
+geometric zero -> 0.0
+covariance lengths StatisticsError covariance requires that both inputs have same number of data points
+correlation constant StatisticsError at least one of the inputs is constant
+StatisticsError is ValueError True
+NormalDist NormalDist(mu=100.0, sigma=15.0) 100.0 15.0 225.0
+cdf 0.5 0.977249868
+inv_cdf 100.0 129.39946
+pdf 0.026596152027
+zscore 2.0
+quantiles [89.882654, 100.0, 110.117346]
+overlap 0.617075077
+arith NormalDist(mu=110.0, sigma=15.0) NormalDist(mu=200.0, sigma=30.0) NormalDist(mu=90.0, sigma=25.0)
+from_samples NormalDist(mu=5.0, sigma=2.138089935299395)
+eq True
+negative sigma StatisticsError sigma must be non-negative
+kde 0.294294576

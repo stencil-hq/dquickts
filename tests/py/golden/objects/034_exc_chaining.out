@@ -1,0 +1,18 @@
+from exc ValueError cause=KeyError context=KeyError suppress=True
+cause is context True
+implicit RuntimeError cause=None context=ZeroDivisionError suppress=False
+context message division by zero
+from None LookupError cause=None context=IndexError suppress=True
+from new instance TypeError cause=ValueError context=None suppress=True ValueError('v')
+from class TypeError cause=ValueError context=None suppress=True ValueError()
+from invalid TypeError exception causes must derive from BaseException
+chain walk ['RuntimeError:c', 'ValueError:b', "KeyError:'a'"]
+fresh exception None None False
+setting cause sets suppress True
+suppress writable False
+TypeError exception cause must be None or derive from BaseException
+TypeError exception context must be None or derive from BaseException
+re-raise same object no self context None
+context after nested handled KeyError('ctx')
+finally context ValueError('in try')
+self cause True None

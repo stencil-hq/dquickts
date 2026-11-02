@@ -46,6 +46,8 @@ endif
 ifndef CONFIG_M32
 CONFIG_TEMPORAL_INTL=y
 endif
+# Python 3.15 front end (python/) and the qpy program
+CONFIG_PYTHON=y
 
 # installation directory
 PREFIX?=/usr/local
@@ -177,6 +179,9 @@ endif
 ifdef CONFIG_DUMPS
 DEFINES+=-DENABLE_DUMPS
 endif
+ifdef CONFIG_PYTHON
+DEFINES+=-DCONFIG_PYTHON
+endif
 
 CFLAGS+=$(DEFINES)
 CFLAGS_DEBUG=$(CFLAGS) -O0
@@ -228,6 +233,9 @@ endif
 endif
 
 PROGS=qjs$(EXE) qjsc$(EXE) run-test262$(EXE)
+ifdef CONFIG_PYTHON
+PROGS+=qpy$(EXE)
+endif
 
 ifneq ($(CROSS_PREFIX),)
 QJSC_CC=gcc
@@ -292,6 +300,25 @@ qjs-debug$(EXE): $(patsubst %.o, %.debug.o, $(QJS_OBJS))
 qjsc$(EXE): $(OBJDIR)/qjsc.o $(QJS_LIB_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
+qpy$(EXE): $(OBJDIR)/qpy.o $(QJS_LIB_OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+
+ifdef CONFIG_PYTHON
+# python/*.c are #included by quickjs.c (see python/quickpy.c)
+PY_SRCS=$(wildcard python/*.c python/*.h)
+$(OBJDIR)/quickjs.o $(OBJDIR)/quickjs.nolto.o $(OBJDIR)/quickjs.debug.o \
+$(OBJDIR)/quickjs.check.o $(OBJDIR)/quickjs.fuzz.o $(OBJDIR)/quickjs.host.o \
+$(OBJDIR)/quickjs.pic.o: $(PY_SRCS)
+$(OBJDIR)/qpy.o: python/quickpy.h
+endif
+
+# regenerate the generated Python front-end sources (needs CPython 3.15;
+# HOST_PYTHON is defined with the Python test targets below)
+.PHONY: py-regen
+py-regen:
+	export HOST_PYTHON="$(HOST_PYTHON)"; \
+	sh python/gen_ast.sh && sh python/gen_token.sh && sh python/gen_parser.sh
+
 fuzz_eval: $(OBJDIR)/fuzz_eval.o $(OBJDIR)/fuzz_common.o libquickjs.fuzz.a
 	$(CC) $(CFLAGS_OPT) $^ -o fuzz_eval $(LIB_FUZZING_ENGINE)
 
@@ -301,7 +328,13 @@ fuzz_compile: $(OBJDIR)/fuzz_compile.o $(OBJDIR)/fuzz_common.o libquickjs.fuzz.a
 fuzz_regexp: $(OBJDIR)/fuzz_regexp.o $(OBJDIR)/libregexp.fuzz.o $(OBJDIR)/cutils.fuzz.o $(OBJDIR)/libunicode.fuzz.o
 	$(CC) $(CFLAGS_OPT) $^ -o fuzz_regexp $(LIB_FUZZING_ENGINE)
 
+fuzz_py_compile: $(OBJDIR)/fuzz_py_compile.o libquickjs.fuzz.a
+	$(CC) $(CFLAGS_OPT) $^ -o fuzz_py_compile $(LIB_FUZZING_ENGINE)
+
 libfuzzer: fuzz_eval fuzz_compile fuzz_regexp
+ifdef CONFIG_PYTHON
+libfuzzer: fuzz_py_compile
+endif
 
 ifneq ($(CROSS_PREFIX),)
 
@@ -394,6 +427,7 @@ unicode_gen: $(OBJDIR)/unicode_gen.host.o $(OBJDIR)/cutils.host.o libunicode.c u
 clean:
 	rm -f repl.c out.c
 	rm -f *.a *.o *.d *~ unicode_gen regexp_test fuzz_eval fuzz_compile fuzz_regexp $(PROGS)
+	rm -f qpy$(EXE) fuzz_py_compile
 	rm -f hello.c test_fib.c
 	rm -f examples/*.so tests/*.so tests/test_std_api$(EXE) tests/test_api$(EXE)
 	rm -f tests/test_qjsc_unused tests/test_qjsc_modules tests/test_qjsc_modules.c
@@ -575,6 +609,50 @@ test2-update: run-test262
 test2-check: run-test262
 	time ./run-test262 -t -m -c test262.conf -E -a
 endif
+
+# Python support tests (see doc/python-plan.md and tests/py/run.py)
+HOST_PYTHON ?= python3.15
+CPYTHON_TAG = v3.15.2
+CPYTHON_DIR = cpython
+
+.PHONY: testpy-bootstrap testpy testpy-update testpy-golden testpy-ast \
+	testpy-l3b testpy-corpus testpy-replay
+
+testpy-bootstrap:
+	if [ ! -d $(CPYTHON_DIR) ]; then \
+	  git clone --depth 1 --branch $(CPYTHON_TAG) https://github.com/python/cpython $(CPYTHON_DIR); \
+	else \
+	  git -C $(CPYTHON_DIR) fetch --depth 1 origin tag $(CPYTHON_TAG) && \
+	  git -C $(CPYTHON_DIR) checkout -q -f $(CPYTHON_TAG) && \
+	  git -C $(CPYTHON_DIR) reset -q --hard; \
+	fi
+	if [ -f tests/cpython.patch ]; then \
+	  patch -p1 -d $(CPYTHON_DIR) < tests/cpython.patch; \
+	fi
+
+testpy:
+	$(HOST_PYTHON) tests/py/run.py l0
+	$(HOST_PYTHON) tests/py/run.py ast --lib
+	$(HOST_PYTHON) tests/py/run.py l3 --set l3a
+
+testpy-update:
+	$(HOST_PYTHON) tests/py/run.py l0 -u
+	$(HOST_PYTHON) tests/py/run.py l3 --set all -u
+
+testpy-golden:
+	$(HOST_PYTHON) tests/py/run.py golden-regen
+
+testpy-ast:
+	$(HOST_PYTHON) tests/py/run.py ast --lib --corpus
+
+testpy-l3b:
+	$(HOST_PYTHON) tests/py/run.py l3 --set l3b
+
+testpy-corpus:
+	$(HOST_PYTHON) tests/py/corpus.py extract
+
+testpy-replay:
+	$(HOST_PYTHON) tests/py/run.py replay
 
 testall: all test microbench test2o test2
 

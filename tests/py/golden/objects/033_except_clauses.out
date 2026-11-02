@@ -1,0 +1,15 @@
+classify ZeroDivisionError branch
+classify ArithmeticError branch
+classify tuple branch KeyError
+classify tuple branch IndexError
+classify Exception branch ValueError
+order broad first
+caught division by zero
+as name unbound at module NameError name 'err' is not defined
+as name unbound in function UnboundLocalError: cannot access local variable 'e' where it is not associated with a value
+saved exception ValueError('kept')
+preexisting name removed False
+else on success ['try', 'else', 'finally']
+else skipped on error ['try', 'except', 'finally']
+error in else not caught by same try KeyError 'from else'
+nested ['inner finally', "outer caught 'inner'"]

@@ -1,0 +1,110 @@
+pformat default:
+{'alpha': {'name': 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+           'nested': {'deep': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                      'flag': True}},
+ 'beta': {1, 2, 3},
+ 'long': 'a fairly long string value that will need wrapping when the width is '
+         'small enough',
+ 'mid': ('tuple', 'of', 'strings', None),
+ 'zeta': [1, 2, 3]}
+pformat width=40:
+{'alpha': {'name': 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+           'nested': {'deep': [0,
+                               1,
+                               2,
+                               3,
+                               4,
+                               5,
+                               6,
+                               7,
+                               8,
+                               9,
+                               10,
+                               11],
+                      'flag': True}},
+ 'beta': {1, 2, 3},
+ 'long': 'a fairly long string value '
+         'that will need wrapping when '
+         'the width is small enough',
+ 'mid': ('tuple',
+         'of',
+         'strings',
+         None),
+ 'zeta': [1, 2, 3]}
+pformat unsorted:
+{'zeta': [1, 2, 3],
+ 'alpha': {'nested': {'deep': [0,
+                               1,
+                               2,
+                               3,
+                               4,
+                               5,
+                               6,
+                               7,
+                               8,
+                               9,
+                               10,
+                               11],
+                      'flag': True},
+           'name': 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'},
+ 'mid': ('tuple', 'of', 'strings', None),
+ 'beta': {1, 2, 3},
+ 'long': 'a fairly long string value that will need '
+         'wrapping when the width is small enough'}
+pformat depth=1: {'alpha': {...},
+ 'beta': {1, 2, 3},
+ 'long': 'a fairly long string value that will need wrapping when the width is '
+         'small enough',
+ 'mid': (...),
+ 'zeta': [...]}
+pformat compact:
+[0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+ 10, 11, 12, 13, 14, 15, 16,
+ 17, 18, 19, 20, 21, 22, 23,
+ 24, 25, 26, 27, 28, 29, 30,
+ 31, 32, 33, 34, 35, 36, 37,
+ 38, 39]
+pformat indent:
+{   'a': [1, {'b': 2}],
+    'c': 'dddddddddddddddddddddddddddddddddddddddddddddddddd'}
+underscore_numbers 12_345_678
+recursive [1, <Recursion on list with id=N>] True False
+saferepr {'a': [2], 'b': 1}
+isreadable True False
+PrettyPrinter:
+{'key1': 'value1',
+ 'key2': 'value2'}
+pp function:
+{'b': 1, 'a': 2}
+bytes wrap:
+(b'xxxxxxxxxxxxxxxxxxxxxxxx'
+ b'xxxxxxxxxxxxxxxxxxxxxxxx'
+ b'xxxxxxxxxxxx')
+kwlist ['False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except', 'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return', 'try', 'while', 'with', 'yield']
+softkwlist ['_', 'case', 'lazy', 'match', 'type']
+iskeyword True False False True
+issoftkeyword True True False
+char 'A' LATIN CAPITAL LETTER A Lu L 0 Na 0
+char '\xe9' LATIN SMALL LETTER E WITH ACUTE Ll L 0 A 0
+char '\u20ac' EURO SIGN Sc ET 0 A 0
+char '\u0661' ARABIC-INDIC DIGIT ONE Nd AN 0 N 0
+char '\xa0' NO-BREAK SPACE Zs CS 0 N 0
+char '\U0001f600' GRINNING FACE So ON 0 W 0
+char '\xdf' LATIN SMALL LETTER SHARP S Ll L 0 A 0
+char '\u0301' COMBINING ACUTE ACCENT Mn NSM 230 A 0
+char '\u03a9' GREEK CAPITAL LETTER OMEGA Lu L 0 A 0
+name default no name
+name missing ValueError no such name
+lookup α ☃
+lookup missing KeyError "undefined character name 'NOT A REAL NAME'"
+numeric 3 2 0.5 -1
+decimal missing ValueError not a decimal
+normalize NFC '\xe9' '\ufb01\xb2'
+normalize NFD 'e\u0301' '\ufb01\xb2'
+normalize NFKC '\xe9' 'fi2'
+normalize NFKD 'e\u0301' 'fi2'
+is_normalized True False
+equal after NFC False True
+decomposition 0065 0301 '' <compat> 0066 0069
+bad form ValueError invalid normalization form
+casefold strasse σας ǅ FI

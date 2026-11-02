@@ -1,0 +1,16 @@
+call 6 18
+callable True True False
+map with callable obj [5, 15]
+TypeError Adder.__call__() missing 1 required positional argument: 'x'
+normal ['enter a', 'body A', 'exit a None None']
+propagated ['enter b', 'exit b ValueError bad', 'caught bad']
+suppressed ['enter c', "exit c KeyError 'hidden'", 'after suppressed']
+nested order ['enter outer', 'enter inner', 'body OUTER INNER', 'exit inner None None', 'exit outer None None']
+parenthesized ['enter p1', 'enter p2', 'exit p2 RuntimeError x', 'exit p1 None None']
+return in with returned ['enter ret', 'exit ret None None']
+TypeError 'NoExit' object does not support the context manager protocol (missed __exit__ method)
+TypeError 'NoEnter' object does not support the context manager protocol (missed __enter__ method)
+OSError enter failed
+exit raised TypeError from exit context ValueError
+as binding None None
+truthy exit suppresses ZeroDivisionError

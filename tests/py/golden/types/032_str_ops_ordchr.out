@@ -1,0 +1,94 @@
+'ab' * 3 'ababab'
+3 * 'ab' 'ababab'
+'ab' * 0 ''
+'ab' * -2 ''
+'' * 100 ''
+'ab' * True 'ab'
+'ab' * 2.0 TypeError can't multiply sequence by non-int of type 'float'
+'ab' * 'c' TypeError can't multiply sequence by non-int of type 'str'
+'ab' * 2**62 OverflowError repeated string is too long
+'😀' * 3 '😀😀😀'
+'a' + 'b' 'ab'
+'a' + 1 TypeError can only concatenate str (not "int") to str
+1 + 'a' TypeError unsupported operand type(s) for +: 'int' and 'str'
+'a' + None TypeError can only concatenate str (not "NoneType") to str
+'a' + b'b' TypeError can only concatenate str (not "bytes") to str
+'a' - 'b' TypeError unsupported operand type(s) for -: 'str' and 'str'
+augmented 'xyxy'
+'a' < 'b' True
+'Z' < 'a' True
+'abc' < 'abd' True
+'ab' < 'abc' True
+'' < 'a' True
+'b' > 'abc' True
+'é' > 'z' True
+'\uffff' < '😀' True
+'\ue000' < '😀' True
+'a' == 'a' True
+'a' != 'A' True
+'a' < 1 TypeError '<' not supported between instances of 'str' and 'int'
+'a' == 1 False
+'1' == 1 False
+sorted strs ['', '10', '9', 'A', 'B', 'a', 'b', 'é', '\uffff', '😀']
+max str 'o'
+min str 'apple'
+max key len 'apple'
+ord 'a' 97
+ord 'A' 65
+ord '0' 48
+ord ' ' 32
+ord '\n' 10
+ord '\x00' 0
+ord '\x7f' 127
+ord '\xe9' 233
+ord '\u20ac' 8364
+ord '\uffff' 65535
+ord '\U0001f600' 128512
+ord '\U0010ffff' 1114111
+ord '\ud800' 55296
+chr 0 '\x00'
+chr 9 '\t'
+chr 10 '\n'
+chr 32 ' '
+chr 65 'A'
+chr 127 '\x7f'
+chr 128 '\x80'
+chr 255 '\xff'
+chr 256 '\u0100'
+chr 8364 '\u20ac'
+chr 55295 '\ud7ff'
+chr 57344 '\ue000'
+chr 65533 '\ufffd'
+chr 128512 '\U0001f600'
+chr 1114111 '\U0010ffff'
+chr(0xd800) '\ud800'
+chr(0x110000) ValueError chr() arg not in range(0x110000)
+chr(-1) ValueError chr() arg not in range(0x110000)
+chr(2**63) ValueError chr() arg not in range(0x110000)
+chr(65.0) TypeError 'float' object cannot be interpreted as an integer
+chr('a') TypeError 'str' object cannot be interpreted as an integer
+chr(True) '\x01'
+ord('') TypeError ord() expected a character, but string of length 0 found
+ord('ab') TypeError ord() expected a character, but string of length 2 found
+ord(b'a') 97
+ord(bytearray(b'z')) 122
+ord(b'ab') TypeError ord() expected a character, but string of length 2 found
+ord(65) TypeError ord() expected string of length 1, but int found
+ord('\ud83d\ude00') TypeError ord() expected a character, but string of length 2 found
+chr/ord roundtrip True
+str() ''
+str(42) '42'
+str(-0.0) '-0.0'
+str(None) 'None'
+str('x') 'x'
+str(b'x') "b'x'"
+str([1, 'a']) "[1, 'a']"
+str(object=5) '5'
+type(str(1)) 'str'
+'abc'[1] 'b'
+'abc'[-1] 'c'
+'abc'[3] IndexError string index out of range
+'abc'[::-1] 'cba'
+'abcdef'[1:5:2] 'bd'
+'abc'[10:] ''
+str item assign AttributeError 'str' object has no attribute '__setitem__'

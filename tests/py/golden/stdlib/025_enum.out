@@ -1,0 +1,41 @@
+member Color.RED <Color.RED: 1>
+name/value GREEN 2
+iteration skips alias [<Color.RED: 1>, <Color.GREEN: 2>, <Color.BLUE: 3>]
+members incl alias ['RED', 'GREEN', 'BLUE', 'CRIMSON']
+alias identity True RED
+by value Color.GREEN by name Color.BLUE
+len/contains 3 True True False
+type Color True
+eq int False True
+hashable r
+bad value ValueError 9 is not a valid Color
+bad name KeyError 'PINK'
+reassign AttributeError cannot reassign member 'RED'
+no order TypeError '<' not supported between instances of 'Color' and 'Color'
+auto [1, 2, 3]
+methods square#2 3
+IntEnum 5 <Priority.MID: 5> 6 True
+IntEnum eq int True [<Priority.LOW: 1>, 3, <Priority.HIGH: 10>]
+IntEnum format 5    5 5
+StrEnum read <Mode.READ: 'read'> True READ w
+StrEnum value read read
+Flag Perm.R|W <Perm.R|W: 6> 6
+Flag contains True False
+Flag iter [<Perm.R: 4>, <Perm.W: 2>] [<Perm.R: 4>, <Perm.W: 2>, <Perm.X: 1>]
+Flag ops Perm.R|X Perm.W|X Perm.W|X
+Flag empty Perm(0) False <Perm: 0>
+Flag members [<Perm.R: 4>, <Perm.W: 2>, <Perm.X: 1>] 3
+Flag from value Perm.R|W True
+Flag bad ValueError <flag 'Perm'> invalid value 8
+    given 0b0 1000
+  allowed 0b0 0111
+IntFlag [1, 2, 4] 5 5 10
+IntFlag repr <Bits.A|B: 3>
+unique ValueError duplicate values found in <enum 'Dup'>: B -> A
+functional [<Animal.ANT: 1>, <Animal.BEE: 2>, <Animal.CAT: 3>] 2
+functional pairs 404 200
+_missing_ Lenient.ONE
+_missing_ none ValueError 'two' is not a valid Lenient
+extend TypeError <enum 'Extend'> cannot extend <enum 'Color'>
+member type mappingproxy EnumType
+verify C.B

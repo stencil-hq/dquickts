@@ -1,0 +1,55 @@
++= 15
+-= 12
+*= 48
+/= 6.0 float
+//= 3
+%= 1
+**= 81
+<<= 324
+>>= 40
+&= 8
+|= 13
+^= 2
+neg //= -4
+neg %= 3
+%= neg -3
+neg >>= -4
+neg <<= big -1180591620717411303424
+neg &= 250
+**= neg 0.5 float
+neg **= fraction complex
+float += 2.5
+float *= -5.0
+float //= -3.0
+float %= 2.0
+float **= 4.0
+float /= 14.0
+bool += 2 int
+bool &= False bool
+bool ^= False bool
+complex *= (-2+1j)
+complex += (-1+1j)
+complex **= -2j
+big *= 340282366920938463463374607431768211456
+big //= 34028236692093846346337460743
+big >>= 0
+int /= 0 ZeroDivisionError division by zero
+int //= 0 ZeroDivisionError division by zero
+int %= 0 ZeroDivisionError division by zero
+float /= 0 ZeroDivisionError division by zero
+float %= 0 ZeroDivisionError division by zero
+<<= negative ValueError negative shift count
+&= float TypeError unsupported operand type(s) for &=: 'int' and 'float'
++= None TypeError unsupported operand type(s) for +=: 'int' and 'NoneType'
++= str TypeError unsupported operand type(s) for +=: 'int' and 'str'
+0 **= -1 ZeroDivisionError zero to a negative power
+int **= huge stays exact 10000000000000000000000000000000000000000
+complex //= TypeError unsupported operand type(s) for //=: 'complex' and 'int'
+undefined += NameError name 'undefined_counter' is not defined
+unbound local += UnboundLocalError cannot access local variable 'count' where it is not associated with a value
+syntax 'x = (y += 1)' invalid syntax
+syntax 'x += 1 += 2' invalid syntax
+syntax 'a, b += 1, 2' 'tuple' is an illegal expression for augmented assignment
+syntax '[a] += [1]' 'list' is an illegal expression for augmented assignment
+syntax 'f() += 1' 'function call' is an illegal expression for augmented assignment
+syntax 'x +== 1' invalid syntax

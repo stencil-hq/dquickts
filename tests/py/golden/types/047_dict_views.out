@@ -1,0 +1,48 @@
+keys repr dict_keys(['a', 'b'])
+values repr dict_values([1, 2])
+items repr dict_items([('a', 1), ('b', 2)])
+keys live dict_keys(['a', 'b', 'c'])
+values live [1, 2, 3]
+items live [('a', 1), ('b', 2), ('c', 3)]
+len live (2, 2, 2)
+'b' in keys True
+2 in values True
+('b', 2) in items True
+('b', 3) in items False
+['b', 2] in items False
+unhashable in items False
+reversed keys ['c', 'b']
+reversed values [3, 2]
+reversed items [('c', 3), ('b', 2)]
+reversed dict ['c', 'b']
+keys & keys ['b', 'c']
+keys | keys ['a', 'b', 'c', 'd']
+keys - keys ['a']
+keys ^ keys ['a', 'd']
+keys & set ['a']
+keys | list ['a', 'b', 'c', 'z']
+set - keys ['q']
+result type 'set'
+keys == set True
+keys <= set True
+keys < keys True
+keys isdisjoint True
+keys & int TypeError 'int' object is not iterable
+items & items [('a', 1)]
+items - items [('b', 2)]
+items | items [('a', 1), ('b', 2), ('b', 3)]
+items ^ items [('b', 2), ('b', 3)]
+items == set True
+values == values False
+values & values TypeError unsupported operand type(s) for &: 'dict_values' and 'dict_values'
+values unhashable ok [[1]]
+items with unhashable &  TypeError unhashable type: 'list'
+keys hash TypeError unhashable type: 'dict_keys'
+mapping attr mappingproxy({'a': 1, 'b': 2, 'c': 3})
+keys index TypeError 'dict_keys' object is not subscriptable
+add during iteration RuntimeError dictionary changed size during iteration
+del during iteration RuntimeError dictionary changed size during iteration
+overwrite during iteration ok {0: 0, 1: -1, 2: -2, 3: -3, 4: -4}
+pop during keys iteration RuntimeError dictionary changed size during iteration
+clear during values iteration RuntimeError dictionary changed size during iteration
+iterate over list copy ok {1: 1, 2: 0}

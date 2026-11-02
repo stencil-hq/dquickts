@@ -1,0 +1,37 @@
+shallow is new True True
+shallow shares True
+deep separate True True
+after mutation [1, [2, 3, 99]] [1, [2, 3]]
+deep tuple with list copied True True
+immutable tuple kept True True
+str identity True
+cycle True True [1, 2]
+dict cycle True
+shared preserved True True
+memo used True
+object deepcopy a True True
+hooks ('copied', 1) ('deep', [1])
+replace P(x=1, y=5)
+list.copy vs slicing True [('a', 1)]
+itemgetter 20 ('a', 'c')
+itemgetter dict v
+sort itemgetter [('c', 1), ('a', 2), ('b', 2)]
+itemgetter slice [2, 3]
+attrgetter root ('deep', 'root')
+methodcaller ['a', 'b'] bonana
+methodcaller kw b'\x01\x02'
+repr getters operator.itemgetter(1, 'x') operator.methodcaller('m', 1, k=2)
+arith 5 -1 abab 3.5
+arith 2 -4 1 256 -5 matmul
+compare True True False True
+logic True False True True
+bitwise 8 14 6 -1 16
+sequence [1, 2] True 2 2
+setitem/delitem [9, 3] 3
+iadd in place True [1, 2]
+iadd immutable ab a
+index 7 3 5
+index float TypeError 'float' object cannot be interpreted as an integer
+itemgetter missing IndexError list index out of range
+attrgetter missing AttributeError 'Node' object has no attribute 'nope'
+call 9

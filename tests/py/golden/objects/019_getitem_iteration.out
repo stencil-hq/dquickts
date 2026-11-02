@@ -1,0 +1,26 @@
+iterate via getitem [0, 1, 4, 9]
+indices requested [0, 1, 2, 3, 4]
+for loop [0, 1, 4]
+contains via iteration True False
+iter type iterator
+unpack 0 1 4
+tuple unpack 0 1
+sum 30 max 16
+enumerate [(0, 0), (1, 1), (2, 4)]
+zip [(0, 'a'), (1, 'b'), (4, 'c')]
+reversed needs len TypeError object of type 'Squares' has no len()
+reversed with len [9, 4, 1, 0]
+StopIteration also ends [0, 1]
+other errors propagate KeyError 0
+TypeError 'NotIterable' object is not iterable
+still subscriptable 7
+TypeError 'NoContains' object is not a container
+contains via __iter__ True False
+TypeError BadIter.__iter__() must return an iterator, not int
+TypeError BadIter.__iter__() must return an iterator, not int
+TypeError NoNext.__iter__() must return an iterator, not NoNext
+manual next 0 1 4
+exhausted StopIteration ()
+seq iterator stays exhausted done
+string iteration ['h', 'é', 'l', 'l', 'o'] ['a', 'b']
+dict iteration keys ['b', 'a']

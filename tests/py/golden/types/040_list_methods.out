@@ -1,0 +1,48 @@
+append returns None
+after append [1, 2, 3, 4]
+append list nests [1, 2, 3, 4, [5, 6]]
+extend list [1, 2, 3, 4, 5, 6]
+extend str [1, 2, 3, 4, 5, 6, 'a', 'b']
+extend range [1, 2, 3, 4, 5, 6, 'a', 'b', 0, 1]
+extend empty [1, 2, 3, 4, 5, 6, 'a', 'b', 0, 1]
+extend int TypeError 'int' object is not iterable
+extend None TypeError 'NoneType' object is not iterable
+extend self [1, 2, 3, 1, 2, 3]
+insert ['far-neg', 'start', 'a', 'b', 'c', 'before-end', 'end', 'far']
+insert float TypeError 'float' object cannot be interpreted as an integer
+insert missing arg TypeError insert expected 2 arguments, got 1
+pop() 50
+pop(0) 10
+pop(-2) 30
+after pops [20, 40]
+pop(10) IndexError pop index out of range
+pop(-10) IndexError pop index out of range
+pop empty IndexError pop from empty list
+pop str TypeError 'str' object cannot be interpreted as an integer
+remove first [1, 3, 2, 1]
+remove missing ValueError list.remove(x): x not in list
+remove missing str ValueError list.remove(x): x not in list
+remove by equality [1, 1.0]
+index 1
+index start 3
+index start stop 4
+index neg start 4
+index missing ValueError list.index(x): x not in list
+index missing in range ValueError list.index(x): x not in list
+index None ValueError list.index(x): x not in list
+count 2
+count missing 0
+count numeric eq 3
+count nested 2
+count no arg TypeError list.count() takes exactly one argument (0 given)
+reverse returns None
+after reverse [3, 2, 1]
+reverse empty []
+copy shallow orig [[1, 2, 99], 3]
+copy shallow copy [[1, 2, 99], 0]
+copy is new True
+copy via slice True
+clear ([], [], True)
+clear empty None
+methods on tuple AttributeError 'tuple' object has no attribute 'append'
+list.append unbound [7]

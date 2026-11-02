@@ -1,0 +1,70 @@
+nested repr [1, [2, [3, []]], 's', (4,), {'k': [5]}]
+self ref [1, 2, [...]]
+self ref str '[1, 2, [...]]'
+[[...]] [[[...]]]
+mutual ref [[[...]]]
+dict in list ref {'list': [{...}]}
+self ref len 3
+self ref eq self True
+list() []
+list(range(5)) [0, 1, 2, 3, 4]
+list(range(5, 0, -2)) [5, 3, 1]
+list('ab') ['a', 'b']
+list({'a': 1}) ['a']
+list(5) TypeError 'int' object is not iterable
+list(None) TypeError 'NoneType' object is not iterable
+list(gen) [0, 1, 4, 9]
+list copies False
+len([]) 0
+len nested 2
+min 1
+max 3
+min args 1
+max key 'ccc'
+max key tie first 'ab'
+min key tie first 'e'
+min empty ValueError min() iterable argument is empty
+max empty ValueError max() iterable argument is empty
+min empty default 'none'
+max default unused 1
+max args default TypeError Cannot specify a default for max() with multiple positional arguments
+max no args TypeError max expected at least 1 argument, got 0
+min int TypeError 'int' object is not iterable
+max mixed TypeError '>' not supported between instances of 'str' and 'int'
+max str 'cherry'
+sum 6
+sum start 13
+sum start kw 13
+sum lists [1, 2, 3]
+sum floats 0.75
+sum bools 2
+sum empty 0
+sum str TypeError sum() can't sum strings [use ''.join(seq) instead]
+sum bytes TypeError sum() can't sum bytes [use b''.join(seq) instead]
+sum str items TypeError unsupported operand type(s) for +: 'int' and 'str'
+sum big 36893488147419103231
+enumerate [(0, 'a'), (1, 'b'), (2, 'c')]
+enumerate start [(1, 'a'), (2, 'b'), (3, 'c')]
+enumerate start kw [(-5, 'a'), (-4, 'b')]
+enumerate big start [(18446744073709551616, 'a'), (18446744073709551617, 'b')]
+enumerate float start TypeError 'float' object cannot be interpreted as an integer
+zip [(1, 'a'), (2, 'b')]
+zip three [('a', 'c', 'e'), ('b', 'd', 'f')]
+zip none []
+zip one [(1,), (2,)]
+zip strict ok [(1, 'a'), (2, 'b')]
+zip strict short 2nd ValueError zip() argument 2 is shorter than argument 1
+zip strict long 2nd ValueError zip() argument 2 is longer than argument 1
+zip strict 3rd ValueError zip() argument 3 is longer than arguments 1-2
+unzip [(1, 2), ('a', 'b')]
+reversed list [3, 2, 1]
+reversed str ['c', 'b', 'a']
+reversed range [2, 1, 0]
+reversed tuple [2, 1]
+reversed gen TypeError 'generator' object is not reversible
+reversed set TypeError 'set' object is not reversible
+reversed type 'list_reverseiterator'
+any/all (False, True, True, False)
+map ['1', '2']
+filter [1, 'a']
+filter func [1, 3, 5]

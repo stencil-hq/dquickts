@@ -1,0 +1,93 @@
+inf inf
+-inf -inf
+nan nan
+-nan nan
+str(inf) 'inf'
+float('-nan') nan
+1e309 inf
+-1e309 -inf
+inf == inf True
+inf > 1e308 True
+-inf < -1e308 True
+inf == -inf False
+nan == nan False
+nan != nan True
+nan < 1 False
+nan > 1 False
+nan <= nan False
+nan is nan True
+float('nan') != float('nan') True
+[nan] == [nan] True
+[float('nan')] == [float('nan')] False
+nan in [nan] True
+float('nan') in [nan] False
+(nan,) == (nan,) True
+[nan].count(nan) 2
+{nan: 1}[nan] 1
+len({nan, float('nan')}) 2
+max(1, nan) 1
+max(nan, 1) nan
+min(nan, 1) nan
+sorted with nan [1.0, 2.0, 3.0]
+inf + 1 inf
+inf - inf nan
+inf * 0 nan
+inf * -1 -inf
+inf / inf nan
+1 / inf 0.0
+-1 / inf -0.0
+inf // 1 nan
+inf % 2 nan
+2 % inf 2.0
+-2 % inf inf
+2 // inf 0.0
+-2 // inf -1.0
+nan + 1 nan
+nan * 0 nan
+nan ** 0 1.0
+1 ** nan 1.0
+inf ** 0 1.0
+inf ** -1 0.0
+(-inf) ** 3 -inf
+(-inf) ** 2 inf
+0.5 ** inf 0.0
+2.0 ** -inf 0.0
+abs(-inf) inf
+abs(nan) nan
+1e308 + 1e308 inf
+10.0 ** 400 OverflowError (34, 'Result too large')
+2.0 ** 1024 OverflowError (34, 'Result too large')
+inf.is_integer() False
+nan.is_integer() False
+inf.as_integer_ratio() OverflowError cannot convert Infinity to integer ratio
+nan.as_integer_ratio() ValueError cannot convert NaN to integer ratio
+bool(nan) True
+bool(inf) True
+-0.0 -0.0
+str(-0.0) '-0.0'
+-0.0 == 0.0 True
+-0.0 < 0.0 False
+-0.0 is 0.0 via hash True
+0.0 * -1 -0.0
+-0.0 + 0.0 0.0
+-0.0 + -0.0 -0.0
+-0.0 - 0.0 -0.0
+0.0 - 0.0 0.0
+-(0.0) -0.0
+abs(-0.0) 0.0
+1 / -0.0 error ZeroDivisionError division by zero
+-0.0 // 1 -0.0
+-0.0 % 1 0.0
+0.0 % -1 -0.0
+-1e-320 * 1e-10 -0.0
+-0.0 as ratio (0, 1)
+-0.0 hex '-0x0.0p+0'
+{0.0: 'a', -0.0: 'b'} {0.0: 'b'}
+{-0.0: 'a', 0.0: 'b'} {-0.0: 'b'}
+round(-0.4) 0
+int(-0.0) 0
+max(0.0, -0.0) 0.0
+max(-0.0, 0.0) -0.0
+format(-0.0, '.1f') '-0.0'
+format(-0.0, 'z.1f') '0.0'
+format(-1e-9, 'z.2f') '0.00'

@@ -1,0 +1,18 @@
+set_name events ['set_name Person.name', 'set_name Person.age']
+get ann 30
+TypeError age must be int
+class access returns descriptor Typed age
+storage in dict ['_age', '_name']
+after delete <unset> delete age
+before dict from non-data descriptor from data descriptor
+precedence instance wins over non-data | from data descriptor
+assign non-data assign shadows non-data
+AttributeError read-only data descriptor
+__delete__ makes it data get
+delete hook
+owner arg (True, 'UsesOwner') (False, 'UsesOwner') (True, 'SubOwner')
+function __get__ func called on F method
+function __get__ None True
+staticmethod __get__ True
+classmethod __get__ func called on type
+ValueError refused attr note

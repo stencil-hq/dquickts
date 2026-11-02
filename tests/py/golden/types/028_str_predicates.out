@@ -1,0 +1,80 @@
+'' 000000000011
+'abc' 000110010111
+'ABC' 000110100111
+'Abc' 000110001111
+'aBc' 000110000111
+'Abc Def' 000000001011
+'Abc def' 000000000011
+'123' 111010000011
+'12.5' 000000000011
+'-1' 000000000011
+'abc123' 000010010111
+'abc 123' 000000010011
+' ' 000001000011
+'\t\n' 000001000001
+'\x0b\x0c\x1c' 000001000001
+'\xa0' 000001000000
+'\u3000' 000001000000
+'\u200b' 000000000000
+'\u2028' 000001000000
+'\x85' 000001000000
+'\x00' 000000000001
+'\x7f' 000000000001
+'\xb2' 101010000010
+'\xbd' 001010000010
+'\u0663' 111010000010
+'\uff11' 111010000010
+'\u2167' 001010101110
+'\u4e00' 001110000110
+'\xe9' 000110010110
+'\xc9t\xe9' 000110001110
+'\xdf' 000110010110
+'\u01c5' 000110001110
+'\u01c5a' 000110001110
+'_x' 000000010111
+'x1' 000010010111
+'1x' 000010010011
+'class' 000110010111
+'None' 000110001111
+'a-b' 000000010011
+'\u03c0' 000110010110
+'\u2118' 000000000110
+'\U0001f600' 000000000010
+'a\U0001f600' 000000010010
+'\ud800' 000000000000
+'Hello World!' 000000001011
+'HELLO 123' 000000100011
+'hello 123' 000000010011
+'\u01c5ungla' 000110001110
+'\u0300' 000000000010
+'a\u0300' 000000010110
+'\u2160' 001010101110
+'\u1d2c' 000110010110
+'\xaa' 000110010110
+'\u0f33' 001010000010
+'\U0001d7ce' 111010000010
+'\U00010107' 001010000010
+columns isdigit isdecimal isnumeric isalpha isalnum isspace isupper islower istitle isidentifier isprintable isascii
+isidentifier keywords [True, True, True, True, False]
+isdigit vs isdecimal True False
+isnumeric fraction True False
+isprintable space True False
+isupper no cased False True
+istitle edge True True False True
+isascii empty True True False
+isdecimal non-BMP digit True True
+isnumeric CJK True True True
+isalpha combining False False
+isalnum mixed scripts True False
+isspace each [True, True, True, True, True, True, True, True, True, True, True, True]
+isspace not [False, False, False, False]
+isidentifier unicode [True, True, True]
+isidentifier other [False, False, False]
+isidentifier digits [True, False]
+isprintable each [True, True, False, False, False, False]
+isprintable empty True
+istitle digraph True True
+isupper/islower digraph False False
+islower with digits True True True
+isupper Roman numeral True True
+arg error TypeError str.isdigit() takes no arguments (1 given)

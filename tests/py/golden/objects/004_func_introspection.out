@@ -1,0 +1,42 @@
+name top
+qualname top
+doc 'Top-level docstring.'
+module __main__
+nested qualname top.<locals>.inner
+nested name inner
+deep qualname top.<locals>.inner.<locals>.innermost
+no doc None
+lambda name <lambda>
+lambda qualname <lambda>
+nested lambda qualname make_lambda.<locals>.<lambda>
+method qualname Outer.method
+method doc Method doc.
+helper in method Outer.method.<locals>.helper
+inner class qualname Outer.Inner
+inner method qualname Outer.Inner.m
+static qualname Outer.s
+classmethod qualname Outer.c
+class lambda qualname Outer.<lambda>
+class doc Outer doc.
+class name Outer Inner
+bound method name method
+bound __func__ is True
+local class qualname make_class.<locals>.Local
+local method qualname make_class.<locals>.Local.m
+renamed renamed Some.renamed
+TypeError __name__ must be set to a string object
+new doc new doc
+func attrs 1 ['a']
+func dict {'counter': 1, 'tags': ['a']}
+hasattr True False
+after del {'tags': ['a']}
+AttributeError 'function' object has no attribute 'missing'
+annotations {'a': <class 'int'>, 'b': 'str', 'return': <class 'bool'>}
+code name annotated
+argcount 2
+varnames ('a', 'b')
+posonly count 2
+kwonly count 1
+all varnames ('a', 'b', 'c', 'd', 'args', 'kw', 'x')
+callable True True False False
+type name function builtin_function_or_method method

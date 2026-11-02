@@ -1,0 +1,18 @@
+subscript once ['obj', 'key', "get 'a'", "set 'a'=11"] {'a': 11}
+list item ['list', 'idx'] [1, 2, 15]
+missing key KeyError 'missing'
+attr once ['obj', 'getattr x', 'setattr x=42'] 42
+missing attr AttributeError 'Plain' object has no attribute 'counter'
+attr counter 6
+instance shadows class 5 0
+class attr 1 1 5
+shared list ['x'] ['x'] True
+nested [[0, 0], [7, -1]]
+nested dict {'outer': {'inner': 8}}
+slice += [1, 2, 3, 'a', 4]
+extended slice *= 1 [1, 2, 3, 4]
+extended slice += grows ValueError attempt to assign sequence of size 3 to extended slice of size 2
+order ["get 'k'", 'rhs', "set 'k'=3"]
+global 2 3 3
+nonlocal 1 2 3
+counts {'a': 3, 'b': 2, 'c': 1} {'s': 'a3b2c1'}

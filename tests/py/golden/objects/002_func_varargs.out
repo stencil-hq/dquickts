@@ -1,0 +1,34 @@
+empty ((), {})
+positional ((1, 2, 3), {})
+keywords order ((), {'z': 1, 'a': 2, 'm': 3})
+mixed ((1, 'two'), {'key': None})
+args type tuple
+kwargs type dict
+mixed 1 (1, 2, (), 3, 4, {})
+mixed 2 (1, 2, (3, 4, 5), 6, 4, {})
+mixed 3 (1, 2, (), 3, 5, {'e': 6, 'f': 7})
+mixed 4 (9, 2, (), 0, 4, {'zz': 1})
+unpack call ((1, 2, 3), {'x': 10, 'y': 20})
+multi unpack ((1, 2, 3, 'a', 'b', 0), {'x': 10, 'y': 20, 'w': 1})
+unpack range ((0, 1, 2), {})
+unpack dict keys (('k1', 'k2'), {})
+unpack gen ((0, 1, 4, 9), {})
+TypeError __main__.collect() got multiple values for keyword argument 'x'
+TypeError keywords must be strings
+TypeError Value after * must be an iterable, not int
+TypeError Value after ** must be a mapping, not list
+kw sorted ['a', 'b', 'c']
+kw odd keys ((), {'not an identifier': 1, 'class': 2})
+first rest (1, ())
+first rest 2 (1, (2, 3))
+TypeError first_and_rest() missing 1 required positional argument: 'first'
+kwargs is a copy {'a': 1} {'a': 1, 'added': True}
+args from list (1, 2, 'extra') [1, 2]
+defaults star 1 (1, 10, ())
+defaults star 2 (1, 2, (3,))
+passthrough ((1, 2), {'k': 'v'})
+dict order kept [('c', 3), ('b', 2), ('a', 1)]
+star in list [1, 2, 3, 'x', 'y']
+star in dict {'x': 0, 'y': 20}
+star in tuple ('h', 'i', 1)
+star in set sorted [1, 2, 3, 4]

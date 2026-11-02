@@ -36,3 +36,7 @@ tests/test_api
 tests/test_qjsc_unused
 tests/test_qjsc_modules
 tests/test_qjsc_modules.c
+
+# Python harness
+/cpython/
+/build/testpy/

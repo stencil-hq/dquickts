@@ -1,0 +1,35 @@
+exec globals 1 2 __builtins__ injected True
+exec user keys ['x', 'y']
+exec locals [('b', 20), ('c', 21)] globals untouched False
+eval 7
+eval with globals 3
+eval with locals override local
+eval returns object [0, 1, 4, 9]
+exec returns None None
+empty builtins NameError name 'len' is not defined
+custom builtins fake abc
+builtins from dict 3
+eval statement SyntaxError invalid syntax
+eval incomplete SyntaxError 1
+exec syntax error SyntaxError 1
+indentation IndentationError 2
+runtime error in exec KeyError 'inside exec'
+code object code <generated> <module>
+compiled exec 42
+code reusable 10
+compiled eval [0, 1, 4, 9]
+single mode prints:
+42
+single None printed nothing
+ValueError compile() mode must be 'exec', 'eval' or 'single'
+eval of exec code returns None
+defined via exec hi bob greet True
+exec class 7 fake_module
+eval sees function locals local
+exec cannot rebind fast locals 1
+eval whitespace 2 2
+eval bytes source 9
+TypeError eval() arg 1 must be a string, bytes or code object
+TypeError exec() globals must be a dict or a frozendict, not list
+nested eval 2
+dont_inherit flag ok 1

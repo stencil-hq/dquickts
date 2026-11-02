@@ -1,0 +1,22 @@
+slots values 1 2
+assign slot 10
+AttributeError 'Point' object has no attribute 'z' and no __dict__ for setting new attributes
+has __dict__ False
+TypeError vars() argument must have __dict__ attribute
+AttributeError 'Point' object has no attribute 'y'
+AttributeError y
+reassigned 5
+slot descriptor type member_descriptor
+slots attr ('x', 'y')
+AttributeError 'Unset' object has no attribute 'a'
+subclass slots 1 2 3
+AttributeError 'Point3' object has no attribute 'w' and no __dict__ for setting new attributes
+child without slots has dict ok {'extra': 'ok'}
+slots plus dict 1 {'b': 2}
+ValueError 'v' in __slots__ conflicts with class variable
+class attr readable class level
+AttributeError 'ClassAttr' object attribute 'shared' is read-only
+AttributeError 'Empty' object has no attribute 'anything' and no __dict__ for setting new attributes
+mangled slot hidden ('__private',) True
+property over slot 40
+getattr setattr on slots 10 None 99

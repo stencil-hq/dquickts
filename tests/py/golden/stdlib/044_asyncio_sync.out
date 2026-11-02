@@ -1,0 +1,18 @@
+lock ['in1', 'out1', 'in2', 'out2', 'in3', 'out3'] False
+event before set [False, False] False
+event ['waiter0 saw event', 'waiter1 saw event']
+event cleared False
+condition [0, 1, 2]
+semaphore peak 2 False
+bounded release ValueError BoundedSemaphore released too many times
+TaskGroup g done h done
+TaskGroup error ['tg-err'] True
+wait all 1 0 ['d done']
+wait first True True
+as_completed ['fast', 'slow']
+async gen [0, 1, 4, 9]
+anext 0 1 4 end
+current task True
+shield s done
+future future value True
+asyncio.run main done

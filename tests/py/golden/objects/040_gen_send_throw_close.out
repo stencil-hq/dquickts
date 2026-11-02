@@ -1,0 +1,24 @@
+TypeError can't send non-None value to a just-started generator
+prime 0
+send a 1
+send b 2
+  echo finally, received ['a', 'b']
+send after close StopIteration
+close twice ok
+throw caught caught v1
+next after throw waiting
+throw uncaught propagates KeyError 'k'
+now exhausted exhausted
+throw into unstarted ValueError before start
+unstarted closed after throw exhausted
+throw into exhausted into exhausted
+  got GeneratorExit
+close unstarted is silent ok
+RuntimeError generator ignored GeneratorExit
+close return value 'close value'
+close unstarted value None
+ValueError generator already executing
+accumulated via send 35
+  echo finally, received []
+throw GeneratorExit propagates
+send after throw GeneratorExit exhausted

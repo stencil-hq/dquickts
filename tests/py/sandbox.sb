@@ -1,0 +1,31 @@
+;; macOS sandbox profile for L1 corpus replay kernels (tests/py/replay.py).
+;;
+;; Everything is allowed except:
+;;   - file writes outside the per-kernel scratch directory, its private TMPDIR,
+;;     and a few device nodes that ordinary programs write to;
+;;   - network access other than unix-domain sockets.
+;;
+;; Usage:
+;;   sandbox-exec -f tests/py/sandbox.sb -D SCRATCH=/real/scratch -D TMP=/real/tmp \
+;;       python3.15 tests/py/kernel.py
+;;
+;; SCRATCH and TMP must be real paths (symlinks resolved, e.g. /private/var/...),
+;; because the sandbox matches the resolved path of every file operation.
+
+(version 1)
+(allow default)
+
+;; Later rules take precedence: deny all writes, then re-allow the exceptions.
+(deny file-write*)
+(allow file-write*
+    (subpath (param "SCRATCH"))
+    (subpath (param "TMP"))
+    (literal "/dev/null")
+    (literal "/dev/tty")
+    (subpath "/dev/fd")
+    (literal "/dev/dtracehelper"))
+
+(deny network*)
+(allow network*
+    (local unix-socket)
+    (remote unix-socket))

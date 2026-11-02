@@ -1,0 +1,43 @@
+simple 25 2.25
+no args const
+multiple args 7
+defaults 11 3
+keyword call 9
+varargs (1, 2, 3) ()
+kwargs [('a', 2), ('z', 1)]
+kw-only 5 6
+pos-only (1, 2)
+all kinds (1, 2, (3, 4), 5, {'f': 6})
+nested lambda 15
+immediately invoked ternary odd
+returns tuple (1, 2)
+name <lambda> <lambda>
+type function
+late binding [2, 2, 2]
+late binding sees rebinding [100, 100, 100]
+default binding [0, 1, 2]
+default overridable 99
+factory binding [10, 20, 30]
+default evaluated once 1 1 [1]
+mutable default [1, 2] [1, 2]
+sort key ['Apple', 'banana', 'cherry', 'date']
+sort len then alpha ['date', 'Apple', 'banana', 'cherry']
+max key cherry
+map [0, 1, 4, 9, 16]
+filter [0, 3, 6, 9]
+sort by second [(2, 'a'), (1, 'b'), (0, 'c')]
+captures variable not value 2
+syntax 'lambda: return 1' invalid syntax
+syntax 'lambda: x = 1' invalid syntax
+compiles 'lambda: (yield)'
+syntax 'lambda x, x: 0' duplicate parameter 'x' in function definition
+syntax 'lambda *: 0' named parameters must follow bare *
+syntax 'lambda x=1, y: 0' parameter without a default follows parameter with a default
+syntax 'lambda: pass' invalid syntax
+missing arg TypeError <lambda>.<locals>.<lambda>() missing 1 required positional argument: 'a'
+too many args TypeError <lambda>.<locals>.<lambda>() takes 1 positional argument but 2 were given
+unexpected kw TypeError <lambda>.<locals>.<lambda>() got an unexpected keyword argument 'b'
+pos-only as kw TypeError <lambda>.<locals>.<lambda>() got some positional-only arguments passed as keyword arguments: 'a'
+kw-only missing TypeError <lambda>.<locals>.<lambda>() missing 1 required keyword-only argument: 'k'
+recursive lambda 3628800
+dispatch [9, 3, 18]

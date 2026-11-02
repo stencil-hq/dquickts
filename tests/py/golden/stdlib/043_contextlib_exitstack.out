@@ -1,0 +1,14 @@
+enter_context returns stacked
+ExitStack LIFO ['enter stacked', 'body', 'exit stacked', 'cb2', 'cb1', 'cb0']
+pop_all deferred []
+closed later ['never']
+push suppress exit saw RuntimeError
+exception passes through KeyError('k') ['enter outer', 'enter inner', 'exit inner', 'exit outer']
+not a context manager TypeError
+nullcontext 42
+nullcontext none None
+closing yields same True False
+closing closed True
+ContextDecorator ['M enter', 'work', 'M exit']
+AbstractContextManager returns self True
+async managers ['aenter x', 'abody X', 'aexit x', 'aenter y', 'sync cb', 'aexit y', 'first 1', 'agen closed']

@@ -1,0 +1,9 @@
+traced 3 ['call add']
+lost name wrapper trace.<locals>.wrapper None
+preserved sub sub Subtract. 2
+wrapped original 9
+with args ['hi bob', 'hi bob', 'hi bob']
+stacked order <b><i>x</i></b>
+evaluation order ['factory outer', 'factory inner', 'apply inner', 'apply outer']
+class decorator 9 16 2
+decorated type CountCalls

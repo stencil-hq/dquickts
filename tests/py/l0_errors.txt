@@ -1,0 +1,2 @@
+# Expected-failing L0 golden scripts: one `group/NNN_name` per line, sorted.
+# Rewritten by `python3.15 tests/py/run.py l0 -u` (header comment lines are kept).

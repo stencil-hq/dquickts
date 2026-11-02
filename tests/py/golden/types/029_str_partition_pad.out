@@ -1,0 +1,59 @@
+partition ('key', '=', 'value=x')
+rpartition ('key=value', '=', 'x')
+partition missing ('abc', '', '')
+rpartition missing ('', '', 'abc')
+partition at start ('', '=', 'abc')
+partition at end ('abc', '=', '')
+partition multi-char ('a', '::', 'b::c')
+rpartition multi-char ('a::b', '::', 'c')
+partition empty str ('', '', '')
+partition empty sep ValueError empty separator
+rpartition empty sep ValueError empty separator
+partition None TypeError must be str, not NoneType
+partition type 'tuple'
+center '   abc   '
+center even pad ' abc  '
+center even pad 2 '  ab '
+center fill '***abc***'
+center small 'abc'
+center negative 'abc'
+ljust 'abc   |'
+ljust fill 'abc...'
+rjust '   abc'
+rjust fill '000abc'
+rjust non-BMP fill '😀😀x'
+center fill too long TypeError The fill character must be exactly one character long
+center fill empty TypeError The fill character must be exactly one character long
+ljust bad width TypeError 'str' object cannot be interpreted as an integer
+ljust float width TypeError 'float' object cannot be interpreted as an integer
+center width only odd '-a--'
+center width only odd 2 '--aa-'
+zfill '00042'
+zfill negative '-0042'
+zfill plus '+0042'
+zfill short '12345'
+zfill empty '000'
+zfill only sign '-00'
+zfill text '000abc'
+zfill float '-00003.5'
+zfill double sign '-00-1'
+expandtabs default 'a       bc      def     g'
+expandtabs 4 'a   bc  def g'
+expandtabs 0 'ab'
+expandtabs 1 'a b'
+expandtabs neg 'ab'
+expandtabs newline resets 'ab  c\nd   e'
+expandtabs cr resets 'ab  c\rd   e'
+expandtabs leading '      x'
+expandtabs kw 'a b'
+removeprefix 'Case'
+removeprefix missing 'TestCase'
+removeprefix once 'aab'
+removeprefix empty 'abc'
+removeprefix whole ''
+removesuffix 'file.tar'
+removesuffix missing 'file.tar.gz'
+removesuffix empty 'abc'
+removesuffix longer 'c'
+removeprefix tuple TypeError removeprefix() argument must be str, not tuple
+removesuffix None TypeError removesuffix() argument must be str, not None

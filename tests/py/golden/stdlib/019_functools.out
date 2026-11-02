@@ -1,0 +1,26 @@
+reduce 10
+reduce initial 1 ['a', 'b']
+reduce str cba
+reduce empty TypeError reduce() of empty iterable with no initial value
+partial 49 27
+partial attrs True () {'exp': 2}
+partial mod 3
+partial positional 1024 8
+partial nested flatten (2, 5)
+partial placeholder 8
+partial sorted ['a', 'bb', 'ccc']
+lru 10 20 10 30 20
+lru calls [1, 2, 3, 2]
+cache_info CacheInfo(hits=1, misses=4, maxsize=2, currsize=2)
+cleared CacheInfo(hits=0, misses=0, maxsize=2, currsize=0)
+cache_parameters {'maxsize': 2, 'typed': False}
+fib 80 23416728348467685 CacheInfo(hits=78, misses=81, maxsize=None, currsize=81)
+cache 1 vs 1.0 int float 2
+wrapped fib
+unhashable arg TypeError unhashable type: 'list'
+wraps add Add two numbers. add ('logged', 3)
+wraps wrapped 3
+WRAPPER_ASSIGNMENTS ('__module__', '__name__', '__qualname__', '__doc__', '__annotate__', '__type_params__')
+cmp_to_key ['c', 'a', 'bb', 'aa', 'ccc']
+cmp_to_key objects True True True
+reduce max 9

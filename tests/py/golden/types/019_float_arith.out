@@ -1,0 +1,116 @@
+7.5 // 2 3.0
+7.5 % 2 1.5
+divmod(7.5, 2) (3.0, 1.5)
+-7.5 // 2 -4.0
+-7.5 % 2 0.5
+divmod(-7.5, 2) (-4.0, 0.5)
+7.5 // -2 -4.0
+7.5 % -2 -0.5
+divmod(7.5, -2) (-4.0, -0.5)
+-7.5 // -2 3.0
+-7.5 % -2 -1.5
+divmod(-7.5, -2) (3.0, -1.5)
+7 // 2.5 2.0
+7 % 2.5 2.0
+divmod(7, 2.5) (2.0, 2.0)
+-7 // 2.5 -3.0
+-7 % 2.5 0.5
+divmod(-7, 2.5) (-3.0, 0.5)
+0.0 // 3 0.0
+0.0 % 3 0.0
+divmod(0.0, 3) (0.0, 0.0)
+-0.0 // 3 -0.0
+-0.0 % 3 0.0
+divmod(-0.0, 3) (-0.0, 0.0)
+1.0 // 0.1 9.0
+1.0 % 0.1 0.09999999999999995
+divmod(1.0, 0.1) (9.0, 0.09999999999999995)
+-1.0 // 0.1 -10.0
+-1.0 % 0.1 5.551115123125783e-17
+divmod(-1.0, 0.1) (-10.0, 5.551115123125783e-17)
+1e+300 // 3.0 3.3333333333333335e+299
+1e+300 % 3.0 0.0
+divmod(1e+300, 3.0) (3.3333333333333335e+299, 0.0)
+-1e-300 // 1.0 -1.0
+-1e-300 % 1.0 1.0
+divmod(-1e-300, 1.0) (-1.0, 1.0)
+5.0 // 1e+300 0.0
+5.0 % 1e+300 5.0
+divmod(5.0, 1e+300) (0.0, 5.0)
+-5.0 // 1e+300 -1.0
+-5.0 % 1e+300 1e+300
+divmod(-5.0, 1e+300) (-1.0, 1e+300)
+0.3 // 0.1 2.0
+0.3 % 0.1 0.09999999999999998
+divmod(0.3, 0.1) (2.0, 0.09999999999999998)
+6.0 // -3.0 -2.0
+6.0 % -3.0 -0.0
+divmod(6.0, -3.0) (-2.0, -0.0)
+-6.0 // 3.0 -2.0
+-6.0 % 3.0 0.0
+divmod(-6.0, 3.0) (-2.0, 0.0)
+types int int + int * int / float
+types int float + float * float / float
+types int bool + int * int / float
+types int complex + complex * complex / complex
+types float int + float * float / float
+types float float + float * float / float
+types float bool + float * float / float
+types float complex + complex * complex / complex
+types bool int + int * int / float
+types bool float + float * float / float
+types bool bool + int * int / float
+types bool complex + complex * complex / complex
+types complex int + complex * complex / complex
+types complex float + complex * complex / complex
+types complex bool + complex * complex / complex
+types complex complex + complex * complex / complex
+1 + 1.0 2.0
+2 * 0.5 1.0
+3 - 3.0 0.0
+10 ** 2.0 100.0
+10.0 ** 2 100.0
+4 ** 0.5 2.0
+(-8) ** (1/3) type 'complex'
+(-8.0) ** 2.0 64.0
+(-8.0) ** 3 -512.0
+0.0 ** 0.0 1.0
+0.0 ** 0.5 0.0
+10.0 ** 308 1e+308
+10.0 ** 309 OverflowError (34, 'Result too large')
+2.0 ** 1023 * 2 inf
+1e308 + 1e308 (no error) inf
+10 ** 309 * 1.0 OverflowError int too large to convert to float
+10 ** 309 + 1.0 OverflowError int too large to convert to float
+float(10 ** 309) OverflowError int too large to convert to float
+1.0 * 2 ** 1024 OverflowError int too large to convert to float
+2 ** 1024 / 2.0 OverflowError int too large to convert to float
+2 ** 1024 // 2.0 OverflowError int too large to convert to float
+2 ** 1023 // 2.0 4.49423283715579e+307
+1.5 + True 2.5
+0.1 * 3 == 0.3 False
+0.5 * 4 == 2 True
+1.0 + 2**53 9007199254740992.0
+2**53 + 1.0 == 2**53 True
+-(-1.5) 1.5
++(-1.5) -1.5
+abs(-1.5) 1.5
+1.0 + 'a' TypeError unsupported operand type(s) for +: 'float' and 'str'
+1.0 * 'a' TypeError can't multiply sequence by non-int of type 'float'
+1.0 // 1j TypeError unsupported operand type(s) for //: 'float' and 'complex'
+1.0 % None TypeError unsupported operand type(s) for %: 'float' and 'NoneType'
+-1.0 ** 0.5 -1.0
+pow(-1.0, 0.5) type 'complex'
+0.0 ** -1.0 ZeroDivisionError zero to a negative power
+(-0.0) ** -1 ZeroDivisionError zero to a negative power
+1e-320 / 1e10 0.0
+1e-320 * 1e-320 0.0
+sum floats 0.6
+sum floats start 1.3
+sum ints then float 6.5
+sum compensated 1.0
+sum many tenths 1.0
+x += 0.1 loop 0.9999999999999999
+int /= -> float 2.5
+float //=  2.0
+float %=  0.5

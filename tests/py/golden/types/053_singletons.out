@@ -1,0 +1,64 @@
+None None
+str(None) 'None'
+NotImplemented NotImplemented
+Ellipsis Ellipsis
+... Ellipsis
+... is Ellipsis True
+True/False (True, False)
+type(None)() True
+type(...)() True
+type(NotImplemented)() True
+bool() is False True
+bool(1) is True True
+type(None)(1) TypeError NoneType takes no arguments
+type names ['NoneType', 'ellipsis', 'NotImplementedType', 'bool']
+bool(None) False
+bool(...) True
+bool(NotImplemented) TypeError NotImplemented should not be used in a boolean context
+None == None True
+None == 0 False
+None == False False
+None == '' False
+None < 1 TypeError '<' not supported between instances of 'NoneType' and 'int'
+None < None TypeError '<' not supported between instances of 'NoneType' and 'NoneType'
+None + 1 TypeError unsupported operand type(s) for +: 'NoneType' and 'int'
+None() TypeError 'NoneType' object is not callable
+None.x AttributeError 'NoneType' object has no attribute 'x'
+None[0] TypeError 'NoneType' object is not subscriptable
+len(None) TypeError object of type 'NoneType' has no len()
+iter(None) TypeError 'NoneType' object is not iterable
+Ellipsis == Ellipsis True
+... < ... TypeError '<' not supported between instances of 'ellipsis' and 'ellipsis'
+hash consistency True
+None in [None] True
+{None: 1} {None: 1, Ellipsis: 2}
+None.__bool__() False
+None.__repr__() 'None'
+Ellipsis.__reduce__() 'Ellipsis'
+NotImplemented.__reduce__() 'NotImplemented'
+int.__add__(1, 'a') NotImplemented
+float.__eq__(1.0, 'a') NotImplemented
+str.__lt__('a', 1) NotImplemented
+Left() + 1 TypeError unsupported operand type(s) for +: 'Left' and 'int'
+Left() + Right() 'Right.__radd__'
+Left() == Left() False
+left == left identity fallback True
+left != left False
+Left() == 1 False
+hash(Left()) TypeError unhashable type: 'Left'
+f-strings 'None Ellipsis True NotImplemented'
+format(None, '') 'None'
+format(None, '>6') TypeError unsupported format string passed to NoneType.__format__
+format(True, '>6') '     1'
+format(True, '^6s') ValueError Unknown format code 's' for object of type 'bool'
+'%s %r' % (None, ...) 'None Ellipsis'
+isinstance(None, object) True
+x is None idiom [True, False, False, False]
+or chain 'last'
+and chain None
+not None True
+True + False 1
+True is not False True
+max(None) TypeError 'NoneType' object is not iterable
+sorted([None, None]) TypeError '<' not supported between instances of 'NoneType' and 'NoneType'
+sorted([None, 1]) TypeError '<' not supported between instances of 'int' and 'NoneType'

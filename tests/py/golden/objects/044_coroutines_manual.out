@@ -1,0 +1,20 @@
+coroutine type coroutine
+name answer answer
+result via StopIteration 42
+reuse RuntimeError cannot reuse already awaited coroutine
+await chain ([3, 13], [])
+implicit None (None, [])
+exception caught by awaiter ('caught inside coroutine', [])
+exception escapes send ValueError inside coroutine
+recursive awaits ('d4/d3/d2/d1/bottom', [])
+send after close RuntimeError cannot reuse already awaited coroutine
+TypeError 'int' object can't be awaited
+double await RuntimeError cannot reuse already awaited coroutine
+coroutines are not iterators TypeError 'coroutine' object is not an iterator
+not iterable TypeError 'coroutine' object is not iterable
+throw into unstarted coroutine KeyError 'thrown'
+  coroutine finally
+finally in coroutine ('normal', [])
+async def is function function
+coroutine flag check True True
+returns function answer

@@ -1,0 +1,104 @@
+int -> int
+big int -> int
+bool -> bool
+float -> float
+complex -> complex
+str -> str
+bytes -> bytes
+bytearray -> bytearray
+memoryview -> memoryview
+list -> list
+tuple -> tuple
+dict -> dict
+set -> set
+frozenset -> frozenset
+range -> range
+slice -> slice
+None -> NoneType
+Ellipsis -> ellipsis
+NotImplemented -> NotImplementedType
+function -> function
+lambda -> function
+generator -> generator
+coroutine -> coroutine
+builtin function -> builtin_function_or_method
+builtin method -> builtin_function_or_method
+method -> method
+class -> type
+instance -> Plain
+type -> type
+object -> object
+exception -> ValueError
+list iterator -> list_iterator
+tuple iterator -> tuple_iterator
+range iterator -> range_iterator
+set iterator -> set_iterator
+dict keyiterator -> dict_keyiterator
+dict keys -> dict_keys
+dict values -> dict_values
+dict items -> dict_items
+reversed -> list_reverseiterator
+enumerate -> enumerate
+zip -> zip
+map -> map
+filter -> filter
+property -> property
+staticmethod -> staticmethod
+classmethod -> classmethod
+super -> super
+code -> code
+wrapper descriptor -> wrapper_descriptor
+method descriptor -> method_descriptor
+method-wrapper -> method-wrapper
+getset descriptor -> getset_descriptor
+function in class dict -> function
+class of builtin function -> type
+bytes iterator -> bytes_iterator
+callable_iterator -> callable_iterator
+type int int builtins ['int', 'object']
+type bool bool builtins ['bool', 'int', 'object']
+type float float builtins ['float', 'object']
+type complex complex builtins ['complex', 'object']
+type str str builtins ['str', 'object']
+type bytes bytes builtins ['bytes', 'object']
+type bytearray bytearray builtins ['bytearray', 'object']
+type list list builtins ['list', 'object']
+type tuple tuple builtins ['tuple', 'object']
+type dict dict builtins ['dict', 'object']
+type set set builtins ['set', 'object']
+type frozenset frozenset builtins ['frozenset', 'object']
+type range range builtins ['range', 'object']
+type slice slice builtins ['slice', 'object']
+type type type builtins ['type', 'object']
+type object object builtins ['object']
+type memoryview memoryview builtins ['memoryview', 'object']
+type BaseException BaseException builtins ['BaseException', 'object']
+type Exception Exception builtins ['Exception', 'BaseException', 'object']
+type KeyError KeyError builtins ['KeyError', 'LookupError', 'Exception', 'BaseException', 'object']
+type(type) type type(object) type
+type(Plain) type Plain Plain __main__
+type(Plain.method) function
+isinstance(True, int) True
+isinstance(1, bool) False
+isinstance(1, float) False
+isinstance(1, (str, int)) True
+isinstance(1, int | str) True
+isinstance(None, type(None)) True
+isinstance(int, type) True
+isinstance(type, object) True
+isinstance(object, type) True
+issubclass(bool, int) True
+issubclass(int, bool) False
+issubclass(int, object) True
+issubclass(KeyError, LookupError) True
+issubclass(frozenset, set) False
+type(1) is int True type(True) is int False
+type(True) == bool True
+type of union Union
+repr of union int | None
+repr of generic alias list[int] dict[str, list[int]]
+type of generic alias GenericAlias
+callable [True, True, False, False, True, False]
+isinstance bad TypeError isinstance() arg 2 must be a type, a tuple of types, or a union
+issubclass bad TypeError issubclass() arg 1 must be a class
+type() bad TypeError type() takes 1 or 3 arguments

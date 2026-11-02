@@ -1,0 +1,30 @@
+del name NameError name 'a' is not defined
+del undefined NameError name 'never_defined' is not defined
+del multiple, z remains 3
+x gone NameError name 'x' is not defined
+del local UnboundLocalError: cannot access local variable 'v' where it is not associated with a value
+del dict item {'a': 1, 'c': 3}
+del missing key KeyError 'zz'
+del list item/slice [1, 4]
+del all []
+del attr AttributeError 'C' object has no attribute 'inst'
+del class attr via instance AttributeError 'C' object has no attribute 'cls_attr'
+del class attr False
+del tuple target [2] {}
+del list of names ok False False
+  __delitem__ 1
+  __delitem__ slice('x', 'y', None)
+  __delattr__ anything
+assert no msg AssertionError '' ()
+assert msg AssertionError one is not greater than two
+assert non-str msg (['msg', 'is', 'a list'],)
+message lazy []
+tuple assertion passes (always true)
+pass returns None None None Empty
+pass statements ok
+syntax 'del f()' cannot delete function call
+syntax 'del 1' cannot delete literal
+syntax 'del (a + b)' cannot delete expression
+syntax 'del *a' cannot delete starred
+syntax 'del a, *b' cannot delete starred
+compiles 'del [a, (b, c)]'

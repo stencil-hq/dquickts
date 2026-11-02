@@ -1,0 +1,22 @@
+custom iterator [3, 2, 1]
+loop value 2
+loop value 1
+exhausted iterator []
+re-iterable [2, 1] [2, 1]
+iter is identity True
+partial consume 1 [2, 3] []
+next default dflt
+next raises StopIteration None
+callable sentinel [3, 2, 1] [4]
+bad __iter__ TypeError Bad.__iter__() must return an iterator, not int
+next raises other LookupError explode
+PEP 479 RuntimeError generator raised StopIteration cause StopIteration
+dict changed RuntimeError dictionary changed size during iteration
+set changed RuntimeError Set changed size during iteration
+dict values updated {'a': 10, 'b': 20}
+remove while iterating [1, 3]
+remove from copy [1, 3]
+map lazy 2 [4, 6]
+reversed iterator TypeError 'list_iterator' object is not reversible
+reversed via sequence protocol ['c', 'b', 'a']
+unpack from iterator 0 1 2 [3, 4, 5, 6, 7, 8, 9]

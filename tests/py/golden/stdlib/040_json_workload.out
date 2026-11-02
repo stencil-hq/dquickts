@@ -1,0 +1,32 @@
+merged config
+{
+  "features": [
+    "beta"
+  ],
+  "log": {
+    "file": null,
+    "level": "debug"
+  },
+  "server": {
+    "host": "localhost",
+    "port": 9090,
+    "tls": true
+  }
+}
+defaults untouched 8080
+payload length 430
+payload head [{"__type__":"Order","id":1,"customer":"ann","items":[{"sku":"A1","qty":2}],"pla
+restored equal True
+restored types Order date Decimal
+jsonl error 4 Expecting value 1
+jsonl good [{'id': 1, 'customer': 'ann', 'n': 1}, {'id': 2, 'customer': 'bob', 'n': 2}, {'id': 3, 'customer': 'ann', 'n': 0}] bad 1
+totals {"ann": "19.98", "bob": "42.00"}
+skus {"A1": 3, "B7": 1}
+path a.b.0.c 1
+path a.b.1.d.e 'deep'
+path a.b.5.c '<missing>'
+path a.x '<missing>'
+path a.b.one '<missing>'
+path a.b.1.c.z '<missing>'
+pretty compact list {"rows": [[1, 2], [3, 4]]}
+stable keys True

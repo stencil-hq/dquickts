@@ -1,0 +1,34 @@
+str batch (3 sub-exceptions)
+repr ExceptionGroup('batch', [ValueError(1), TypeError('t'), ValueError(2)])
+message batch
+exceptions (ValueError(1), TypeError('t'), ValueError(2))
+type ExceptionGroup True
+except* ValueError ExceptionGroup('batch', [ValueError(1), ValueError(2)])
+except* TypeError ExceptionGroup('batch', [TypeError('t')])
+handled keys ["'k'", "'k2'"]
+unhandled remainder ExceptionGroup('mixed', [OSError('o')])
+naked exception wrapped ExceptionGroup (ValueError('naked'),) True
+tuple except* ['ValueError', 'TypeError']
+LookupError except* ['KeyError']
+nested repr ExceptionGroup('outer', [ValueError('a'), ExceptionGroup('inner', [TypeError('b'), ValueError('c')])])
+nested ValueErrors keep structure ExceptionGroup('outer', [ValueError('a'), ExceptionGroup('inner', [ValueError('c')])])
+nested TypeErrors ExceptionGroup('outer', [ExceptionGroup('inner', [TypeError('b')])])
+split match ExceptionGroup('outer', [ValueError('a'), ExceptionGroup('inner', [ValueError('c')])])
+split rest ExceptionGroup('outer', [ExceptionGroup('inner', [TypeError('b')])])
+subgroup ExceptionGroup('outer', [ExceptionGroup('inner', [TypeError('b')])])
+subgroup none None
+subgroup predicate ExceptionGroup('outer', [ExceptionGroup('inner', [ValueError('c')])])
+split all True None
+bad ctor ValueError second argument (exceptions) must be a non-empty sequence
+bad ctor ValueError Item 0 of second argument (exceptions) is not an exception
+bad ctor TypeError BaseExceptionGroup.__new__() argument 1 must be str, not int
+bad ctor TypeError second argument (exceptions) must be a sequence
+BaseExceptionGroup with base exc BaseExceptionGroup
+BaseExceptionGroup auto-narrows ExceptionGroup
+TypeError Cannot nest BaseExceptions in an ExceptionGroup
+raise in except* handler KeyError 'raised in handler' context ExceptionGroup('g', [ValueError('v')])
+bare raise in except* ExceptionGroup('g', [ValueError('v')])
+fully handled continues
+custom derive MyGroup('custom!', [ValueError(1)]) MyGroup
+except* ExceptionGroup invalid TypeError catching ExceptionGroup with except* is not allowed. Use except instead.
+mixing except and except* SyntaxError cannot have both 'except' and 'except*' on the same 'try' 5

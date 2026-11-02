@@ -1,0 +1,52 @@
+plain Ann is 42
+expr 43 84 8 2 -42
+call 3 ANN 2
+index A 3 v
+conv r 'Ann' s Ann a 'it\'s "q" \xe9 \u2713'
+conv r on str with quotes 'it\'s "q" é ✓'
+conv on int 42 42 42
+conv with spec      'Ann'|Ann   |
+none None None bool True
+float 1.5 0.30000000000000004 1e+100 -0.0
+list [1, 'a'] tuple (1,) dict {'a': 1}
+x=10
+x = 10
+x= 10|x =10|
+y='yy'
+y=yy
+x=   10|
+x * 2 + 1=21
+name.lower()='ann'
+3.14159=3.14
+x=    10|
+same quotes value
+single value
+nested f-string 42
+join a, b, c
+backslash in expr l1
+l2
+{literal} {42} {}
+{ Ann }
+}{
+line one 42 line two Ann
+triple
+quoted 42
+  indented 'Ann'
+multiline expr 43
+comment inside 84
+lambda 8
+ternary yes
+walrus 5 then 5
+raw \n Ann
+raw2 \t42\d
+[     Ann]
+[  Ann   ]
+P-format() P-str P-repr P-format(xyz)   P-repr|
+syntax f"{}" SyntaxError f-string: valid expression required before '}'
+syntax f"{x!z}" SyntaxError f-string: invalid conversion character 'z': expected 's', 'r', or 'a'
+syntax f"{" SyntaxError f-string: expecting '}'
+syntax f"}" SyntaxError f-string: single '}' is not allowed
+compiles f"{x:{y:{z}}}"
+bad spec for int ValueError Unknown format code 's' for object of type 'int'
+undefined in f-string NameError name 'undefined_var' is not defined
+type str True ''

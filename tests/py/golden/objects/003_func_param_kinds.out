@@ -1,0 +1,40 @@
+missing pos TypeError f() missing 1 required positional argument: 'x'
+too many TypeError f() takes 1 positional argument but 2 were given
+unexpected kw TypeError f() got an unexpected keyword argument 'y'
+multiple values TypeError f() got multiple values for argument 'x'
+by keyword 3
+g 3 given TypeError g() takes 2 positional arguments but 3 were given
+g missing 2 TypeError g() missing 2 required positional arguments: 'a' and 'b'
+g missing b TypeError g() missing 1 required positional argument: 'b'
+g kw both (2, 1)
+from to TypeError g_defaults() takes from 2 to 3 positional arguments but 4 were given
+missing with default TypeError g_defaults() missing 2 required positional arguments: 'a' and 'b'
+posonly ok (1, 2, 3)
+posonly c kw (1, 2, 3)
+posonly as kw TypeError pos_only() got some positional-only arguments passed as keyword arguments: 'b'
+posonly missing TypeError pos_only() missing 2 required positional arguments: 'b' and 'c'
+posonly name in kwargs (1, {'a': 2})
+kwonly ok (1, 2, 3)
+kwonly positional TypeError kw_only() takes 1 positional argument but 2 were given
+kwonly missing TypeError kw_only() missing 1 required keyword-only argument: 'b'
+kwonly missing 2 TypeError kw_only2() missing 2 required keyword-only arguments: 'x' and 'y'
+kwonly positional 2 TypeError kw_only2() takes 0 positional arguments but 1 was given
+full 1 (1, 2, 3, 4, 5, {})
+full 2 (1, 2, 3, 4, 6, {'f': 7})
+full too many TypeError full() takes from 1 to 3 positional arguments but 4 positional arguments (and 1 keyword-only argument) were given
+missing 3 TypeError many() missing 3 required positional arguments: 'b', 'c', and 'd'
+missing 4 TypeError many() missing 4 required positional arguments: 'a', 'b', 'c', and 'd'
+method missing TypeError K.method() missing 1 required positional argument: 'x'
+method too many TypeError K.method() takes 2 positional arguments but 3 were given
+unbound missing self TypeError K.method() missing 2 required positional arguments: 'self' and 'x'
+static missing TypeError K.smeth() missing 1 required positional argument: 'x'
+classmethod missing TypeError K.cmeth() missing 1 required positional argument: 'x'
+builtin len args TypeError len() takes exactly one argument (0 given)
+builtin len kw TypeError len() takes no keyword arguments
+builtin int kw 5
+builtin divmod 1 TypeError divmod expected 2 arguments, got 1
+lambda missing TypeError <lambda>() missing 2 required positional arguments: 'p' and 'q'
+lambda kw TypeError <lambda>() got an unexpected keyword argument 'q'
+not callable TypeError 'int' object is not callable
+none not callable TypeError 'NoneType' object is not callable
+str not callable TypeError 'str' object is not callable

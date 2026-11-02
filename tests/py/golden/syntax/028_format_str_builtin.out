@@ -1,0 +1,42 @@
+str '' [] [] [        ] [     ] [         ] [*********] [------] [] [        ] [       ] [====] [00000] []
+str 'a' [a] [a] [       a] [a    ] [    a    ] [****a****] [a-----] [a] [       a] [   a   ] [===a] [a0000] [a]
+str 'abc' [abc] [abc] [     abc] [abc  ] [   abc   ] [***abc***] [abc---] [ab] [      ab] [   a   ] [=abc] [abc00] [abc]
+str 'hello world' [hello world] [hello world] [hello world] [hello world] [hello world] [hello world] [hello world] [he] [      he] [   h   ] [hello world] [hello world] [hello world]
+str 'é✓' [é✓] [é✓] [      é✓] [é✓   ] [   é✓    ] [***é✓****] [é✓----] [é✓] [      é✓] [   é   ] [==é✓] [é✓000] [é✓]
+str 'tab\tx' [tab	x] [tab	x] [   tab	x] [tab	x] [  tab	x  ] [**tab	x**] [tab	x-] [ta] [      ta] [   t   ] [tab	x] [tab	x] [tab	x]
+ljust/rjust/center 'mid....' '....mid' '..mid...'
+format eq True True
+center odd ' ab  ' '  ab ' ' abc  ' ' abc  '
+fmt 'x' 'd' ValueError Unknown format code 'd' for object of type 'str'
+fmt 'x' '+' ValueError Sign not allowed in string format specifier
+fmt 'x' ',' ValueError Cannot specify ',' with 's'.
+fmt 'x' '#' ValueError Alternate form (#) not allowed in string format specifier
+fmt 'x' '=5' ValueError '=' alignment not allowed in string format specifier
+fmt 'x' 'z' ValueError Negative zero coercion (z) not allowed in string format specifier
+fmt 'x' '10.3s' 'x         '
+fmt 'x' '☃^5' '☃☃x☃☃'
+fmt None '' 'None'
+fmt None '>6' TypeError unsupported format string passed to NoneType.__format__
+fmt [1, 2] '' '[1, 2]'
+fmt [1, 2] '>10' TypeError unsupported format string passed to list.__format__
+fmt (1,) '' '(1,)'
+fmt {'a': 1} '' "{'a': 1}"
+fmt True '' 'True'
+fmt True '>6' '     1'
+fmt b'ab' '' "b'ab'"
+fmt range(0, 3) '' 'range(0, 3)'
+fmt (3+4j) '>12' '      (3+4j)'
+fmt <class 'object'> '' "<class 'object'>"
+default __format__ Thing! Thing! Thing!
+fmt Thing() '' 'Thing!'
+fmt Thing() '>10' TypeError unsupported format string passed to Thing.__format__
+custom custom[anything] custom[xy] custom[z]
+fmt BadFormat() '' TypeError BadFormat.__format__() must return a str, not int
+format raises KeyError 'k'
+format no args TypeError format expected at least 1 argument, got 0
+format non-str spec TypeError format() argument 2 must be str, not int
+subclass '  q' str
+subclass override HEY!5 X!>3
+unicode fill [→→→x→→→] [日本    ]| 6
+truncate [abc] [     abc] [ab]
+format type str str

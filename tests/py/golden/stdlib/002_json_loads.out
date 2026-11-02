@@ -1,0 +1,75 @@
+int 42
+float 1.0 1.0
+float exp 1000.0 -0.0025
+neg zero 0 -0.0
+big int 123456789012345678901234567890
+big float inf -inf
+nan inf [nan, inf, -inf]
+literals [True, False, None]
+string 'a\nb\t"q" é 😀'
+lone surrogate '\ud800'
+raw unicode '日本'
+whitespace {'a': [1, 2]}
+dup keys {'a': 2}
+nested {'x': {'y': [1, {'z': []}]}}
+types ['int', 'float', 'str', 'NoneType', 'bool', 'list', 'dict']
+pairs hook [('b', 1), ('a', 2), ('b', 3)]
+ordered OrderedDict [('z', 1), ('y', 2)]
+object hook [('x', 1), ('y', [('x', 2)])]
+parse_float [Decimal('1.10'), 2]
+parse_int ['1!', 2.0]
+parse_constant ['nan', 'infinity']
+bytes utf8 {'k': 'é'}
+bytes utf16 ['x']
+err ''
+    Expecting value | pos 0 | line 1 | col 1
+    str: Expecting value: line 1 column 1 (char 0)
+err '[1, 2'
+    Expecting ',' delimiter | pos 5 | line 1 | col 6
+    str: Expecting ',' delimiter: line 1 column 6 (char 5)
+err '{"a" 1}'
+    Expecting ':' delimiter | pos 5 | line 1 | col 6
+    str: Expecting ':' delimiter: line 1 column 6 (char 5)
+err "{'a': 1}"
+    Expecting property name enclosed in double quotes | pos 1 | line 1 | col 2
+    str: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+err '[1,]'
+    Illegal trailing comma before end of array | pos 2 | line 1 | col 3
+    str: Illegal trailing comma before end of array: line 1 column 3 (char 2)
+err '{"a": 1,}'
+    Illegal trailing comma before end of object | pos 7 | line 1 | col 8
+    str: Illegal trailing comma before end of object: line 1 column 8 (char 7)
+err 'tru'
+    Expecting value | pos 0 | line 1 | col 1
+    str: Expecting value: line 1 column 1 (char 0)
+err '"unterminated'
+    Unterminated string starting at | pos 0 | line 1 | col 1
+    str: Unterminated string starting at: line 1 column 1 (char 0)
+err '"bad \\x escape"'
+    Invalid \escape | pos 5 | line 1 | col 6
+    str: Invalid \escape: line 1 column 6 (char 5)
+err '[1] extra'
+    Extra data | pos 4 | line 1 | col 5
+    str: Extra data: line 1 column 5 (char 4)
+err '{\n  "a": 1,\n  "b": ?\n}'
+    Expecting value | pos 19 | line 3 | col 8
+    str: Expecting value: line 3 column 8 (char 19)
+err '01'
+    Extra data | pos 1 | line 1 | col 2
+    str: Extra data: line 1 column 2 (char 1)
+err '"ctl \x01 char"'
+    Invalid control character at | pos 5 | line 1 | col 6
+    str: Invalid control character at: line 1 column 6 (char 5)
+err 'nan'
+    Expecting value | pos 0 | line 1 | col 1
+    str: Expecting value: line 1 column 1 (char 0)
+is ValueError True
+strict false 'tab\there'
+non-str TypeError the JSON object must be str, bytes or bytearray, not int
+raw_decode ({'a': 1}, 8)
+raw_decode idx ([1, 2], 8)
+load {'items': [1, 2, 3], 'ok': True} 6
+roundtrip eq True
+roundtrip float True
+tuple becomes list [1, 2]
+int keys become str {'1': 'a'}

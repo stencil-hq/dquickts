@@ -1,0 +1,68 @@
+None None False falsy
+True True True truthy
+False False False falsy
+int 0 0 False falsy
+int 1 1 True truthy
+int -1 -1 True truthy
+big int 10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 True truthy
+float 0.0 0.0 False falsy
+float -0.0 -0.0 False falsy
+float tiny 5e-324 True truthy
+float inf inf True truthy
+float nan nan True truthy
+complex 0j 0j False falsy
+complex -0j (-0-0j) False falsy
+complex 1j 1j True truthy
+complex real (1+0j) True truthy
+str empty '' False falsy
+str space ' ' True truthy
+str zero '0' True truthy
+str False 'False' True truthy
+str nul '\x00' True truthy
+bytes empty b'' False falsy
+bytes nul b'\x00' True truthy
+bytearray empty bytearray(b'') False falsy
+bytearray one bytearray(b'\x00') True truthy
+list empty [] False falsy
+list [None] [None] True truthy
+list [[]] [[]] True truthy
+tuple empty () False falsy
+tuple (0,) (0,) True truthy
+dict empty {} False falsy
+dict nonempty {None: None} True truthy
+set empty set() False falsy
+set {0} {0} True truthy
+frozenset empty frozenset() False falsy
+frozenset nonempty frozenset({0}) True truthy
+range 0 range(0, 0) False falsy
+range 1 range(0, 1) True truthy
+range empty neg range(5, 0) False falsy
+range neg step range(5, 0, -1) True truthy
+Ellipsis Ellipsis True truthy
+memoryview empty False nonempty True
+slice slice(0, 0, None) True truthy
+type <class 'int'> True truthy
+function truthy True
+lambda truthy True
+builtin truthy True
+object() truthy True
+class truthy True
+True + True 2
+True * 3 3
+False - 1 -1
+isinstance bool int True
+bool(int subclass) True 1 0
+True == 1 True False == 0 True
+hash eq True
+dict key merge {1: 'bool'}
+str(True) True repr(False) False
+bool('False') True
+bool() False
+not NotImplemented TypeError NotImplemented should not be used in a boolean context
+bool kw TypeError bool() takes no keyword arguments
+all empty True
+any empty False
+all mixed True False
+any mixed False True
+filter None [1, 'a', [0], 2.5, {1}]
+count truthy 5

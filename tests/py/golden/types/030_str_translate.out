@@ -1,0 +1,33 @@
+maketrans 2-arg [(97, 120), (98, 121), (99, 122)]
+maketrans 3-arg [(97, 65), (98, 66), (99, None), (100, None)]
+maketrans dict [(97, '1'), (98, None), (99, 'zz'), (100, 101)]
+maketrans empty TypeError if you give only one argument to maketrans it must be a dict
+maketrans unequal ValueError the first two maketrans arguments must have equal length
+maketrans dict multi-char key ValueError string keys in translatetable must be of length 1
+maketrans dict bad key TypeError keys in translate table mustbe strings or integers
+maketrans one str TypeError if you give only one argument to maketrans it must be a dict
+maketrans non-BMP [(128512, 120)]
+translate basic 'xyzxyz'
+translate delete 'he wrd'
+translate dict ord 'AAc'
+translate int value 'Abc'
+translate non-BMP value 'a😀b'
+translate non-BMP key 'x!y'
+translate str key ignored 'abc'
+translate empty table 'abc'
+translate rot13 'Uryyb, Jbeyq!'
+translate list table 'ab\x02'
+translate bad value TypeError character mapping must return integer, None or str
+translate value too big ValueError character mapping must be in range(0x110000)
+translate negative value ValueError character mapping must be in range(0x110000)
+translate None table TypeError 'NoneType' object is not subscriptable
+translate 3-arg delete wins 'bc'
+translate empty string ''
+translate unicode 'Unicode'
+bytes.maketrans b'xy'
+bytes.maketrans len 256
+bytes translate b'xycxyc'
+bytes translate delete b'heo'
+bytes translate bad table ValueError translation table must be 256 characters long
+bytes maketrans unequal ValueError maketrans arguments must have same length
+bytearray translate bytearray(b'ac')

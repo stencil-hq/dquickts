@@ -1,0 +1,37 @@
+builtin exceptions
+  ValueError args=() str='' repr=ValueError()
+  ValueError args=('one',) str='one' repr=ValueError('one')
+  ValueError args=('a', 2) str="('a', 2)" repr=ValueError('a', 2)
+  ValueError args=(None,) str='None' repr=ValueError(None)
+  KeyError args=('k',) str="'k'" repr=KeyError('k')
+  KeyError args=() str='' repr=KeyError()
+  Exception args=(1, [2]) str='(1, [2])' repr=Exception(1, [2])
+plain subclass
+  AppError args=() str='' repr=AppError()
+  AppError args=('msg',) str='msg' repr=AppError('msg')
+  AppError args=('msg', 42) str="('msg', 42)" repr=AppError('msg', 42)
+custom init calling super
+  CodeError args=('not found',) str='not found' repr=CodeError('not found')
+  code attr 404
+custom init without super
+  NoSuperInit args=(1, 2) str='(1, 2)' repr=NoSuperInit(1, 2)
+  total 3
+custom __str__
+  WithStr args=('name',) str="invalid field 'name'" repr=WithStr('name')
+custom __repr__
+  WithRepr args=('x',) str='x' repr=<WithRepr custom>
+args assignable ('changed', 1) ('changed', 1)
+args converted to tuple ('a', 'b', 'c')
+dynamic attr dynamic attribute
+caught by base Hierarchy deep
+init raised ValueError negative value: -1
+name not bound after failed init False
+new raised no instances
+TypeError exceptions must derive from BaseException
+raise class with default default message
+raise class needing args TypeError CodeError.__init__() missing 2 required positional arguments: 'code' and 'message'
+with_traceback returns self True
+exception equality is identity False
+exceptions are hashable True
+str of nested args ('a', 1) []
+BaseException kwargs TypeError ValueError() takes no keyword arguments

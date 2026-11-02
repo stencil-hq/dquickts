@@ -1,0 +1,45 @@
+write returns 6 6 0
+tell 12
+getvalue 'hello world\n'
+read at end ''
+read 5 'hello' 5
+readline ' world\n' ''
+overwrite 'hello World\n'
+append 'hello World\nmore'
+truncate 3 'hel' 3
+write past end pads 'hel\x00\x00\x00\x00\x00\x00\x00x'
+initial pos 0 lines ['line1\n', 'line2\r\n', 'line3']
+iterate ['line1\n', 'line2\r\n', 'line3']
+newline=None 'a\nb\nc'
+newline='' ['a\r\n', 'b\r', 'c']
+newline=crlf write ''
+crlf translate 'x\r\ny\r\n'
+flags True True True False
+negative seek ValueError Negative seek position -1
+relative seek OSError Can't do nonzero cur-relative seeks
+closed ValueError I/O operation on closed file
+bytes init TypeError initial_value must be str or None, not bytes
+context ctx
+context closed True
+bytes read b'012' 3
+seek 8 b'89'
+seek cur 5 b'56'
+write b'AB23456789'
+write past end b'AB23456789\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00Z'
+truncate 4 b'AB23' 21
+readinto 3 bytearray(b'AB2')
+read1 b'3' b''
+getbuffer b'qB23' 4
+export locks BufferError Existing exports of data: object cannot be re-sized
+after release b'qB23!'
+bytes lines [b'a\n', b'bb\r\n', b'ccc']
+bytes iterate [b'x\n', b'y']
+str init TypeError a bytes-like object is required, not 'str'
+write str TypeError a bytes-like object is required, not 'str'
+TextIOWrapper bytes b'caf\xc3\xa9\n'
+TextIOWrapper decode '��line'
+BufferedReader b'b' b'buffered' b' data'
+classes True True
+UnsupportedOperation True True
+read-only write UnsupportedOperation write
+open_code exists True True

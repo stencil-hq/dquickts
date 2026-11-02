@@ -1,0 +1,20 @@
+row 1 2 3
+row 4 5 6
+row 7 8 9
+transpose [[1, 4, 7], [2, 5, 8], [3, 6, 9]]
+table 1 [1, 2, 3]
+table 2 [2, 4, 6]
+table 3 [3, 6, 9]
+flag exit (1, 1)
+else-continue idiom 2 1
+locate 6 (1, 2)
+locate 10 None
+exception exit (2, 6)
+pythagorean [(3, 4, 5), (5, 12, 13), (6, 8, 10)] iterations 560
+while in for [2, 3, 0]
+for in while ['a0', 'b0', 'a1', 'b1', 'a2', 'b2']
+triangle [[], [0], [0, 1], [0, 1, 2]]
+pair ax pair ay pair bx pair by 
+words with vowels ['apple', 'tree']
+flatten [1, 2, 3, 4, 5]
+odd-sum products 48

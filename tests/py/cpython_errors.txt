@@ -1,0 +1,5 @@
+# Expected-failing CPython Lib/test test ids for the L3 harness (tests/py/run.py l3).
+# Format: one test id per line, e.g. test_int.IntTestCases.test_basic, sorted.
+# Ids drop the leading "test." package prefix; a bare module name means the module
+# failed to import or crashed. Lines starting with '#' are comments and are preserved.
+# Maintained by `tests/py/run.py l3 -u` (make testpy-update); do not edit by hand.
