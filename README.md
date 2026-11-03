@@ -141,8 +141,6 @@ Limits:
   `c.inc()`).
 
 ### Python sessions
-![qjs --drepl --python: a Python session calls JavaScript through the js module; both survive quitting and restarting the REPL](doc/drepl-python-demo.gif)
-
 
 `qjs --drepl FILE --python` is the same REPL for Python 3.15. It follows the CPython REPL:
 `>>>` and `...` prompts (`sys.ps1`, `sys.ps2`), a block ends with an empty line,
@@ -184,7 +182,8 @@ Restored the durable session session.snap
 
 The architecture is the one above: `repl.js` edits the lines, the durable runtime holds a Python
 session (`python/pythonrun.c`, the `qp_drepl_*` functions) and runs the inputs, and the runtime
-is saved as a delta after each input (about 6 KB for the transcript above). In detail:
+is saved as a delta after each input (about 34 KB for the transcript above, in a directory with
+a few files: the import system caches the listing of the working directory). In detail:
 
 - The whole heap is saved: globals, functions, classes, instances, closures, generators and
   coroutines suspended in the middle, the imported modules (not imported again on load),
@@ -235,6 +234,8 @@ C state. Locks no thread holds and finished threads are saved as values, and the
 `threading` objects are bound to the main thread of the process that restores the session.
 
 ### JS and Python in one REPL
+
+![qjs --drepl --python: Python and TypeScript inputs call each other through py and js, and both survive quitting and restarting the REPL](doc/drepl-python-demo.gif)
 
 The REPL of `qjs` takes JavaScript (TypeScript with `--typescript`) and Python inputs, and
 both languages run in the same runtime and heap. `\py` switches the next inputs to Python and
