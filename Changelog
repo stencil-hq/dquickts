@@ -195,6 +195,10 @@ unreleased:
   uses memset
 - JS_GetTypedArrayBuffer() returns the current length of length-tracking
   views
+- linear time substring search: String.prototype.indexOf(),
+  lastIndexOf(), includes(), split(), replace() and replaceAll() use the
+  Two-Way algorithm for long needles (no allocation), instead of a naive
+  search in O(n * m) (a 16k character needle in 1 MB took 12 s)
 
 2026-06-04:
 
