@@ -164,6 +164,7 @@ static no_inline int qp_lst_normalize(JSContext *ctx, JSObject *p)
     p->u.array.u.values = NULL;
     p->u.array.count = 0;
     p->u.array.u1.size = 0;
+    p->u.array.offset = 0;
     if (len > 0 && expand_fast_array(ctx, p, len)) {
         qp_lst_set_count(p, 0);
         goto fail;
@@ -249,19 +250,22 @@ static int qp_lst_push(JSContext *ctx, JSObject *p, JSValue v)
 /* list_clear: empty the list and release its storage. */
 static int qp_lst_clear(JSContext *ctx, JSObject *p)
 {
-    JSValue *items;
+    JSValue *items, *base;
     uint32_t i;
     if (qp_lst_mfast(ctx, p))
         return -1;
     items = p->u.array.u.values;
+    /* shift() may have left free slots before the elements */
+    base = fast_array_base(p);
     i = p->u.array.count;
     p->u.array.u.values = NULL;
     p->u.array.u1.size = 0;
+    p->u.array.offset = 0;
     qp_lst_set_count(p, 0);
     /* the list is consistent before any value is released */
     while (i-- > 0)
         JS_FreeValue(ctx, items[i]);
-    js_free(ctx, items);
+    js_free(ctx, base);
     return 0;
 }
 
@@ -646,8 +650,8 @@ static int qp_lst_sort_lt(JSContext *ctx, JSValueConst a, JSValueConst b, void *
 static int qp_list_sort(JSContext *ctx, JSValueConst list, JSValueConst key, int reverse)
 {
     JSObject *p = QP_LST_OBJ(list);
-    JSValue *saved, *keys = NULL, *final_items;
-    uint32_t saved_n, saved_size, final_n, i;
+    JSValue *saved, *saved_base, *keys = NULL, *final_items, *final_base;
+    uint32_t saved_n, saved_size, saved_offset, final_n, i;
     qp_sort_lt_fn *lt;
     int ret = 0;
 
@@ -656,8 +660,12 @@ static int qp_list_sort(JSContext *ctx, JSValueConst list, JSValueConst key, int
     saved = p->u.array.u.values;
     saved_n = p->u.array.count;
     saved_size = p->u.array.u1.size;
+    /* free slots before the elements, left by shift() */
+    saved_offset = p->u.array.offset;
+    saved_base = fast_array_base(p);
     p->u.array.u.values = NULL;
     p->u.array.u1.size = 0;
+    p->u.array.offset = 0;
     qp_lst_set_count(p, 0);
 
     if (!QP_IS_NULL(key) && saved_n > 0) {
@@ -716,23 +724,26 @@ static int qp_list_sort(JSContext *ctx, JSValueConst list, JSValueConst key, int
                 qp_raise_type_error(ctx, "cannot use a sealed JS array as a list");
             for (i = 0; i < saved_n; i++)
                 JS_FreeValue(ctx, saved[i]);
-            js_free(ctx, saved);
+            js_free(ctx, saved_base);
             return -1;
         }
         p->fast_array = 1;
         p->u.array.u.values = NULL;
         p->u.array.count = 0;
         p->u.array.u1.size = 0;
+        p->u.array.offset = 0;
     }
     final_items = p->u.array.u.values;
+    final_base = fast_array_base(p);
     final_n = p->u.array.count;
     p->u.array.u.values = saved;
     p->u.array.u1.size = saved_size;
+    p->u.array.offset = saved_offset;
     qp_lst_set_count(p, saved_n);
     if (final_items) {
         while (final_n-- > 0)
             JS_FreeValue(ctx, final_items[final_n]);
-        js_free(ctx, final_items);
+        js_free(ctx, final_base);
     }
     return ret;
 }
