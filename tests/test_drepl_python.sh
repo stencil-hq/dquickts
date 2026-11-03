@@ -221,4 +221,32 @@ print("again:", rl._is_owned(), lock.locked(), sorted(csv.list_dialects()))
 EOF
 expect "again: False True ['excel', 'excel-tab', 'pipes', 'unix']"
 
+# 8. a session that used the js module: JS objects held by Python, Python
+# objects seen from JS and Function.prototype.callKw survive the restart
+snap=$dir/js_interop.snap
+run <<'EOF'
+import js
+shop = js.eval("({ items: [], add(name, qty) { return this.items.push({ name, qty }) } })")
+shop.add("apples", 3)
+class P:
+    x = 41
+
+show = js.eval("(o) => o.x + 1")
+print("show:", show(P()))
+EOF
+expect "show: 42"
+grep -qF "not saved" "$out" && fail "session 8 not saved"
+run <<'EOF'
+shop.add("pears", 2)
+print("items:", [i.name for i in shop.items], sum(i.qty for i in shop.items))
+print("show:", show(P()))
+def g(a, b=2): return a * 10 + b
+
+print("callKw:", js.eval("(f) => f.callKw([1], {b: 5})")(g))
+EOF
+expect "Restored the durable session $snap"
+expect "items: ['apples', 'pears'] 5"
+expect "show: 42"
+expect "callKw: 15"
+
 echo "test_drepl_python: OK"

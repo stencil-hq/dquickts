@@ -367,6 +367,23 @@ static const void * const qp_snap_extra_natives[] = {
     (const void *)qp_slot_tp_getattro,          /* typeobject_slots.h: __getattr__ */
 };
 
+/* JS functions made by the interop state (jsinterop.c): the fallback
+   methods of Python objects seen from JS, Function.prototype.callKw, and
+   the promise reactions and iterator steps it creates */
+static const void * const qp_snap_jsi_natives[] = {
+    (const void *)qp_jsi_fn_iterator,
+    (const void *)qp_jsi_fn_tostring,
+    (const void *)qp_jsi_fn_tojson,
+    (const void *)qp_jsi_fn_valueof,
+    (const void *)qp_jsi_fn_then,
+    (const void *)qp_jsi_fn_callkw,
+    (const void *)qp_jsi_fn_hasinstance,
+    (const void *)qp_jsi_fn_tojs,
+    (const void *)qp_jsi_task_resume,
+    (const void *)qp_jsi_iter_next,
+    (const void *)qp_jsi_return_data,
+};
+
 static int qp_snap_add_entries(JSRuntime *rt, SnapNatives *n, const char *type_name,
                                const char *table_name, const void *tab, size_t count,
                                size_t elem_size)
@@ -454,6 +471,10 @@ static int qp_snap_add_natives(JSRuntime *rt, SnapNatives *n)
     }
     for (i = 0; i < countof(qp_snap_extra_natives); i++) {
         if (snap_natives_push(rt, n, qp_snap_extra_natives[i]))
+            return -1;
+    }
+    for (i = 0; i < countof(qp_snap_jsi_natives); i++) {
+        if (snap_natives_push(rt, n, qp_snap_jsi_natives[i]))
             return -1;
     }
 #ifdef CONFIG_PYTHON_CAPI
@@ -1312,7 +1333,19 @@ static int qp_snap_write_state(SnapWriter *w, JSContext *ctx)
     bc_put_leb128(&w->bc, s->next_type_version);
     bc_put_u64(&w->bc, s->next_dict_uid);
     dbuf_put(&w->bc.dbuf, s->hash_key, sizeof(s->hash_key));
-    return qp_snap_write_modstate(w, s->mod_state);
+    if (qp_snap_write_modstate(w, s->mod_state))
+        return -1;
+    /* the interop state is rebuilt on read (qp_snap_jsi_apply) */
+    bc_put_u8(&w->bc, ctx->py_js != NULL);
+    return 0;
+}
+
+/* the interop state of a session that used it: exotic handlers of the
+   Python classes (and the is_exotic bit of the restored objects),
+   Function.prototype.callKw and the fallback methods */
+static int qp_snap_jsi_apply(JSContext *ctx, JSObject *unused)
+{
+    return qp_jsi_state(ctx) ? 0 : -1;
 }
 
 /* process state described by the restored module state */
@@ -1347,7 +1380,7 @@ static int qp_snap_read_state(SnapReader *r, JSContext *ctx)
     QPSnapRead *rs;
     QPState *s;
     struct QPStrCache *c;
-    uint8_t present;
+    uint8_t present, interop;
     uint64_t uid;
     int i;
 
@@ -1426,9 +1459,11 @@ static int qp_snap_read_state(SnapReader *r, JSContext *ctx)
        of the hash tables then rehashes their keys) */
     if (r->rt->py_snap_hash_key)
         memcpy(s->hash_key, r->rt->py_snap_hash_key, sizeof(s->hash_key));
-    if (qp_snap_read_modstate(r, s))
+    if (qp_snap_read_modstate(r, s) || bc_get_u8(&r->bc, &interop))
         return -1;
     /* the object slot carries the context (see qp_snap_run_deferred) */
+    if (interop && qp_snap_defer(r, (JSObject *)ctx, qp_snap_jsi_apply))
+        return -1;
     return qp_snap_defer(r, (JSObject *)ctx, qp_snap_state_apply);
 }
 

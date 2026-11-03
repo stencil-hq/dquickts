@@ -1,4 +1,8 @@
 unreleased:
+- Python snapshots: a runtime that used the js module can be saved (the
+  interop functions, e.g. Function.prototype.callKw, were unregistered
+  natives, so `import js` made every later qjs --drepl --python save fail);
+  the interop state is rebuilt on read
 - Python: sys.monitoring (PEP 669) delivers its events: global and local
   event sets, per-location DISABLE, restart_events(), all events including
   C_RETURN/C_RAISE, BRANCH_LEFT/RIGHT (and the BRANCH alias), STOP_ITERATION,
