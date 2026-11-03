@@ -1,4 +1,19 @@
 unreleased:
+- bilingual REPL: in qjs and qjs --drepl FILE --python, \py and \js switch
+  the language of the next inputs, '\py CODE' / '\js CODE' run one input in
+  the other language; the prompt shows the language (qjs> or sys.ps1/ps2);
+  `js` is imported in Python's __main__ and the JS global `py` is __main__;
+  the plain REPL initializes Python on its first Python input or use of
+  `py`; durable Python sessions save the JS state with the Python state,
+  give their TypeScript inputs print() and console.log() and restart in
+  the language they were left in; a JavaScript session's \py tells to
+  start it with --python
+- Python: js.name also reads the top-level let, const and class
+  declarations of JS (the global lexical environment), as a JS global
+  name resolves
+- qjs REPL: with stdin not a terminal, every REPL reads plain lines
+  (no echo, no colors), runs them one input at a time (waiting for
+  asynchronous results) and quits at the end of the input
 - Python snapshots: a runtime that used the js module can be saved (the
   interop functions, e.g. Function.prototype.callKw, were unregistered
   natives, so `import js` made every later qjs --drepl --python save fail);

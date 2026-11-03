@@ -3179,10 +3179,12 @@ int qp_main(int argc, char **argv)
     return m.kb ? qp_main_exit_sigint() : exitcode;
 }
 
-/* ---- durable REPL (qjs --drepl FILE --python) ------------------------- */
+/* ---- the REPL of qjs (qjs --drepl FILE --python, qjs's \py inputs) ---- */
 
-/* qjs keeps the line editor in its own runtime and runs the inputs in the
-   session context through these functions.  The session is saved with
+/* qjs keeps the line editor in its own runtime and runs the Python inputs
+   through these functions, in the context of a durable session
+   (qp_drepl_init()) or in the context of its plain REPL
+   (qp_drepl_init_main()).  A durable session is saved with
    JS_WriteSnapshot() as a delta of its base, a new session, which qjs
    rebuilds in each process: the base must be the same bytes in every
    process of the build, so qp_drepl_init() does not depend on the
@@ -3192,6 +3194,35 @@ int qp_main(int argc, char **argv)
    object, so that it survives the restarts like the sources registered
    for the tracebacks */
 #define QP_DREPL_COUNT "\x01qp_drepl_count"
+
+/* The REPL is bilingual: `js` is imported in __main__ and, if 'define_py',
+   the JS global `py` is the __main__ module (qjs defines a getter that
+   initializes Python instead in its plain REPL).  0, or -1 with an
+   exception pending. */
+static int qp_drepl_bilingual(JSContext *ctx, BOOL define_py)
+{
+    JSValue m, js;
+    JSAtom a;
+    int r = -1;
+
+    m = qp_run_main_module(ctx);
+    if (JS_IsException(m))
+        return -1;
+    js = qp_import_module(ctx, "js");
+    if (!JS_IsException(js)) {
+        a = JS_NewAtom(ctx, "js");
+        if (a != JS_ATOM_NULL) {
+            r = qp_setattr(ctx, m, a, js);
+            JS_FreeAtom(ctx, a);
+        }
+        JS_FreeValue(ctx, js);
+    }
+    if (r >= 0 && define_py)
+        r = JS_DefinePropertyValueStr(ctx, ctx->global_obj, "py", JS_DupValue(ctx, m),
+                                      JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE);
+    JS_FreeValue(ctx, m);
+    return r < 0 ? -1 : 0;
+}
 
 /* A new session: Python like the interactive `python`, with options that
    make the state reproducible: the hash seed of the session file,
@@ -3288,6 +3319,8 @@ int qp_drepl_init(JSContext *ctx, const char *argv0, uint32_t hash_seed)
     if (JS_DefinePropertyValueStr(ctx, ctx->global_obj, QP_DREPL_COUNT, JS_NewInt32(ctx, 0),
                                   JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE) < 0)
         goto fail;
+    if (qp_drepl_bilingual(ctx, TRUE) < 0)
+        goto fail;
     /* the finders of sys.path entries: '' is the working directory */
     {
         JSAtom name = JS_NewAtom(ctx, "path_importer_cache");
@@ -3314,6 +3347,63 @@ int qp_drepl_init(JSContext *ctx, const char *argv0, uint32_t hash_seed)
             signal(i, SIG_IGN);
     }
     return ret;
+}
+
+/* Python in ctx, the context of the plain REPL of qjs (qjs without
+   --drepl), initialized by its first Python input: the interactive
+   `python` without arguments (the PYTHON* environment variables apply,
+   sys.argv == ['']) except that the standard streams are unbuffered (the
+   output of Python and of JS interleave) and SystemExit is not inspected.
+   `js` is imported in __main__.  argv0 is the program (sys.executable).
+   Returns 0, or -1 after printing the error. */
+int qp_drepl_init_main(JSContext *ctx, const char *argv0)
+{
+    /* the state keeps pointers into m.cfg: they live as long as the
+       process */
+    static QPMain m;
+    char *argv[2];
+    JSValue mod;
+
+    if (ctx->py)
+        return 0;
+    /* _Py_SetLocaleFromEnv(LC_CTYPE) (pymain_init) */
+    setlocale(LC_CTYPE, "");
+    qp_preconfig_configure_locale = 1;
+    argv[0] = (char *)argv0;
+    argv[1] = NULL;
+    if (qp_main_parse(&m, 1, argv) >= 0)
+        return -1;
+    m.cfg.inspect = 0;
+    m.cfg.unbuffered = 1;
+    if (qp_state_init(ctx, &m.cfg) < 0) {
+        fprintf(stderr, "Fatal Python error: init: Python state initialization failed\n");
+        return -1;
+    }
+#ifdef QP_IMPORTLIB_BOOT
+    if (qp_importlib_boot(ctx) < 0)
+        goto fail;
+#endif
+    mod = qp_run_main_module(ctx);
+    if (JS_IsException(mod))
+        goto fail;
+    JS_FreeValue(ctx, mod);
+    if (m.cfg.sys_path_0 && qp_main_add_path0(ctx, m.cfg.sys_path_0) < 0)
+        goto fail;
+    qp_repl_default_prompt(ctx, QP_ATOM(ctx, ps1), ">>> ");
+    qp_repl_default_prompt(ctx, QP_ATOM(ctx, ps2), "... ");
+    if (qp_drepl_bilingual(ctx, FALSE) < 0)
+        goto fail;
+    return 0;
+ fail:
+    qp_handle_uncaught(ctx);
+    return -1;
+}
+
+/* The __main__ module of the Python of ctx (the JS global `py` of the
+   REPL), or JS_EXCEPTION */
+JSValue qp_drepl_main(JSContext *ctx)
+{
+    return qp_run_main_module(ctx);
 }
 
 /* The session ctx, new (after writing its base) or restored: -1 if it has

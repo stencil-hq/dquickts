@@ -164,6 +164,10 @@ printf 'let a = 1\n\\q\n' | "$QJS" --drepl "$dir/js.snap" > /dev/null 2>&1
 [ -s "$dir/js.snap" ] || fail "no JS session file"
 "$QJS" --drepl "$dir/js.snap" --python < /dev/null > "$out" 2>&1 && fail "Python mode loaded a JS session"
 expect "not a Python session"
+# a JavaScript session cannot switch to Python
+printf '\\py\n1 + 1\n' | "$QJS" --drepl "$dir/js.snap" > "$out" 2>&1
+expect "\\py: this session has no Python: start it with qjs --drepl FILE --python"
+expect "qjs> 2"
 
 # 7. a session that imports asyncio, csv, threading, logging and
 # subprocess: the main thread's objects (threading's main Thread, an RLock
@@ -248,5 +252,49 @@ expect "Restored the durable session $snap"
 expect "items: ['apples', 'pears'] 5"
 expect "show: 42"
 expect "callKw: 15"
+
+# 9. a bilingual session: \js switches to TypeScript, \py back, '\py CODE'
+# and '\js CODE' run one input in the other language; js.NAME reads the JS
+# globals (top-level let, const and class too) and py is __main__ in JS.
+# The JS state is saved with the Python state, and the session restarts
+# in the language it was left in.
+snap=$dir/bilingual.snap
+run <<'EOF'
+\js function add(a: number, b: number): number { return a + b }
+js.add(2, 3)
+def sq(x): return x * x
+
+\js py.sq(7)
+\js
+let n: number = 3
+console.log("n:", n)
+\py js.n + 1
+class K { v = 9 }
+py.y = 1
+\py
+print("y:", y, "K:", js.K.new().v)
+\js
+EOF
+[ $? -eq 0 ] || fail "session 9 exit status"
+expect ">>> 5"
+expect ">>> 49"
+expect "n: 3"
+expect "qjs> 4"
+expect "qjs> 1"
+expect ">>> y: 1 K: 9"
+grep -qF "not saved" "$out" && fail "session 9 not saved"
+run <<'EOF'
+add(py.sq(3), n)
+\py print("again:", js.add(1, 2), sq(4), js.n, y, js.K.new().v)
+\py
+EOF
+expect "Restored the durable session $snap"
+expect "qjs> 12"
+expect "again: 3 16 3 1 9"
+run <<'EOF'
+sq(js.add(1, 1))
+EOF
+expect ">>> 4"
+grep -qF "not saved" "$out" && fail "session 9 not saved after the restart"
 
 echo "test_drepl_python: OK"

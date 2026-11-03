@@ -39,14 +39,28 @@ import * as os from "os";
        each command. It keeps the values: it returns their rendering
        and answers the completion queries with JSON copies. */
     var durable = options.durable;
-    /* qjs --drepl FILE --python: the commands are Python. The durable
-       runtime decides when the lines form a complete input
-       (durable.complete()), gives the prompts (sys.ps1, sys.ps2) and the
-       completions, and Python writes the results and the tracebacks
-       itself. */
-    var python = !!(durable && durable.python);
-    /* Python with stdin not a terminal: read lines without editing them */
+    /* Python (qjs built with it, except in a JavaScript durable session):
+       it runs the Python inputs in the durable session or, in the plain
+       REPL, in this runtime (initialized by the first Python input).
+       Python decides when the lines form a complete input
+       (pyrt.complete()), gives the prompts (sys.ps1, sys.ps2) and the
+       completions, and writes the results and the tracebacks itself. */
+    var pyrt = options.python;
+    /* the language selected by \py and \js: true for Python (a Python
+       durable session starts in Python, or in the language it was left
+       in) */
+    var lang_py = !!(durable && pyrt && durable.language !== "js");
+    /* the language of the current input: '\py CODE' and '\js CODE' run
+       one input in the other language */
+    var python = lang_py;
+    /* stdin is not a terminal: the lines are read without editing or
+       echo, and wait in 'plain_lines' while an input runs */
     var plain = false;
+    var plain_line = "";
+    var plain_lines = [];
+    var plain_busy = false; /* an input runs (until readline_start()) */
+    var plain_loop = false; /* plain_next() runs the lines */
+    var plain_eof = false; /* the end of stdin was read */
 
     /* close global objects */
     var Object = g.Object;
@@ -145,8 +159,11 @@ import * as os from "os";
                 /* set the TTY to raw mode */
                 os.ttySetRaw(term_fd);
             }
-        } else if (python) {
+        } else {
             plain = true;
+            show_colors = false;
+            for (var k in colors)
+                colors[k] = "";
         }
 
         /* install a Ctrl-C signal handler */
@@ -165,8 +182,8 @@ import * as os from "os";
     function term_read_handler() {
         var l, i;
         l = os.read(term_fd, term_read_buf.buffer, 0, term_read_buf.length);
-        if (l <= 0 && python) {
-            python_eof();
+        if (l <= 0) {
+            input_eof();
             return;
         }
         for(i = 0; i < l; i++)
@@ -679,7 +696,8 @@ import * as os from "os";
         /* add non-numeric regular properties with s as prefix */
         for (j = 0; j < props.length; j++) {
             var prop = props[j];
-            if (""+(+prop) != prop && prop.startsWith(s))
+            /* (not the hidden names of the Python sessions, "\x01...") */
+            if (""+(+prop) != prop && prop.startsWith(s) && prop[0] >= " ")
                 r.push(prop);
         }
         if (r.length > 1) {
@@ -719,7 +737,7 @@ import * as os from "os";
             expr = m[1];
         else if (pos - s.length > 0 && line[pos - s.length - 1] === ".")
             return { tab: [], pos: s.length };
-        names = durable.names(expr, s);
+        names = pyrt.names(expr, s);
         return { tab: names ? names.split("\n") : [], pos: s.length };
     }
 
@@ -851,15 +869,19 @@ import * as os from "os";
     }
 
     function readline_start(defstr, cb) {
-        cmd = defstr || "";
+        /* the plain lines are not edited */
+        cmd = plain ? "" : defstr || "";
         cursor_pos = cmd.length;
         history_index = history.length;
         readline_cb = cb;
+        /* a new input is in the selected language */
+        if (!mexpr)
+            python = lang_py;
 
         prompt = pstate;
 
         if (python) {
-            prompt = durable.prompt(!!mexpr);
+            prompt = pyrt.prompt(!!mexpr);
         } else if (mexpr) {
             prompt += dupstr(" ", plen - prompt.length);
             prompt += ps2;
@@ -874,6 +896,28 @@ import * as os from "os";
         readline_print_prompt();
         update();
         readline_state = 0;
+        if (plain) {
+            /* the next line can run (after the jobs of an input whose
+               evaluation is asynchronous) */
+            plain_busy = false;
+            if (!plain_loop)
+                os.setTimeout(plain_next, 0);
+        }
+    }
+
+    /* run the lines read from a plain stdin, one input at a time, then
+       end the REPL after the last one */
+    function plain_next() {
+        plain_loop = true;
+        while (!plain_busy && plain_lines.length > 0) {
+            plain_busy = true;
+            readline_cb(plain_lines.shift());
+        }
+        plain_loop = false;
+        if (!plain_busy && plain_eof) {
+            plain_eof = false;
+            input_end("");
+        }
     }
 
     function handle_char(c1) {
@@ -881,13 +925,13 @@ import * as os from "os";
         if (plain) {
             /* one line, without echo */
             if (c1 == 10) {
-                c = cmd;
-                cmd = "";
-                readline_cb(c);
+                plain_lines.push(plain_line);
+                plain_line = "";
+                plain_next();
             } else if (c1 == 3) {
                 control_c(); /* from sigint_handler() */
             } else if (c1 != 13) {
-                cmd += String.fromCodePoint(c1);
+                plain_line += String.fromCodePoint(c1);
             }
             return;
         }
@@ -1028,6 +1072,8 @@ import * as os from "os";
             return n ? "*": " ";
         }
         std.puts("\\h          this help\n" +
+                 "\\js [code] " + sel(!lang_py) + "JavaScript inputs, or run 'code' as one\n" +
+                 "\\py [code] " + sel(lang_py) + "Python inputs, or run 'code' as one\n" +
                  "\\x         " + sel(hex_mode) + "hexadecimal number display\n" +
                  "\\d         " + sel(!hex_mode) + "decimal number display\n" +
                  "\\t         " + sel(show_time) + "toggle timing display\n" +
@@ -1037,7 +1083,7 @@ import * as os from "os";
 
     function cmd_start() {
         if (python)
-            std.puts(durable.banner);
+            std.puts(pyrt.banner);
         else
             std.puts('QuickJS - Type "\\h" for help\n');
         if (durable) {
@@ -1066,7 +1112,7 @@ import * as os from "os";
         if (!mexpr && /^[ \t\f\r]*(#.*)?$/.test(line))
             return false; /* blank line or comment */
         src = mexpr ? mexpr + "\n" + line : line;
-        if (!durable.complete(src)) {
+        if (!pyrt.complete(src)) {
             mexpr = src;
             return false;
         }
@@ -1075,43 +1121,92 @@ import * as os from "os";
         return true;
     }
 
-    /* end of the input of a Python session: run the pending input, as
-       Python does, then quit */
-    function python_eof() {
+    /* the end of stdin: the remaining lines run (in a plain stdin), then
+       the REPL ends */
+    function input_eof() {
+        os.setReadHandler(term_fd, null);
+        if (plain) {
+            if (plain_line) {
+                plain_lines.push(plain_line);
+                plain_line = "";
+            }
+            plain_eof = true;
+            plain_next();
+        } else {
+            input_end(cmd);
+        }
+    }
+
+    /* end the REPL after the last line 'line' (not run): a pending Python
+       input runs, as Python does */
+    function input_end(line) {
         var src = mexpr;
-        if (cmd)
-            src = src ? src + "\n" + cmd : cmd;
+        if (line)
+            src = src ? src + "\n" + line : line;
         mexpr = cmd = "";
         std.puts("\n");
-        if (src && !/^[ \t\f\r]*(#.*)?$/.test(src))
+        if (python && src && !/^[ \t\f\r]*(#.*)?$/.test(src))
             python_eval(src);
         os.signal(os.SIGINT, null);
-        os.setReadHandler(term_fd, null);
     }
 
     /* run the complete Python input 'src' (Python prints the results);
        SystemExit ends qjs */
     function python_eval(src) {
-        var result = durable.eval(src);
+        var result = pyrt.eval(src);
         if (result.exit !== undefined)
             std.exit(result.exit);
     }
 
-    /* return true if async termination */
-    function handle_cmd(expr) {
-        var colorstate, cmd;
-
-        if (python)
-            return handle_py_cmd(expr);
-        if (expr === null) {
-            expr = "";
+    /* \py and \js: 'py' selects Python for the next inputs, or JavaScript
+       if false; with 'code', only 'code' is an input in that language
+       (its continuation lines too). Return true if async termination. */
+    function select_language(py, code) {
+        if (py) {
+            if (!pyrt) {
+                std.puts(durable ?
+                         "\\py: this session has no Python: start it with qjs --drepl FILE --python\n" :
+                         "\\py: this qjs has no Python\n");
+                return false;
+            }
+            try {
+                pyrt.init();
+            } catch (e) {
+                std.puts("\\py: " + e.message + "\n");
+                return false;
+            }
+        }
+        code = code.replace(/^[ \t]+/, "");
+        if (code === "") {
+            if (lang_py != py && durable && durable.setLanguage)
+                durable.setLanguage(py ? "python" : "js");
+            lang_py = python = py;
             return false;
         }
-        if (expr === "?") {
+        python = py;
+        return py ? handle_py_cmd(code) : handle_js_cmd(code);
+    }
+
+    /* return true if async termination */
+    function handle_cmd(expr) {
+        var cmd;
+
+        if (expr === null)
+            return false;
+        /* in Python, the directives start an input */
+        if (python && mexpr)
+            return handle_py_cmd(expr);
+        if (expr === "?" && !python) {
             help();
             return false;
         }
         cmd = extract_directive(expr);
+        if (cmd === "py" || cmd === "js") {
+            /* they start an input */
+            if (mexpr)
+                return handle_js_cmd(expr);
+            return select_language(cmd === "py", expr.substring(cmd.length + 1));
+        }
         if (cmd === "load" && durable) {
             /* the file is a command of the durable runtime */
             var filename = directive_filename(cmd, expr);
@@ -1120,6 +1215,7 @@ import * as os from "os";
                 std.puts("Cannot load " + filename + "\n");
                 return false;
             }
+            python = false;
             eval_and_print_start(expr);
             return true;
         }
@@ -1129,9 +1225,16 @@ import * as os from "os";
             }
             expr = expr.substring(cmd.length + 1);
         }
+        return python ? handle_py_cmd(expr) : handle_js_cmd(expr);
+    }
+
+    /* a JavaScript line: run the command when it is complete (return true
+       if async termination) */
+    function handle_js_cmd(expr) {
+        var colorstate;
+
         if (expr === "")
             return false;
-
         if (mexpr)
             expr = mexpr + '\n' + expr;
         colorstate = colorize_js(expr);

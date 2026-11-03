@@ -471,11 +471,13 @@ static size_t get_suffixed_size(const char *str)
    timers, handlers) that a snapshot cannot save. Its commands are
    TypeScript.
 
-   With --python (qjs --drepl FILE --python), the commands are Python:
-   the durable runtime holds a Python session (python/pythonrun.c, the
-   qp_drepl_* functions), which writes its results and tracebacks itself.
-   The base also depends on the hash seed of the session, stored in a
-   header of FILE (DREPL_PY_MAGIC) before the delta. */
+   With --python (qjs --drepl FILE --python), the session is bilingual:
+   the durable runtime also holds a Python session (python/pythonrun.c,
+   the qp_drepl_* functions), which runs the Python inputs and writes
+   their results and tracebacks itself, and the inputs are Python or, after
+   \js, TypeScript. The base also depends on the hash seed of the session,
+   stored in a header of FILE (DREPL_PY_MAGIC) before the delta with the
+   language of the inputs. */
 
 typedef struct {
     JSRuntime *rt; /* NULL without --drepl */
@@ -484,11 +486,11 @@ typedef struct {
     int eval_flags;
     BOOL restored; /* TRUE if restored from 'path' */
     void (*prev_sigint)(int); /* Ctrl-C handler of the main runtime */
-    const JSSnapshotHost *host; /* host natives of the session */
 #ifdef CONFIG_PYTHON
     BOOL python; /* --python: a Python session */
     const char *argv0; /* the program, for sys.executable */
     uint32_t hash_seed; /* of the Python session */
+    BOOL js_lang; /* the inputs of the Python session are TypeScript (\js) */
 #endif
 } DurableRepl;
 
@@ -506,11 +508,14 @@ static const JSSnapshotHost drepl_host = {
 };
 
 #ifdef CONFIG_PYTHON
-/* header of the file of a Python session: this text, then the hash seed
-   of the session as 4 bytes, little endian */
+/* header of the file of a Python session: this text, the hash seed of the
+   session as 4 bytes, little endian, then the language of the inputs as
+   one byte (DREPL_LANG_xxx) */
 #define DREPL_PY_MAGIC "qjs --drepl --python\n"
 #define DREPL_PY_MAGIC_LEN (sizeof(DREPL_PY_MAGIC) - 1)
-#define DREPL_PY_HEADER_LEN (DREPL_PY_MAGIC_LEN + 4)
+#define DREPL_PY_HEADER_LEN (DREPL_PY_MAGIC_LEN + 5)
+#define DREPL_LANG_PYTHON 0
+#define DREPL_LANG_JS 1
 
 /* the session runs Python (its context has the Python state) */
 #define drepl_is_python() (drepl.python)
@@ -650,7 +655,7 @@ static int drepl_save(void)
     if (drepl.python)
         qp_drepl_environ(dctx, 0);
 #endif
-    buf = JS_WriteSnapshot(dctx, &len, drepl.host, NULL, 0, JS_SNAPSHOT_DELTA);
+    buf = JS_WriteSnapshot(dctx, &len, &drepl_host, NULL, 0, JS_SNAPSHOT_DELTA);
 #ifdef CONFIG_PYTHON
     if (drepl.python)
         qp_drepl_environ(dctx, 1);
@@ -670,10 +675,11 @@ static int drepl_save(void)
             ok = TRUE;
 #ifdef CONFIG_PYTHON
             if (drepl.python) {
-                uint8_t seed[4];
-                put_u32(seed, drepl.hash_seed);
+                uint8_t header[5];
+                put_u32(header, drepl.hash_seed);
+                header[4] = drepl.js_lang ? DREPL_LANG_JS : DREPL_LANG_PYTHON;
                 ok = fwrite(DREPL_PY_MAGIC, 1, DREPL_PY_MAGIC_LEN, f) == DREPL_PY_MAGIC_LEN &&
-                    fwrite(seed, 1, 4, f) == 4;
+                    fwrite(header, 1, 5, f) == 5;
             }
 #endif
             written = fwrite(buf, 1, len, f);
@@ -765,18 +771,88 @@ static JSValue drepl_copy_number(JSContext *ctx, JSValueConst val)
 }
 
 #ifdef CONFIG_PYTHON
-/* durable.eval(src) of a Python session: run the input 'src' (a complete
-   input, see durable.complete()) and its jobs, then save the session.
+/* The Python inputs (the 'python' object of the options of repl.js) run
+   in the durable session or, in the plain REPL (without --drepl), in the
+   context of the REPL itself, whose Python is initialized by the first
+   Python input or the first use of the 'py' global. */
+static struct {
+    int state; /* plain REPL: 0 Python not initialized, 1 ready, -1 failed */
+    BOOL stack_size; /* --stack-size was given */
+    void (*prev_sigint)(int); /* while an input runs */
+} repl_py;
+
+/* initialize Python in 'ctx', the context of the plain REPL (once) */
+static int repl_py_init(JSContext *ctx)
+{
+    void (*prev)(int);
+
+    if (repl_py.state == 0) {
+        /* Python takes SIGINT (KeyboardInterrupt) only from its default
+           action; the line editor gets it back after the init */
+        prev = signal(SIGINT, SIG_DFL);
+        if (!repl_py.stack_size)
+            qp_drepl_set_stack(JS_GetRuntime(ctx));
+        repl_py.state = qp_drepl_init_main(ctx, qjs_argv[0]) < 0 ? -1 : 1;
+        signal(SIGINT, prev);
+    }
+    if (repl_py.state < 0) {
+        JS_ThrowInternalError(ctx, "Python could not be initialized");
+        return -1;
+    }
+    return 0;
+}
+
+/* The context of the Python inputs, ready to run one (Ctrl-C raises
+   KeyboardInterrupt): the durable session, or 'ctx'. NULL with an
+   exception in 'ctx' if Python cannot be initialized. */
+static JSContext *repl_py_enter(JSContext *ctx)
+{
+    if (drepl.rt) {
+        drepl_enter();
+        return drepl.ctx;
+    }
+    if (repl_py_init(ctx) < 0)
+        return NULL;
+    repl_py.prev_sigint = qp_drepl_signals(ctx);
+    return ctx;
+}
+
+static void repl_py_leave(void)
+{
+    if (drepl.rt)
+        drepl_leave();
+    else
+        signal(SIGINT, repl_py.prev_sigint);
+}
+
+/* python.init(): initialize Python if needed (throws if it fails) */
+static JSValue js_repl_py_init(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv)
+{
+    if (!drepl.rt && repl_py_init(ctx) < 0)
+        return JS_EXCEPTION;
+    return JS_UNDEFINED;
+}
+
+/* python.eval(src): run the Python input 'src' (a complete input, see
+   python.complete()) and its jobs, then save the durable session.
    Python writes the results and the tracebacks itself. Returns {error,
    exit}: 'error' if an exception was reported, 'exit' the exit status if
-   the input raised SystemExit. 'str' is freed. */
-static JSValue js_drepl_py_eval(JSContext *ctx, const char *str, size_t len)
+   the input raised SystemExit. */
+static JSValue js_repl_py_eval(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv)
 {
     static const char *props[] = { "error", "exit" };
+    JSContext *pctx;
     JSValue values[2];
+    const char *str;
+    size_t len;
     DynBuf src;
     int ret, status = 0;
 
+    str = JS_ToCStringLen(ctx, &len, argv[0]);
+    if (!str)
+        return JS_EXCEPTION;
     /* the input ends with a newline, as in the interactive loop */
     dbuf_init(&src);
     dbuf_put(&src, (const uint8_t *)str, len);
@@ -787,26 +863,32 @@ static JSValue js_drepl_py_eval(JSContext *ctx, const char *str, size_t len)
         dbuf_free(&src);
         return JS_ThrowOutOfMemory(ctx);
     }
-    /* the output of the main runtime comes first: Python writes to the
-       file descriptors */
+    /* the output of the REPL comes first: Python writes to the file
+       descriptors */
     fflush(stdout);
     fflush(stderr);
-    drepl_enter();
-    ret = qp_drepl_exec(drepl.ctx, (const char *)src.buf, src.size - 1, &status);
-    drepl_leave();
+    pctx = repl_py_enter(ctx);
+    if (!pctx) {
+        dbuf_free(&src);
+        return JS_EXCEPTION;
+    }
+    ret = qp_drepl_exec(pctx, (const char *)src.buf, src.size - 1, &status);
+    repl_py_leave();
     dbuf_free(&src);
-    drepl_save();
+    if (drepl.rt)
+        drepl_save();
     values[0] = JS_NewBool(ctx, ret == 1);
     values[1] = ret == 2 ? JS_NewInt32(ctx, status) : JS_UNDEFINED;
     return JS_NewObjectFromStr(ctx, countof(props), props, values);
 }
 
-/* durable.complete(src): TRUE if the lines 'src' are a complete Python
+/* python.complete(src): TRUE if the lines 'src' are a complete Python
    input (or one that more lines cannot fix), FALSE if more lines are
    needed */
-static JSValue js_drepl_complete(JSContext *ctx, JSValueConst this_val,
-                                 int argc, JSValueConst *argv)
+static JSValue js_repl_py_complete(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
 {
+    JSContext *pctx;
     const char *str;
     size_t len;
     int ret;
@@ -814,43 +896,53 @@ static JSValue js_drepl_complete(JSContext *ctx, JSValueConst this_val,
     str = JS_ToCStringLen(ctx, &len, argv[0]);
     if (!str)
         return JS_EXCEPTION;
-    drepl_enter();
-    ret = qp_drepl_input_complete(drepl.ctx, str, len);
-    drepl_leave();
+    pctx = repl_py_enter(ctx);
+    if (!pctx) {
+        JS_FreeCString(ctx, str);
+        return JS_EXCEPTION;
+    }
+    ret = qp_drepl_input_complete(pctx, str, len);
+    repl_py_leave();
     JS_FreeCString(ctx, str);
     return JS_NewBool(ctx, ret);
 }
 
-/* a string of the session (NULL) as a string of 'ctx' ('def' if NULL) */
-static JSValue drepl_py_string(JSContext *ctx, const char *s, const char *def)
+/* a string 's' of the Python context 'pctx' (NULL) as a string of 'ctx'
+   ('def' if NULL) */
+static JSValue repl_py_string(JSContext *ctx, JSContext *pctx, const char *s,
+                              const char *def)
 {
     JSValue ret = JS_NewString(ctx, s ? s : def);
     if (s)
-        JS_FreeCString(drepl.ctx, s);
+        JS_FreeCString(pctx, s);
     return ret;
 }
 
-/* durable.prompt(more): str(sys.ps1), or str(sys.ps2) if 'more' */
-static JSValue js_drepl_prompt(JSContext *ctx, JSValueConst this_val,
-                               int argc, JSValueConst *argv)
+/* python.prompt(more): str(sys.ps1), or str(sys.ps2) if 'more' */
+static JSValue js_repl_py_prompt(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv)
 {
     int more = JS_ToBool(ctx, argv[0]);
+    JSContext *pctx;
     const char *s;
 
-    drepl_enter();
-    s = qp_drepl_prompt(drepl.ctx, more);
-    drepl_leave();
-    return drepl_py_string(ctx, s, more ? "... " : ">>> ");
+    pctx = repl_py_enter(ctx);
+    if (!pctx)
+        return JS_EXCEPTION;
+    s = qp_drepl_prompt(pctx, more);
+    repl_py_leave();
+    return repl_py_string(ctx, pctx, s, more ? "... " : ">>> ");
 }
 
-/* durable.names(expr, prefix): the completions of the word 'prefix'
+/* python.names(expr, prefix): the completions of the word 'prefix'
    after the dotted name 'expr' ("" for a word that starts an
    expression), as a newline separated string. The session is not
    saved. */
-static JSValue js_drepl_names(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv)
+static JSValue js_repl_py_names(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv)
 {
-    const char *expr, *prefix, *s;
+    const char *expr, *prefix, *s = NULL;
+    JSContext *pctx;
 
     expr = JS_ToCString(ctx, argv[0]);
     if (!expr)
@@ -860,19 +952,81 @@ static JSValue js_drepl_names(JSContext *ctx, JSValueConst this_val,
         JS_FreeCString(ctx, expr);
         return JS_EXCEPTION;
     }
-    drepl_enter();
-    s = qp_drepl_names(drepl.ctx, expr, prefix);
-    drepl_leave();
+    pctx = repl_py_enter(ctx);
+    if (pctx) {
+        s = qp_drepl_names(pctx, expr, prefix);
+        repl_py_leave();
+    }
     JS_FreeCString(ctx, expr);
     JS_FreeCString(ctx, prefix);
-    return drepl_py_string(ctx, s, "");
+    if (!pctx)
+        return JS_EXCEPTION;
+    return repl_py_string(ctx, pctx, s, "");
 }
 
-/* A new Python session: a context with the Python state of
-   qp_drepl_init() */
+/* setting the 'py' global of the plain REPL makes it a plain variable */
+static JSValue js_repl_py_set(JSContext *ctx, JSValueConst this_val,
+                              JSValueConst val)
+{
+    JSValue global = JS_GetGlobalObject(ctx);
+    int ret;
+
+    ret = JS_DefinePropertyValueStr(ctx, global, "py", JS_DupValue(ctx, val),
+                                    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_FreeValue(ctx, global);
+    return ret < 0 ? JS_EXCEPTION : JS_UNDEFINED;
+}
+
+/* the 'py' global of the plain REPL: Python's __main__ module. Its first
+   read initializes Python and makes it a plain variable. */
+static JSValue js_repl_py_get(JSContext *ctx, JSValueConst this_val)
+{
+    JSValue m, ret;
+
+    if (repl_py_init(ctx) < 0)
+        return JS_EXCEPTION;
+    m = qp_drepl_main(ctx);
+    if (JS_IsException(m))
+        return m;
+    ret = js_repl_py_set(ctx, this_val, m);
+    if (JS_IsException(ret)) {
+        JS_FreeValue(ctx, m);
+        return ret;
+    }
+    return m;
+}
+
+/* durable.setLanguage(lang): the inputs of a Python session are now
+   "python" or "js" (TypeScript): saved with the session, which restarts
+   in this language */
+static JSValue js_drepl_set_language(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    const char *lang;
+    BOOL js_lang;
+
+    lang = JS_ToCString(ctx, argv[0]);
+    if (!lang)
+        return JS_EXCEPTION;
+    js_lang = !strcmp(lang, "js");
+    JS_FreeCString(ctx, lang);
+    if (js_lang != drepl.js_lang) {
+        drepl.js_lang = js_lang;
+        /* it is called from a C function of the main runtime */
+        JS_UpdateStackTop(drepl.rt);
+        drepl_save();
+    }
+    return JS_UNDEFINED;
+}
+
+static JSContext *drepl_new_context(JSRuntime *rt);
+
+/* A new Python session: the context of a JavaScript session (its
+   TypeScript inputs get the same print() and console.log()) with the
+   Python state of qp_drepl_init() */
 static JSContext *drepl_new_py_context(JSRuntime *rt)
 {
-    JSContext *ctx = JS_NewContext(rt);
+    JSContext *ctx = drepl_new_context(rt);
 
     if (ctx && qp_drepl_init(ctx, drepl.argv0, drepl.hash_seed) < 0) {
         /* the Python state of a failed init is released with the
@@ -900,10 +1054,6 @@ static JSValue js_drepl_eval(JSContext *ctx, JSValueConst this_val,
     str = JS_ToCStringLen(ctx, &len, argv[0]);
     if (!str)
         return JS_EXCEPTION;
-#ifdef CONFIG_PYTHON
-    if (drepl.python)
-        return js_drepl_py_eval(ctx, str, len);
-#endif
     drepl_enter();
     val = drepl_settle(JS_Eval(dctx, str, len, "<input>", drepl.eval_flags));
     drepl_leave();
@@ -1048,7 +1198,7 @@ static uint8_t *drepl_py_base_fork(size_t *plen)
         if (rt)
             ctx = drepl_new_py_context(rt);
         if (ctx)
-            base = JS_WriteSnapshot(ctx, &base_len, drepl.host, NULL, 0, JS_SNAPSHOT_BASE);
+            base = JS_WriteSnapshot(ctx, &base_len, &drepl_host, NULL, 0, JS_SNAPSHOT_BASE);
         if (!base)
             _exit(1);
         if (write(fd[1], &base_len, sizeof(base_len)) != sizeof(base_len))
@@ -1118,13 +1268,13 @@ static int drepl_restore(const uint8_t *delta, size_t delta_len)
                 base_ctx = drepl_new_context(base_rt);
         }
         if (base_ctx)
-            base = JS_WriteSnapshot(base_ctx, &base_len, drepl.host, NULL, 0,
+            base = JS_WriteSnapshot(base_ctx, &base_len, &drepl_host, NULL, 0,
                                     JS_SNAPSHOT_BASE);
     }
     if (!base) {
         snprintf(err, sizeof(err), "cannot rebuild the base of the session");
     } else if (JS_ReadSnapshot(drepl.rt, base, base_len, delta, delta_len,
-                               drepl.host, &res, err, sizeof(err)) == 0) {
+                               &drepl_host, &res, err, sizeof(err)) == 0) {
         if (res.context_count == 1
 #ifdef CONFIG_PYTHON
             && (!drepl.python || qp_drepl_attach(res.contexts[0]) == 0)
@@ -1166,7 +1316,8 @@ static int drepl_open(JSRuntime *rt, const char *path, int ts_flags)
     drepl.path = path;
     drepl.eval_flags = JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_ASYNC |
         JS_EVAL_FLAG_BACKTRACE_BARRIER | JS_EVAL_FLAG_TYPESCRIPT | ts_flags;
-    /* Python handles Ctrl-C itself (KeyboardInterrupt) */
+    /* Python handles Ctrl-C itself (KeyboardInterrupt, also raised in the
+       TypeScript inputs of a Python session) */
     if (!drepl_is_python())
         JS_SetInterruptHandler(rt, drepl_interrupt_handler, NULL);
 
@@ -1183,6 +1334,7 @@ static int drepl_open(JSRuntime *rt, const char *path, int ts_flags)
         }
         if (drepl.python) {
             drepl.hash_seed = get_u32(buf + DREPL_PY_MAGIC_LEN);
+            drepl.js_lang = buf[DREPL_PY_MAGIC_LEN + 4] == DREPL_LANG_JS;
             ret = drepl_restore(buf + DREPL_PY_HEADER_LEN,
                                 len - DREPL_PY_HEADER_LEN);
         } else
@@ -1215,7 +1367,7 @@ static int drepl_open(JSRuntime *rt, const char *path, int ts_flags)
     }
     /* the base of the deltas saved after each command: the same as the
        one rebuilt by drepl_restore(), so before qp_drepl_attach() */
-    buf = JS_WriteSnapshot(drepl.ctx, &len, drepl.host, NULL, 0,
+    buf = JS_WriteSnapshot(drepl.ctx, &len, &drepl_host, NULL, 0,
                            JS_SNAPSHOT_BASE);
     if (!buf) {
         drepl_report("not saved");
@@ -1240,8 +1392,10 @@ static void drepl_close(void)
     JS_FreeRuntime(drepl.rt);
 }
 
-/* Define the options of repl.js: 'typescript' and, with --drepl, the
-   'durable' object which runs the commands. */
+/* Define the options of repl.js: 'typescript', with --drepl the 'durable'
+   object which runs the TypeScript commands and, with Python (except in a
+   JavaScript durable session), the 'python' object which runs the Python
+   inputs. The plain REPL gets the 'py' global. */
 static int set_repl_options(JSContext *ctx, BOOL typescript)
 {
     static const JSCFunctionListEntry durable_funcs[] = {
@@ -1250,12 +1404,20 @@ static int set_repl_options(JSContext *ctx, BOOL typescript)
     };
 #ifdef CONFIG_PYTHON
     static const JSCFunctionListEntry durable_py_funcs[] = {
-        JS_CFUNC_DEF("eval", 1, js_drepl_eval ),
-        JS_CFUNC_DEF("complete", 1, js_drepl_complete ),
-        JS_CFUNC_DEF("prompt", 1, js_drepl_prompt ),
-        JS_CFUNC_DEF("names", 2, js_drepl_names ),
+        JS_CFUNC_DEF("setLanguage", 1, js_drepl_set_language ),
+    };
+    static const JSCFunctionListEntry python_funcs[] = {
+        JS_CFUNC_DEF("init", 0, js_repl_py_init ),
+        JS_CFUNC_DEF("eval", 1, js_repl_py_eval ),
+        JS_CFUNC_DEF("complete", 1, js_repl_py_complete ),
+        JS_CFUNC_DEF("prompt", 1, js_repl_py_prompt ),
+        JS_CFUNC_DEF("names", 2, js_repl_py_names ),
+    };
+    static const JSCFunctionListEntry py_global[] = {
+        JS_CGETSET_DEF("py", js_repl_py_get, js_repl_py_set ),
     };
     char banner[256];
+    JSValue python;
 #endif
     JSValue options, durable, global;
     int ret;
@@ -1266,23 +1428,39 @@ static int set_repl_options(JSContext *ctx, BOOL typescript)
     JS_SetPropertyStr(ctx, options, "typescript", JS_NewBool(ctx, typescript));
     if (drepl.rt) {
         durable = JS_NewObject(ctx);
+        JS_SetPropertyFunctionList(ctx, durable, durable_funcs,
+                                   countof(durable_funcs));
 #ifdef CONFIG_PYTHON
         if (drepl.python) {
             JS_SetPropertyFunctionList(ctx, durable, durable_py_funcs,
                                        countof(durable_py_funcs));
-            JS_SetPropertyStr(ctx, durable, "python", JS_TRUE);
-            qp_drepl_banner(banner, sizeof(banner));
-            JS_SetPropertyStr(ctx, durable, "banner", JS_NewString(ctx, banner));
-        } else
+            JS_SetPropertyStr(ctx, durable, "language",
+                              JS_NewString(ctx, drepl.js_lang ? "js" : "python"));
+        }
 #endif
-        JS_SetPropertyFunctionList(ctx, durable, durable_funcs,
-                                   countof(durable_funcs));
         JS_SetPropertyStr(ctx, durable, "path", JS_NewString(ctx, drepl.path));
         JS_SetPropertyStr(ctx, durable, "restored",
                           JS_NewBool(ctx, drepl.restored));
         JS_SetPropertyStr(ctx, options, "durable", durable);
     }
     global = JS_GetGlobalObject(ctx);
+#ifdef CONFIG_PYTHON
+    if (!drepl.rt || drepl.python) {
+        python = JS_NewObject(ctx);
+        JS_SetPropertyFunctionList(ctx, python, python_funcs,
+                                   countof(python_funcs));
+        qp_drepl_banner(banner, sizeof(banner));
+        JS_SetPropertyStr(ctx, python, "banner", JS_NewString(ctx, banner));
+        JS_SetPropertyStr(ctx, options, "python", python);
+    }
+    if (!drepl.rt) {
+        /* unless a script defined it */
+        JSAtom atom = JS_NewAtom(ctx, "py");
+        if (JS_HasProperty(ctx, global, atom) == 0)
+            JS_SetPropertyFunctionList(ctx, global, py_global, countof(py_global));
+        JS_FreeAtom(ctx, atom);
+    }
+#endif
     ret = JS_SetPropertyStr(ctx, global, "__repl", options);
     JS_FreeValue(ctx, global);
     return ret;
@@ -1313,7 +1491,8 @@ void help(int exit_status)
            "                   run in a runtime saved to 'file' after each command\n"
            "                   and restored from it at startup\n"
 #ifdef CONFIG_PYTHON
-           "    --drepl file --python  the same with Python 3.15 commands\n"
+           "    --drepl file --python  the same with Python 3.15 commands (and\n"
+           "                   TypeScript commands after \\js)\n"
 #endif
            "-m  --module       load as ES6 module (default=autodetect)\n"
            "    --script       load as ES6 script (default=autodetect)\n"
@@ -1628,11 +1807,8 @@ int main(int argc, char **argv)
             exit(2);
         }
         JS_SetDumpFlags(drt, dump_flags);
-        drepl.host = &drepl_host;
 #ifdef CONFIG_PYTHON
         if (drepl.python) {
-            /* the Python heap has no host natives */
-            drepl.host = NULL;
             drepl.argv0 = argv[0];
             qp_drepl_set_stack(drt);
         }
@@ -1644,6 +1820,9 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+#ifdef CONFIG_PYTHON
+    repl_py.stack_size = stack_size != 0;
+#endif
     js_std_set_worker_new_context_func(JS_NewCustomContext);
     js_std_init_handlers(rt);
     js_std_set_typescript_flags(rt, ts_flags);

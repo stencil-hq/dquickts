@@ -106,8 +106,15 @@ void qp_set_frozen_modules(const uint8_t *data, size_t size);
    reported, or 2 with *pstatus for SystemExit.  qp_drepl_prompt() is
    str(sys.ps1) or str(sys.ps2) and qp_drepl_names() the completions of a
    word (see pythonrun.c); both return strings freed with JS_FreeCString(),
-   or NULL. */
+   or NULL.  The REPL is bilingual: `js` is imported in __main__ and the JS
+   global `py` of a session is __main__.  The plain REPL of qjs (without
+   --drepl) runs its Python inputs with the same functions in its own
+   context, after qp_drepl_init_main() (the interactive `python`, with the
+   environment; 0, or -1 after printing the error); qp_drepl_main() returns
+   __main__, for its `py` global. */
 int qp_drepl_init(JSContext *ctx, const char *argv0, uint32_t hash_seed);
+int qp_drepl_init_main(JSContext *ctx, const char *argv0);
+JSValue qp_drepl_main(JSContext *ctx);
 int qp_drepl_attach(JSContext *ctx);
 void qp_drepl_environ(JSContext *ctx, int fill);
 void (*qp_drepl_signals(JSContext *ctx))(int);

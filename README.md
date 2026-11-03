@@ -20,8 +20,9 @@ cd dquickts
 make                 # builds qjs, qjsc, qpy and libquickjs.a
 ./qjs hello.ts
 ./qpy hello.py               # Python, with CPython's command line
+./qjs                        # the REPL: JS, or Python after \py (\js switches back)
 ./qjs --drepl session.snap   # a REPL whose state survives restarts
-./qjs --drepl py.snap --python   # the same for Python
+./qjs --drepl py.snap --python   # the same for Python and JS together
 make test-snapshot   # builds and runs the suspension and snapshot test hosts
 ```
 
@@ -30,6 +31,7 @@ make test-snapshot   # builds and runs the suspension and snapshot test hosts
 - [What this fork adds](#what-this-fork-adds)
 - [Durable REPL](#durable-repl)
   - [Python sessions](#python-sessions)
+  - [JS and Python in one REPL](#js-and-python-in-one-repl)
 - [Snapshots](#snapshots)
   - [What a snapshot is](#what-a-snapshot-is)
   - [When you can take one](#when-you-can-take-one)
@@ -71,6 +73,7 @@ fork adds:
 | Ports from [quickjs-ng](https://github.com/quickjs-ng/quickjs) | `queueMicrotask()`, `atob()`/`btoa()`, `DOMException`, the V8 stack trace API, promise hooks, immutable `ArrayBuffer`s, `performance`, `os.setInterval()`, `std.writeFile()`, the `bjson` module, a re-entrant event loop, C closures, private symbols, runtime dump flags, and bug fixes |
 | Embedder helpers | `JS_IsEqual()`, `JS_NewProxy()`, `JS_GetProxyTarget()`, `JS_PromiseMarkAsHandled()`, and others |
 | A REPL whose functions and variables survive restarts | `qjs --drepl FILE` |
+| A REPL that switches between JS/TypeScript and Python from one input to the next, in one runtime | `\py`, `\js` in `qjs` and `qjs --drepl FILE --python` |
 | Python 3.15 compiled to QuickJS bytecode, sharing the runtime with JS; CPython-compatible C API (abi3 wheels, source builds of numpy, Pillow and matplotlib) | `qpy`, `JS_InitPython()`, `JS_EvalPython()`, `qjs --drepl FILE --python` |
 | Rust bindings built on this engine | [`rquickjs/`](rquickjs/README.md) |
 
@@ -197,7 +200,8 @@ is saved as a delta after each input (about 6 KB for the transcript above). In d
   drops the input. Ctrl-D, or the end of a piped input, quits. `SystemExit` (`sys.exit()`) ends
   `qjs` with its exit status, after the session is saved.
 - `FILE` starts with a header that holds the hash seed of the session (the `str` hashes are
-  randomized per session), then the delta. The base is rebuilt with that seed. So that the base
+  randomized per session) and the language of the inputs, then the delta. The base is rebuilt
+  with that seed. So that the base
   is the same in every process, the session ignores the `PYTHON*` environment variables (like
   `python -E`), runs in UTF-8 mode without the user site, has `sys.argv == ['']` and unbuffered,
   non-seekable standard streams that record nothing about their file descriptors, starts with
@@ -209,7 +213,7 @@ is saved as a delta after each input (about 6 KB for the transcript above). In d
   passwords), and a restored session sees the environment of the new process.
 - Tab completes the keywords, the globals and the builtins, and after a dotted name its
   attributes (evaluating the name, like `rlcompleter`). At the start of a line it indents.
-- If stdin is not a terminal, the lines are read without editing or echo.
+- `\js` switches the session to TypeScript (see [below](#js-and-python-in-one-repl)).
 
 Limits:
 
@@ -228,6 +232,72 @@ Sessions may import the CPython C modules (`re`, `json`, `decimal`, `datetime`, 
 `csv`, `threading`, `logging`, `subprocess`...) and keep their objects: the snapshot saves their
 C state. Locks no thread holds and finished threads are saved as values, and the main thread's
 `threading` objects are bound to the main thread of the process that restores the session.
+
+### JS and Python in one REPL
+
+The REPL of `qjs` takes JavaScript (TypeScript with `--typescript`) and Python inputs, and
+both languages run in the same runtime and heap. `\py` switches the next inputs to Python and
+`\js` switches back. `\py CODE` and `\js CODE` run a single input in the other language,
+including its continuation lines. The prompt shows the language: `qjs> ` for JavaScript,
+`sys.ps1` and `sys.ps2` (`>>> `, `... `) for Python. `\h` lists the commands.
+
+Neither language needs an import to reach the other:
+
+- In Python, `js` is already imported in `__main__`. `js.name` reads a JavaScript global
+  variable, including the top-level `let`, `const` and `class` declarations of earlier inputs.
+- In JavaScript, `py` is Python's `__main__` module. `py.fib(10)` calls a Python function and
+  `py.x = 1` sets a Python global.
+
+Python inputs behave as in the [Python sessions](#python-sessions): `codeop` decides when an
+input is complete, `sys.displayhook` and `sys.excepthook` print, top-level `await` works and Tab
+completes Python names. JavaScript inputs keep the usual REPL behavior.
+
+`qjs --drepl FILE --python` sessions start in Python. The JavaScript state is part of the same
+heap snapshot as the Python state, and a restored session comes back in the language it was
+left in:
+
+```text
+$ ./qjs --drepl session.snap --python
+Python 3.15.2 (main) [dquickts 2026-06-04] on darwin
+Type "help", "copyright", "credits" or "license" for more information.
+Created the durable session session.snap
+>>> def fib(n):
+...     return n if n < 2 else fib(n - 1) + fib(n - 2)
+...
+>>> \js
+qjs> let scale: number = 10
+undefined
+qjs> function area(w: number, h: number): number { return w * h * scale }
+undefined
+qjs> py.fib(10)
+55
+qjs> \py [js.area(2, i) for i in range(3)]
+[0, 20, 40]
+qjs> ^D
+$ ./qjs --drepl session.snap --python
+QuickJS - Type "\h" for help
+Restored the durable session session.snap
+qjs> py.fib(scale)
+55
+qjs> \py
+>>> fib(js.area(1, 1))
+55
+```
+
+In those sessions, JavaScript inputs get the same `print()` and `console.log()` as a
+JavaScript session. A JavaScript session (`qjs --drepl FILE` without `--python`) has no Python
+in its base snapshot, so it cannot switch: `\py` prints an error telling you to start the
+session with `--python`.
+
+The plain REPL (`qjs` without `--drepl`) starts in JavaScript. Python is initialized by the
+first Python input, or by the first use of `py`, so a JavaScript-only REPL starts as fast as
+before. It runs like the interactive `python` with no arguments (the `PYTHON*` environment
+variables apply, `sys.argv == ['']`), except that its standard streams are unbuffered so that
+Python and JavaScript output come out in order. `SystemExit` ends `qjs` with its exit status.
+
+If stdin is not a terminal, every REPL reads its lines without editing, echo or colors, and
+runs them one input at a time, waiting for an asynchronous JavaScript result before reading the
+next input. When the input ends, the REPL quits.
 
 ## Snapshots
 
@@ -712,6 +782,8 @@ reports the ones that fail for another reason than a listed C module quickpy doe
   keys and the string keys of mappings are items, `Symbol.iterator` iterates, `toString()` is
   `str()`, `toJSON()` converts dicts to objects and tuples/sets to arrays, coroutines are
   thenables and `instanceof` on a Python type is `isinstance()`.
+- `js.name` is the JS global variable `name`, resolved the way JS resolves a global name: a
+  top-level `let`, `const` or `class` of the scripts, otherwise `globalThis.name`.
 - From Python, a JS object is a `js.JsObject`: attributes are JS properties, it supports
   iteration, `len()`, `in`, `await` on promises, `.new(*args)` for constructors and `.to_py()`.
 - JS has no keyword arguments: call `f.callKw(args, kwargs)`. Python keyword arguments passed to

@@ -128,6 +128,15 @@ get the @code{design:type}, @code{design:paramtypes} and
 @item -i
 @item --interactive
 Go to interactive mode (it is not the default when files are provided on the command line).
+The interactive mode also runs Python 3.15 (in builds with Python):
+@code{\py} switches the next inputs to Python and @code{\js} back to
+JavaScript; @code{\py code} and @code{\js code} run one input in the
+other language. Both languages share the runtime: Python's
+@code{__main__} has @code{js} imported (@code{js.name} reads a
+JavaScript global variable, including a top-level @code{let},
+@code{const} or @code{class}) and the JavaScript global @code{py} is
+the @code{__main__} module. Python is initialized by the first Python
+input or the first use of @code{py}. @code{\h} lists the commands.
 
 @item --drepl file
 Durable interactive mode. The commands are TypeScript and run in a
@@ -141,6 +150,14 @@ host state cannot be saved). @code{\load} evaluates a file in it.
 @code{file} only holds a delta of a new session (see the heap
 snapshots): the base, a new session with every builtin instantiated,
 is rebuilt at startup.
+
+@item --drepl file --python
+The same with a session that also holds Python 3.15 (in builds with
+Python): the inputs start in Python and @code{\js} switches them to
+TypeScript. The JavaScript and Python state of the session are saved in
+the same snapshot, and a restored session comes back in the language it
+was left in. A session started without @code{--python} cannot switch
+to Python.
 
 @item -m
 @item --module
