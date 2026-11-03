@@ -1312,7 +1312,10 @@ struct JSObject {
                 double *double_ptr;     /* JS_CLASS_FLOAT64_ARRAY */
             } u;
             uint32_t count; /* <= 2^31-1. 0 for a detached typed array */
-        } array;    /* 12/20 bytes */
+            /* JS_CLASS_ARRAY: number of free slots before 'values' in
+               its allocation, left by shift() (0 for the other classes) */
+            uint32_t offset;
+        } array;    /* 16/24 bytes */
         JSRegExp regexp;    /* JS_CLASS_REGEXP: 8/16 bytes */
         struct { /* JS_CLASS_ERROR: 12/16/24 bytes */
             /* [[ErrorData]] stack trace (see Error.prototype.stack):
@@ -7059,6 +7062,7 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
             p->u.array.u.values = NULL;
             p->u.array.count = 0;
             p->u.array.u1.size = 0;
+            p->u.array.offset = 0;
             if (!props) {
                 /* XXX: remove */
                 /* the length property is always the first one */
@@ -7100,6 +7104,7 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
         p->fast_array = 1;
         p->u.array.u.ptr = NULL;
         p->u.array.count = 0;
+        p->u.array.offset = 0;
         break;
     case JS_CLASS_DATAVIEW:
         p->u.array.u.ptr = NULL;
@@ -7707,6 +7712,14 @@ static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref)
     }
 }
 
+/* start of the allocation of the elements of a fast array */
+static inline JSValue *fast_array_base(JSObject *p)
+{
+    /* no pointer arithmetic on a NULL 'values' */
+    return p->u.array.offset ? p->u.array.u.values - p->u.array.offset :
+        p->u.array.u.values;
+}
+
 static void js_array_finalizer(JSRuntime *rt, JSValue val)
 {
     JSObject *p = JS_VALUE_GET_OBJ(val);
@@ -7715,7 +7728,7 @@ static void js_array_finalizer(JSRuntime *rt, JSValue val)
     for(i = 0; i < p->u.array.count; i++) {
         JS_FreeValueRT(rt, p->u.array.u.values[i]);
     }
-    js_free_rt(rt, p->u.array.u.values);
+    js_free_rt(rt, fast_array_base(p));
 }
 
 static void js_array_mark(JSRuntime *rt, JSValueConst val,
@@ -12172,10 +12185,11 @@ static no_inline __exception int convert_fast_array_to_array(JSContext *ctx,
             pr->u.value = *tab++;
         }
     }
-    js_free(ctx, p->u.array.u.values);
+    js_free(ctx, fast_array_base(p));
     p->u.array.count = 0;
     p->u.array.u.values = NULL; /* fail safe */
     p->u.array.u1.size = 0;
+    p->u.array.offset = 0;
     p->fast_array = 0;
     clear_std_array_prototype(ctx->rt, p);
     return 0;
@@ -12425,23 +12439,38 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
 {
     uint64_t new_size;
     size_t slack;
-    JSValue *new_array_prop;
+    JSValue *new_array_prop, *base;
+    uint32_t offset = p->u.array.offset;
+
+    base = fast_array_base(p);
+    if (offset != 0 && offset >= p->u.array.count / 2) {
+        /* move the elements back to the start of the allocation: the
+           copy (at most 2 elements per shift() call which freed a slot)
+           is paid by the shift() calls */
+        memmove(base, p->u.array.u.values, sizeof(JSValue) * p->u.array.count);
+        p->u.array.u.values = base;
+        p->u.array.u1.size += offset;
+        p->u.array.offset = offset = 0;
+        if (new_len <= p->u.array.u1.size)
+            return 0;
+    }
     /* grow by 50%: computed in 64 bits to avoid an overflow */
     new_size = (uint64_t)p->u.array.u1.size * 3 / 2;
     if (new_size < new_len)
         new_size = new_len;
     if (new_size > UINT32_MAX ||
-        new_size > SIZE_MAX / sizeof(JSValue)) {
+        new_size + offset > SIZE_MAX / sizeof(JSValue)) {
         JS_ThrowOutOfMemory(ctx);
         return -1;
     }
-    new_array_prop = js_realloc2(ctx, p->u.array.u.values, sizeof(JSValue) * new_size, &slack);
+    /* the free slots before the elements are kept */
+    new_array_prop = js_realloc2(ctx, base, sizeof(JSValue) * (new_size + offset), &slack);
     if (!new_array_prop)
         return -1;
     new_size += slack / sizeof(*new_array_prop);
     if (new_size > UINT32_MAX)
         new_size = UINT32_MAX;
-    p->u.array.u.values = new_array_prop;
+    p->u.array.u.values = new_array_prop + offset;
     p->u.array.u1.size = new_size;
     return 0;
 }
@@ -56736,9 +56765,13 @@ static JSValue js_array_pop(JSContext *ctx, JSValueConst this_val,
         if (js_get_fast_array(ctx, obj, &arrp, &count32) && count32 == len) {
             JSObject *p = JS_VALUE_GET_OBJ(obj);
             if (shift) {
+                /* O(1): the first slot becomes a free slot before the
+                   elements (reused by expand_fast_array()) */
                 res = arrp[0];
-                memmove(arrp, arrp + 1, (count32 - 1) * sizeof(*arrp));
+                p->u.array.u.values++;
+                p->u.array.u1.size--;
                 p->u.array.count--;
+                p->u.array.offset++;
             } else {
                 res = arrp[count32 - 1];
                 p->u.array.count--;

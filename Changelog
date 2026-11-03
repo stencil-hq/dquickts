@@ -1,4 +1,7 @@
 unreleased:
+- Python lists: list.clear() and list.sort() free the whole storage of a
+  JS array left with free slots before its elements by shift() (they freed
+  an interior pointer and kept a stale offset)
 - Python snapshots: a runtime that used the js module can be saved (the
   interop functions, e.g. Function.prototype.callKw, were unregistered
   natives, so `import js` made every later qjs --drepl --python save fail);
@@ -315,6 +318,9 @@ unreleased:
   uses memset
 - JS_GetTypedArrayBuffer() returns the current length of length-tracking
   views
+- Array.prototype.shift() of a fast array is O(1) instead of moving all
+  the elements: the freed slots before the elements are reused when the
+  array grows (queues using push() and shift() were O(n^2))
 
 2026-06-04:
 

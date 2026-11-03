@@ -208,6 +208,34 @@ def test_cycle_collected():
     check(called == [1], "weakref callback ran")
 
 
+def test_shifted_js_array():
+    # Array.prototype.shift() leaves free slots before the elements of a
+    # fast array: the list storage handoffs must free the whole allocation
+    shifted = js.eval("(n) => { const a = []; for (let i = 0; i < n; i++) a.push(i);"
+                      " a.shift(); a.shift(); return a; }")
+    a = shifted(64)
+    a.clear()
+    a.extend(range(100))
+    check(len(a) == 100 and a[0] == 0 and a[-1] == 99, "clear() of a shifted JS array")
+
+    a = shifted(64)
+    a.sort(reverse=True)
+    js.eval("(a) => { a.shift(); a.push(-1); }")(a)
+    check(len(a) == 62 and a[0] == 62 and a[-1] == -1, "sort() keeps the shifted storage")
+
+    a = shifted(64)
+
+    def key(x):
+        if x == 2:
+            a.append(-1)
+            js.eval("(a) => { a.push(-2); a.shift(); }")(a)
+        return -x
+    raises(ValueError, lambda: a.sort(key=key))
+    check(len(a) == 62 and a[0] == 63 and a[-1] == 2, "sort() with the list mutated by its key")
+    a.append(64)
+    check(a[-1] == 64, "append after a failed sort")
+
+
 test_js_module()
 test_jsobject()
 test_identity_and_calls()
@@ -216,4 +244,5 @@ test_exceptions()
 test_async()
 test_import_module()
 test_cycle_collected()
+test_shifted_js_array()
 print(f"PASS test_interop.py ({checks} checks)")
