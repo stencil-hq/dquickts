@@ -1,22 +1,27 @@
 # dquickts
 
 A fork of [QuickJS](https://bellard.org/quickjs/), Fabrice Bellard's small embeddable JavaScript
-engine, that adds two things:
+engine, that adds three things:
 
 - **Durable execution.** You can pause a running program, even in the middle of a `for` loop,
   serialize its whole heap to bytes, and resume it later in a different process.
 - **Native TypeScript.** `.ts` files run directly. The parser erases the types as it reads them,
   so there is no transpile step.
+- **Python 3.15.** Python is compiled to QuickJS bytecode and runs on the same VM, heap and GC
+  as JS, with objects shared between the two languages. A CPython-compatible C API loads
+  extension modules: pip, abi3 wheels, and source builds of numpy, Pillow and matplotlib.
 
 It also includes Rust bindings (a port of [rquickjs](https://github.com/DelSkayn/rquickjs)) that
-expose both features.
+expose all three.
 
 ```sh
 git clone https://github.com/stencil-hq/dquickts
 cd dquickts
-make                 # builds qjs, qjsc and libquickjs.a
+make                 # builds qjs, qjsc, qpy and libquickjs.a
 ./qjs hello.ts
+./qpy hello.py               # Python, with CPython's command line
 ./qjs --drepl session.snap   # a REPL whose state survives restarts
+./qjs --drepl py.snap --python   # the same for Python
 make test-snapshot   # builds and runs the suspension and snapshot test hosts
 ```
 
@@ -66,7 +71,7 @@ fork adds:
 | Ports from [quickjs-ng](https://github.com/quickjs-ng/quickjs) | `queueMicrotask()`, `atob()`/`btoa()`, `DOMException`, the V8 stack trace API, promise hooks, immutable `ArrayBuffer`s, `performance`, `os.setInterval()`, `std.writeFile()`, the `bjson` module, a re-entrant event loop, C closures, private symbols, runtime dump flags, and bug fixes |
 | Embedder helpers | `JS_IsEqual()`, `JS_NewProxy()`, `JS_GetProxyTarget()`, `JS_PromiseMarkAsHandled()`, and others |
 | A REPL whose functions and variables survive restarts | `qjs --drepl FILE` |
-| Python 3.15 compiled to QuickJS bytecode, sharing the runtime with JS; CPython-compatible C API (abi3 wheels, source builds of numpy and Pillow) | `qpy`, `JS_InitPython()`, `JS_EvalPython()`, `qjs --drepl FILE --python` |
+| Python 3.15 compiled to QuickJS bytecode, sharing the runtime with JS; CPython-compatible C API (abi3 wheels, source builds of numpy, Pillow and matplotlib) | `qpy`, `JS_InitPython()`, `JS_EvalPython()`, `qjs --drepl FILE --python` |
 | Rust bindings built on this engine | [`rquickjs/`](rquickjs/README.md) |
 
 The full list is under `unreleased` in [`Changelog`](Changelog).
@@ -132,6 +137,8 @@ Limits:
   `c.inc()`).
 
 ### Python sessions
+![qjs --drepl --python: a Python session calls JavaScript through the js module; both survive quitting and restarting the REPL](doc/drepl-python-demo.gif)
+
 
 `qjs --drepl FILE --python` is the same REPL for Python 3.15. It follows the CPython REPL:
 `>>>` and `...` prompts (`sys.ps1`, `sys.ps2`), a block ends with an empty line,
@@ -178,6 +185,8 @@ is saved as a delta after each input (about 6 KB for the transcript above). In d
 - The whole heap is saved: globals, functions, classes, instances, closures, generators and
   coroutines suspended in the middle, the imported modules (not imported again on load),
   `sys.path` and the sources that the tracebacks show.
+- The `js` module works in a session: the JS objects that Python holds, the Python objects
+  that JS holds and `Function.prototype.callKw` are saved with the rest.
 - Python decides when the lines form a complete input (`codeop` rules) and writes the results
   and the tracebacks itself.
 - Top-level `await` (`PyCF_ALLOW_TOP_LEVEL_AWAIT`): an input that awaits runs as a coroutine
@@ -766,8 +775,12 @@ Third-party extensions load with `dlopen` (the C API symbols are exported by `qp
 - **Source builds** against `capi/include`, which may use the full non-limited API. `sysconfig`
   reports `EXT_SUFFIX` `.quickpy-315-<plat>.so` (`.quickpy-315-darwin.so`,
   `.quickpy-315-<arch>-linux-gnu.so`), `SOABI` and the include directory, so setuptools and
-  meson-python build for `qpy` unchanged. `tools/build_numpy.sh` and `tools/build_pillow.sh`
-  build numpy and Pillow from their sdists into a `qpy` venv and optionally run their tests.
+  meson-python build for `qpy` unchanged. `tools/build_numpy.sh`, `tools/build_pillow.sh` and
+  `tools/build_matplotlib.sh` build numpy, Pillow and matplotlib (with kiwisolver and the
+  pybind11-based contourpy) from their sdists into a `qpy` venv, running pip, meson and the
+  compilers' build helpers under `qpy`, and optionally run their tests. `tests/py/mpl/run.sh`
+  runs a numpy + matplotlib script under `qpy` and CPython and compares the printed results and
+  the rendered PNGs pixel by pixel (identical).
 - Version-specific CPython binaries (`*.cpython-315-*.so`, `cp315` wheels) raise `ImportError`
   naming their ABI tag (a pure-Python module of the same name still wins). The free-threaded
   build is not a goal.
@@ -778,7 +791,11 @@ Third-party extensions load with `dlopen` (the C API symbols are exported by `qp
   blocking calls and `time.sleep()` release it), with `fork()`, signals delivered to the main
   thread, `_thread.interrupt_main()` and `sys._current_frames()`.
 - **Tracing**: `sys.settrace()`/`sys.setprofile()` (and `threading.settrace_all_threads()`)
-  produce CPython's event streams, so `pdb`, `bdb`, `trace`, `profile` and `cProfile` work.
+  follow CPython's legacy tracing, including `frame.f_lineno` jumps, so `pdb`, `bdb`, `trace`,
+  `profile` and `cProfile` work (`test_sys_settrace` 448/448, `test_pdb` 235/237).
+  `sys.monitoring` (PEP 669) delivers every event, with local events, `DISABLE` and
+  `co_branches()` laid out like CPython's bytecode (`co_code` is synthesized in CPython's
+  format), so coverage.py's line and branch reports match CPython's.
 - **tracemalloc** traces the runtime's allocations (Python objects, `PyObject_Malloc`,
   `PyMem_*`, `PyTraceMalloc_Track()` domains) with Python tracebacks; `-X tracemalloc[=N]` and
   `PYTHONTRACEMALLOC` start it at startup. It costs one test per allocation while it is off.
@@ -814,8 +831,9 @@ Third-party extensions load with `dlopen` (the C API symbols are exported by `qp
 - The C modules are bound to one runtime at a time (see [Embedding](#embedding-python-in-c));
   subinterpreters, per-interpreter GILs and the free-threaded ABI are not supported.
 - CPython internals that have no equivalent on this VM differ: inline values and the object
-  layout of `__dict__`, frame `f_locals` writes, the `sys.monitoring` events (none are
-  delivered) and `locale`-aware `int`/`float` formatting.
+  layout of `__dict__`, frame `f_locals` writes, exact bytecode offsets in `dis` and
+  `sys.monitoring` (`co_code` is CPython-shaped, not identical) and `locale`-aware
+  `int`/`float` formatting.
 - Code objects carry QuickJS bytecode; `.pyc` files are not interchangeable with CPython's.
 
 ### Testing Python
@@ -838,14 +856,15 @@ testpy-replay`). L2 compares `ast.dump()` from our parser with CPython's on ever
 L3 runs CPython's own `Lib/test` modules with `unittest`: L3a is the language core, L3b the
 stdlib, L3c the remaining modules (`tests/py/cpython.conf` lists the sets). Expected failures are
 listed in `tests/py/l0_errors.txt` and `tests/py/cpython_errors.txt`; a run fails on any other
-failure. Current results: L0 207/211, L2 100% of `Lib/`, L3a 4563/4617, L3b about 9047/9082,
-L3c 14087/14155 tests.
+failure. Current results: L0 207/211, L2 100% of `Lib/`, L3a 4562/4617, L3b 9043/9082,
+L3c 14128/14180 tests.
 
-Other suites: `tests/py/{threads,finalize,interop,posix,l1gaps}/run.sh`,
+Other suites: `tests/py/{threads,finalize,interop,posix,l1gaps,monitoring}/run.sh`,
+`tests/py/mpl/run.sh` (numpy + matplotlib vs CPython),
 `tests/py/trace/test_trace.py` (compared with its `.out`),
 `tests/py/abi3/run.sh` (the abi3 wheels, network access needed), `make test-embed` (the
 embedder API and teardown) and `make test-snapshot-capi` (snapshots of C module state).
-`make bench-py` reports a geometric mean of about 1.48x CPython's time over 16 benchmarks and
+`make bench-py` reports a geometric mean of about 1.5x CPython's time over 16 benchmarks and
 startup at about 1.0x. `tools/build_numpy.sh` (with `NUMPY_TESTS=1`) and
 `tools/build_pillow.sh -t` build and test numpy and Pillow. See
 [`doc/python-plan.md`](doc/python-plan.md) for the design and status.
