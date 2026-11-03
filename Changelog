@@ -195,6 +195,10 @@ unreleased:
   uses memset
 - JS_GetTypedArrayBuffer() returns the current length of length-tracking
   views
+- faster compilation of functions with many variables: the variables
+  and global variables of a function are indexed by a hash table, and a
+  scope chain lookup skips each scope at once (16k 'let' declarations
+  in a block compiled in 2 s, now 16 ms); the bytecode is unchanged
 
 2026-06-04:
 
