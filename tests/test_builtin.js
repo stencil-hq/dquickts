@@ -1423,11 +1423,79 @@ function test_dom_exception()
     assert(e.code, 20);
 }
 
+/* the Two-Way search (long needles and haystacks) against a naive search,
+   with periodic needles and all the combinations of string widths */
+function test_string_search()
+{
+    var seed = 1, iter, h, n, from, i, k, exp, parts, p, e;
+    var alphabets = [ ["a", "b"], ["a", "b", "c"], ["a"], ["\u0100", "a"],
+                      ["\uffff", "\u00ff", "a"], ["\ud83d", "\ude00", "x"] ];
+    function rnd(n) {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        return seed % n;
+    }
+    function rstr(alpha, len) {
+        var s = "";
+        while (s.length < len)
+            s += alpha[rnd(alpha.length)];
+        return s;
+    }
+    function periodic(alpha, len) {
+        var unit = rstr(alpha, 1 + rnd(4)), s = "";
+        while (s.length < len)
+            s += unit;
+        return s.slice(0, len) + rstr(alpha, rnd(3));
+    }
+    function naive_index(h, n, from, step) {
+        for (i = from; i >= 0 && i + n.length <= h.length; i += step) {
+            for (k = 0; k < n.length && h.charCodeAt(i + k) === n.charCodeAt(k); k++)
+                continue;
+            if (k === n.length)
+                return i;
+        }
+        return -1;
+    }
+    for (iter = 0; iter < 4000; iter++) {
+        var alpha = alphabets[rnd(alphabets.length)];
+        h = rnd(3) ? rstr(alpha, 60 + rnd(200)) : periodic(alpha, 60 + rnd(200));
+        switch (rnd(3)) {
+        case 0:
+            n = periodic(alpha, 10 + rnd(30));
+            break;
+        case 1:
+            p = rnd(h.length);
+            n = h.slice(p, p + 10 + rnd(40)) + (rnd(2) ? alpha[rnd(alpha.length)] : "");
+            break;
+        default:
+            n = rstr(alphabets[rnd(alphabets.length)], 5 + rnd(5));
+            break;
+        }
+        from = rnd(h.length);
+        assert(h.indexOf(n, from), naive_index(h, n, from, 1));
+        assert(h.includes(n, from), naive_index(h, n, from, 1) >= 0);
+        exp = naive_index(h, n, Math.min(from, h.length - n.length), -1);
+        assert(h.lastIndexOf(n, from), exp);
+        parts = [];
+        for (p = 0; (e = naive_index(h, n, p, 1)) >= 0; p = e + n.length)
+            parts.push(h.slice(p, e));
+        parts.push(h.slice(p));
+        assert(h.split(n).join("|"), parts.join("|"));
+    }
+    /* worst case of the naive search */
+    h = "a".repeat(200000);
+    n = "a".repeat(5000) + "b";
+    assert(h.indexOf(n), -1);
+    assert((h + "b").indexOf(n), 200000 - 5000);
+    assert(("b" + h).lastIndexOf("b" + "a".repeat(5000)), 0);
+    assert(h.includes(n), false);
+}
+
 test();
 test_function();
 test_enum();
 test_array();
 test_string();
+test_string_search();
 test_math();
 test_number();
 test_eval();
