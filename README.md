@@ -252,7 +252,9 @@ Neither language needs an import to reach the other:
 
 Python inputs behave as in the [Python sessions](#python-sessions): `codeop` decides when an
 input is complete, `sys.displayhook` and `sys.excepthook` print, top-level `await` works and Tab
-completes Python names. JavaScript inputs keep the usual REPL behavior.
+completes Python names. JavaScript inputs keep the usual REPL behavior. In a terminal, the input
+is syntax-highlighted in its language, with the colors of the JavaScript REPL; the rest of a
+`\py CODE` or `\js CODE` line is highlighted as that language.
 
 `qjs --drepl FILE --python` sessions start in Python. The JavaScript state is part of the same
 heap snapshot as the Python state, and a restored session comes back in the language it was

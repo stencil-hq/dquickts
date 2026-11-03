@@ -1,4 +1,8 @@
 unreleased:
+- REPL: Python inputs are syntax-highlighted (keywords, soft keywords at
+  the start of a statement, strings with their prefixes, numbers,
+  comments, decorators, def/class names), and the rest of a '\py CODE' or
+  '\js CODE' line is highlighted in that language
 - bilingual REPL: in qjs and qjs --drepl FILE --python, \py and \js switch
   the language of the next inputs, '\py CODE' / '\js CODE' run one input in
   the other language; the prompt shows the language (qjs> or sys.ps1/ps2);
