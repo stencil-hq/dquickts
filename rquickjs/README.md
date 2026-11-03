@@ -86,7 +86,7 @@ The community has also built various utilities which might be relevant to you:
 
 ## Development status
 
-This bindings is feature complete, mostly stable and ready to use.
+These bindings are feature complete, mostly stable and ready to use.
 The error handling is only thing which may change in the future.
 Some experimental features like `parallel` may not works as expected. Use it for your own risk.
 
