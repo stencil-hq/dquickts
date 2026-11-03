@@ -45,6 +45,8 @@ typedef struct QPTypeExt {
     uint8_t capi_class;         /* D5: class made by the exec of a C module and
                                    stored in its namespace (snapshots save it by
                                    reference, python/capi_snapshot.c) */
+    uint8_t no_version;         /* type_mro_modified: a custom MRO makes the
+                                   type uncacheable (no version tag, ever) */
 } QPTypeExt;
 
 /* New str: CPython tp_name, used by "'%.100s' object ..." messages

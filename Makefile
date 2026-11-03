@@ -498,13 +498,15 @@ qjsc$(EXE): $(OBJDIR)/qjsc.o $(QJS_LIB_OBJS) $(QJS_CAPI_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 
-# qpy-base.c: the base snapshot of qpy, an empty one for qpy-nobase, the
-# qpy that writes it (qpy --write-base-snapshot; FILE.d lists the stdlib
-# sources it was made from)
+# qpy-base.c: the base snapshot and the frozen modules of qpy, none for
+# qpy-nobase, the qpy that writes them (qpy --write-frozen-modules, then
+# qpy --write-base-snapshot with them; FILE.d lists the stdlib sources
+# each was made from)
 ifdef CONFIG_QPY_NO_BASE
 QPY_BASE_OBJ=$(OBJDIR)/qpy-nobase.o
 else
 QPY_BASE=$(OBJDIR)/qpy-base.bin
+QPY_FROZEN=$(OBJDIR)/qpy-frozen.bin
 QPY_BASE_OBJ=$(OBJDIR)/qpy-base.o
 endif
 
@@ -518,12 +520,17 @@ $(OBJDIR)/qpy-nobase.o: qpy-base.c | $(OBJDIR)
 	$(CC) $(CFLAGS_OPT) -c -o $@ $<
 
 ifndef CONFIG_QPY_NO_BASE
-$(OBJDIR)/qpy-base.o: qpy-base.c $(QPY_BASE) | $(OBJDIR)
-	$(CC) $(CFLAGS_OPT) -DQPY_BASE_FILE='"$(abspath $(QPY_BASE))"' -c -o $@ $<
+$(OBJDIR)/qpy-base.o: qpy-base.c $(QPY_BASE) $(QPY_FROZEN) | $(OBJDIR)
+	$(CC) $(CFLAGS_OPT) -DQPY_BASE_FILE='"$(abspath $(QPY_BASE))"' \
+	    -DQPY_FROZEN_FILE='"$(abspath $(QPY_FROZEN))"' -c -o $@ $<
 
-$(QPY_BASE): $(OBJDIR)/qpy-nobase$(EXE)
-	$(OBJDIR)/qpy-nobase$(EXE) --write-base-snapshot $@ $(CURDIR)
+$(QPY_FROZEN): $(OBJDIR)/qpy-nobase$(EXE)
+	$(OBJDIR)/qpy-nobase$(EXE) --write-frozen-modules $@ $(CURDIR)
 
+$(QPY_BASE): $(OBJDIR)/qpy-nobase$(EXE) $(QPY_FROZEN)
+	$(OBJDIR)/qpy-nobase$(EXE) --write-base-snapshot $@ $(CURDIR) $(QPY_FROZEN)
+
+-include $(QPY_FROZEN).d
 -include $(QPY_BASE).d
 endif
 
@@ -919,7 +926,7 @@ CPYTHON_TAG = v3.15.2
 CPYTHON_DIR = cpython
 
 .PHONY: testpy-bootstrap testpy testpy-update testpy-golden testpy-ast \
-	testpy-l3b testpy-corpus testpy-replay
+	testpy-l3b testpy-l3c testpy-corpus testpy-replay
 
 testpy-bootstrap:
 	if [ ! -d $(CPYTHON_DIR) ]; then \
@@ -932,6 +939,9 @@ testpy-bootstrap:
 	if [ -f tests/cpython.patch ]; then \
 	  patch -p1 -d $(CPYTHON_DIR) < tests/cpython.patch; \
 	fi
+# `test` is part of the stdlib of a CPython install: qpy -I subprocesses
+# of Lib/test import it from pylib/test (tests/py/run.py l3 makes it too)
+	if [ ! -L pylib/test ]; then ln -s ../$(CPYTHON_DIR)/Lib/test pylib/test; fi
 
 testpy:
 	$(HOST_PYTHON) tests/py/run.py l0
@@ -951,6 +961,9 @@ testpy-ast:
 testpy-l3b:
 	$(HOST_PYTHON) tests/py/run.py l3 --set l3b
 
+testpy-l3c:
+	$(HOST_PYTHON) tests/py/run.py l3 --set l3c
+
 testpy-corpus:
 	$(HOST_PYTHON) tests/py/corpus.py extract
 
@@ -963,12 +976,29 @@ testpy-replay:
 # limited API), loaded through python/capi_dynload.c.  tests/py/run.py puts
 # $(CAPI_TESTMODS_DIR) on the PYTHONPATH of the L3 runs, so that the Lib/test
 # modules that import _testlimitedcapi (test_bytes, test_capi, ...) run it.
+# _testmultiphase and _testsinglephase (PEP 489 / single-phase init tests
+# of test_importlib, test_import, ...) are built the same way as
+# version-specific extensions; they use the internal API of capi/compat.
+# _testcapi (the full, version-specific API) is built the same way from its
+# vendored copy in capi/modules, whose PATCHES compile out what tests CPython
+# internals that do not exist here (tools/capi_sync.py TEST_MODULE_SOURCES).
 ifdef CONFIG_PYTHON_CAPI
 CAPI_TESTMODS_DIR=build/testpy/capi-testmods
 CAPI_TESTMODS_OBJDIR=$(OBJDIR)/capi-testmods
 CAPI_TESTLIMITEDCAPI_SRCS=$(CPYTHON_DIR)/Modules/_testlimitedcapi.c \
 	$(sort $(wildcard $(CPYTHON_DIR)/Modules/_testlimitedcapi/*.c))
 CAPI_TESTLIMITEDCAPI_OBJS=$(patsubst $(CPYTHON_DIR)/Modules/%.c,$(CAPI_TESTMODS_OBJDIR)/%.o,$(CAPI_TESTLIMITEDCAPI_SRCS))
+CAPI_TESTMODS_INTERNAL=_testmultiphase _testsinglephase
+CAPI_TESTCAPI_SRCS=capi/modules/_testcapimodule.c \
+	$(sort $(wildcard capi/modules/_testcapi/*.c))
+CAPI_TESTCAPI_OBJS=$(patsubst capi/modules/%.c,$(CAPI_TESTMODS_OBJDIR)/testcapi/%.o,$(CAPI_TESTCAPI_SRCS))
+# "." QP_SOABI ".so" (python/sysmodule.c QP_MULTIARCH): the first entry of
+# importlib.machinery.EXTENSION_SUFFIXES
+ifdef CONFIG_DARWIN
+CAPI_TESTMODS_EXT_SUFFIX=.quickpy-315-darwin.so
+else
+CAPI_TESTMODS_EXT_SUFFIX=.quickpy-315-$(shell uname -m)-linux-gnu.so
+endif
 # CPython's CFLAGS of a release build plus CCSHARED, without
 # Py_BUILD_CORE_MODULE: the modules are external, as in CPython
 CAPI_TESTMODS_CFLAGS=-std=c11 -O2 -g -DNDEBUG -fno-strict-overflow -fPIC \
@@ -981,20 +1011,39 @@ CAPI_TESTMODS_LDSHARED=-shared
 endif
 
 .PHONY: capi-testmods
-capi-testmods: $(CAPI_TESTMODS_DIR)/_testlimitedcapi.abi3.so
+capi-testmods: $(CAPI_TESTMODS_DIR)/_testlimitedcapi.abi3.so \
+	$(CAPI_TESTMODS_DIR)/_testcapi$(CAPI_TESTMODS_EXT_SUFFIX) \
+	$(patsubst %,$(CAPI_TESTMODS_DIR)/%$(CAPI_TESTMODS_EXT_SUFFIX),$(CAPI_TESTMODS_INTERNAL))
 
 $(CAPI_TESTMODS_DIR)/_testlimitedcapi.abi3.so: $(CAPI_TESTLIMITEDCAPI_OBJS)
 	@mkdir -p $(@D)
 	$(CC) $(CAPI_TESTMODS_LDSHARED) $(filter -fsanitize=%,$(CFLAGS)) -o $@ $^
 
+$(CAPI_TESTMODS_DIR)/_testcapi$(CAPI_TESTMODS_EXT_SUFFIX): $(CAPI_TESTCAPI_OBJS)
+	@mkdir -p $(@D)
+	$(CC) $(CAPI_TESTMODS_LDSHARED) $(filter -fsanitize=%,$(CFLAGS)) -o $@ $^
+
+$(CAPI_TESTCAPI_OBJS): CAPI_TESTMODS_CFLAGS+=-Icapi/compat
+
+$(CAPI_TESTMODS_OBJDIR)/testcapi/%.o: capi/modules/%.c
+	@mkdir -p $(@D)
+	$(CC) $(CAPI_TESTMODS_CFLAGS) -c -o $@ $<
+
+$(CAPI_TESTMODS_DIR)/%$(CAPI_TESTMODS_EXT_SUFFIX): $(CAPI_TESTMODS_OBJDIR)/%.o
+	@mkdir -p $(@D)
+	$(CC) $(CAPI_TESTMODS_LDSHARED) $(filter -fsanitize=%,$(CFLAGS)) -o $@ $^
+
+$(patsubst %,$(CAPI_TESTMODS_OBJDIR)/%.o,$(CAPI_TESTMODS_INTERNAL)): CAPI_TESTMODS_CFLAGS+=-Icapi/compat
+
 $(CAPI_TESTMODS_OBJDIR)/%.o: $(CPYTHON_DIR)/Modules/%.c
 	@mkdir -p $(@D)
 	$(CC) $(CAPI_TESTMODS_CFLAGS) -c -o $@ $<
 
--include $(CAPI_TESTLIMITEDCAPI_OBJS:.o=.d)
+-include $(CAPI_TESTLIMITEDCAPI_OBJS:.o=.d) $(CAPI_TESTCAPI_OBJS:.o=.d) \
+	$(patsubst %,$(CAPI_TESTMODS_OBJDIR)/%.d,$(CAPI_TESTMODS_INTERNAL))
 
 # the L3 runs import them
-testpy testpy-update testpy-l3b: capi-testmods
+testpy testpy-update testpy-l3b testpy-l3c: capi-testmods
 endif
 
 .PHONY: bench-py

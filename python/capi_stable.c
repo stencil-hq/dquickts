@@ -175,6 +175,173 @@ int PyFile_WriteString(const char *s, PyObject *f)
     return err;
 }
 
+/* Py_UniversalNewlineFgets (Objects/fileobject.c): fgets that translates
+   \r and \r\n to \n; fobj must be NULL */
+char *Py_UniversalNewlineFgets(char *buf, int n, FILE *stream, PyObject *fobj)
+{
+    char *p = buf;
+    int c;
+
+    if (fobj) {
+        errno = ENXIO;
+        return NULL;
+    }
+    flockfile(stream);
+    while (--n > 0 && (c = getc_unlocked(stream)) != EOF) {
+        if (c == '\r') {
+            /* a \r is translated into a \n, and an adjacent \n is skipped */
+            c = getc_unlocked(stream);
+            if (c != '\n') {
+                ungetc(c, stream);
+                c = '\n';
+            }
+        }
+        *p++ = (char)c;
+        if (c == '\n')
+            break;
+    }
+    funlockfile(stream);
+    *p = '\0';
+    if (p == buf)
+        return NULL;
+    return buf;
+}
+
+/* The std printer (Objects/fileobject.c): a minimal write-only file object
+   over the stdout or stderr fd.  A C-API-only extension type, readied by
+   the first PyFile_NewStdPrinter. */
+typedef struct {
+    PyObject_HEAD
+    int fd;
+} QPCapiStdPrinter;
+
+static PyObject *qp_capi_stdprinter_write(PyObject *op, PyObject *args)
+{
+    QPCapiStdPrinter *self = (QPCapiStdPrinter *)op;
+    PyObject *unicode, *bytes = NULL;
+    const char *str;
+    Py_ssize_t n;
+    int err;
+
+    if (self->fd < 0)
+        Py_RETURN_NONE;
+    if (!PyArg_ParseTuple(args, "U", &unicode))
+        return NULL;
+    /* UTF-8, backslashreplace for the surrogates */
+    str = PyUnicode_AsUTF8AndSize(unicode, &n);
+    if (!str) {
+        PyErr_Clear();
+        bytes = PyUnicode_AsEncodedString(unicode, "utf-8", "backslashreplace");
+        if (!bytes)
+            return NULL;
+        str = PyBytes_AS_STRING(bytes);
+        n = PyBytes_GET_SIZE(bytes);
+    }
+    /* _Py_write: retry on EINTR */
+    do {
+        Py_BEGIN_ALLOW_THREADS
+        n = write(self->fd, str, (size_t)n);
+        Py_END_ALLOW_THREADS
+        err = errno;
+    } while (n < 0 && err == EINTR && PyErr_CheckSignals() == 0);
+    Py_XDECREF(bytes);
+    if (n < 0) {
+        if (err == EAGAIN)
+            Py_RETURN_NONE;
+        if (!PyErr_Occurred()) {
+            errno = err;
+            PyErr_SetFromErrno(PyExc_OSError);
+        }
+        return NULL;
+    }
+    return PyLong_FromSsize_t(n);
+}
+
+static PyObject *qp_capi_stdprinter_fileno(PyObject *op, PyObject *Py_UNUSED(ignored))
+{
+    return PyLong_FromLong(((QPCapiStdPrinter *)op)->fd);
+}
+
+static PyObject *qp_capi_stdprinter_repr(PyObject *op)
+{
+    return PyUnicode_FromFormat("<stdprinter(fd=%d) object at %p>", ((QPCapiStdPrinter *)op)->fd, op);
+}
+
+static PyObject *qp_capi_stdprinter_noop(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    Py_RETURN_NONE;
+}
+
+static PyObject *qp_capi_stdprinter_isatty(PyObject *op, PyObject *Py_UNUSED(ignored))
+{
+    int fd = ((QPCapiStdPrinter *)op)->fd;
+    long res;
+    if (fd < 0)
+        Py_RETURN_FALSE;
+    Py_BEGIN_ALLOW_THREADS
+    res = isatty(fd);
+    Py_END_ALLOW_THREADS
+    return PyBool_FromLong(res);
+}
+
+static PyObject *qp_capi_stdprinter_closed(PyObject *self, void *Py_UNUSED(closure))
+{
+    Py_RETURN_FALSE;
+}
+
+static PyObject *qp_capi_stdprinter_mode(PyObject *self, void *Py_UNUSED(closure))
+{
+    return PyUnicode_FromString("w");
+}
+
+static PyObject *qp_capi_stdprinter_encoding(PyObject *self, void *Py_UNUSED(closure))
+{
+    Py_RETURN_NONE;
+}
+
+static PyMethodDef qp_capi_stdprinter_methods[] = {
+    {"close", qp_capi_stdprinter_noop, METH_NOARGS, ""},
+    {"flush", qp_capi_stdprinter_noop, METH_NOARGS, ""},
+    {"fileno", qp_capi_stdprinter_fileno, METH_NOARGS, ""},
+    {"isatty", qp_capi_stdprinter_isatty, METH_NOARGS, ""},
+    {"write", qp_capi_stdprinter_write, METH_VARARGS, ""},
+    {NULL, NULL}
+};
+
+static PyGetSetDef qp_capi_stdprinter_getsets[] = {
+    {"closed", qp_capi_stdprinter_closed, NULL, "True if the file is closed"},
+    {"encoding", qp_capi_stdprinter_encoding, NULL, "Encoding of the file"},
+    {"mode", qp_capi_stdprinter_mode, NULL, "String giving the file mode"},
+    {0},
+};
+
+PyTypeObject PyStdPrinter_Type = {
+    PyVarObject_HEAD_INIT(&PyType_Type, 0)
+    .tp_name = "stderrprinter",
+    .tp_basicsize = sizeof(QPCapiStdPrinter),
+    .tp_repr = qp_capi_stdprinter_repr,
+    .tp_getattro = PyObject_GenericGetAttr,
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_DISALLOW_INSTANTIATION,
+    .tp_methods = qp_capi_stdprinter_methods,
+    .tp_getset = qp_capi_stdprinter_getsets,
+    .tp_alloc = PyType_GenericAlloc,
+    .tp_free = PyObject_Free,
+};
+
+PyObject *PyFile_NewStdPrinter(int fd)
+{
+    QPCapiStdPrinter *self;
+
+    if (fd != fileno(stdout) && fd != fileno(stderr))
+        return NULL;    /* CPython: not enough infrastructure for PyErr_BadInternalCall() */
+    if (PyType_Ready(&PyStdPrinter_Type) < 0)
+        return NULL;
+    self = PyObject_New(QPCapiStdPrinter, &PyStdPrinter_Type);
+    if (self)
+        self->fd = fd;
+    return (PyObject *)self;
+}
+
 int PyObject_AsFileDescriptor(PyObject *o)
 {
     PyObject *meth;
@@ -492,6 +659,85 @@ PyObject *PyMarshal_WriteObjectToString(PyObject *x, int version)
     return r;
 }
 
+/* File forms (Python/marshal.c): the readers use the FILE* path of the
+   runtime's reader (python/mod_misc.c), so the stream stops right after
+   the value; the writers report errors through PyErr_Occurred(). */
+
+void PyMarshal_WriteLongToFile(long x, FILE *fp, int version)
+{
+    unsigned char buf[4];
+    (void)version;
+    buf[0] = (unsigned char)(x & 0xff);
+    buf[1] = (unsigned char)((x >> 8) & 0xff);
+    buf[2] = (unsigned char)((x >> 16) & 0xff);
+    buf[3] = (unsigned char)((x >> 24) & 0xff);
+    fwrite(buf, 1, sizeof(buf), fp);
+}
+
+void PyMarshal_WriteObjectToFile(PyObject *x, FILE *fp, int version)
+{
+    JSContext *ctx = qp_capi.ctx;
+    JSValue xv = qp_capi_value(ctx, x), b;
+    const uint8_t *data;
+    Py_ssize_t n;
+
+    if (JS_IsException(xv))
+        return;
+    b = qp_marshal_write_object(ctx, xv, version, 1);
+    if (JS_IsException(b))
+        return;
+    data = qp_bytes_data(b, &n);
+    fwrite(data, 1, (size_t)n, fp);
+    JS_FreeValue(ctx, b);
+}
+
+static void qp_capi_marshal_rfile_init(qp_marshal_RFILE *rf, FILE *fp)
+{
+    memset(rf, 0, sizeof(*rf));
+    rf->ctx = qp_capi.ctx;
+    rf->allow_code = 1;
+    rf->readable = QP_NULL;
+    rf->fp = fp;
+}
+
+int PyMarshal_ReadShortFromFile(FILE *fp)
+{
+    qp_marshal_RFILE rf;
+    int err, res;
+    qp_capi_marshal_rfile_init(&rf, fp);
+    res = qp_marshal_r_short(&rf, &err);
+    qp_marshal_rfile_free(&rf);
+    return res;
+}
+
+long PyMarshal_ReadLongFromFile(FILE *fp)
+{
+    qp_marshal_RFILE rf;
+    int err;
+    long res;
+    qp_capi_marshal_rfile_init(&rf, fp);
+    res = qp_marshal_r_long(&rf, &err);
+    qp_marshal_rfile_free(&rf);
+    return res;
+}
+
+PyObject *PyMarshal_ReadObjectFromFile(FILE *fp)
+{
+    qp_marshal_RFILE rf;
+    JSValue v;
+    qp_capi_marshal_rfile_init(&rf, fp);
+    v = qp_marshal_read_object(&rf);
+    qp_marshal_rfile_free(&rf);
+    return qp_capi_from_js_result(qp_capi.ctx, v);
+}
+
+/* the last object of a file: CPython reads files below 256 KiB at once and
+   unmarshals the bytes; the result is the same as reading from the stream */
+PyObject *PyMarshal_ReadLastObjectFromFile(FILE *fp)
+{
+    return PyMarshal_ReadObjectFromFile(fp);
+}
+
 /* ========================================================================= */
 /* Import                                                                     */
 /* ========================================================================= */
@@ -516,15 +762,18 @@ PyObject *PyImport_ImportModuleNoBlock(const char *name)
     return PyImport_ImportModule(name);
 }
 
-/* No frozen modules exist (mod_imp.c): find_frozen() reports
-   FROZEN_NOT_FOUND for every name, and CPython returns 0 then. */
+/* python/frozen.c: 1 imported, 0 not a frozen module, -1 error */
 int PyImport_ImportFrozenModuleObject(PyObject *name)
 {
-    if (!PyUnicode_Check(name)) {
-        PyErr_BadArgument();
+    JSContext *ctx = qp_capi.ctx;
+    JSValue nv;
+
+    if (name == NULL)
+        return 0;   /* find_frozen(): FROZEN_BAD_NAME */
+    nv = qp_capi_value(ctx, name);
+    if (JS_IsException(nv))
         return -1;
-    }
-    return 0;
+    return qp_import_frozen_module(ctx, nv);
 }
 
 int PyImport_ImportFrozenModule(const char *name)
@@ -565,12 +814,9 @@ static void qp_capi_remove_module(PyObject *name)
 static PyObject *qp_capi_module_dict_for_exec(PyObject *name)
 {
     PyObject *m, *d;
-    const char *cname = PyUnicode_AsUTF8(name);
     int r;
 
-    if (!cname)
-        return NULL;
-    m = PyImport_AddModuleRef(cname);
+    m = qp_capi_import_add_module(name);
     if (!m)
         return NULL;
     d = PyModule_GetDict(m);
@@ -1233,14 +1479,19 @@ void PyInterpreterView_Close(PyInterpreterView *view)
    like PyGILState_Ensure; the token records whether it was attached
    before, and Release restores that.  Foreign threads are rejected by
    PyGILState_Ensure (capi-design.md §5). */
-static const char qp_capi_ensure_tokens[2];
+static const char qp_capi_ensure_tokens[3];
 #define QP_CAPI_TOKEN_LOCKED   ((PyThreadStateToken *)&qp_capi_ensure_tokens[0])
 #define QP_CAPI_TOKEN_UNLOCKED ((PyThreadStateToken *)&qp_capi_ensure_tokens[1])
+/* a thread state (maybe not the thread's own: PyThreadState_Swap) was
+   attached already: Ensure and Release leave it alone */
+#define QP_CAPI_TOKEN_ATTACHED ((PyThreadStateToken *)&qp_capi_ensure_tokens[2])
 
 PyThreadStateToken *PyThreadState_Ensure(PyInterpreterGuard *guard)
 {
     if (guard == NULL || guard->interp != qp_capi.interp)
         return NULL;
+    if (qp_capi_holds_gil() && qp_capi.tstate_current != NULL)
+        return QP_CAPI_TOKEN_ATTACHED;
     return PyGILState_Ensure() == PyGILState_LOCKED ? QP_CAPI_TOKEN_LOCKED : QP_CAPI_TOKEN_UNLOCKED;
 }
 
@@ -1259,6 +1510,8 @@ PyThreadStateToken *PyThreadState_EnsureFromView(PyInterpreterView *view)
 
 void PyThreadState_Release(PyThreadStateToken *token)
 {
+    if (token == QP_CAPI_TOKEN_ATTACHED)
+        return;
     if (token != QP_CAPI_TOKEN_LOCKED && token != QP_CAPI_TOKEN_UNLOCKED)
         Py_FatalError("PyThreadState_Release() called with an invalid token");
     PyGILState_Release(token == QP_CAPI_TOKEN_LOCKED ? PyGILState_LOCKED : PyGILState_UNLOCKED);
@@ -1504,6 +1757,7 @@ void Py_InitializeEx(int install_sigs)
     if (qp_capi.initialized == 2)
         return;
     setlocale(LC_CTYPE, "");
+    qp_preconfig_configure_locale = 1;
     rt = JS_NewRuntime();
     if (!rt)
         Py_FatalError("Py_InitializeEx: cannot allocate the runtime");

@@ -5,8 +5,8 @@
 # `tools/capi_sync.py --record`; the `#` notes before each diff are kept.
 #
 # Modules built unmodified, with what makes them work:
-#   _collections  defaultdict: DICT + NATIVE.  Patched below: no
-#                 OrderedDict export (see the note of the diff).
+#   _collections  defaultdict: DICT + NATIVE; OrderedDict is the runtime's
+#                 (PyODict_Type: python/odictobject.c).
 #   _pickle       _Py_Mangle/_Py_IsPrivateName exported by D (P1).
 #   _datetime     PyObject_Malloc + _PyObject_Init (= PyObject_Init, A);
 #                 patched below to ready its static types.
@@ -42,29 +42,9 @@
 # item and replace it with PyList_SetItem (CPython moved the slot's
 # reference to the returned item; here the list drops its own).
 
-# _collections: PyODict_Type is defined (B) but has no implementation
-# (Objects/odictobject.c is not vendored), so the module does not export
-# it: `from _collections import OrderedDict` fails with ImportError and
-# collections keeps its pure-Python OrderedDict.
-
 # _datetime: CPython readies the static datetime types at interpreter init
 # (pylifecycle.c pycore_init_types -> _PyDateTime_InitTypes); here the first
 # module exec does it.
-
---- a/_collectionsmodule.c
-+++ b/_collectionsmodule.c
-@@ -2870,9 +2870,8 @@
-     ADD_TYPE(module, &dequereviter_spec, state->dequereviter_type, NULL);
-     ADD_TYPE(module, &tuplegetter_spec, state->tuplegetter_type, NULL);
- 
--    if (PyModule_AddType(module, &PyODict_Type) < 0) {
--        return -1;
--    }
-+    /* dquickts: no C OrderedDict (Objects/odictobject.c); collections
-+       falls back to its pure-Python class when the name is missing */
- 
-     return 0;
- }
 
 # _ctypes: CPython's configure defines USING_APPLE_OS_LIBFFI when it links
 # the macOS SDK's libffi (no ffi_prep_closure there on arm64, runtime
@@ -110,6 +90,22 @@
          PyTypeObject *type = capi_types[i];
          const char *name = _PyType_Name(type);
 
+# _decimal: signaldict_richcompare read the flags pointer of the other
+# operand even when it is a dict (CPython reads the dict's ma_used there,
+# nonzero for a full signal dict); PyDictObject.ma_used is not maintained
+# here, so only a SignalDict operand is checked.
+--- a/_decimal/_decimal.c
++++ b/_decimal/_decimal.c
+@@ -795,7 +795,8 @@
+     decimal_state *state = get_module_state_by_def(Py_TYPE(v));
+     assert(PyDecSignalDict_Check(state, v));
+ 
+-    if ((SdFlagAddr(v) == NULL) || (SdFlagAddr(w) == NULL)) {
++    if ((SdFlagAddr(v) == NULL) ||
++        (PyDecSignalDict_Check(state, w) && SdFlagAddr(w) == NULL)) {
+         return value_error_ptr(INVALID_SIGNALDICT_ERROR_MSG);
+     }
+ 
 --- a/_heapqmodule.c
 +++ b/_heapqmodule.c
 @@ -22,10 +22,22 @@
@@ -640,6 +636,110 @@
  }
  
  static PyType_Slot sslerror_type_slots[] = {
+
+# _testcapi (test-only, make capi-testmods): immortal.c takes
+# _PyLong_IsSmallInt from the capi/compat shim (no Include/internal/).
+--- a/_testcapi/immortal.c
++++ b/_testcapi/immortal.c
+@@ -1,7 +1,7 @@
+ #include "parts.h"
+ 
+ #define Py_BUILD_CORE
+-#include "internal/pycore_long.h"   // IMMORTALITY_BIT_MASK
++#include "pycore_long.h"            // dquickts: capi/compat shim
+ 
+ int verify_immortality(PyObject *object)
+ {
+
+# _testcapi monitoring.c: only the public cpython/monitoring.h API is used;
+# the pycore_instruments.h include is dropped.
+--- a/_testcapi/monitoring.c
++++ b/_testcapi/monitoring.c
+@@ -1,8 +1,8 @@
+ #include "parts.h"
+ #include "util.h"
+ 
+-#define Py_BUILD_CORE
+-#include "internal/pycore_instruments.h"
++/* dquickts: the public cpython/monitoring.h API only (no
++   pycore_instruments.h). */
+ 
+ typedef struct {
+     PyObject_HEAD
+
+# _testcapi watchers.c: PyContext's struct is internal (not our layout):
+# clear_context_stack clears the _contextvars context stack through
+# _PyQp_ClearContextStack.
+--- a/_testcapi/watchers.c
++++ b/_testcapi/watchers.c
+@@ -736,16 +736,17 @@
+ static PyObject *
+ clear_context_stack(PyObject *Py_UNUSED(self), PyObject *Py_UNUSED(args))
+ {
+-    PyThreadState *tstate = PyThreadState_Get();
+-    if (tstate->context == NULL) {
+-        Py_RETURN_NONE;
++    /* dquickts: the context stack is the _contextvars state, not
++       tstate->context (PyContext is not CPython's struct) */
++    int r = _PyQp_ClearContextStack();
++    if (r < 0) {
++        return NULL;
+     }
+-    if (((PyContext *)tstate->context)->ctx_prev != NULL) {
++    if (r > 0) {
+         PyErr_SetString(PyExc_RuntimeError,
+                         "must first exit all non-base contexts");
+         return NULL;
+     }
+-    Py_CLEAR(tstate->context);
+     Py_RETURN_NONE;
+ }
+ 
+
+# _testcapimodule.c: the test_* functions that create subinterpreters
+# (Py_NewInterpreter / Py_NewInterpreterFromConfig fail: one interpreter
+# per C-API process) are left out of the method table, so Test_testcapi
+# does not run them.
+--- a/_testcapimodule.c
++++ b/_testcapimodule.c
+@@ -3067,7 +3067,9 @@
+      METH_NOARGS},
+     {"buffer_fill_info",        buffer_fill_info,                METH_VARARGS},
+     {"crash_no_current_thread", crash_no_current_thread,         METH_NOARGS},
++#if 0  /* dquickts: needs a subinterpreter (Py_NewInterpreter fails here) */
+     {"test_current_tstate_matches", test_current_tstate_matches, METH_NOARGS},
++#endif
+     {"run_in_subinterp",        run_in_subinterp,                METH_VARARGS},
+     {"create_cfunction",        create_cfunction,                METH_NOARGS},
+     {"call_in_temporary_c_thread", call_in_temporary_c_thread, METH_VARARGS,
+@@ -3117,17 +3119,27 @@
+     {"function_set_warning", function_set_warning, METH_NOARGS},
+     {"test_critical_sections", test_critical_sections, METH_NOARGS},
+     {"finalize_thread_hang", finalize_thread_hang, METH_O, NULL},
++#if 0  /* dquickts: needs a subinterpreter (Py_NewInterpreter fails here) */
+     {"test_atexit", test_atexit, METH_NOARGS},
++#endif
+     {"code_offset_to_line", _PyCFunction_CAST(code_offset_to_line), METH_FASTCALL},
+     {"toggle_reftrace_printer", toggle_reftrace_printer, METH_O},
+     {"create_managed_weakref_nogc_type",
+         create_managed_weakref_nogc_type, METH_NOARGS},
+     {"test_soft_deprecated_macros", test_soft_deprecated_macros, METH_NOARGS},
++#if 0  /* dquickts: needs a subinterpreter (Py_NewInterpreter fails here) */
+     {"test_interpreter_guards", test_interpreter_guards, METH_NOARGS},
++#endif
+     {"test_thread_state_ensure_nested", test_thread_state_ensure_nested, METH_NOARGS},
++#if 0  /* dquickts: needs a subinterpreter (Py_NewInterpreter fails here) */
+     {"test_thread_state_ensure_crossinterp", test_thread_state_ensure_crossinterp, METH_NOARGS},
++#endif
++#if 0  /* dquickts: needs a subinterpreter (Py_NewInterpreter fails here) */
+     {"test_interp_view_after_shutdown", test_interp_view_after_shutdown, METH_NOARGS},
++#endif
++#if 0  /* dquickts: needs a subinterpreter (Py_NewInterpreter fails here) */
+     {"test_thread_state_ensure_view", test_thread_state_ensure_view, METH_NOARGS},
++#endif
+     {"test_thread_state_ensure_detachment", test_thread_state_ensure_detachment, METH_NOARGS},
+     {"test_thread_state_ensure_detached_gilstate", test_thread_state_ensure_detached_gilstate, METH_NOARGS},
+     {"test_thread_state_release_with_destructor", test_thread_state_release_with_destructor, METH_NOARGS},
 
 # _zstd: "internal/pycore_lock.h" is capi/compat/pycore_lock.h (no
 # internal/ directory: the compat headers are flat).

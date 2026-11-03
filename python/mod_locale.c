@@ -94,6 +94,19 @@ static int qp_locale_dict_set(JSContext *ctx, JSValueConst d, const char *key, J
     return r;
 }
 
+/* CHAR_MAX of the platform C ABI, which the C library (localeconv()
+   grouping) and C extensions use: this file is built with -funsigned-char
+   (Makefile), so <limits.h> CHAR_MAX is UCHAR_MAX on every target.  Plain
+   char is unsigned on these ABIs and signed elsewhere. */
+#if ((defined(__aarch64__) || defined(__arm__)) && !defined(__APPLE__) && !defined(_WIN32)) || \
+    defined(__powerpc__) || defined(__powerpc64__) || defined(__s390__) || defined(__riscv)
+#define QP_LOCALE_CHAR_MAX UCHAR_MAX
+#define QP_LOCALE_CHAR(c) ((long)(unsigned char)(c))
+#else
+#define QP_LOCALE_CHAR_MAX SCHAR_MAX
+#define QP_LOCALE_CHAR(c) ((long)(signed char)(c))
+#endif
+
 /* the grouping is terminated by either 0 or CHAR_MAX */
 static JSValue qp_locale_copy_grouping(JSContext *ctx, const char *s)
 {
@@ -108,14 +121,14 @@ static JSValue qp_locale_copy_grouping(JSContext *ctx, const char *s)
     do {
         JSValue val;
         i++;
-        val = qp_long_from_int64(ctx, (long)s[i]);
+        val = qp_long_from_int64(ctx, QP_LOCALE_CHAR(s[i]));
         if (JS_IsException(val) || qp_list_append(ctx, result, val) < 0) {
             JS_FreeValue(ctx, val);
             JS_FreeValue(ctx, result);
             return JS_EXCEPTION;
         }
         JS_FreeValue(ctx, val);
-    } while (s[i] != '\0' && s[i] != CHAR_MAX);
+    } while (s[i] != '\0' && QP_LOCALE_CHAR(s[i]) != QP_LOCALE_CHAR_MAX);
     return result;
 }
 
@@ -864,7 +877,7 @@ static int qp_locale_exec(JSContext *ctx, JSValueConst module)
 #endif
     QP_LOCALE_INT("LC_NUMERIC", LC_NUMERIC);
     QP_LOCALE_INT("LC_ALL", LC_ALL);
-    QP_LOCALE_INT("CHAR_MAX", CHAR_MAX);
+    QP_LOCALE_INT("CHAR_MAX", QP_LOCALE_CHAR_MAX);
 
     err = qp_locale_new_error_type(ctx);
     if (JS_IsException(err))

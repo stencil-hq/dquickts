@@ -109,9 +109,9 @@ rm -rf "$WORK/wheels"
 "$PY" -c 'from PIL import features; features.pilinfo(supported_formats=False)'
 
 if [ "$RUN_TESTS" = 1 ]; then
-    # junitxml needs xml.etree and faulthandler is not available in qpy
+    # junitxml needs xml.etree
     cd "$SRC"
-    "$PY" -m pytest -p no:cacheprovider -p no:junitxml -p no:faulthandler -q \
+    "$PY" -m pytest -p no:cacheprovider -p no:junitxml -q \
         Tests/test_image.py Tests/test_image_resize.py Tests/test_file_png.py \
         Tests/test_file_jpeg.py Tests/test_imagedraw.py
 fi

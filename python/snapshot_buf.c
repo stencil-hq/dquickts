@@ -24,8 +24,7 @@
  *                (hash: -1, exports: 0, flags: recomputed by qp_mv_init_flags)
  *   exception    value args, context, cause, traceback, u8 suppress_context,
  *                i64 written, i64 start, i64 end, QP_EXC_NFIELDS x value f[i]
- *   traceback    value next, func, frame, self_hint, locals,
- *                sleb lasti, sleb lineno
+ *   traceback    value next, func, frame, sleb lasti, sleb lineno
  *   module       value dict, u8 builtin; a module executed by the C API
  *                starts with 2 instead of 1, then leb its execution order
  *                and its inittab entry (python/capi_snapshot.c executes
@@ -589,8 +588,8 @@ static int qp_snap_buf_read_exc(SnapReader *r, JSObject *p)
 /* ------------------------------------------------------------------------ */
 
 /* lasti is a pc into the bytecode of `func`, which the snapshot restores
-   with the same layout, so it stays valid; `frame` (the lazily created
-   frame facade) is an ordinary PY_FRAME value whose own payload writer
+   with the same layout, so it stays valid; `frame` (the frame object of
+   the activation) is an ordinary PY_FRAME value whose own payload writer
    decides whether it can be saved. */
 static int qp_snap_buf_write_tb(SnapWriter *w, JSObject *p)
 {
@@ -600,8 +599,7 @@ static int qp_snap_buf_write_tb(SnapWriter *w, JSObject *p)
     if (!tb)
         return 0;
     if (snap_put_value(w, tb->next) || snap_put_value(w, tb->func) ||
-        snap_put_value(w, tb->frame) || snap_put_value(w, tb->self_hint) ||
-        snap_put_value(w, tb->locals))
+        snap_put_value(w, tb->frame))
         return -1;
     bc_put_sleb128(&w->bc, tb->lasti);
     bc_put_sleb128(&w->bc, tb->lineno);
@@ -628,14 +626,11 @@ static int qp_snap_buf_read_tb(SnapReader *r, JSObject *p)
     tb->next = JS_UNDEFINED;
     tb->func = QP_NULL;
     tb->frame = QP_NULL;
-    tb->self_hint = QP_NULL;
-    tb->locals = QP_NULL;
     p->u.opaque = tb;
     snap_payload_ready(r);
 
     if (snap_get_value(r, &tb->next) || snap_get_value(r, &tb->func) ||
-        snap_get_value(r, &tb->frame) || snap_get_value(r, &tb->self_hint) ||
-        snap_get_value(r, &tb->locals))
+        snap_get_value(r, &tb->frame))
         return -1;
     if (bc_get_sleb128(&r->bc, &v))
         return -1;

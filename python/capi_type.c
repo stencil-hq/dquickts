@@ -1037,6 +1037,13 @@ static JSValue qp_capi_member_get(JSContext *ctx, JSValueConst self, int magic)
         Py_DECREF(x);
         return JS_EXCEPTION;
     }
+    if ((d->u.m->type == _Py_T_OBJECT || d->u.m->type == Py_T_OBJECT_EX) &&
+        Py_TYPE(x)->tp_weaklistoffset > 0 && d->u.m->offset == Py_TYPE(x)->tp_weaklistoffset) {
+        /* the weak reference list lives on J (QuickJS weak references):
+           its head is the first weak reference, as __weakref__ */
+        Py_DECREF(x);
+        return qp_weakref_get_first(ctx, self);
+    }
     res = PyMember_GetOne((const char *)x, d->u.m);
     Py_DECREF(x);
     if (!res)
@@ -1807,7 +1814,8 @@ typedef struct QPCapiModuleObject {
 #define QP_CAPI_STATIC_DEFS(X)                                                                \
     X(PyBaseObject_Type, "object", sizeof(PyObject), 0, 0)                                   \
     X(PyType_Type, "type", sizeof(PyHeapTypeObject), sizeof(PyMemberDef),                    \
-      QP_CAPI_GC | Py_TPFLAGS_ITEMS_AT_END,                                                  \
+      QP_CAPI_GC | Py_TPFLAGS_ITEMS_AT_END | Py_TPFLAGS_HAVE_VECTORCALL,                     \
+      .tp_vectorcall_offset = offsetof(PyTypeObject, tp_vectorcall),                        \
       .tp_dictoffset = offsetof(PyTypeObject, tp_dict),                                     \
       .tp_weaklistoffset = offsetof(PyTypeObject, tp_weaklist))                             \
     X(PySuper_Type, "super", QP_CAPI_OPAQUE(3), 0, QP_CAPI_GC)                               \
@@ -1877,17 +1885,18 @@ typedef struct QPCapiModuleObject {
     X(PyZip_Type, "zip", QP_CAPI_OPAQUE(3), 0, QP_CAPI_GC)                                   \
     X(Py_GenericAliasType, "types.GenericAlias", QP_CAPI_OPAQUE(6), 0, QP_CAPI_GC)           \
     X(PySentinel_Type, "sentinel", QP_CAPI_OPAQUE(2), 0, 0)                                  \
-    X(PyStdPrinter_Type, "stderrprinter", QP_CAPI_OPAQUE(1), 0, 0)                           \
     X(_PyAsyncGenASend_Type, "async_generator_asend", QP_CAPI_OPAQUE(4), 0, QP_CAPI_GC)      \
     X(PyModule_Type, "module", sizeof(QPCapiModuleObject), 0, QP_CAPI_GC,                    \
       .tp_dictoffset = offsetof(QPCapiModuleObject, md_dict),                               \
       .tp_weaklistoffset = offsetof(QPCapiModuleObject, md_weaklist))                       \
-    /* never instantiated (no C OrderedDict, no frame locals proxy) */                       \
-    X(PyODict_Type, "collections.OrderedDict", sizeof(PyDictObject), 0, QP_CAPI_GC)          \
-    X(PyODictIter_Type, "odict_iterator", QP_CAPI_OPAQUE(4), 0, QP_CAPI_GC)                  \
+    /* PyODictObject: PyDictObject + 8 pointer-sized fields */                               \
+    X(PyODict_Type, "collections.OrderedDict", sizeof(PyDictObject) + 8 * sizeof(void *), 0, \
+      QP_CAPI_GC)                                                                            \
+    X(PyODictIter_Type, "odict_iterator", QP_CAPI_OPAQUE(6), 0, QP_CAPI_GC)                  \
     X(PyODictKeys_Type, "odict_keys", QP_CAPI_OPAQUE(1), 0, QP_CAPI_GC)                      \
     X(PyODictItems_Type, "odict_items", QP_CAPI_OPAQUE(1), 0, QP_CAPI_GC)                    \
     X(PyODictValues_Type, "odict_values", QP_CAPI_OPAQUE(1), 0, QP_CAPI_GC)                  \
+    /* never instantiated (no frame locals proxy) */                                         \
     X(PyFrameLocalsProxy_Type, "FrameLocalsProxy", QP_CAPI_OPAQUE(1), 0, QP_CAPI_GC)
 
 #define QP_CAPI_STATIC_DEF(sym, name, size, isize, cflags, ...)           \
@@ -1896,7 +1905,7 @@ typedef struct QPCapiModuleObject {
         .tp_name = name,                                                  \
         .tp_basicsize = (Py_ssize_t)(size),                               \
         .tp_itemsize = (Py_ssize_t)(isize),                               \
-        .tp_flags = Py_TPFLAGS_DEFAULT | (cflags),                        \
+        .tp_flags = Py_TPFLAGS_DEFAULT | _Py_TPFLAGS_STATIC_BUILTIN | (cflags), \
         __VA_ARGS__                                                       \
     };
 QP_CAPI_STATIC_DEFS(QP_CAPI_STATIC_DEF)
@@ -1907,7 +1916,6 @@ static void qp_capi_static_bases_init(void)
 {
     PyBool_Type.tp_base = &PyLong_Type;
     PyCMethod_Type.tp_base = &PyCFunction_Type;
-    PyODict_Type.tp_base = &PyDict_Type;
 }
 
 /* ========================================================================= */
@@ -2117,6 +2125,32 @@ static PyTypeObject *qp_capi_fwd_owner(QPType *t, size_t qoff, void *fwd)
     return NULL;
 }
 
+/* Nearest builtin static type in the MRO of t (t excluded) whose QP slot
+   is qf: a class inheriting a builtin's slot inherits that type's C slot,
+   so C code comparing slots (Argument Clinic's
+   `type->tp_init == base_tp->tp_init`) sees CPython's inheritance. */
+static PyTypeObject *qp_capi_builtin_slot_owner(QPType *t, size_t qoff, void *qf)
+{
+    PyTypeObject *tp;
+    QPCapiTypeInfo *ti;
+    Py_ssize_t i, n;
+    JSValue *items;
+
+    if (JS_VALUE_GET_TAG(t->mro) != JS_TAG_OBJECT)
+        return NULL;
+    n = QP_TUPLE_SIZE(t->mro);
+    items = QP_TUPLE_ITEMS(t->mro);
+    for (i = 1; i < n; i++) {
+        QPType *u = qp_type_from_value(items[i]);
+        if (!u || QP_CAPI_QSLOT(u, qoff) != qf)
+            continue;
+        if ((tp = qp_capi_type_map_get(u)) && (ti = qp_capi_tinfo(tp)) &&
+            ti->origin == QP_CAPI_TO_BUILTIN)
+            return tp;
+    }
+    return NULL;
+}
+
 static const QPCapiSlotMapEntry *qp_capi_slot_entry(size_t qoff)
 {
     size_t i;
@@ -2124,6 +2158,20 @@ static const QPCapiSlotMapEntry *qp_capi_slot_entry(size_t qoff)
         if (qp_capi_slot_map[i].qoff == qoff)
             return &qp_capi_slot_map[i];
     return NULL;
+}
+
+/* The type of the slot wrapper being called for QP slot qoff
+   (qp_wrapper_raw_call) when that slot is a forward bridge, else NULL.
+   The wrapper type stays recorded while a wrapped slot that is not a
+   forward bridge runs (object.__ne__ calls type(self).__eq__, which can be
+   a forward bridge of another type): only the bridge it wraps uses it. */
+static QPType *qp_capi_wrapper_pending(JSContext *ctx, size_t qoff)
+{
+    QPState *s = QP_STATE(ctx);
+    QPType *w = s->wrapper_type;
+    if (!w || s->wrapper_slot != (int)qoff || !qp_capi_is_fwd(QP_CAPI_QSLOT(w, qoff)))
+        return NULL;
+    return w;
 }
 
 /* C function of slot `qoff` for objects of QP type t reached from forward
@@ -2134,11 +2182,11 @@ static const QPCapiSlotMapEntry *qp_capi_slot_entry(size_t qoff)
    qp_wrapper_raw_call), which the call consumes. */
 static QPType *qp_capi_fwd_type(JSContext *ctx, QPType *t, size_t qoff)
 {
-    QPState *s = QP_STATE(ctx);
-    if (s->wrapper_type && s->wrapper_slot == (int)qoff) {
-        if (qp_type_is_subtype(t, s->wrapper_type))
-            t = s->wrapper_type;
-        s->wrapper_type = NULL;
+    QPType *w = qp_capi_wrapper_pending(ctx, qoff);
+    if (w) {
+        if (qp_type_is_subtype(t, w))
+            t = w;
+        QP_STATE(ctx)->wrapper_type = NULL;
     }
     return t;
 }
@@ -2183,7 +2231,7 @@ static int qp_capi_fwd_pair(JSContext *ctx, JSValueConst a, JSValueConst b, size
     *pfa = *pfb = NULL;
     /* called by the slot wrapper of a C-defined type (Base.__getitem__(self, i),
        Base.__radd__(self, x)): its C function only, whatever type(self) has */
-    if ((w = s->wrapper_type) && s->wrapper_slot == (int)qoff) {
+    if ((w = qp_capi_wrapper_pending(ctx, qoff))) {
         s->wrapper_type = NULL;
         if (qp_type_is_subtype(ta, w) && (o = qp_capi_fwd_owner(w, qoff, fwd)))
             *pfa = qp_capi_cslot_get(o, e);
@@ -2243,8 +2291,18 @@ static JSValue qp_capi_fwd_ternary(JSContext *ctx, JSValueConst a, JSValueConst 
 {
     void *fa, *fb;
     PyObject *x, *y, *z, *r;
-    if (qp_capi_fwd_pair(ctx, a, b, qoff, fwd, both, &fa, &fb) < 0)
+    if (both && QP_CAPI_QSLOT(qp_type_of(ctx, a), qoff) != fwd &&
+        QP_CAPI_QSLOT(qp_type_of(ctx, b), qoff) != fwd &&
+        !qp_capi_wrapper_pending(ctx, qoff)) {
+        /* ternary_op's last try: the slot of the type of z
+           (pow(10, 2, Decimal(7))) */
+        fa = qp_capi_fwd_cfunc(ctx, qp_type_of(ctx, c), qoff, fwd);
+        fb = NULL;
+        if (!fa)
+            return JS_EXCEPTION;
+    } else if (qp_capi_fwd_pair(ctx, a, b, qoff, fwd, both, &fa, &fb) < 0) {
         return JS_EXCEPTION;
+    }
     x = qp_capi_new_ref(ctx, a);
     y = x ? qp_capi_new_ref(ctx, b) : NULL;
     z = y ? qp_capi_new_ref(ctx, c) : NULL;
@@ -2429,6 +2487,36 @@ static int qp_capi_fwd_setattro(JSContext *ctx, JSValueConst obj, JSAtom name, J
     Py_DECREF(n);
     Py_DECREF(x);
     return r < 0 ? -1 : 0;
+}
+
+/* QPTypeSlots.tp_vectorcall of a C type with tp_vectorcall (Py_tp_vectorcall):
+   calling the type object itself (CPython's type tp_vectorcall_offset). */
+static JSValue qp_capi_fwd_type_vectorcall(JSContext *ctx, JSValueConst callable,
+                                           JSValueConst *args, size_t nargsf,
+                                           JSValueConst kwnames)
+{
+    int nargs = (int)qp_nargs(nargsf);
+    int nkw = QP_IS_NULL(kwnames) ? 0 : (int)QP_TUPLE_SIZE(kwnames);
+    PyObject *x, *kwn = NULL, *r = NULL;
+    QPCapiArgs a;
+    JSValue res;
+
+    x = qp_capi_new_ref(ctx, callable);
+    if (!x)
+        return JS_EXCEPTION;
+    if (!PyType_Check(x) || !((PyTypeObject *)x)->tp_vectorcall) {
+        Py_DECREF(x);
+        return qp_raise_system_error(ctx, "C slot bridge: no tp_vectorcall for '%T'", callable);
+    }
+    if (qp_capi_args_init(ctx, &a, args, nargs + nkw) == 0 &&
+        (!nkw || (kwn = qp_capi_new_ref(ctx, kwnames)) != NULL))
+        r = ((PyTypeObject *)x)->tp_vectorcall(x, a.v + 1,
+                                               (size_t)nargs | PY_VECTORCALL_ARGUMENTS_OFFSET, kwn);
+    Py_XDECREF(kwn);
+    qp_capi_args_free(ctx, &a);
+    res = qp_capi_result_to_js(ctx, r, ((PyTypeObject *)x)->tp_name);
+    Py_DECREF(x);
+    return res;
 }
 
 static JSValue qp_capi_fwd_call(JSContext *ctx, JSValueConst callable, JSValueConst *args,
@@ -2875,6 +2963,12 @@ static void qp_capi_tinfo_free(PyTypeObject *tp)
 static unsigned long qp_capi_flags_from_qp(QPType *t, unsigned long c_bits)
 {
     unsigned long f = ((unsigned long)t->flags & QP_CAPI_FLAGS_SHARED) | (c_bits & QP_CAPI_FLAGS_C_ONLY);
+    /* the runtime's method-cache state; CPython 3.15 never sets the bit */
+    f &= ~Py_TPFLAGS_VALID_VERSION_TAG;
+    /* static builtin types keep their __dict__ at tp_dictoffset (a managed
+       dict requires a heap type: type_ready_managed_dict) */
+    if (c_bits & _Py_TPFLAGS_STATIC_BUILTIN)
+        f &= ~Py_TPFLAGS_MANAGED_DICT;
     if (t->flags & QP_TPFLAGS_READY)
         f |= Py_TPFLAGS_READY;
     return f;
@@ -2892,6 +2986,10 @@ static uint64_t qp_capi_flags_to_qp(PyTypeObject *tp)
         f |= QP_TPFLAGS_WEAKREF;
     if (tp->tp_dictoffset || (tp->tp_flags & Py_TPFLAGS_MANAGED_DICT))
         f |= QP_TPFLAGS_MANAGED_DICT;
+    /* tp_itemsize != 0: no arbitrary __slots__ and no implicit __weakref__
+       in Python subclasses (type_new_descriptors, type_new_slots_impl) */
+    if (tp->tp_itemsize)
+        f |= QP_TPFLAGS_PRIV_VARSIZE;
     return f;
 }
 
@@ -3169,7 +3267,12 @@ static void *qp_capi_mirror_cslot(QPType *t, const QPCapiSlotMapEntry *e)
         return owner ? qp_capi_cslot_get(owner, e) : NULL;
     }
     cf = qp_capi_known_q2c(e->qoff, qf);
-    return cf ? cf : e->rb;
+    if (cf)
+        return cf;
+    owner = qp_capi_builtin_slot_owner(t, e->qoff, qf);
+    if (owner && (cf = qp_capi_cslot_get(owner, e)))
+        return cf;
+    return e->rb;
 }
 
 static void qp_capi_mirror_fill_slots(PyTypeObject *tp, QPType *t)
@@ -3206,6 +3309,10 @@ static void qp_capi_mirror_fill_slots(PyTypeObject *tp, QPType *t)
     tp->tp_free = lb->tp_free ? lb->tp_free : PyObject_GC_Del;
     tp->tp_basicsize = lb->tp_basicsize;
     tp->tp_itemsize = lb->tp_itemsize;
+    /* the instance dict stays in the C base's slot (type_new keeps the
+       base's tp_dictoffset) */
+    if (lb->tp_dictoffset > 0)
+        tp->tp_dictoffset = lb->tp_dictoffset;
     tp->tp_finalize = lb->tp_finalize;
     tp->tp_del = lb->tp_del;
     if (QP_CAPI_QSLOT(t, QP_CAPI_QOFF(tp_call)) == (void *)qp_capi_fwd_call &&
@@ -3220,11 +3327,45 @@ static unsigned long qp_capi_mirror_c_bits(QPType *t)
 {
     PyTypeObject *lb = qp_capi_layout_base(t);
     unsigned long f = lb->tp_flags & (Py_TPFLAGS_ITEMS_AT_END | Py_TPFLAGS_HAVE_GC);
-    if (t->flags & QP_TPFLAGS_HEAPTYPE)
+    if (t->flags & QP_TPFLAGS_HEAPTYPE) {
         f |= Py_TPFLAGS_HAVE_GC;
+        /* type_new_descriptors: a __weakref__ added by a class statement
+           is managed */
+        if ((t->flags & QP_TPFLAGS_WEAKREF) && lb->tp_weaklistoffset == 0)
+            f |= Py_TPFLAGS_MANAGED_WEAKREF;
+    } else {
+        /* the runtime's own types are CPython's static builtin types */
+        f |= _Py_TPFLAGS_STATIC_BUILTIN;
+    }
     if (QP_CAPI_QSLOT(t, QP_CAPI_QOFF(tp_call)) == (void *)qp_capi_fwd_call)
         f |= lb->tp_flags & Py_TPFLAGS_HAVE_VECTORCALL;
     return f;
+}
+
+/* tp_flags of the mirror of a runtime type.  Py_TPFLAGS_MANAGED_DICT is
+   CPython's for heap types whose __dict__ was added by a class statement
+   (type_new_descriptors, inherited by subclasses); static builtin types
+   with a __dict__ (BaseException, module, function) and their subclasses
+   use tp_dictoffset instead.  Managed dicts have inline values unless the
+   layout has items (type_ready_managed_dict). */
+static unsigned long qp_capi_mirror_flags(QPType *t)
+{
+    unsigned long f = qp_capi_flags_from_qp(t, qp_capi_mirror_c_bits(t));
+    QPType *b;
+
+    if (f & Py_TPFLAGS_MANAGED_DICT) {
+        BOOL managed = (t->flags & QP_TPFLAGS_HEAPTYPE) != 0 &&
+                       qp_capi_layout_base(t)->tp_dictoffset == 0;
+        for (b = t; managed && b; b = b->base) {
+            if (!(b->flags & QP_TPFLAGS_HEAPTYPE) && (b->flags & QP_TPFLAGS_MANAGED_DICT))
+                managed = FALSE;
+        }
+        if (!managed)
+            f &= ~Py_TPFLAGS_MANAGED_DICT;
+        else if (qp_capi_layout_base(t)->tp_itemsize == 0)
+            f |= Py_TPFLAGS_INLINE_VALUES;
+    }
+    return f | Py_TPFLAGS_READY;
 }
 
 static size_t qp_capi_type_kind_size(JSContext *ctx, JSValueConst v)
@@ -3276,7 +3417,7 @@ static int qp_capi_type_kind_init(JSContext *ctx, PyObject *op, JSValueConst v)
         ht->ht_qualname = Py_NewRef(ht->ht_name);
     }
     /* layout, flags, slots */
-    tp->tp_flags = qp_capi_flags_from_qp(t, qp_capi_mirror_c_bits(t)) | Py_TPFLAGS_READY;
+    tp->tp_flags = qp_capi_mirror_flags(t);
     qp_capi_mirror_fill_slots(tp, t);
     tp->tp_version_tag = t->version_tag;
     return qp_capi_type_sync_tuples(ctx, tp, t);
@@ -3292,7 +3433,7 @@ static void qp_capi_type_kind_refresh(JSContext *ctx, PyObject *op)
         return;
     t = ti->qt;
     if (ti->origin == QP_CAPI_TO_MIRROR) {
-        tp->tp_flags = qp_capi_flags_from_qp(t, qp_capi_mirror_c_bits(t)) | Py_TPFLAGS_READY;
+        tp->tp_flags = qp_capi_mirror_flags(t);
         qp_capi_mirror_fill_slots(tp, t);
     } else {
         tp->tp_flags = qp_capi_flags_from_qp(t, tp->tp_flags) |
@@ -3341,14 +3482,32 @@ static void qp_capi_type_kind_clear(JSRuntime *rt, PyObject *op)
     qp_capi_tinfo_free(tp);
 }
 
-/* to_js of a C-primary TYPE object: heap types made by PyType_FromSpec* */
+/* clear for the cycle collector: tp_base, the name and the type record stay
+   until dealloc, as with CPython's type_clear (the tp_clear of a metaclass
+   instance reads PyObject_GetTypeData(self, metaclass)) */
+static void qp_capi_type_kind_gc_clear(JSRuntime *rt, PyObject *op)
+{
+    PyHeapTypeObject *ht = (PyHeapTypeObject *)op;
+    PyTypeObject *tp = &ht->ht_type;
+    Py_CLEAR(tp->tp_dict);
+    Py_CLEAR(tp->tp_bases);
+    Py_CLEAR(tp->tp_mro);
+    Py_CLEAR(ht->ht_name);
+    Py_CLEAR(ht->ht_qualname);
+    Py_CLEAR(ht->ht_slots);
+    Py_CLEAR(ht->ht_module);
+}
+
+/* to_js of a C-primary TYPE object: heap types made by PyType_FromSpec* or
+   allocated with tp_alloc and readied by PyType_Ready */
 static JSValue qp_capi_heap_type_create(JSContext *ctx, PyTypeObject *type);
 
 static JSValue qp_capi_type_kind_to_js(JSContext *ctx, PyObject *op)
 {
     QPCapiTypeInfo *ti = qp_capi_tinfo((PyTypeObject *)op);
     if (!ti || ti->origin != QP_CAPI_TO_CHEAP)
-        return qp_raise_system_error(ctx, "type object '%s' was not created by PyType_FromSpec",
+        return qp_raise_system_error(ctx, "type object '%s' was not created by PyType_FromSpec "
+                                     "or readied by PyType_Ready",
                                      ((PyTypeObject *)op)->tp_name);
     return qp_capi_heap_type_create(ctx, (PyTypeObject *)op);
 }
@@ -3464,19 +3623,33 @@ static void qp_capi_type_modified(JSContext *ctx, QPType *t)
     }
     if (qp_capi_tinfo(tp))
         qp_capi_type_kind_refresh(ctx, (PyObject *)tp);
-    qp_capi_type_watched(tp);
+    /* type_modified_unlocked: the watchers see the first modification
+       after the version tag was assigned (a lookup), so that consecutive
+       modifications are reported once */
+    if (t->version_tag != 0)
+        qp_capi_type_watched(tp);
 }
 
 /* ========================================================================= */
 /* Extension instances (kind NATIVE)                                          */
 /* ========================================================================= */
 
-/* Slot at tp_dictoffset (> 0, inside the C instance) of extension object op,
-   NULL if its type has none. */
+/* Slot at tp_dictoffset (inside the C instance; a negative offset counts
+   from the end of the instance, _PyObject_ComputedDictPointer) of
+   extension object op, NULL if its type has none. */
 static PyObject **qp_capi_native_dictptr(PyObject *op)
 {
-    Py_ssize_t off = Py_TYPE(op)->tp_dictoffset;
-    if (off <= 0 || off + (Py_ssize_t)sizeof(PyObject *) > Py_TYPE(op)->tp_basicsize)
+    PyTypeObject *tp = Py_TYPE(op);
+    Py_ssize_t off = tp->tp_dictoffset, size = tp->tp_basicsize;
+
+    if (off < 0) {
+        if (tp->tp_itemsize) {
+            Py_ssize_t n = Py_SIZE(op);
+            size = (Py_ssize_t)_PyObject_VAR_SIZE(tp, n < 0 ? -n : n);
+        }
+        off += size;
+    }
+    if (off <= 0 || off + (Py_ssize_t)sizeof(PyObject *) > size)
         return NULL;
     return (PyObject **)((char *)op + off);
 }
@@ -3502,34 +3675,132 @@ static JSValue qp_capi_native_kind_to_js(JSContext *ctx, PyObject *op)
     if (JS_IsException(v))
         return v;
     JS_VALUE_GET_OBJ(v)->u.opaque = op;
-    /* a dict the C code already stored at tp_dictoffset (numpy's ufunc
-       sets ufunc->dict in its constructor) is the instance __dict__ */
+    /* the slot at tp_dictoffset holds the instance __dict__ (C code reads
+       and replaces it, e.g. partial's __reduce__/__setstate__): the object
+       is in dict mode from the start and qp_capi_native_dict_sync follows
+       the slot.  A dict the C code already stored there (numpy's ufunc sets
+       ufunc->dict in its constructor) is adopted at once. */
     dp = qp_capi_native_dictptr(op);
-    if (dp && *dp && PyDict_Check(*dp)) {
-        JSValue d = qp_capi_value(ctx, *dp);
-        if (JS_IsException(d) || qp_obj_adopt_dict(ctx, JS_VALUE_GET_OBJ(v), d) < 0) {
-            JS_VALUE_GET_OBJ(v)->u.opaque = NULL;
-            JS_FreeValue(ctx, v);
-            return JS_EXCEPTION;
+    if (dp) {
+        JS_VALUE_GET_OBJ(v)->py_dict_mode = 1;
+        if (*dp && PyDict_Check(*dp)) {
+            JSValue d = qp_capi_value(ctx, *dp);
+            if (JS_IsException(d) || qp_obj_adopt_dict(ctx, JS_VALUE_GET_OBJ(v), d) < 0) {
+                JS_VALUE_GET_OBJ(v)->u.opaque = NULL;
+                JS_FreeValue(ctx, v);
+                return JS_EXCEPTION;
+            }
         }
     }
     return v;
 }
 
-/* The instance __dict__ of a C extension object (JS_CLASS_PY_NATIVE p) was
-   just made by the runtime: C code that reads the slot at tp_dictoffset
+/* The runtime set the instance __dict__ of a C extension object
+   (JS_CLASS_PY_NATIVE p) to d: C code that reads the slot at tp_dictoffset
    sees it too (CPython's _PyObject_GetDictPtr storage). */
 static void qp_capi_native_dict_made(JSContext *ctx, JSObject *p, JSValueConst d)
 {
-    PyObject *op = p->u.opaque, **dp;
-    if (!op || !(dp = qp_capi_native_dictptr(op)) || *dp)
+    PyObject *op = p->u.opaque, **dp, *nd;
+    if (!op || !(dp = qp_capi_native_dictptr(op)))
         return;
-    *dp = qp_capi_new_ref(ctx, d);
-    if (!*dp)
+    if (*dp) {
+        JSValue cur = qp_capi_value(ctx, *dp);
+        if (JS_IsException(cur))
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        else if (JS_VALUE_GET_PTR(cur) == JS_VALUE_GET_PTR(d))
+            return;
+    }
+    nd = qp_capi_new_ref(ctx, d);
+    if (!nd) {
         JS_FreeValue(ctx, JS_GetException(ctx));
+        return;
+    }
+    Py_XSETREF(*dp, nd);
+}
+
+/* Borrowed instance __dict__ of extension object p (JS_CLASS_PY_NATIVE),
+   QP_NULL if none.  When its type has a tp_dictoffset slot, the slot is
+   the source of truth: a dict the C code stored there replaces the
+   runtime's, and a slot the C code cleared reads as a new empty dict
+   (PyObject_GenericGetDict). */
+static JSValue qp_capi_native_dict_sync(JSContext *ctx, JSObject *p)
+{
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    PyObject *op = p->u.opaque, **dp;
+    JSValue cur, d;
+
+    prs = find_own_property(&pr, p, QP_STATE(ctx)->atom_dict_slot);
+    cur = prs ? pr->u.value : QP_NULL;
+    if (!op || !(dp = qp_capi_native_dictptr(op)))
+        return cur;
+    if (!*dp) {
+        if (!prs)
+            return QP_NULL;
+        d = qp_dict_new(ctx);
+        if (JS_IsException(d)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            return cur;
+        }
+        *dp = qp_capi_new_ref(ctx, d);
+        if (!*dp) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            JS_FreeValue(ctx, d);
+            return cur;
+        }
+        set_value(ctx, &pr->u.value, d);
+        return d;
+    }
+    if (!PyDict_Check(*dp))
+        return cur;
+    d = qp_capi_value(ctx, *dp);
+    if (JS_IsException(d)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return cur;
+    }
+    if (prs) {
+        if (JS_VALUE_GET_PTR(d) != JS_VALUE_GET_PTR(cur))
+            set_value(ctx, &pr->u.value, JS_DupValue(ctx, d));
+        return d;
+    }
+    pr = add_property(ctx, p, QP_STATE(ctx)->atom_dict_slot, JS_PROP_WRITABLE);
+    if (!pr) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return QP_NULL;
+    }
+    pr->u.value = JS_DupValue(ctx, d);
+    p->py_dict_mode = 1;
+    return d;
 }
 
 /* __class__ assignment: ob_type follows the JS prototype */
+/* The C object of a J the runtime created (object.__new__ of a C type,
+   allocated at its first crossing): as for the instances C creates
+   (qp_capi_native_kind_to_js), the slot at tp_dictoffset holds the
+   instance __dict__ from now on.  Attributes already set move into the
+   dict; without any, the dict is made by the first one. */
+static int qp_capi_native_kind_init(JSContext *ctx, PyObject *op, JSValueConst v)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(v);
+    JSShapeProperty *prs;
+    JSValue d;
+    int i;
+
+    if (!qp_capi_native_dictptr(op))
+        return 0;
+    d = qp_obj_dict_get(ctx, p);
+    if (!QP_IS_NULL(d)) {
+        qp_capi_native_dict_made(ctx, p, d);
+        return 0;
+    }
+    for (i = 0, prs = get_shape_prop(p->shape); i < p->shape->prop_count; i++, prs++) {
+        if (qp_shape_prop_is_attr(ctx, prs))
+            return JS_IsException(qp_obj_materialize_dict(ctx, p)) ? -1 : 0;
+    }
+    p->py_dict_mode = 1;
+    return 0;
+}
+
 static void qp_capi_native_kind_refresh(JSContext *ctx, PyObject *op)
 {
     QPCapiHead *h = QP_CAPI_HEAD(op);
@@ -3799,6 +4070,8 @@ static int qp_capi_build_spec(JSContext *ctx, QPCapiTypeInfo *ti)
         qf = qp_capi_known_c2q(e->qoff, cf);
         *(void **)((uint8_t *)&s->slots + e->qoff) = qf ? qf : e->fwd;
     }
+    if (tp->tp_vectorcall)
+        s->slots.tp_vectorcall = qp_capi_fwd_type_vectorcall;
     if (tp->tp_as_buffer && tp->tp_as_buffer->bf_getbuffer) {
         s->slots.bf.bf_getbuffer = qp_capi_bf_getbuffer_fwd;
         s->slots.bf.bf_releasebuffer = qp_capi_bf_releasebuffer_fwd;
@@ -3950,12 +4223,49 @@ static int qp_capi_c_type_finish(JSContext *ctx, QPCapiTypeInfo *ti, int heap)
     return 0;
 }
 
+/* type_ready_preheader; HAVE_GC as inherit_special will set it from base */
+static int qp_capi_type_ready_preheader(PyTypeObject *type, PyTypeObject *base)
+{
+    BOOL gc = (type->tp_flags & Py_TPFLAGS_HAVE_GC) ||
+              (base && (base->tp_flags & Py_TPFLAGS_HAVE_GC) &&
+               !type->tp_traverse && !type->tp_clear);
+
+    if (type->tp_flags & Py_TPFLAGS_MANAGED_DICT) {
+        if (type->tp_dictoffset > 0 || type->tp_dictoffset < -1) {
+            PyErr_Format(PyExc_TypeError, "type %s has the Py_TPFLAGS_MANAGED_DICT flag "
+                         "but tp_dictoffset is set", type->tp_name);
+            return -1;
+        }
+        if (!gc) {
+            PyErr_Format(PyExc_SystemError, "type %s has the Py_TPFLAGS_MANAGED_DICT flag "
+                         "but not Py_TPFLAGS_HAVE_GC flag", type->tp_name);
+            return -1;
+        }
+    }
+    if (type->tp_flags & Py_TPFLAGS_MANAGED_WEAKREF) {
+        /* CPython's MANAGED_WEAKREF_OFFSET (pycore_object.h) */
+        if (type->tp_weaklistoffset != 0 &&
+            type->tp_weaklistoffset != (Py_ssize_t)sizeof(PyObject *) * -4) {
+            PyErr_Format(PyExc_TypeError, "type %s has the Py_TPFLAGS_MANAGED_WEAKREF flag "
+                         "but tp_weaklistoffset is set", type->tp_name);
+            return -1;
+        }
+        if (!gc) {
+            PyErr_Format(PyExc_SystemError, "type %s has the Py_TPFLAGS_MANAGED_WEAKREF flag "
+                         "but not Py_TPFLAGS_HAVE_GC flag", type->tp_name);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 int PyType_Ready(PyTypeObject *type)
 {
     JSContext *ctx = qp_capi.ctx;
     QPCapiTypeInfo *ti;
     PyTypeObject *base;
     JSValue v;
+    int heap;
 
     if (type->tp_flags & Py_TPFLAGS_READY)
         return 0;
@@ -3972,8 +4282,11 @@ int PyType_Ready(PyTypeObject *type)
         return -1;
     }
     base = type->tp_base;
-    if (!base && type != &PyBaseObject_Type)
-        base = type->tp_base = &PyBaseObject_Type;
+    if (!base && type != &PyBaseObject_Type) {
+        /* type_ready_set_base: a heap type owns its tp_base */
+        base = &PyBaseObject_Type;
+        type->tp_base = (type->tp_flags & Py_TPFLAGS_HEAPTYPE) ? (PyTypeObject *)Py_NewRef(base) : base;
+    }
     if (base && !(base->tp_flags & Py_TPFLAGS_READY) && PyType_Ready(base) < 0)
         return -1;
     if (!Py_TYPE(type) && base)
@@ -3991,22 +4304,42 @@ int PyType_Ready(PyTypeObject *type)
     }
     /* type_ready: historically, all static types were immutable (bpo-43908;
        _zoneinfo derives an immutable heap type from datetime.tzinfo) */
-    if (!(type->tp_flags & Py_TPFLAGS_HEAPTYPE))
+    if (!(type->tp_flags & Py_TPFLAGS_HEAPTYPE)) {
         type->tp_flags |= Py_TPFLAGS_IMMUTABLETYPE;
+        /* a static type defined without PyObject_HEAD_INIT (designated
+           initializers only, as _testcapi's RecursingInfinitelyError) has
+           no head: what PyObject_HEAD_INIT would have set */
+        if (!(((PyObject *)type)->ob_flags & _Py_STATICALLY_ALLOCATED_FLAG) && Py_REFCNT(type) == 0)
+            ((PyObject *)type)->ob_refcnt_full = _Py_STATIC_IMMORTAL_INITIAL_REFCNT;
+    }
+    if (qp_capi_type_ready_preheader(type, base) < 0)
+        return -1;
+    /* A PyHeapTypeObject allocated with tp_alloc of a metatype and filled in
+       by hand (pybind11's metaclass, object base and classes) is a heap type
+       like PyType_FromSpec's: its runtime type is made by the TYPE kind
+       to_js when it first crosses. */
+    heap = (type->tp_flags & Py_TPFLAGS_HEAPTYPE) && QP_CAPI_HAS_HEAD((PyObject *)type);
     type->tp_flags |= Py_TPFLAGS_READYING;
-    ti = qp_capi_tinfo_new(type, QP_CAPI_TO_CSTATIC);
+    ti = qp_capi_tinfo_new(type, heap ? QP_CAPI_TO_CHEAP : QP_CAPI_TO_CSTATIC);
     if (!ti)
         goto fail;
-    v = qp_capi_c_type_create(ctx, ti);
-    if (JS_IsException(v))
-        goto fail;
-    ti->j = v;
-    if (qp_capi_c_type_finish(ctx, ti, 0) < 0)
+    if (heap) {
+        if (!type->tp_dealloc)
+            type->tp_dealloc = qp_capi_subtype_dealloc;
+        if (JS_IsException(qp_capi_value(ctx, (PyObject *)type)))
+            goto fail;
+    } else {
+        v = qp_capi_c_type_create(ctx, ti);
+        if (JS_IsException(v))
+            goto fail;
+        ti->j = v;
+    }
+    if (qp_capi_c_type_finish(ctx, ti, heap) < 0)
         goto fail;
     return 0;
 fail:
     type->tp_flags &= ~Py_TPFLAGS_READYING;
-    if (ti) {
+    if (ti && !(heap && ti->qt)) {
         JS_FreeValue(ctx, ti->j);
         ti->j = QP_NULL;
         qp_capi_tinfo_free(type);
@@ -4108,7 +4441,7 @@ static PyTypeObject *qp_capi_best_base(PyObject *bases)
     for (i = 0; i < PyTuple_GET_SIZE(bases); i++) {
         PyObject *b = PyTuple_GET_ITEM(bases, i);
         if (!PyType_Check(b)) {
-            PyErr_SetString(PyExc_TypeError, "bases must be types");
+            PyErr_Format(PyExc_TypeError, "bases must be types; got '%T'", b);
             return NULL;
         }
         if (!(((PyTypeObject *)b)->tp_flags & Py_TPFLAGS_BASETYPE)) {
@@ -4415,6 +4748,8 @@ static PyObject *qp_capi_type_from_slots_or_spec(PySlot *slots, PyType_Spec *spe
                      type->tp_name);
         goto finally;
     }
+    if (qp_capi_type_ready_preheader(type, type->tp_base) < 0)
+        goto finally;
 
     /* bind: the runtime type object is created by the TYPE kind to_js */
     v = qp_capi_value(ctx, (PyObject *)res);
@@ -4642,7 +4977,7 @@ int PyType_IsSubtype(PyTypeObject *a, PyTypeObject *b)
     if (ta && tb && ta->qt && tb->qt)
         return qp_type_is_subtype(ta->qt, tb->qt);
     if (!tb && b != &PyBaseObject_Type)
-        return 0;       /* unbound types (PyODict_Type, ...) have no instances */
+        return 0;       /* unbound types (PyFrameLocalsProxy_Type) have no instances */
     mro = a->tp_mro;
     if (mro && PyTuple_Check(mro)) {
         Py_ssize_t i;
@@ -5112,9 +5447,11 @@ static int qp_capi_validate_type_watcher(int id)
 int PyType_AddWatcher(PyType_WatchCallback callback)
 {
     int i;
+    /* Start at 1, 0 is reserved for cpython optimizer */
     for (i = 1; i < QP_CAPI_TYPE_MAX_WATCHERS; i++) {
         if (!qp_capi_type_watchers[i]) {
             qp_capi_type_watchers[i] = callback;
+            qp_capi_type_watchers_set |= (uint8_t)(1 << i);
             return i;
         }
     }
@@ -5127,7 +5464,31 @@ int PyType_ClearWatcher(int watcher_id)
     if (qp_capi_validate_type_watcher(watcher_id) < 0)
         return -1;
     qp_capi_type_watchers[watcher_id] = NULL;
+    qp_capi_type_watchers_set &= (uint8_t)~(1 << watcher_id);
     return 0;
+}
+
+/* type_dealloc: the watchers of a dying watched type (qp_del_context
+   defers its free to the finalizer queue, where the type is intact). */
+static BOOL qp_capi_type_dealloc_watched(JSObject *p)
+{
+    PyObject *op;
+    if (!qp_capi_type_watchers_set || !p->py_has_mirror)
+        return FALSE;
+    op = qp_capi_lookup(JS_MKPTR(JS_TAG_OBJECT, p));
+    return op && (((PyTypeObject *)op)->tp_watched & qp_capi_type_watchers_set) != 0;
+}
+
+static void qp_capi_type_dealloc_notify(JSContext *ctx, JSValueConst obj)
+{
+    PyObject *op = qp_capi_new_ref(ctx, obj);
+    if (!op) {
+        PyErr_WriteUnraisable(NULL);
+        return;
+    }
+    if (((PyTypeObject *)op)->tp_watched)
+        qp_capi_type_watched((PyTypeObject *)op);
+    Py_DECREF(op);
 }
 
 int PyType_Watch(int watcher_id, PyObject *obj)
@@ -5170,6 +5531,20 @@ static void *qp_capi_member_addr(PyObject *obj, PyMemberDef *mp)
     return addr;
 }
 
+/* Py_T_BYTE is a plain `char` of the platform C ABI (the extension's
+   compiler); this file is built with -funsigned-char (Makefile), so use the
+   ABI's signedness explicitly (as python/mod_locale.c QP_LOCALE_CHAR_MAX). */
+#if ((defined(__aarch64__) || defined(__arm__)) && !defined(__APPLE__) && !defined(_WIN32)) || \
+    defined(__powerpc__) || defined(__powerpc64__) || defined(__s390__) || defined(__riscv)
+typedef unsigned char qp_capi_abi_char;
+#define QP_CAPI_ABI_CHAR_MIN 0
+#define QP_CAPI_ABI_CHAR_MAX UCHAR_MAX
+#else
+typedef signed char qp_capi_abi_char;
+#define QP_CAPI_ABI_CHAR_MIN SCHAR_MIN
+#define QP_CAPI_ABI_CHAR_MAX SCHAR_MAX
+#endif
+
 PyObject *PyMember_GetOne(const char *obj_addr, PyMemberDef *l)
 {
     PyObject *v;
@@ -5182,7 +5557,7 @@ PyObject *PyMember_GetOne(const char *obj_addr, PyMemberDef *l)
     addr = qp_capi_member_addr((PyObject *)obj_addr, l);
     switch (l->type) {
     case Py_T_BOOL: v = PyBool_FromLong(*(char *)addr); break;
-    case Py_T_BYTE: v = PyLong_FromLong(*(char *)addr); break;
+    case Py_T_BYTE: v = PyLong_FromLong(*(qp_capi_abi_char *)addr); break;
     case Py_T_UBYTE: v = PyLong_FromUnsignedLong(*(unsigned char *)addr); break;
     case Py_T_SHORT: v = PyLong_FromLong(*(short *)addr); break;
     case Py_T_USHORT: v = PyLong_FromUnsignedLong(*(unsigned short *)addr); break;
@@ -5279,8 +5654,8 @@ int PyMember_SetOne(char *addr, PyMemberDef *l, PyObject *v)
         long_val = PyLong_AsLong(v);
         if (long_val == -1 && PyErr_Occurred())
             return -1;
-        *(char *)addr = (char)long_val;
-        if (long_val > CHAR_MAX || long_val < CHAR_MIN)
+        *(qp_capi_abi_char *)addr = (qp_capi_abi_char)long_val;
+        if (long_val > QP_CAPI_ABI_CHAR_MAX || long_val < QP_CAPI_ABI_CHAR_MIN)
             QP_CAPI_WARN("Truncation of value to char");
         break;
     case Py_T_UBYTE:
@@ -6194,15 +6569,75 @@ static PyObject *qp_capi_func_borrow_attr(PyObject *op, int role, JSAtom atom, i
 #define QP_CAPI_FUNC_MAX_WATCHERS 8
 static PyFunction_WatchCallback qp_capi_func_watchers[QP_CAPI_FUNC_MAX_WATCHERS];
 
+static_assert(PyFunction_EVENT_CREATE == QP_FUNC_EVENT_CREATE &&
+              PyFunction_EVENT_DESTROY == QP_FUNC_EVENT_DESTROY &&
+              PyFunction_EVENT_MODIFY_CODE == QP_FUNC_EVENT_MODIFY_CODE &&
+              PyFunction_EVENT_MODIFY_DEFAULTS == QP_FUNC_EVENT_MODIFY_DEFAULTS &&
+              PyFunction_EVENT_MODIFY_KWDEFAULTS == QP_FUNC_EVENT_MODIFY_KWDEFAULTS &&
+              PyFunction_EVENT_MODIFY_QUALNAME == QP_FUNC_EVENT_MODIFY_QUALNAME,
+              "function watcher events");
+
+static const char *qp_capi_func_event_name(PyFunction_WatchEvent event)
+{
+    switch (event) {
+#define QP_CAPI_FUNC_EVENT_CASE(op) case PyFunction_EVENT_##op: return "PyFunction_EVENT_" #op;
+    PY_FOREACH_FUNC_EVENT(QP_CAPI_FUNC_EVENT_CASE)
+#undef QP_CAPI_FUNC_EVENT_CASE
+    }
+    return "?";
+}
+
+/* notify_func_watchers.  The events come from the runtime
+   (qp_capi_func_event: def / lambda, FunctionType(), exec of code, the
+   __code__ / __defaults__ / __kwdefaults__ / __qualname__ setters, which
+   the PyFunction_Set* functions use too, and the deallocation through the
+   finalizer queue) and from PyFunction_New*. */
 static void qp_capi_func_notify(PyFunction_WatchEvent event, PyObject *func, PyObject *new_value)
 {
+    JSContext *ctx = qp_capi.ctx;
+    unsigned bits = qp_capi_func_watchers_set;
     int i;
-    for (i = 0; i < QP_CAPI_FUNC_MAX_WATCHERS; i++) {
-        if (qp_capi_func_watchers[i] &&
-            qp_capi_func_watchers[i](event, (PyFunctionObject *)func, new_value) < 0)
-            PyErr_FormatUnraisable("Exception ignored in function watcher callback #%d for %R",
-                                   i, func);
+    for (i = 0; bits; i++, bits >>= 1) {
+        PyFunction_WatchCallback cb;
+        if (!(bits & 1))
+            continue;
+        cb = qp_capi_func_watchers[i];
+        if (cb && cb(event, (PyFunctionObject *)func, new_value) < 0) {
+            JSValue fv = qp_capi_value(ctx, func);
+            QPFuncData *d = JS_IsException(fv) ? NULL : qp_function_data(fv);
+            PyObject *qualname = d ? qp_capi_new_ref(ctx, d->qualname) : NULL;
+            if (qualname)
+                PyErr_FormatUnraisable("Exception ignored in %s watcher callback for "
+                                       "function %U at %p", qp_capi_func_event_name(event),
+                                       qualname, JS_VALUE_GET_PTR(fv));
+            else
+                PyErr_FormatUnraisable("Exception ignored in %s watcher callback",
+                                       qp_capi_func_event_name(event));
+            Py_XDECREF(qualname);
+        }
     }
+}
+
+static void qp_capi_func_event(JSContext *ctx, int event, JSValueConst func,
+                               JSValueConst new_value)
+{
+    PyObject *f, *v = NULL;
+
+    if (!qp_capi_func_watchers_set || qp_capi_dead || !qp_capi.ctx || ctx != qp_capi.ctx ||
+        qp_capi.initialized != 2)
+        return;
+    f = qp_capi_new_ref(ctx, func);
+    if (f && !QP_IS_NULL(new_value) && !JS_IsUndefined(new_value) &&
+        !(v = qp_capi_new_ref(ctx, new_value)))
+        Py_CLEAR(f);
+    if (!f) {
+        PyErr_FormatUnraisable("Exception ignored in %s watcher callback",
+                               qp_capi_func_event_name((PyFunction_WatchEvent)event));
+        return;
+    }
+    qp_capi_func_notify((PyFunction_WatchEvent)event, f, v);
+    Py_XDECREF(v);
+    Py_DECREF(f);
 }
 
 int PyFunction_AddWatcher(PyFunction_WatchCallback callback)
@@ -6211,6 +6646,7 @@ int PyFunction_AddWatcher(PyFunction_WatchCallback callback)
     for (i = 0; i < QP_CAPI_FUNC_MAX_WATCHERS; i++) {
         if (!qp_capi_func_watchers[i]) {
             qp_capi_func_watchers[i] = callback;
+            qp_capi_func_watchers_set |= (uint8_t)(1 << i);
             return i;
         }
     }
@@ -6229,6 +6665,7 @@ int PyFunction_ClearWatcher(int watcher_id)
         return -1;
     }
     qp_capi_func_watchers[watcher_id] = NULL;
+    qp_capi_func_watchers_set &= (uint8_t)~(1 << watcher_id);
     return 0;
 }
 
@@ -6259,18 +6696,31 @@ PyObject *PyFunction_NewWithQualName(PyObject *code, PyObject *globals, PyObject
                         "PyFunction_New: code objects with free variables are not supported");
         return NULL;
     }
-    f = qp_function_new(ctx, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b), gj);
+    if (!b->is_py) {
+        PyErr_BadInternalCall();
+        return NULL;
+    }
+    /* the qualname is set before PyFunction_EVENT_CREATE (no MODIFY event) */
+    f = qp_fo_create_quiet(ctx, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b), QP_NULL, gj, QP_NULL);
     if (JS_IsException(f))
         return NULL;
     if (qualname && qualname != Py_None) {
         JSValue q = qp_capi_value(ctx, qualname);
-        if (JS_IsException(q) || qp_setattr(ctx, f, QP_ATOM(ctx, __qualname__), q) < 0) {
+        QPFuncData *d = qp_function_data(f);
+        if (JS_IsException(q)) {
             JS_FreeValue(ctx, f);
             return NULL;
         }
+        if (!qp_str_check(ctx, q)) {
+            JS_FreeValue(ctx, f);
+            PyErr_SetString(PyExc_TypeError, "__qualname__ must be set to a string object");
+            return NULL;
+        }
+        JS_FreeValue(ctx, d->qualname);
+        d->qualname = JS_DupValue(ctx, q);
     }
     res = qp_capi_steal(ctx, f);
-    if (res)
+    if (res && qp_capi_func_watchers_set)
         qp_capi_func_notify(PyFunction_EVENT_CREATE, res, NULL);
     return res;
 }
@@ -6320,11 +6770,25 @@ PyObject *PyFunction_GetClosure(PyObject *op)
 
 PyObject *PyFunction_GetAnnotations(PyObject *op)
 {
-    return qp_capi_func_borrow_attr(op, QP_CAPI_ROLE_FUNC_ANNOTATIONS,
-                                    QP_ATOM(qp_capi.ctx, __annotations__), 1);
+    /* func_get_annotation_dict: None when there is neither a dict nor a
+       callable __annotate__ (unlike the __annotations__ getter, no empty
+       dict is created) */
+    JSContext *ctx = qp_capi.ctx;
+    QPFuncData *d = qp_capi_func_data(ctx, op, NULL);
+    JSValue a;
+    if (!d)
+        return NULL;
+    a = qp_fo_annotation_dict(ctx, d);
+    if (JS_IsException(a))
+        return NULL;
+    if (JS_IsUndefined(a))
+        return Py_None;
+    return qp_capi_func_borrow(ctx, op, QP_CAPI_ROLE_FUNC_ANNOTATIONS, a, 1);
 }
 
-static int qp_capi_func_set(PyObject *op, JSAtom atom, PyObject *value, PyFunction_WatchEvent ev)
+/* The setter of the attribute reports the MODIFY event, as CPython's
+   PyFunction_Set* and the descriptors do. */
+static int qp_capi_func_set(PyObject *op, JSAtom atom, PyObject *value)
 {
     JSContext *ctx = qp_capi.ctx;
     JSValue fv, v = JS_UNDEFINED;
@@ -6335,7 +6799,6 @@ static int qp_capi_func_set(PyObject *op, JSAtom atom, PyObject *value, PyFuncti
         if (JS_IsException(v))
             return -1;
     }
-    qp_capi_func_notify(ev, op, value);
     return qp_setattr(ctx, fv, atom, v) < 0 ? -1 : 0;
 }
 
@@ -6347,8 +6810,7 @@ int PyFunction_SetDefaults(PyObject *op, PyObject *defaults)
         PyErr_SetString(PyExc_SystemError, "non-tuple default args");
         return -1;
     }
-    return qp_capi_func_set(op, QP_ATOM(qp_capi.ctx, __defaults__), defaults,
-                            PyFunction_EVENT_MODIFY_DEFAULTS);
+    return qp_capi_func_set(op, QP_ATOM(qp_capi.ctx, __defaults__), defaults);
 }
 
 int PyFunction_SetKwDefaults(PyObject *op, PyObject *defaults)
@@ -6359,8 +6821,7 @@ int PyFunction_SetKwDefaults(PyObject *op, PyObject *defaults)
         PyErr_SetString(PyExc_SystemError, "non-dict keyword only default args");
         return -1;
     }
-    return qp_capi_func_set(op, QP_ATOM(qp_capi.ctx, __kwdefaults__), defaults,
-                            PyFunction_EVENT_MODIFY_KWDEFAULTS);
+    return qp_capi_func_set(op, QP_ATOM(qp_capi.ctx, __kwdefaults__), defaults);
 }
 
 int PyFunction_SetAnnotations(PyObject *op, PyObject *annotations)
@@ -6371,17 +6832,15 @@ int PyFunction_SetAnnotations(PyObject *op, PyObject *annotations)
         PyErr_SetString(PyExc_SystemError, "non-dict annotations");
         return -1;
     }
-    return qp_capi_func_set(op, QP_ATOM(qp_capi.ctx, __annotations__), annotations,
-                            PyFunction_EVENT_MODIFY_DEFAULTS);
+    return qp_capi_func_set(op, QP_ATOM(qp_capi.ctx, __annotations__), annotations);
 }
 
-/* Closures of runtime functions are captured variable references; only
-   "no closure" can be (re)stated. */
+/* The cells of the tuple become the function's free variable references
+   (python/funcobject.c qp_fo_set_closure); __closure__ returns the tuple. */
 int PyFunction_SetClosure(PyObject *op, PyObject *closure)
 {
     JSContext *ctx = qp_capi.ctx;
-    JSValue fv;
-    struct JSFunctionBytecode *b;
+    JSValue fv, cv = JS_UNDEFINED;
     if (!qp_capi_func_data(ctx, op, &fv))
         return -1;
     if (closure == Py_None)
@@ -6391,12 +6850,13 @@ int PyFunction_SetClosure(PyObject *op, PyObject *closure)
                      Py_TYPE(closure)->tp_name);
         return -1;
     }
-    b = qp_code_bytecode(fv);
-    if (!closure && b && b->closure_var_count == 0)
-        return 0;
-    PyErr_SetString(PyExc_SystemError,
-                    "PyFunction_SetClosure: the closure of a function cannot be replaced");
-    return -1;
+    if (closure) {
+        cv = qp_capi_value(ctx, closure);
+        if (JS_IsException(cv))
+            return -1;
+    }
+    qp_fo_set_closure(ctx, fv, cv);
+    return 0;
 }
 
 /* The runtime calls functions through their bytecode; a C vectorcall
@@ -6585,7 +7045,7 @@ PyObject *PyStructSequence_GetItem(PyObject *op, Py_ssize_t i)
 }
 
 /* ========================================================================= */
-/* types.GenericAlias, never-instantiated OrderedDict                        */
+/* types.GenericAlias, OrderedDict                                           */
 /* ========================================================================= */
 
 PyObject *Py_GenericAlias(PyObject *origin, PyObject *args)
@@ -6600,30 +7060,56 @@ PyObject *Py_GenericAlias(PyObject *origin, PyObject *args)
     return qp_capi_from_js_result(ctx, qp_generic_alias_new(ctx, o, a));
 }
 
-/* No C OrderedDict: collections.OrderedDict (pure Python) instances; they
-   are not PyODict_Check (capi-design 8, _collections). */
+/* PyODict_Type is the runtime's collections.OrderedDict
+   (python/odictobject.c), also exported by _collections. */
 PyObject *PyODict_New(void)
 {
-    PyObject *mod = PyImport_ImportModule("collections"), *cls, *res;
-    if (!mod)
-        return NULL;
-    cls = PyObject_GetAttrString(mod, "OrderedDict");
-    Py_DECREF(mod);
-    if (!cls)
-        return NULL;
-    res = PyObject_CallNoArgs(cls);
-    Py_DECREF(cls);
-    return res;
+    JSContext *ctx = qp_capi.ctx;
+    return qp_capi_from_js_result(ctx, qp_odict_new(ctx));
+}
+
+/* the JS value of an OrderedDict argument, JS_EXCEPTION otherwise */
+static JSValue qp_capi_odict_value(JSContext *ctx, PyObject *od)
+{
+    JSValue v = qp_capi_value(ctx, od);
+    if (JS_IsException(v))
+        return v;
+    if (!qp_odict_check(ctx, v)) {
+        PyErr_BadInternalCall();
+        return JS_EXCEPTION;
+    }
+    return v;
 }
 
 int PyODict_SetItem(PyObject *od, PyObject *key, PyObject *item)
 {
-    return PyObject_SetItem(od, key, item);
+    JSContext *ctx = qp_capi.ctx;
+    JSValue d, k, v;
+
+    d = qp_capi_odict_value(ctx, od);
+    if (JS_IsException(d))
+        return -1;
+    k = qp_capi_value(ctx, key);
+    if (JS_IsException(k))
+        return -1;
+    v = qp_capi_value(ctx, item);
+    if (JS_IsException(v))
+        return -1;
+    return qp_odict_set_item(ctx, d, k, v);
 }
 
 int PyODict_DelItem(PyObject *od, PyObject *key)
 {
-    return PyObject_DelItem(od, key);
+    JSContext *ctx = qp_capi.ctx;
+    JSValue d, k;
+
+    d = qp_capi_odict_value(ctx, od);
+    if (JS_IsException(d))
+        return -1;
+    k = qp_capi_value(ctx, key);
+    if (JS_IsException(k))
+        return -1;
+    return qp_odict_del_item(ctx, d, k);
 }
 
 /* ========================================================================= */
@@ -6662,10 +7148,11 @@ static int qp_capi_init_types(JSContext *ctx)
     qp_capi.kind_ops[QP_CAPI_K_TYPE] = (QPCapiKindOps){
         .name = "type", .size = qp_capi_type_kind_size, .init = qp_capi_type_kind_init,
         .to_js = qp_capi_type_kind_to_js, .refresh = qp_capi_type_kind_refresh,
-        .traverse = qp_capi_type_kind_traverse, .clear = qp_capi_type_kind_clear };
+        .traverse = qp_capi_type_kind_traverse, .clear = qp_capi_type_kind_clear,
+        .gc_clear = qp_capi_type_kind_gc_clear };
     qp_capi.kind_ops[QP_CAPI_K_NATIVE] = (QPCapiKindOps){
-        .name = "native", .size = qp_capi_native_kind_size, .to_js = qp_capi_native_kind_to_js,
-        .refresh = qp_capi_native_kind_refresh };
+        .name = "native", .size = qp_capi_native_kind_size, .init = qp_capi_native_kind_init,
+        .to_js = qp_capi_native_kind_to_js, .refresh = qp_capi_native_kind_refresh };
     qp_capi.kind_ops[QP_CAPI_K_CFUNCTION] = (QPCapiKindOps){
         .name = "builtin_function_or_method", .size = qp_capi_cfunc_kind_size,
         .init = qp_capi_cfunc_kind_init, .traverse = qp_capi_cfunc_kind_traverse,
@@ -6748,6 +7235,8 @@ static void qp_capi_types_teardown(JSContext *ctx)
     /* the watchers are per interpreter (CPython clears them at finalization) */
     memset(qp_capi_type_watchers, 0, sizeof(qp_capi_type_watchers));
     memset(qp_capi_func_watchers, 0, sizeof(qp_capi_func_watchers));
+    qp_capi_type_watchers_set = 0;
+    qp_capi_func_watchers_set = 0;
 }
 
 /* ==== end of capi_type.c ==== */

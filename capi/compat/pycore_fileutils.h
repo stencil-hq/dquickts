@@ -19,6 +19,8 @@
 
 PyAPI_FUNC(int) _Py_dup(int fd);
 
+PyAPI_FUNC(int) _Py_IsValidFD(int fd);
+
 /* POSIX: the C library's struct stat (python/capi_stable.c implements
    the functions; mmap) */
 #define _Py_stat_struct stat

@@ -36,6 +36,12 @@ make test-snapshot   # builds and runs the suspension and snapshot test hosts
   - [Limitations](#limitations)
 - [TypeScript](#typescript)
 - [Python](#python)
+  - [JS and Python together](#js-and-python-together)
+  - [Embedding Python in C](#embedding-python-in-c)
+  - [C API and extension modules](#c-api-and-extension-modules)
+  - [Runtime features](#runtime-features)
+  - [Known deviations](#known-deviations)
+  - [Testing Python](#testing-python)
 - [Rust bindings](#rust-bindings)
 - [Testing](#testing)
 - [Documentation](#documentation)
@@ -60,6 +66,7 @@ fork adds:
 | Ports from [quickjs-ng](https://github.com/quickjs-ng/quickjs) | `queueMicrotask()`, `atob()`/`btoa()`, `DOMException`, the V8 stack trace API, promise hooks, immutable `ArrayBuffer`s, `performance`, `os.setInterval()`, `std.writeFile()`, the `bjson` module, a re-entrant event loop, C closures, private symbols, runtime dump flags, and bug fixes |
 | Embedder helpers | `JS_IsEqual()`, `JS_NewProxy()`, `JS_GetProxyTarget()`, `JS_PromiseMarkAsHandled()`, and others |
 | A REPL whose functions and variables survive restarts | `qjs --drepl FILE` |
+| Python 3.15 compiled to QuickJS bytecode, sharing the runtime with JS; CPython-compatible C API (abi3 wheels, source builds of numpy and Pillow) | `qpy`, `JS_InitPython()`, `JS_EvalPython()`, `qjs --drepl FILE --python` |
 | Rust bindings built on this engine | [`rquickjs/`](rquickjs/README.md) |
 
 The full list is under `unreleased` in [`Changelog`](Changelog).
@@ -198,7 +205,8 @@ is saved as a delta after each input (about 6 KB for the transcript above). In d
 Limits:
 
 - Objects holding host state cannot be saved: files other than the standard streams, sockets,
-  child processes, threads, `os.scandir()` iterators, `select.poll()` objects. The input still
+  child processes, running threads other than the main thread, `os.scandir()` iterators,
+  `select.poll()` objects, C extension objects that cannot be pickled. The input still
   runs, but `qjs` reports the `TypeError` naming the object and `FILE` keeps the previous state
   (`qjs: FILE not saved: TypeError: snapshot: cannot save Python object 'select.poll': poll
   object on file descriptors`). The next inputs are not saved either, until the object is no
@@ -206,6 +214,11 @@ Limits:
 - A session file only loads into the `qjs` build and the mode that wrote it: `--python` rejects
   a JavaScript session ("not a Python session") and the JavaScript mode rejects a Python session
   ("a Python session (add --python)").
+
+Sessions may import the CPython C modules (`re`, `json`, `decimal`, `datetime`, `asyncio`,
+`csv`, `threading`, `logging`, `subprocess`...) and keep their objects: the snapshot saves their
+C state. Locks no thread holds and finished threads are saved as values, and the main thread's
+`threading` objects are bound to the main thread of the process that restores the session.
 
 ## Snapshots
 
@@ -705,9 +718,28 @@ import { mean } from "./stats.py";      // def mean(xs): return sum(xs) / len(xs
 console.log(mean([1, 2, 3, 4]));         // 2.5
 ```
 
-From C, `JS_InitPython()`, `JS_EvalPython()` (modes `JS_PY_EVAL_EXEC`, `_EVAL`, `_SINGLE`, and
-`JS_PY_EVAL_FLAG_ASYNC` for top-level `await`) and `JS_PythonImport()` in
-[`quickjs.h`](quickjs.h) run Python in any context.
+### Embedding Python in C
+
+The API is in [`quickjs.h`](quickjs.h):
+
+- `JS_InitPython(ctx, cfg)` creates the Python state of a context (`builtins`, `sys`,
+  `importlib`, `__main__`; `site` is not imported). `JSPythonConfig` gives `sys.argv`,
+  `sys.executable`, the home (the stdlib is `<home>/pylib`), `sys.path`, the hash seed, `-O`,
+  `-I` and the recursion limit. It is optional: the first `JS_EvalPython()`,
+  `JS_PythonImport()` or `.py` import initializes Python with the defaults.
+- `JS_EvalPython(ctx, src, len, filename, flags)` runs source in the globals of `__main__`, in
+  mode `JS_PY_EVAL_EXEC`, `JS_PY_EVAL_EVAL` or `JS_PY_EVAL_SINGLE`; with
+  `JS_PY_EVAL_FLAG_ASYNC` top-level `await` is allowed and the result is a promise settled by
+  the job queue. A Python exception is the pending JS exception.
+- `JS_PythonImport(ctx, name)` is `importlib.import_module(name)`.
+- `JS_FreeRuntime()` finalizes Python first, as `Py_FinalizeEx()` does at the exit of `qpy`
+  (`threading._shutdown`, `atexit`, flushed streams, finalized modules), then frees the C
+  extension state, so nothing leaks.
+
+The CPython C modules (built-in or loaded with `dlopen`) are bound to **one runtime of the
+process at a time**: the first context that imports one owns them, other contexts and runtimes
+(in other threads too) get `ImportError` for them until that runtime is freed, and a later
+runtime then binds them again. Pure-Python code has no such limit.
 
 ### C API and extension modules
 
@@ -721,9 +753,52 @@ rquickjs, `libquickjs.a`). The modules that need a system library (`zlib`, `_bz2
 `qpy` and `qjs`; rquickjs has one `python-*` cargo feature per library. Optional libraries are
 found with pkg-config and each can be turned off with a
 `CONFIG_PYTHON_CAPI_NO_*` variable. `make capi-sync` re-vendors the sources and headers from the
-pinned CPython tag. The C API is being integrated; threads (a real GIL) and loading
-third-party abi3 modules with `dlopen` are in progress. Binary compatibility with
-version-specific wheels and the free-threaded ABI are not goals.
+pinned CPython tag.
+
+Third-party extensions load with `dlopen` (the C API symbols are exported by `qpy` and `qjs`):
+
+- **Stable ABI wheels**: `*.abi3.so` and `*.abi3t.so` (and their `-<multiarch>` forms). `qpy`
+  has `venv`, `ensurepip` and `pip`, so `./qpy -m venv env && env/bin/python -m pip install
+  --only-binary=:all: bcrypt` works. `tests/py/abi3/run.sh` installs 13 abi3 wheels from PyPI
+  (bcrypt, cramjam, nh3, psutil, rpds-py, safetensors, charset-normalizer, uuid-utils,
+  css-inline, jsonschema-rs, html-to-markdown, hf-xet, watchfiles) into a `qpy` venv and a
+  CPython venv and compares their smoke tests.
+- **Source builds** against `capi/include`, which may use the full non-limited API. `sysconfig`
+  reports `EXT_SUFFIX` `.quickpy-315-<plat>.so` (`.quickpy-315-darwin.so`,
+  `.quickpy-315-<arch>-linux-gnu.so`), `SOABI` and the include directory, so setuptools and
+  meson-python build for `qpy` unchanged. `tools/build_numpy.sh` and `tools/build_pillow.sh`
+  build numpy and Pillow from their sdists into a `qpy` venv and optionally run their tests.
+- Version-specific CPython binaries (`*.cpython-315-*.so`, `cp315` wheels) raise `ImportError`
+  naming their ABI tag (a pure-Python module of the same name still wins). The free-threaded
+  build is not a goal.
+
+### Runtime features
+
+- **Threads**: `_thread`/`threading` run real OS threads under a GIL (`sys.getswitchinterval()`,
+  blocking calls and `time.sleep()` release it), with `fork()`, signals delivered to the main
+  thread, `_thread.interrupt_main()` and `sys._current_frames()`.
+- **Tracing**: `sys.settrace()`/`sys.setprofile()` (and `threading.settrace_all_threads()`)
+  produce CPython's event streams, so `pdb`, `bdb`, `trace`, `profile` and `cProfile` work.
+- **tracemalloc** traces the runtime's allocations (Python objects, `PyObject_Malloc`,
+  `PyMem_*`, `PyTraceMalloc_Track()` domains) with Python tracebacks; `-X tracemalloc[=N]` and
+  `PYTHONTRACEMALLOC` start it at startup. It costs one test per allocation while it is off.
+- **faulthandler**: CPython's `faulthandler` module dumps the Python tracebacks of the current
+  or all threads on SIGSEGV/SIGFPE/SIGABRT/SIGBUS/SIGILL, on a timeout
+  (`dump_traceback_later()`) or on a user signal (`register()`); `-X faulthandler`,
+  `PYTHONFAULTHANDLER` and `-X dev` enable it at startup, and `Py_FatalError()` dumps the
+  thread tracebacks.
+- **Frozen modules**: `importlib._bootstrap[_external]`, `zipimport`, the startup and `runpy`
+  modules and `__hello__`/`__phello__` are embedded as bytecode written at build time;
+  `-X frozen_modules` and `PYTHON_FROZEN_MODULES` work as in CPython.
+- **Startup snapshot**: `qpy` embeds a heap snapshot of an initialized interpreter (made by
+  `qpy --write-base-snapshot` at build time with the frozen modules) and starts by reading it
+  when the configuration and the stdlib sources match. `qpy -I -c pass` takes about 15 ms, like
+  CPython 3.15 (about 43 ms without the snapshot, e.g. with `-X frozen_modules=off`).
+- **Bytecode cache**: `marshal` serializes code objects as QuickJS bytecode and
+  `sys.implementation.cache_tag` is `quickpy-315`, so imports read and write
+  `__pycache__/*.quickpy-315.pyc` like CPython (`-B`, `PYTHONDONTWRITEBYTECODE`,
+  `PYTHONPYCACHEPREFIX`). Importing `asyncio`, `json` and `email.parser` takes about 90 ms with
+  the cache and about 230 ms compiling the sources (CPython: 50 ms).
 
 ### Known deviations
 
@@ -736,9 +811,12 @@ version-specific wheels and the free-threaded ABI are not goals.
   `sys.builtin_module_names` and have no `__file__`; `pkgutil.iter_modules()` does not list them.
 - Running a script whose source can't be decoded reports the error like `compile()` of the file's
   bytes (whole-file positions), not like CPython's line-by-line file tokenizer.
-- Only one interpreter per process uses the C API.
-- `_thread.start_new_thread()` raises `RuntimeError("can't start new thread")` until thread
-  support lands. `sys.settrace`-based tools (debuggers, coverage) are in progress.
+- The C modules are bound to one runtime at a time (see [Embedding](#embedding-python-in-c));
+  subinterpreters, per-interpreter GILs and the free-threaded ABI are not supported.
+- CPython internals that have no equivalent on this VM differ: inline values and the object
+  layout of `__dict__`, frame `f_locals` writes, the `sys.monitoring` events (none are
+  delivered) and `locale`-aware `int`/`float` formatting.
+- Code objects carry QuickJS bytecode; `.pyc` files are not interchangeable with CPython's.
 
 ### Testing Python
 
@@ -746,8 +824,11 @@ version-specific wheels and the free-threaded ABI are not goals.
 make testpy-bootstrap    # clone CPython at the pinned tag into the test tree
 make testpy              # L0, the L2 stdlib parser check and L3a
 make testpy-l3b          # L3b: stdlib test modules
+make testpy-l3c          # L3c: the rest of Lib/test (threads, signals, import, tools, io)
 make testpy-ast          # L2 on Lib/ and the corpus
+make testpy-replay       # L1: replay recorded sessions in qpy and CPython
 make testpy-golden       # regenerate the L0 .out files with host CPython 3.15
+make bench-py            # micro benchmarks, qpy vs CPython (tests/py/bench)
 ```
 
 The harness, `tests/py/run.py`, runs under a host CPython 3.15 and drives `qpy`. L0 runs small
@@ -755,8 +836,19 @@ golden scripts in `tests/py/golden` and compares their output with files produce
 L1 replays recorded sessions cell by cell in `qpy` and CPython side by side (`make
 testpy-replay`). L2 compares `ast.dump()` from our parser with CPython's on every file of `Lib/`.
 L3 runs CPython's own `Lib/test` modules with `unittest`: L3a is the language core, L3b the
-stdlib. Expected failures are listed in `tests/py/l0_errors.txt` and `tests/py/cpython_errors.txt`.
-See [`doc/python-plan.md`](doc/python-plan.md) for the design.
+stdlib, L3c the remaining modules (`tests/py/cpython.conf` lists the sets). Expected failures are
+listed in `tests/py/l0_errors.txt` and `tests/py/cpython_errors.txt`; a run fails on any other
+failure. Current results: L0 207/211, L2 100% of `Lib/`, L3a 4563/4617, L3b about 9047/9082,
+L3c 14087/14155 tests.
+
+Other suites: `tests/py/{threads,finalize,interop,posix,l1gaps}/run.sh`,
+`tests/py/trace/test_trace.py` (compared with its `.out`),
+`tests/py/abi3/run.sh` (the abi3 wheels, network access needed), `make test-embed` (the
+embedder API and teardown) and `make test-snapshot-capi` (snapshots of C module state).
+`make bench-py` reports a geometric mean of about 1.48x CPython's time over 16 benchmarks and
+startup at about 1.0x. `tools/build_numpy.sh` (with `NUMPY_TESTS=1`) and
+`tools/build_pillow.sh -t` build and test numpy and Pillow. See
+[`doc/python-plan.md`](doc/python-plan.md) for the design and status.
 
 ## Rust bindings
 

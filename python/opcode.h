@@ -309,9 +309,11 @@ PYDEF(end_async_for,             2, 2, 0, none)
    count 0 re-raises the handled exception ("No active exception to
    reraise").  Sets __context__/__cause__/__suppress_context__. */
 PYDEF(raise,                     4, 0, 0, npop)
-/* [exc] -> never continues   RERAISE (no lasti: traceback entries are
-   recorded at the first raise, so the re-raise adds none) */
-PYDEF(reraise,                   2, 1, 0, none)
+/* [exc] -> never continues   RERAISE n (no lasti operand: traceback
+   entries are recorded at the first raise, so the re-raise adds none).
+   n != 0: CPython restores f_lasti to the instruction whose exception
+   entered the handler (JSStackFrame.py_raise_pc is not updated) */
+PYDEF(reraise,                   3, 1, 0, u8)
 /* [exc] -> [prev_exc, exc]   PUSH_EXC_INFO.  A thrown value that is not a
    Python exception (JS error, stack overflow, ...) is converted first
    (qp_exc_normalize).  prev_exc may be None. */

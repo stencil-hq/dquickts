@@ -202,6 +202,7 @@ static JSValue qp_dict_alloc(JSContext *ctx, QPType *t, Py_ssize_t presize, int 
     }
     d->uid = ++QP_STATE(ctx)->next_dict_uid;
     d->hash = -1;
+    d->od = NULL;
     /* the class id is fixed for dict/frozendict: type dicts are built
        before qp_init_dicts readies those types */
     if (t == QP_TYPE(ctx, dict))
@@ -235,6 +236,12 @@ static void qp_dict_finalizer(JSRuntime *rt, JSValue val)
     if (!d)
         return;
     JS_VALUE_GET_OBJ(val)->u.opaque = NULL;
+#ifdef CONFIG_PYTHON_CAPI
+    if (unlikely(d->core.version & QP_DC_WATCHER_MASK))
+        qp_capi_dict_forget(&d->core);
+#endif
+    if (d->od)
+        qp_odict_state_free(rt, d->od);
     qp_dictcore_free(rt, &d->core);
     js_free_rt(rt, d);
 }
@@ -242,8 +249,11 @@ static void qp_dict_finalizer(JSRuntime *rt, JSValue val)
 static void qp_dict_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
 {
     QPDict *d = JS_VALUE_GET_OBJ(val)->u.opaque;
-    if (d)
+    if (d) {
         qp_dictcore_mark(rt, &d->core, mark_func);
+        if (d->od)
+            qp_odict_state_mark(rt, d->od, mark_func);
+    }
 }
 
 static void qp_dictiter_finalizer(JSRuntime *rt, JSValue val)
@@ -628,7 +638,7 @@ static int qp_dict_merge_impl(JSContext *ctx, JSValueConst a, JSValueConst b,
 
     if (qp_anydict_check(ctx, b) && qp_dict_has_dict_iter(ctx, b)) {
         JSValue dk = QP_NULL;
-        int r = qp_dictcore_merge(ctx, &QP_DICT(a)->core, &QP_DICT(b)->core, override,
+        int r = qp_dictcore_merge(ctx, &QP_DICT(a)->core, &QP_DICT(b)->core, b, override,
                                   override == 2 ? &dk : NULL, QP_DICT_EQ);
         if (r == QP_DICT_MERGE_DUP) {
             *dupkey = dk;
@@ -2632,9 +2642,7 @@ static JSValue qp_mappingproxy_repr(JSContext *ctx, JSValueConst self)
 }
 
 /* mappingproxy_richcompare: a mutable exact dict is never handed to the
-   other operand's __eq__; a copy is compared instead (gh-152405).
-   OrderedDict (exempted by CPython) is not a builtin type here: a dict
-   copy compares the same. */
+   other operand's __eq__; a copy is compared instead (gh-152405). */
 static JSValue qp_mappingproxy_richcompare(JSContext *ctx, JSValueConst self, JSValueConst w, int op)
 {
     JSValueConst m = QP_PROXY_MAPPING(self);
@@ -2643,7 +2651,8 @@ static JSValue qp_mappingproxy_richcompare(JSContext *ctx, JSValueConst self, JS
         return qp_not_implemented(ctx);
     if (qp_dict_check_exact(ctx, m) &&
         !(qp_anydict_check_exact(ctx, w) ||
-          (qp_mappingproxy_check(w) && qp_type_of(ctx, w) == QP_TYPE(ctx, mappingproxy)))) {
+          (qp_mappingproxy_check(w) && qp_type_of(ctx, w) == QP_TYPE(ctx, mappingproxy)) ||
+          (qp_dict_check(ctx, w) && qp_type_of(ctx, w) == QP_TYPE(ctx, OrderedDict)))) {
         JSValue copy, res;
         copy = qp_anydict_copy_as(ctx, m, 0);
         if (JS_IsException(copy))
@@ -2732,5 +2741,7 @@ static int qp_init_dicts(JSContext *ctx)
         if (qp_type_ready(ctx, QP_STATE(ctx)->types[types[i].id], types[i].spec) < 0)
             return -1;
     }
-    return qp_init_sets(ctx);
+    if (qp_init_sets(ctx) < 0)
+        return -1;
+    return qp_init_odicts(ctx);
 }

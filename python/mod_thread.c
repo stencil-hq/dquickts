@@ -247,7 +247,15 @@ static int qp_thread_acquire_args(JSContext *ctx, const char *fname, JSValueCons
 }
 
 /* ======================= _ThreadHandle ================================== */
-/* slots: 0 ident (int), 1 state (JS int) */
+/* slots: 0 ident (int), 1 state (JS int), 2 qp_thread_fork_gen when made
+   by _make_thread_handle() (a thread that this module did not start: the
+   main thread, a _DummyThread), else unset */
+
+/* number of os.fork() calls between the start of the process and the
+   current process, and the thread that called the last one: the only
+   thread of the process then (qp_thread_after_fork_child) */
+static uint32_t qp_thread_fork_gen;
+static uint64_t qp_thread_fork_ident;
 
 static JSValue qp_thread_handle_alloc(JSContext *ctx, QPType *t)
 {
@@ -286,7 +294,24 @@ static JSValue qp_thread_handle_get_ident(JSContext *ctx, JSValueConst self, int
 
 static BOOL qp_thread_handle_is_exiting(JSContext *ctx, JSValueConst self)
 {
-    return qp_thread_slot_int(self, 1) == QP_TH_DONE;
+    JSValue gen;
+    int state = qp_thread_slot_int(self, 1);
+    if (state != QP_TH_RUNNING)
+        return state == QP_TH_DONE;
+    /* _PyThread_AfterFork: in the child of a fork, the handles of the
+       threads but the forking one are done.  The handles of the threads
+       started here are marked by qp_thread_after_fork_child(); the made
+       ones are recognized here: made before the last fork, for another
+       thread than the forking one. */
+    if (((QPInstance *)JS_VALUE_GET_OBJ(self)->u.opaque)->nslots < 3)
+        return FALSE;       /* restored from a snapshot of an older build */
+    gen = qp_instance_slots(self)[2];
+    if (JS_VALUE_GET_TAG(gen) != JS_TAG_INT ||
+        (uint32_t)JS_VALUE_GET_INT(gen) >= qp_thread_fork_gen ||
+        qp_thread_slot_u64(ctx, self, 0) == qp_thread_fork_ident)
+        return FALSE;
+    qp_thread_set_slot(ctx, self, 1, JS_NewInt32(ctx, QP_TH_DONE));
+    return TRUE;
 }
 
 static int qp_thread_handle_check_started(JSContext *ctx, JSValueConst self)
@@ -374,7 +399,7 @@ static const QPTypeSpec qp_thread_handle_spec = {
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_OBJECT,
-    .nslots = 2,
+    .nslots = 3,
     .slots = {
         .tp_repr = qp_thread_handle_repr,
         .tp_new = qp_thread_handle_new,
@@ -963,7 +988,7 @@ static void qp_thread_local_release(JSContext *ctx, QPThreadState *ts)
         slots = qp_instance_slots(obj);
         if (slots && !QP_IS_NULL(slots[QP_LOCAL_DICTS])) {
             if (qp_dict_del_item(ctx, slots[QP_LOCAL_DICTS], key) < 0)
-                JS_FreeValue(ctx, qp_exc_fetch(ctx));
+                qp_format_unraisable(ctx, "Exception ignored while clearing thread local %R", obj);
             slots = qp_instance_slots(obj);
             if (!QP_IS_NULL(slots[QP_LOCAL_OWNER]) &&
                 qp_thread_slot_u64(ctx, obj, QP_LOCAL_OWNER) == ts->serial) {
@@ -1300,10 +1325,16 @@ static int qp_thread_start(JSContext *ctx, JSValueConst func, JSValueConst args,
     uintptr_t js_stack;
     int rc;
 
-    thr = qp_threads_get(ctx);
-    if (!thr)
-        return -1;
-    if (thr->finalizing) {
+    /* interp->finalizing: qp_threads_finalize() marks the threads, the
+       finalization of the modules the state (when no thread was started
+       before, there are no QPThreads to mark) */
+    thr = NULL;
+    if (!QP_STATE(ctx)->finalizing) {
+        thr = qp_threads_get(ctx);
+        if (!thr)
+            return -1;
+    }
+    if (!thr || thr->finalizing) {
         qp_raise(ctx, QP_EXC(ctx, PythonFinalizationError),
                  "can't create new thread at interpreter shutdown");
         return -1;
@@ -1381,6 +1412,9 @@ static void qp_thread_after_fork_child(JSContext *ctx)
     struct list_head *el, *el1;
     int i;
 
+    /* the handles of _make_thread_handle(), see qp_thread_handle_is_exiting */
+    qp_thread_fork_gen++;
+    qp_thread_fork_ident = qp_thread_ident();
     if (!thr || thr->ctx != ctx) {
         if (qp_tstate_capi_hook)
             qp_tstate_capi_hook(NULL, QP_TSTATE_FORK_CHILD);
@@ -1810,6 +1844,7 @@ static JSValue qp_thread_make_thread_handle(JSContext *ctx, JSValueConst self, J
     }
     qp_thread_set_slot(ctx, h, 0, idv);
     qp_thread_set_slot(ctx, h, 1, JS_NewInt32(ctx, QP_TH_RUNNING));
+    qp_thread_set_slot(ctx, h, 2, JS_NewInt32(ctx, (int32_t)qp_thread_fork_gen));
     return h;
 }
 

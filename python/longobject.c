@@ -937,6 +937,12 @@ static int qp_long_sign(JSValueConst v)
     return QP_IS_NULL(u) ? 0 : qp_li_sign(u);
 }
 
+static uint64_t qp_long_numbits(JSValueConst v)
+{
+    JSValueConst u = qp_long_unwrap(v);
+    return QP_IS_NULL(u) ? 0 : qp_li_numbits(u);
+}
+
 static int qp_long_compare(JSValueConst a, JSValueConst b)
 {
     return qp_li_cmp(qp_long_unwrap(a), qp_long_unwrap(b));

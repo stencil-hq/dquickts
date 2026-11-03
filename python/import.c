@@ -20,11 +20,15 @@
  *    ModuleNotFoundError "No module named %R" for anything else (file-system
  *    imports are M3).
  *
- * Lazy imports: sys.lazy_modules bookkeeping, pending-submodule
- * registration on parent packages and sys.set_lazy_imports_filter are
- * package/file-system features that come with importlib (M3); the
- * lazy_import objects, their resolution, reification in namespaces,
- * `lazy from` projections, cycle detection and error causes are complete.
+ * Lazy imports: the pending-submodule registration on parent packages
+ * (register_lazy_on_parent, _PyImport_TryLoadLazySubmodule: a lazily
+ * imported submodule becomes reachable as an attribute of its parent) is
+ * not implemented; the lazy_import objects, their resolution, reification
+ * in namespaces, `lazy from` projections, cycle detection, error causes,
+ * sys.lazy_modules (QPState.lazy_modules) and the
+ * sys.set_lazy_imports_filter filter (QPState.lazy_imports_filter, applied
+ * by qp_lazy_import_module_level like _PyImport_LazyImportModuleLevelObject)
+ * are complete.
  */
 
 /* ---- small helpers ---------------------------------------------------- */
@@ -53,7 +57,9 @@ static int qp_import_mapping_get(JSContext *ctx, JSValueConst mapping, JSAtom na
     return 1;
 }
 
-/* UTF-8 text of a str or str subclass instance (free with JS_FreeCString). */
+/* UTF-8 text of a str or str subclass instance (free with JS_FreeCString).
+   Lone surrogates (module names are any str, e.g. 'mod\ud800') are kept
+   as their 3-byte sequences; qp_import_str() reads them back. */
 static const char *qp_import_utf8(JSContext *ctx, JSValueConst s, size_t *plen)
 {
     JSValue v = qp_str_value(ctx, s);
@@ -61,9 +67,36 @@ static const char *qp_import_utf8(JSContext *ctx, JSValueConst s, size_t *plen)
 
     if (JS_IsException(v))
         return NULL;
-    p = qp_str_utf8(ctx, v, plen);
+    p = JS_ToCStringLen(ctx, plen, v);
     JS_FreeValue(ctx, v);
     return p;
+}
+
+/* str of a slice of qp_import_utf8() text. */
+static JSValue qp_import_str(JSContext *ctx, const char *s, size_t len)
+{
+    return JS_NewStringLen(ctx, s, len);
+}
+
+/* Code-point index of the first '.' of str s (-1 if none, -2 with an
+   exception); *plen gets the length in code points. */
+static ssize_t qp_import_str_find_dot(JSContext *ctx, JSValueConst s, size_t *plen)
+{
+    qp_strview v;
+    Py_ssize_t i;
+    ssize_t r = -1;
+
+    if (qp_str_view_acquire(ctx, s, &v) < 0)
+        return -2;
+    for (i = 0; i < v.len; i++) {
+        if (QP_SL_READ(v.kind, v.data, i) == '.') {
+            r = i;
+            break;
+        }
+    }
+    *plen = v.len;
+    qp_str_view_release(ctx, &v);
+    return r;
 }
 
 /* Index of the first (dir > 0) or last (dir < 0) '.' in s[0..end), -1 if
@@ -238,7 +271,7 @@ static JSValue qp_import_resolve_name(JSContext *ctx, JSValueConst name, JSValue
             dot = qp_import_find_dot(pkg, pkg_len, -1);
             if (dot < 0)
                 goto no_parent_error;
-            parent = qp_str_from_utf8(ctx, pkg, dot);
+            parent = qp_import_str(ctx, pkg, dot);
             JS_FreeCString(ctx, pkg);
             pkg = NULL;
             if (JS_IsException(parent))
@@ -262,7 +295,7 @@ static JSValue qp_import_resolve_name(JSContext *ctx, JSValueConst name, JSValue
             goto error;
         }
     }
-    base = qp_str_from_utf8(ctx, pkg, last_dot);
+    base = qp_import_str(ctx, pkg, last_dot);
     if (JS_IsException(base) || qp_str_len(ctx, name) == 0)
         goto done;
     res = qp_str_from_format(ctx, "%U.%U", base, name);
@@ -338,8 +371,8 @@ static JSValue qp_import_find_and_load_unlocked(JSContext *ctx, JSValueConst nam
         return JS_EXCEPTION;
     dot = qp_import_find_dot(s, len, -1);
     if (dot >= 0) {
-        parent = qp_str_from_utf8(ctx, s, dot);
-        child = qp_str_from_utf8(ctx, s + dot + 1, len - dot - 1);
+        parent = qp_import_str(ctx, s, dot);
+        child = qp_import_str(ctx, s + dot + 1, len - dot - 1);
         if (JS_IsException(parent) || JS_IsException(child))
             goto done;
         rc = qp_import_get_module(ctx, parent, &parent_module);
@@ -793,13 +826,40 @@ static void qp_import_remove_importlib_frames(JSContext *ctx)
     JS_Throw(ctx, exc);
 }
 
+/* import_ensure_initialized: a module another thread is still executing
+   (__spec__._initializing) is waited for through
+   importlib._bootstrap._lock_unlock_module(name).  0 or -1. */
+static int qp_import_ensure_initialized(JSContext *ctx, JSValueConst mod, JSValueConst name)
+{
+    JSValue spec, v;
+    int rc;
+
+    rc = qp_getattr_opt(ctx, mod, QP_ATOM(ctx, __spec__), &spec);
+    if (rc > 0) {
+        rc = qp_module_spec_is_initializing(ctx, spec);
+        JS_FreeValue(ctx, spec);
+    }
+    if (rc < 0)
+        return -1;
+    if (rc > 0 && JS_IsObject(QP_STATE(ctx)->importlib)) {
+        v = qp_call_method(ctx, QP_STATE(ctx)->importlib, QP_ATOM(ctx, _lock_unlock_module),
+                           &name, 1, QP_NULL);
+        if (JS_IsException(v))
+            return -1;
+        JS_FreeValue(ctx, v);
+    }
+    /* -X importtime=2 reports the modules already loaded */
+    if (QP_STATE(ctx)->config.import_time == 2)
+        qp_import_time_cached(ctx, name);
+    return 0;
+}
+
 /* PyImport_ImportModuleLevelObject (builtins.__import__ core).  globals,
    locals and fromlist may be QP_NULL. */
 static JSValue qp_import_module_level(JSContext *ctx, JSValueConst name, JSValueConst globals,
                                       JSValueConst locals, JSValueConst fromlist, int level)
 {
     JSValue abs_name = JS_EXCEPTION, mod = QP_NULL, final_mod = JS_EXCEPTION, front, to_return, path;
-    const char *s = NULL, *abs_s = NULL;
     size_t len, abs_len;
     ssize_t dot;
     int has_from, rc;
@@ -818,17 +878,14 @@ static JSValue qp_import_module_level(JSContext *ctx, JSValueConst name, JSValue
     if (rc < 0)
         goto error;
     if (rc == 0 || JS_IsUndefined(mod) || JS_IsNull(mod)) {
-        /* (import_ensure_initialized needs module locks only with threads) */
         JS_FreeValue(ctx, mod);
         mod = qp_import_find_and_load(ctx, abs_name);
         if (JS_IsException(mod)) {
             mod = QP_NULL;
             goto error;
         }
-    } else if (QP_STATE(ctx)->config.import_time == 2) {
-        /* import_ensure_initialized: -X importtime=2 reports the modules
-           already loaded */
-        qp_import_time_cached(ctx, abs_name);
+    } else if (qp_import_ensure_initialized(ctx, mod, abs_name) < 0) {
+        goto error;
     }
 
     has_from = 0;
@@ -838,27 +895,28 @@ static JSValue qp_import_module_level(JSContext *ctx, JSValueConst name, JSValue
             goto error;
     }
     if (!has_from) {
-        s = qp_import_utf8(ctx, name, &len);
-        if (!s)
+        /* code points, as PyUnicode_FindChar: a module name need not be
+           encodable (sys.modules['x\udbff']) */
+        dot = qp_import_str_find_dot(ctx, name, &len);
+        if (dot == -2)
             goto error;
         if (level == 0 || len > 0) {
-            dot = qp_import_find_dot(s, len, 1);
             if (dot < 0) {
                 final_mod = JS_DupValue(ctx, mod);
                 goto error;
             }
             if (level == 0) {
-                front = qp_str_from_utf8(ctx, s, dot);
+                front = qp_str_substring(ctx, name, 0, dot);
                 if (JS_IsException(front))
                     goto error;
                 final_mod = qp_import_module_level(ctx, front, QP_NULL, QP_NULL, QP_NULL, 0);
                 JS_FreeValue(ctx, front);
             } else {
                 size_t cut_off = len - dot;
-                abs_s = qp_import_utf8(ctx, abs_name, &abs_len);
-                if (!abs_s)
+                abs_len = qp_str_len(ctx, abs_name);
+                if ((Py_ssize_t)abs_len < 0)
                     goto error;
-                to_return = qp_str_from_utf8(ctx, abs_s, abs_len - cut_off);
+                to_return = qp_str_substring(ctx, abs_name, 0, abs_len - cut_off);
                 if (JS_IsException(to_return))
                     goto error;
                 rc = qp_import_get_module(ctx, to_return, &final_mod);
@@ -893,10 +951,6 @@ static JSValue qp_import_module_level(JSContext *ctx, JSValueConst name, JSValue
         }
     }
  error:
-    if (s)
-        JS_FreeCString(ctx, s);
-    if (abs_s)
-        JS_FreeCString(ctx, abs_s);
     JS_FreeValue(ctx, abs_name);
     JS_FreeValue(ctx, mod);
     if (JS_IsException(final_mod))
@@ -906,14 +960,12 @@ static JSValue qp_import_module_level(JSContext *ctx, JSValueConst name, JSValue
 
 /* PyImport_Import (and PyImport_ImportModule): __import__ of the current
    builtins with fromlist ['__doc__'], then sys.modules[name]. */
-static JSValue qp_import_module(JSContext *ctx, const char *name)
+static JSValue qp_import_module_obj(JSContext *ctx, JSValueConst name_str)
 {
-    JSValue name_str, import_func, from_list, doc, globals, r, args[5];
+    JSValue import_func, from_list, doc, globals, r;
+    JSValueConst args[5];
     int rc;
 
-    name_str = qp_str_from_cstr(ctx, name);
-    if (JS_IsException(name_str))
-        return name_str;
     globals = qp_frame_globals(qp_py_frame_at(ctx, 0));
     rc = qp_import_mapping_get(ctx, qp_import_current_builtins(ctx), QP_ATOM(ctx, __import__),
                                &import_func);
@@ -925,7 +977,6 @@ static JSValue qp_import_module(JSContext *ctx, const char *name)
                 JS_FreeValue(ctx, key);
             }
         }
-        JS_FreeValue(ctx, name_str);
         return JS_EXCEPTION;
     }
     from_list = qp_list_new(ctx, 0);
@@ -935,7 +986,6 @@ static JSValue qp_import_module(JSContext *ctx, const char *name)
         JS_FreeValue(ctx, from_list);
         JS_FreeValue(ctx, doc);
         JS_FreeValue(ctx, import_func);
-        JS_FreeValue(ctx, name_str);
         return JS_EXCEPTION;
     }
     JS_FreeValue(ctx, doc);
@@ -949,22 +999,128 @@ static JSValue qp_import_module(JSContext *ctx, const char *name)
         r = qp_import_module_level(ctx, name_str, QP_IS_NULL(globals) ? QP_NULL : globals,
                                    QP_NULL, from_list, 0);
     else
-        r = qp_vectorcall(ctx, import_func, (JSValueConst *)args, 5, QP_NULL);
+        r = qp_vectorcall(ctx, import_func, args, 5, QP_NULL);
     JS_FreeValue(ctx, from_list);
     JS_FreeValue(ctx, import_func);
-    if (JS_IsException(r)) {
-        JS_FreeValue(ctx, name_str);
+    if (JS_IsException(r))
         return r;
-    }
     JS_FreeValue(ctx, r);
     rc = qp_import_get_module(ctx, name_str, &r);
     if (rc == 0)
         qp_raise_key_error(ctx, name_str);
-    JS_FreeValue(ctx, name_str);
     return rc > 0 ? r : JS_EXCEPTION;
 }
 
+static JSValue qp_import_module(JSContext *ctx, const char *name)
+{
+    JSValue name_str = qp_str_from_cstr(ctx, name), r;
+
+    if (JS_IsException(name_str))
+        return name_str;
+    r = qp_import_module_obj(ctx, name_str);
+    JS_FreeValue(ctx, name_str);
+    return r;
+}
+
 /* ---- lazy imports (PEP 810) ------------------------------------------- */
+/* _PyImport_DiscardLazyModule: name leaves sys.lazy_modules.  0 or -1. */
+static int qp_import_discard_lazy_module(JSContext *ctx, JSValueConst name)
+{
+    JSValueConst lazy_modules = QP_STATE(ctx)->lazy_modules;
+
+    if (JS_IsUndefined(lazy_modules))
+        return 0;
+    return qp_set_discard(ctx, lazy_modules, name) < 0 ? -1 : 0;
+}
+
+/* _PyObject_TryGetInstanceAttribute: name in the attribute storage of obj
+   without descriptors or callbacks.  FALSE when obj has no such storage
+   or its __dict__ is materialized (CPython: no valid inline values);
+   otherwise TRUE with *pres a new reference, or QP_NULL when missing. */
+static BOOL qp_import_try_get_instance_attr(JSContext *ctx, JSValueConst obj, JSAtom name,
+                                            JSValue *pres)
+{
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    JSObject *p;
+
+    *pres = QP_NULL;
+    if (!qp_obj_has_storage(ctx, qp_type_of(ctx, obj), obj))
+        return FALSE;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (qp_obj_dict_mode(p))
+        return FALSE;
+    prs = find_own_property(&pr, p, name);
+    if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL)
+        *pres = JS_DupValue(ctx, pr->u.value);
+    return TRUE;
+}
+
+/* lazy_modules_add: add name to sys.lazy_modules unless it is imported and
+   fully initialized.  pexisting (when not NULL) receives sys.modules[name]
+   (new reference) or QP_NULL.  0 or -1. */
+static int qp_import_lazy_modules_add(JSContext *ctx, JSValueConst name, JSValue *pexisting)
+{
+    JSValue mod, spec, initializing;
+    JSValueConst d;
+    int rc, loaded;
+
+    if (qp_import_get_module(ctx, name, &mod) < 0)
+        return -1;
+    loaded = !QP_IS_NULL(mod) && !JS_IsUndefined(mod);
+    if (loaded && qp_module_check(ctx, mod) && !QP_IS_NULL(d = qp_module_get_dict(mod))) {
+        rc = qp_dict_get_item_atom(ctx, d, QP_ATOM(ctx, __spec__), &spec);
+        if (rc < 0) {
+            JS_FreeValue(ctx, mod);
+            return -1;
+        }
+        loaded = rc == 0 || JS_IsUndefined(spec);
+        /* read the usual flag without callbacks; other spec
+           representations stay conservatively tracked */
+        if (!loaded && qp_import_try_get_instance_attr(ctx, spec, QP_ATOM(ctx, _initializing),
+                                                       &initializing)) {
+            loaded = QP_IS_NULL(initializing) ||
+                (JS_VALUE_GET_TAG(initializing) == JS_TAG_BOOL && !JS_VALUE_GET_BOOL(initializing));
+            JS_FreeValue(ctx, initializing);
+        }
+        if (rc > 0)
+            JS_FreeValue(ctx, spec);
+    }
+    if (pexisting)
+        *pexisting = mod;
+    else
+        JS_FreeValue(ctx, mod);
+    if (loaded || JS_IsUndefined(QP_STATE(ctx)->lazy_modules))
+        return 0;
+    return qp_set_add(ctx, QP_STATE(ctx)->lazy_modules, name);
+}
+
+/* register_from_lazy_on_parent: `lazy from abs_name import from` tracks
+   abs_name.from in sys.lazy_modules unless the imported module already
+   has the attribute (IMPORT_FROM returns it directly).  The pending
+   submodule declaration on the parent (register_lazy_on_parent) is not
+   recorded.  0 or -1. */
+static int qp_import_register_from_lazy(JSContext *ctx, JSValueConst existing_module,
+                                        JSValueConst abs_name, JSValueConst from)
+{
+    JSValue fromname;
+    JSValueConst d;
+    int rc;
+
+    if (!QP_IS_NULL(existing_module) && qp_module_check(ctx, existing_module) &&
+        !QP_IS_NULL(d = qp_module_get_dict(existing_module))) {
+        rc = qp_dict_contains(ctx, d, from);
+        if (rc != 0)
+            return rc < 0 ? -1 : 0;
+    }
+    fromname = qp_str_from_format(ctx, "%U.%U", abs_name, from);
+    if (JS_IsException(fromname))
+        return -1;
+    rc = qp_import_lazy_modules_add(ctx, fromname, NULL);
+    JS_FreeValue(ctx, fromname);
+    return rc;
+}
+
 
 /* lazy_import instances are PY_OBJECT objects with these QPInstance slots */
 enum {
@@ -1073,6 +1229,9 @@ static JSValue qp_lazy_import_path(JSContext *ctx, JSValueConst v)
     ssize_t dot;
 
     if (qp_lazy_import_check(sl[QP_LZ_FROM])) {
+        if (js_check_stack_overflow(ctx->rt, 0))
+            return qp_raise(ctx, QP_EXC(ctx, RecursionError),
+                            "maximum recursion depth exceeded while getting the name of a lazy import");
         base = qp_lazy_import_path(ctx, sl[QP_LZ_FROM]);
         if (JS_IsException(base))
             return base;
@@ -1088,7 +1247,7 @@ static JSValue qp_lazy_import_path(JSContext *ctx, JSValueConst v)
     if (!s)
         return JS_EXCEPTION;
     dot = qp_import_find_dot(s, len, 1);
-    res = dot < 0 ? JS_DupValue(ctx, sl[QP_LZ_FROM]) : qp_str_from_utf8(ctx, s, dot);
+    res = dot < 0 ? JS_DupValue(ctx, sl[QP_LZ_FROM]) : qp_import_str(ctx, s, dot);
     JS_FreeCString(ctx, s);
     return res;
 }
@@ -1160,6 +1319,9 @@ static JSValue qp_lazy_import_replay_from(JSContext *ctx, JSValueConst mod, JSVa
 
     if (!qp_lazy_import_check(sl[QP_LZ_FROM]))
         return JS_DupValue(ctx, mod);
+    if (js_check_stack_overflow(ctx->rt, 0))
+        return qp_raise(ctx, QP_EXC(ctx, RecursionError),
+                        "maximum recursion depth exceeded while resolving a lazy import");
     from = qp_lazy_import_replay_from(ctx, mod, sl[QP_LZ_FROM]);
     if (JS_IsException(from))
         return from;
@@ -1266,6 +1428,9 @@ static JSValue qp_lazy_import_load(JSContext *ctx, JSValueConst lazy_import)
         return qp_import_raise_error(ctx, QP_EXC(ctx, ImportCycleError), errmsg,
                                      rsl[QP_LZ_FROM], QP_NULL, QP_NULL);
     }
+    if (js_check_stack_overflow(ctx->rt, 0))
+        return qp_raise(ctx, QP_EXC(ctx, RecursionError),
+                        "maximum recursion depth exceeded while resolving a lazy import");
     qp_lz_set_state(lazy_import, QP_LZ_RESOLVING, 1);
 
     /* `from a import b, c`: import only the name being resolved; keep an
@@ -1299,8 +1464,16 @@ static JSValue qp_lazy_import_load(JSContext *ctx, JSValueConst lazy_import)
         JS_FreeValue(ctx, from);
     }
  done:
-    if (JS_IsException(obj))
+    if (JS_IsException(obj)) {
         qp_lazy_import_add_exception_cause(ctx, lazy_import);
+    } else {
+        name = qp_lazy_import_path(ctx, lazy_import);
+        if (JS_IsException(name) || qp_import_discard_lazy_module(ctx, name) < 0) {
+            JS_FreeValue(ctx, obj);
+            obj = JS_EXCEPTION;
+        }
+        JS_FreeValue(ctx, name);
+    }
     qp_lz_set_state(lazy_import, QP_LZ_RESOLVING, 0);
     JS_FreeValue(ctx, fromlist);
     JS_FreeValue(ctx, import_func);
@@ -1425,7 +1598,7 @@ static JSValue qp_lazy_import_module_level(JSContext *ctx, JSValueConst name, JS
                                            JSValueConst globals, JSValueConst locals,
                                            JSValueConst fromlist, int level)
 {
-    JSValue abs_name, res = JS_EXCEPTION, fl, item;
+    JSValue abs_name, res = JS_EXCEPTION, fl, item, filter, existing = QP_NULL;
     Py_ssize_t i;
 
     if (QP_IS_NULL(name) || !qp_str_check(ctx, name))
@@ -1447,6 +1620,41 @@ static JSValue qp_lazy_import_module_level(JSContext *ctx, JSValueConst name, JS
         fl = JS_DupValue(ctx, QP_IS_NULL(fromlist) ? JS_UNDEFINED : fromlist);
     if (JS_IsException(fl))
         goto done;
+    /* the filter disables the lazy import when it returns a false value */
+    filter = QP_STATE(ctx)->lazy_imports_filter;
+    if (!JS_IsUndefined(filter)) {
+        JSValue modname, decision;
+        JSValueConst fargs[3];
+        int rc;
+
+        if (!qp_anydict_check(ctx, globals)) {
+            qp_raise_system_error(ctx, "bad argument to internal function");
+            goto done;
+        }
+        filter = JS_DupValue(ctx, filter);  /* the filter may replace itself */
+        rc = qp_dict_get_item_atom(ctx, globals, QP_ATOM(ctx, __name__), &modname);
+        if (rc < 0) {
+            JS_FreeValue(ctx, filter);
+            goto done;
+        }
+        fargs[0] = rc > 0 ? modname : JS_UNDEFINED;
+        fargs[1] = abs_name;
+        fargs[2] = fl;
+        decision = qp_vectorcall(ctx, filter, fargs, 3, QP_NULL);
+        if (rc > 0)
+            JS_FreeValue(ctx, modname);
+        JS_FreeValue(ctx, filter);
+        if (JS_IsException(decision))
+            goto done;
+        rc = qp_bool(ctx, decision);
+        JS_FreeValue(ctx, decision);
+        if (rc < 0)
+            goto done;
+        if (!rc) {
+            res = qp_import_module_level(ctx, name, globals, locals, fl, level);
+            goto done;
+        }
+    }
     /* validate the entire fromlist before creating the placeholder */
     if (qp_tuple_check(ctx, fl)) {
         for (i = 0; i < QP_TUPLE_SIZE(fl); i++) {
@@ -1461,7 +1669,22 @@ static JSValue qp_lazy_import_module_level(JSContext *ctx, JSValueConst name, JS
     }
     res = qp_lazy_import_new(ctx, QP_IS_NULL(builtins) ? qp_import_current_builtins(ctx) : builtins,
                              abs_name, fl);
+    if (JS_IsException(res))
+        goto done;
+    if (qp_import_lazy_modules_add(ctx, abs_name, &existing) < 0)
+        goto error;
+    if (qp_tuple_check(ctx, fl)) {
+        for (i = 0; i < QP_TUPLE_SIZE(fl); i++) {
+            if (qp_import_register_from_lazy(ctx, existing, abs_name, QP_TUPLE_ITEMS(fl)[i]) < 0)
+                goto error;
+        }
+    }
+    goto done;
+ error:
+    JS_FreeValue(ctx, res);
+    res = JS_EXCEPTION;
  done:
+    JS_FreeValue(ctx, existing);
     JS_FreeValue(ctx, fl);
     JS_FreeValue(ctx, abs_name);
     return res;

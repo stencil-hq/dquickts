@@ -3,16 +3,12 @@
  * importlib._bootstrap and importlib._bootstrap_external.
  *
  * Derived from CPython 3.15 Python/import.c (the `_imp` functions,
- * is_builtin, create_builtin, exec_builtin_or_dynamic, set_frozen_error,
- * update_compiled_module) and Python/clinic/import.c.h (PSF-2.0).
+ * is_builtin, create_builtin, exec_builtin_or_dynamic, update_compiled_module)
+ * and Python/clinic/import.c.h (PSF-2.0).  The frozen modules are
+ * python/frozen.c.
  *
  * Differences that follow from this interpreter's configuration, each
  * behaving exactly like CPython built the same way:
- *  - No frozen modules exist (the importlib bootstrap modules are compiled
- *    from pylib at startup, see importlib_boot.c): is_frozen() is False,
- *    find_frozen() is None, init_frozen() is None, _frozen_module_names()
- *    is [], and get_frozen_object() / is_frozen_package() raise CPython's
- *    ImportError "No such frozen object named %R".
  *  - Dynamic loading exists only with the C API (CONFIG_PYTHON_CAPI,
  *    python/capi_dynload.c) and only for the stable ABI: create_dynamic /
  *    exec_dynamic load `*.abi3.so` / `*.abi3t.so`, which are all that
@@ -47,28 +43,6 @@ static int qp_imp_check_str(JSContext *ctx, const char *fname, const char *argna
     qp_raise_type_error(ctx, "%s() %s must be str, not %T", fname, argname, v);
     return -1;
 }
-
-/* set_frozen_error: ImportError(fmt % name, name=name). */
-static JSValue qp_imp_frozen_error(JSContext *ctx, const char *fmt, JSValueConst name)
-{
-    JSValue msg, exc;
-
-    msg = qp_str_from_format(ctx, fmt, name);
-    if (JS_IsException(msg))
-        return msg;
-    exc = qp_exc_new(ctx, QP_EXC(ctx, ImportError), 1, (JSValueConst *)&msg);
-    JS_FreeValue(ctx, msg);
-    if (JS_IsException(exc))
-        return exc;
-    if (qp_setattr(ctx, exc, QP_ATOM(ctx, name), name) < 0) {
-        JS_FreeValue(ctx, exc);
-        return JS_EXCEPTION;
-    }
-    return qp_raise_object(ctx, exc);
-}
-
-#define QP_IMP_FROZEN_NOT_FOUND "No such frozen object named %R"
-#define QP_IMP_FROZEN_INVALID   "Frozen object named %R is invalid"
 
 /* is_builtin(): 1 for an inittab module, -1 for the core modules that
    cannot be re-initialized (CPython's NULL initfunc entries "sys" and
@@ -258,13 +232,20 @@ static JSValue qp_imp_extension_suffixes(JSContext *ctx, JSValueConst self, JSVa
 #endif
 }
 
-/* init_frozen(name, /): PyImport_ImportFrozenModuleObject finds nothing. */
+/* init_frozen(name, /) */
 static JSValue qp_imp_init_frozen(JSContext *ctx, JSValueConst self, JSValueConst *args,
                                   int nargs, JSValueConst kwnames, int magic)
 {
+    int ret;
+
     if (qp_imp_check_str(ctx, "init_frozen", "argument", args[0]) < 0)
         return JS_EXCEPTION;
-    return JS_UNDEFINED;
+    ret = qp_import_frozen_module(ctx, args[0]);
+    if (ret < 0)
+        return JS_EXCEPTION;
+    if (ret == 0)
+        return JS_UNDEFINED;
+    return qp_frozen_add_module(ctx, args[0]);
 }
 
 /* find_frozen(name, /, *, withdata=False) */
@@ -274,7 +255,10 @@ static JSValue qp_imp_find_frozen(JSContext *ctx, JSValueConst self, JSValueCons
     static const char *const kwlist[] = { "", "withdata", NULL };
     static const QPArgSpec spec = { "find_frozen", kwlist, 1, 1, 0 };
     JSValueConst a[2];
-    int withdata;
+    JSValue items[3];
+    QPFrozenInfo info;
+    QPFrozenStatus status;
+    int withdata = 0;
 
     if (qp_arg_parse(ctx, &spec, args, nargs, kwnames, a) < 0)
         return JS_EXCEPTION;
@@ -282,7 +266,29 @@ static JSValue qp_imp_find_frozen(JSContext *ctx, JSValueConst self, JSValueCons
         return JS_EXCEPTION;
     if (!QP_IS_NULL(a[1]) && qp_arg_bool(ctx, a[1], &withdata) < 0)
         return JS_EXCEPTION;
-    return JS_UNDEFINED;
+    status = qp_frozen_find(ctx, a[0], &info);
+    if (status == QP_FROZEN_NOT_FOUND || status == QP_FROZEN_BAD_NAME)
+        return JS_UNDEFINED;
+    if (status != QP_FROZEN_OKAY)
+        return qp_frozen_set_error(ctx, status, a[0]);
+    items[0] = qp_none();
+    if (withdata) {
+        /* PyMemoryView_FromMemory(data, size, PyBUF_READ) */
+        JSValue mbuf = qp_mbuf_raw(ctx, (void *)info.data, (Py_ssize_t)info.size, 1, 1, "B");
+        if (JS_IsException(mbuf))
+            return mbuf;
+        items[0] = qp_mv_from_mbuf(ctx, mbuf);
+        if (JS_IsException(items[0]))
+            return items[0];
+    }
+    items[1] = qp_bool_new(info.is_package);
+    items[2] = info.has_origname && info.origname[0] ?
+        qp_str_from_cstr(ctx, info.origname) : qp_none();
+    if (JS_IsException(items[2])) {
+        JS_FreeValue(ctx, items[0]);
+        return JS_EXCEPTION;
+    }
+    return qp_tuple_new_steal(ctx, 3, items);
 }
 
 /* get_frozen_object(name, data=None, /) */
@@ -290,51 +296,49 @@ static JSValue qp_imp_get_frozen_object(JSContext *ctx, JSValueConst self, JSVal
                                         int nargs, JSValueConst kwnames, int magic)
 {
     JSValueConst name, dataobj;
-    JSValue marshal, code;
+    JSValue code;
+    QPFrozenInfo info;
+    QPFrozenStatus status;
     QPBuffer buf;
-    Py_ssize_t size;
-    JSAtom loads;
+    BOOL have_buf = FALSE;
 
     if (qp_arg_check_positional(ctx, "get_frozen_object", nargs, 1, 2) < 0)
         return JS_EXCEPTION;
     name = args[0];
     if (qp_imp_check_str(ctx, "get_frozen_object", "argument 1", name) < 0)
         return JS_EXCEPTION;
-    dataobj = nargs > 1 ? args[1] : JS_UNDEFINED;
-    if (JS_IsUndefined(dataobj) || JS_IsNull(dataobj))
-        return qp_imp_frozen_error(ctx, QP_IMP_FROZEN_NOT_FOUND, name);
-    if (qp_buffer_get(ctx, dataobj, &buf, QP_BUF_SIMPLE) < 0) {
-        /* PyObject_CheckBuffer failed: _PyArg_BadArgument */
-        if (!qp_exc_pending_matches(ctx, QP_EXC(ctx, TypeError)))
-            return JS_EXCEPTION;
-        JS_FreeValue(ctx, JS_GetException(ctx));
-        return qp_raise_type_error(ctx, "get_frozen_object() argument 2 must be bytes, not %T",
-                                   dataobj);
+    dataobj = nargs > 1 ? args[1] : qp_none();
+    memset(&info, 0, sizeof(info));
+    info.nameobj = QP_NULL;
+    if (!JS_IsUndefined(dataobj) && !QP_IS_NULL(dataobj)) {
+        if (qp_buffer_get(ctx, dataobj, &buf, QP_BUF_SIMPLE) < 0) {
+            /* PyObject_CheckBuffer failed: _PyArg_BadArgument */
+            if (!qp_exc_pending_matches(ctx, QP_EXC(ctx, TypeError)))
+                return JS_EXCEPTION;
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            return qp_raise_type_error(ctx,
+                                       "get_frozen_object() argument 2 must be bytes, not %T",
+                                       dataobj);
+        }
+        have_buf = TRUE;
+        info.data = buf.buf;
+        info.size = (size_t)buf.len;
+    } else {
+        status = qp_frozen_find(ctx, name, &info);
+        if (status != QP_FROZEN_OKAY)
+            return qp_frozen_set_error(ctx, status, name);
     }
-    size = buf.len;
-    qp_buffer_release(ctx, &buf);
-    if (size == 0)   /* does not contain executable code */
-        return qp_imp_frozen_error(ctx, QP_IMP_FROZEN_INVALID, name);
-    /* unmarshal_frozen_code: PyMarshal_ReadObjectFromString(data) */
-    marshal = qp_import_module(ctx, "marshal");
-    if (JS_IsException(marshal))
-        return marshal;
-    loads = JS_NewAtom(ctx, "loads");
-    if (loads == JS_ATOM_NULL) {
-        JS_FreeValue(ctx, marshal);
-        return JS_EXCEPTION;
+    if (QP_IS_NULL(info.nameobj))
+        info.nameobj = name;
+    if (info.size == 0) {
+        /* Does not contain executable code. */
+        if (have_buf)
+            qp_buffer_release(ctx, &buf);
+        return qp_frozen_set_error(ctx, QP_FROZEN_INVALID, name);
     }
-    code = qp_call_method(ctx, marshal, loads, &dataobj, 1, QP_NULL);
-    JS_FreeAtom(ctx, loads);
-    JS_FreeValue(ctx, marshal);
-    if (JS_IsException(code)) {
-        JS_FreeValue(ctx, JS_GetException(ctx));
-        return qp_imp_frozen_error(ctx, QP_IMP_FROZEN_INVALID, name);
-    }
-    if (!qp_typecheck(ctx, code, QP_TYPE(ctx, code))) {
-        JS_FreeValue(ctx, code);
-        return qp_raise_type_error(ctx, "frozen object %R is not a code object", name);
-    }
+    code = qp_frozen_unmarshal(ctx, info.data, info.size, info.nameobj);
+    if (have_buf)
+        qp_buffer_release(ctx, &buf);
     return code;
 }
 
@@ -342,9 +346,15 @@ static JSValue qp_imp_get_frozen_object(JSContext *ctx, JSValueConst self, JSVal
 static JSValue qp_imp_is_frozen_package(JSContext *ctx, JSValueConst self, JSValueConst *args,
                                         int nargs, JSValueConst kwnames, int magic)
 {
+    QPFrozenInfo info;
+    QPFrozenStatus status;
+
     if (qp_imp_check_str(ctx, "is_frozen_package", "argument", args[0]) < 0)
         return JS_EXCEPTION;
-    return qp_imp_frozen_error(ctx, QP_IMP_FROZEN_NOT_FOUND, args[0]);
+    status = qp_frozen_find(ctx, args[0], &info);
+    if (status != QP_FROZEN_OKAY)
+        return qp_frozen_set_error(ctx, status, args[0]);
+    return qp_bool_new(info.is_package);
 }
 
 /* is_builtin(name, /) */
@@ -367,14 +377,14 @@ static JSValue qp_imp_is_frozen(JSContext *ctx, JSValueConst self, JSValueConst 
 {
     if (qp_imp_check_str(ctx, "is_frozen", "argument", args[0]) < 0)
         return JS_EXCEPTION;
-    return qp_bool_new(FALSE);
+    return qp_bool_new(qp_frozen_find(ctx, args[0], NULL) == QP_FROZEN_OKAY);
 }
 
 /* _frozen_module_names() */
 static JSValue qp_imp_frozen_module_names(JSContext *ctx, JSValueConst self, JSValueConst *args,
                                           int nargs, JSValueConst kwnames, int magic)
 {
-    return qp_list_new(ctx, 0);
+    return qp_frozen_module_names(ctx);
 }
 
 /* _override_frozen_modules_for_tests(override, /) */
@@ -454,36 +464,17 @@ static JSValue qp_imp_source_hash(JSContext *ctx, JSValueConst self, JSValueCons
 }
 
 /* _set_lazy_attributes(modobj, name, /): remove the resolved module name
-   from sys.lazy_modules (_PyImport_DiscardLazyModule) and release its
-   pending-submodule declaration (_PyImport_ClearLazySubmodule).  Both
-   registries are absent until lazy imports record them (CPython returns
-   0 when LAZY_MODULES / LAZY_PENDING_SUBMODULES are NULL); the
-   sys.lazy_modules set is used when present. */
+   from sys.lazy_modules (_PyImport_DiscardLazyModule on
+   QPState.lazy_modules).  The pending-submodule declarations
+   (_PyImport_ClearLazySubmodule) are not recorded (python/import.c). */
 static JSValue qp_imp_set_lazy_attributes(JSContext *ctx, JSValueConst self, JSValueConst *args,
                                           int nargs, JSValueConst kwnames, int magic)
 {
-    JSValue lazy;
-    JSAtom atom;
-    int r;
-
     if (qp_arg_check_positional(ctx, "_set_lazy_attributes", nargs, 2, 2) < 0)
         return JS_EXCEPTION;
     if (qp_imp_check_str(ctx, "_set_lazy_attributes", "argument 2", args[1]) < 0)
         return JS_EXCEPTION;
-    atom = JS_NewAtom(ctx, "lazy_modules");
-    if (atom == JS_ATOM_NULL)
-        return JS_EXCEPTION;
-    lazy = qp_sys_get(ctx, atom);
-    JS_FreeAtom(ctx, atom);
-    if (QP_IS_NULL(lazy))
-        return JS_UNDEFINED;
-    if (JS_IsException(lazy))
-        return lazy;
-    r = 0;
-    if (qp_set_check(ctx, lazy))
-        r = qp_set_discard(ctx, lazy, args[1]);
-    JS_FreeValue(ctx, lazy);
-    if (r < 0)
+    if (qp_import_discard_lazy_module(ctx, args[1]) < 0)
         return JS_EXCEPTION;
     return JS_UNDEFINED;
 }

@@ -564,6 +564,15 @@ PyThreadState *Py_NewInterpreter(void)
     return NULL;
 }
 
+/* subinterpreters are not supported (one interpreter per C-API process,
+   capi-design.md §0): creation fails like Py_NewInterpreter */
+PyStatus Py_NewInterpreterFromConfig(PyThreadState **tstate_p, const PyInterpreterConfig *config)
+{
+    (void)config;
+    *tstate_p = NULL;
+    return PyStatus_Error("subinterpreters are not supported");
+}
+
 void Py_EndInterpreter(PyThreadState *tstate)
 {
     _Py_FatalErrorFunc("Py_EndInterpreter", "not a subinterpreter thread state");
@@ -803,72 +812,134 @@ int Py_GetRecursionLimit(void)
     return QP_STATE(ctx)->recursion_limit;
 }
 
-/* Pending calls (Py_AddPendingCall may be called from any thread). */
-#define QP_CAPI_NPENDINGCALLS 300
-static struct {
-    int (*func)(void *);
-    void *arg;
-} qp_capi_pending_calls[QP_CAPI_NPENDINGCALLS];
-static int qp_capi_pending_first, qp_capi_pending_last, qp_capi_pending_busy;
+/* Pending calls (Python/ceval_gil.c): two queues, as in CPython.  The
+   main-thread queue of Py_AddPendingCall (MAXPENDINGCALLS_MAIN entries) runs
+   on the main thread only; the interpreter queue of _PyEval_AddPendingCall
+   (MAXPENDINGCALLS, mainthreadonly = 0; _testinternalcapi.pending_threadfunc)
+   runs on any thread of the C-API context.  Both may be filled from any
+   thread; the interpreter poll (quickjs.c, qp_capi_pending_check) runs
+   them, Py_MakePendingCalls too, not the signal checks of blocking calls
+   (CPython's eval breaker vs PyErr_CheckSignals). */
+#define QP_CAPI_MAXPENDINGCALLS 300
+#define QP_CAPI_MAXPENDINGCALLS_MAIN 32
+typedef struct QPCapiPendingQueue {
+    struct {
+        int (*func)(void *);
+        void *arg;
+    } calls[QP_CAPI_MAXPENDINGCALLS];
+    int first, npending, max;
+} QPCapiPendingQueue;
+static QPCapiPendingQueue qp_capi_pending_main = { .max = QP_CAPI_MAXPENDINGCALLS_MAIN };
+static QPCapiPendingQueue qp_capi_pending_interp = { .max = QP_CAPI_MAXPENDINGCALLS };
+static int qp_capi_pending_busy;
+static int qp_capi_pending_any;     /* atomic: a call may be queued */
 static pthread_mutex_t qp_capi_pending_lock = PTHREAD_MUTEX_INITIALIZER;
 
-int Py_AddPendingCall(int (*func)(void *), void *arg)
+/* 0, or -1 when the queue is full */
+static int qp_capi_add_pending(QPCapiPendingQueue *q, int (*func)(void *), void *arg)
 {
-    int i, j, result = 0;
+    int result = -1;
     pthread_mutex_lock(&qp_capi_pending_lock);
-    i = qp_capi_pending_last;
-    j = (i + 1) % QP_CAPI_NPENDINGCALLS;
-    if (j == qp_capi_pending_first) {
-        result = -1;  /* queue full */
-    } else {
-        qp_capi_pending_calls[i].func = func;
-        qp_capi_pending_calls[i].arg = arg;
-        qp_capi_pending_last = j;
+    if (q->npending < q->max) {
+        int i = (q->first + q->npending) % QP_CAPI_MAXPENDINGCALLS;
+        q->calls[i].func = func;
+        q->calls[i].arg = arg;
+        q->npending++;
+        __atomic_store_n(&qp_capi_pending_any, 1, __ATOMIC_RELEASE);
+        result = 0;
     }
     pthread_mutex_unlock(&qp_capi_pending_lock);
+    /* signal_pending_calls: the thread holding the GIL polls at its next
+       instruction (racy store, like a signal) */
+    if (result == 0 && qp_capi.ctx)
+        __atomic_store_n(&qp_capi.ctx->interrupt_counter, 1, __ATOMIC_RELAXED);
     return result;
 }
 
-static int qp_capi_pop_pending(int (**func)(void *), void **arg)
+int Py_AddPendingCall(int (*func)(void *), void *arg)
+{
+    return qp_capi_add_pending(&qp_capi_pending_main, func, arg);
+}
+
+static int qp_capi_pop_pending(QPCapiPendingQueue *q, int (**func)(void *), void **arg)
 {
     int found = 0;
     pthread_mutex_lock(&qp_capi_pending_lock);
-    if (qp_capi_pending_first != qp_capi_pending_last) {
-        int i = qp_capi_pending_first;
-        *func = qp_capi_pending_calls[i].func;
-        *arg = qp_capi_pending_calls[i].arg;
-        qp_capi_pending_first = (i + 1) % QP_CAPI_NPENDINGCALLS;
+    if (q->npending > 0) {
+        *func = q->calls[q->first].func;
+        *arg = q->calls[q->first].arg;
+        q->first = (q->first + 1) % QP_CAPI_MAXPENDINGCALLS;
+        q->npending--;
         found = 1;
     }
+    if (qp_capi_pending_main.npending == 0 && qp_capi_pending_interp.npending == 0)
+        __atomic_store_n(&qp_capi_pending_any, 0, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&qp_capi_pending_lock);
     return found;
 }
 
-int Py_MakePendingCalls(void)
+/* _make_pending_calls of one queue: at most maxloop calls, so that a call
+   that queues another one does not keep this thread busy forever (the
+   remaining ones run at the next poll, maybe in another thread).  0, or -1
+   with the callback's exception. */
+static int qp_capi_run_pending_queue(QPCapiPendingQueue *q, int maxloop)
 {
-    JSContext *ctx = qp_capi.ctx;
     int (*func)(void *);
     void *arg;
+    int i;
 
-    if (ctx == NULL || !qp_capi_rt_is_main_thread())
-        return 0;
-    /* signal handlers first (CPython _PyEval_MakePendingCalls) */
-    if (qp_signal_check(ctx) < 0)
-        return -1;
-    if (qp_capi_pending_busy)
-        return 0;
-    qp_capi_pending_busy = 1;
-    while (qp_capi_pop_pending(&func, &arg)) {
+    for (i = 0; i < maxloop; i++) {
+        if (!qp_capi_pop_pending(q, &func, &arg))
+            return 0;
         if (func(arg) != 0) {
-            qp_capi_pending_busy = 0;
             if (!PyErr_Occurred())
                 PyErr_SetString(PyExc_SystemError,
                                 "pending call failed without setting an exception");
             return -1;
         }
     }
-    qp_capi_pending_busy = 0;
+    /* hit maxloop: poll again soon */
+    if (__atomic_load_n(&qp_capi_pending_any, __ATOMIC_ACQUIRE))
+        __atomic_store_n(&qp_capi.ctx->interrupt_counter, 1, __ATOMIC_RELAXED);
     return 0;
+}
+
+/* make_pending_calls: the interpreter queue (MAXPENDINGCALLSLOOP calls),
+   then, on the main thread, the main-thread queue (MAXPENDINGCALLSLOOP_MAIN:
+   all of them).  0, or -1 with the callback's exception. */
+static int qp_capi_run_pending(void)
+{
+    int r;
+
+    if (qp_capi_pending_busy)
+        return 0;
+    qp_capi_pending_busy = 1;
+    r = qp_capi_run_pending_queue(&qp_capi_pending_interp, 100);
+    if (r == 0 && qp_capi_rt_is_main_thread())
+        r = qp_capi_run_pending_queue(&qp_capi_pending_main, QP_CAPI_MAXPENDINGCALLS_MAIN);
+    qp_capi_pending_busy = 0;
+    return r;
+}
+
+int Py_MakePendingCalls(void)
+{
+    JSContext *ctx = qp_capi.ctx;
+
+    if (ctx == NULL || !qp_capi_rt_is_main_thread())
+        return 0;
+    /* signal handlers first (CPython _PyEval_MakePendingCalls) */
+    if (qp_signal_check(ctx) < 0)
+        return -1;
+    return qp_capi_run_pending();
+}
+
+/* object.h hook, from qp_signal_check (the interpreter poll) */
+static int qp_capi_pending_check(JSContext *ctx)
+{
+    if (!__atomic_load_n(&qp_capi_pending_any, __ATOMIC_ACQUIRE) || ctx != qp_capi.ctx ||
+        qp_capi.tstate_current == NULL)
+        return 0;
+    return qp_capi_run_pending();
 }
 
 /* The innermost Python frame of the caller (NULL if none). */
@@ -1104,6 +1175,10 @@ PyObject *PyEval_EvalCode(PyObject *co, PyObject *globals, PyObject *locals)
         PyErr_SetString(PyExc_SystemError, "PyEval_EvalCode: NULL globals");
         return NULL;
     }
+    if (!PyDict_Check(globals)) {
+        PyErr_BadInternalCall();
+        return NULL;
+    }
     cv = qp_capi_value(ctx, co);
     gv = qp_capi_value(ctx, globals);
     lv = qp_capi_rt_opt(locals);
@@ -1128,6 +1203,11 @@ PyObject *PyEval_EvalCodeEx(PyObject *co, PyObject *globals, PyObject *locals,
         return PyEval_EvalCode(co, globals, locals);
     if (globals == NULL) {
         PyErr_SetString(PyExc_SystemError, "PyEval_EvalCodeEx: NULL globals");
+        return NULL;
+    }
+    /* kwdefs is read with PyDict_GetItemRef() by the call (SystemError) */
+    if (!PyDict_Check(globals) || (kwdefs != NULL && !PyDict_Check(kwdefs))) {
+        PyErr_BadInternalCall();
         return NULL;
     }
     /* function = types.FunctionType(co, globals, None, defs, closure,
@@ -1190,6 +1270,26 @@ done:
     (PyCF_MASK | PyCF_SOURCE_IS_UTF8 | PyCF_DONT_IMPLY_DEDENT | \
      PyCF_IGNORE_COOKIE | PyCF_TYPE_COMMENTS | PyCF_ALLOW_TOP_LEVEL_AWAIT | \
      PyCF_ALLOW_INCOMPLETE_INPUT)
+/* run_eval_code_obj(): globals must be a real dict (SystemError) */
+static int qp_capi_check_run_globals(PyObject *globals)
+{
+    if (globals == NULL || !PyAnyDict_Check(globals)) {
+        PyErr_SetString(PyExc_SystemError,
+                        "globals must be a real dict or a real frozendict");
+        return -1;
+    }
+    return 0;
+}
+
+static int qp_capi_check_start(int start)
+{
+    if (start == Py_single_input || start == Py_file_input
+        || start == Py_eval_input || start == Py_func_type_input)
+        return 0;
+    PyErr_SetString(PyExc_ValueError, "invalid start argument");
+    return -1;
+}
+
 
 PyObject *PyRun_StringFlags(const char *str, int start, PyObject *globals,
                             PyObject *locals, PyCompilerFlags *flags)
@@ -1198,14 +1298,12 @@ PyObject *PyRun_StringFlags(const char *str, int start, PyObject *globals,
     JSValue gv, lv;
     int f = flags ? (flags->cf_flags & QP_CAPI_CF_PARSE_FLAGS) : 0;
 
+    if (qp_capi_check_start(start) < 0 || qp_capi_check_run_globals(globals) < 0)
+        return NULL;
     gv = qp_capi_rt_opt(globals);
     lv = qp_capi_rt_opt(locals);
     if (JS_IsException(gv) || JS_IsException(lv))
         return NULL;
-    if (QP_IS_NULL(gv)) {
-        PyErr_SetString(PyExc_SystemError, "globals must not be NULL");
-        return NULL;
-    }
     return qp_capi_from_js_result(ctx, qp_run_source(ctx, str, strlen(str), "<string>",
                                                      start, f, gv, lv));
 }
@@ -1262,6 +1360,13 @@ PyObject *PyRun_FileExFlags(FILE *fp, const char *filename, int start, PyObject 
     PyObject *r;
     int f = flags ? (flags->cf_flags & QP_CAPI_CF_PARSE_FLAGS) : 0;
 
+    if (qp_capi_check_start(start) < 0)
+        return NULL;
+    if (qp_capi_check_run_globals(globals) < 0) {
+        if (closeit)
+            fclose(fp);
+        return NULL;
+    }
     src = qp_capi_read_stream(fp, &len);
     if (closeit)
         fclose(fp);
@@ -1345,6 +1450,25 @@ int PyRun_SimpleFileExFlags(FILE *fp, const char *filename, int closeit, PyCompi
         Py_DECREF(fn);
         set_file_name = 1;
     }
+    /* set_main_loader(): when running from stdin, leave __main__.__loader__ alone */
+    if (strcmp(filename, "<stdin>") != 0) {
+        PyObject *bootstrap, *loader_type, *loader = NULL;
+        bootstrap = PyImport_ImportModule("_frozen_importlib_external");
+        loader_type = bootstrap ? PyObject_GetAttrString(bootstrap, "SourceFileLoader") : NULL;
+        Py_XDECREF(bootstrap);
+        fn = loader_type ? PyUnicode_DecodeFSDefault(filename) : NULL;
+        if (fn) {
+            loader = PyObject_CallFunction(loader_type, "sO", "__main__", fn);
+            Py_DECREF(fn);
+        }
+        Py_XDECREF(loader_type);
+        if (loader == NULL || PyDict_SetItemString(d, "__loader__", loader) < 0) {
+            Py_XDECREF(loader);
+            fprintf(stderr, "python: failed to set __main__.__loader__\n");
+            goto done;
+        }
+        Py_DECREF(loader);
+    }
     v = PyRun_FileExFlags(fp, filename, Py_file_input, d, d, closeit, flags);
     closeit = 0;
     qp_run_flush_io(qp_capi.ctx);
@@ -1378,6 +1502,225 @@ int (PyRun_SimpleFileEx)(FILE *f, const char *p, int c)
     return PyRun_SimpleFileExFlags(f, p, c, NULL);
 }
 
+/* Py_FdIsInteractive (Python/pylifecycle.c) */
+int Py_FdIsInteractive(FILE *fp, const char *filename)
+{
+    if (isatty(fileno(fp)))
+        return 1;
+    if (!QP_STATE(qp_capi.ctx)->config.interactive)
+        return 0;
+    return filename == NULL || strcmp(filename, "<stdin>") == 0 || strcmp(filename, "???") == 0;
+}
+
+/* One line of fp (without '\n') appended to line after the prompt
+   str(sys.<prompt_name>) on stderr (PyOS_StdioReadline; stdin goes through
+   the interactive loop's reader, so the readline module applies).
+   1 = line read, 0 = EOF before any character, -1 = exception. */
+static int qp_capi_fp_readline(JSContext *ctx, FILE *fp, JSAtom prompt_name, DynBuf *line)
+{
+    DynBuf prompt;
+    int c, got = 0;
+
+    if (fp == stdin)
+        return qp_repl_readline(ctx, prompt_name, line);
+    dbuf_init(&prompt);
+    qp_repl_prompt(ctx, prompt_name, &prompt);
+    fwrite(prompt.buf ? (const char *)prompt.buf : "", 1, prompt.size, stderr);
+    fflush(stderr);
+    dbuf_free(&prompt);
+    Py_BEGIN_ALLOW_THREADS
+    while ((c = getc(fp)) != EOF) {
+        got = 1;
+        if (c == '\n')
+            break;
+        dbuf_putc(line, c);
+    }
+    if (c == EOF)
+        clearerr(fp);
+    Py_END_ALLOW_THREADS
+    return got;
+}
+
+/* _PyRun_InteractiveOne: read one complete interactive input from fp (sys.ps1
+   then sys.ps2 prompts, codeop's completeness rule) and run it in __main__
+   as Py_single_input.  0, E_EOF at end of input, or -1 with an exception. */
+static int qp_capi_interactive_one(FILE *fp, PyObject *filename, PyCompilerFlags *flags)
+{
+    JSContext *ctx = qp_capi.ctx;
+    int f = flags ? (flags->cf_flags & QP_CAPI_CF_PARSE_FLAGS) : 0;
+    const char *fname;
+    DynBuf src;
+    int rc, more = 0;
+    PyObject *main_module, *d;
+    JSValue dv, res;
+
+    if (!PyUnicode_Check(filename)) {
+        PyErr_Format(PyExc_TypeError, "expect str for filename, got %T", filename);
+        return -1;
+    }
+    fname = PyUnicode_AsUTF8(filename);
+    if (!fname)
+        return -1;
+    dbuf_init(&src);
+    for (;;) {
+        if (more)
+            dbuf_putc(&src, '\n');
+        rc = qp_capi_fp_readline(ctx, fp, more ? QP_ATOM(ctx, ps2) : QP_ATOM(ctx, ps1), &src);
+        dbuf_putc(&src, '\0');
+        src.size--;
+        if (rc < 0) {
+            dbuf_free(&src);
+            return -1;
+        }
+        if (rc == 0) {
+            if (!more) {
+                dbuf_free(&src);
+                return E_EOF;
+            }
+            break;      /* EOF inside a statement: compile what we have */
+        }
+        if (!more && qp_repl_is_blank((const char *)src.buf, src.size)) {
+            src.size = 0;
+            continue;
+        }
+        if (qp_repl_input_complete(ctx, &src))
+            break;
+        more = 1;
+    }
+    dbuf_putc(&src, '\n');
+    dbuf_putc(&src, '\0');
+    src.size--;
+    main_module = PyImport_AddModuleRef("__main__");
+    if (!main_module) {
+        dbuf_free(&src);
+        return -1;
+    }
+    d = PyModule_GetDict(main_module);
+    dv = d ? qp_capi_value(ctx, d) : JS_EXCEPTION;
+    res = JS_IsException(dv) ? JS_EXCEPTION :
+        qp_run_source_ex(ctx, (const char *)src.buf, src.size, fname, Py_single_input,
+                         f, dv, dv, TRUE);
+    Py_DECREF(main_module);
+    dbuf_free(&src);
+    if (JS_IsException(res))
+        return -1;
+    JS_FreeValue(ctx, res);
+    qp_run_flush_io(ctx);
+    return 0;
+}
+
+int PyRun_InteractiveOneObject(FILE *fp, PyObject *filename, PyCompilerFlags *flags)
+{
+    int res = qp_capi_interactive_one(fp, filename, flags);
+    if (res == -1) {
+        PyErr_Print();
+        qp_run_flush_io(qp_capi.ctx);
+    }
+    return res;
+}
+
+int PyRun_InteractiveOneFlags(FILE *fp, const char *filename_str, PyCompilerFlags *flags)
+{
+    PyObject *filename = PyUnicode_DecodeFSDefault(filename_str);
+    int res;
+    if (!filename) {
+        PyErr_Print();
+        return -1;
+    }
+    res = PyRun_InteractiveOneObject(fp, filename, flags);
+    Py_DECREF(filename);
+    return res;
+}
+
+int (PyRun_InteractiveOne)(FILE *f, const char *p)
+{
+    return PyRun_InteractiveOneFlags(f, p, NULL);
+}
+
+/* _PyRun_InteractiveLoop: default sys.ps1/ps2, then one input after the
+   other until EOF; errors are printed (SystemExit ends the loop unless
+   -i), MemoryError more than 16 times in a row aborts.  0 or -1. */
+static int qp_capi_interactive_loop(FILE *fp, PyObject *filename, PyCompilerFlags *flags)
+{
+    JSContext *ctx = qp_capi.ctx;
+    int nomem_count = 0, ret;
+
+    qp_repl_default_prompt(ctx, QP_ATOM(ctx, ps1), ">>> ");
+    qp_repl_default_prompt(ctx, QP_ATOM(ctx, ps2), "... ");
+    do {
+        ret = qp_capi_interactive_one(fp, filename, flags);
+        if (ret == -1 && PyErr_Occurred()) {
+            if (PyErr_ExceptionMatches(PyExc_MemoryError)) {
+                if (++nomem_count > 16) {
+                    PyErr_Clear();
+                    return -1;
+                }
+            } else {
+                nomem_count = 0;
+            }
+            if (!QP_STATE(ctx)->config.inspect && PyErr_ExceptionMatches(PyExc_SystemExit))
+                return -1;
+            PyErr_Print();
+            qp_run_flush_io(ctx);
+        } else {
+            nomem_count = 0;
+        }
+    } while (ret != E_EOF);
+    return 0;
+}
+
+int PyRun_InteractiveLoopFlags(FILE *fp, const char *filename, PyCompilerFlags *flags)
+{
+    PyObject *filename_obj = PyUnicode_DecodeFSDefault(filename);
+    int r;
+    if (!filename_obj) {
+        PyErr_Print();
+        return -1;
+    }
+    r = qp_capi_interactive_loop(fp, filename_obj, flags);
+    Py_DECREF(filename_obj);
+    if (r < 0) {
+        PyErr_Print();
+        return -1;
+    }
+    return 0;
+}
+
+int (PyRun_InteractiveLoop)(FILE *f, const char *p)
+{
+    return PyRun_InteractiveLoopFlags(f, p, NULL);
+}
+
+/* PyRun_AnyFileExFlags: the interactive loop for a terminal (or "<stdin>"
+   under -i), else PyRun_SimpleFileExFlags */
+int PyRun_AnyFileExFlags(FILE *fp, const char *filename, int closeit, PyCompilerFlags *flags)
+{
+    if (filename == NULL)
+        filename = "???";
+    if (Py_FdIsInteractive(fp, filename)) {
+        int r = PyRun_InteractiveLoopFlags(fp, filename, flags);
+        if (closeit)
+            fclose(fp);
+        return r;
+    }
+    return PyRun_SimpleFileExFlags(fp, filename, closeit, flags);
+}
+
+int (PyRun_AnyFile)(FILE *fp, const char *name)
+{
+    return PyRun_AnyFileExFlags(fp, name, 0, NULL);
+}
+
+int (PyRun_AnyFileEx)(FILE *fp, const char *name, int closeit)
+{
+    return PyRun_AnyFileExFlags(fp, name, closeit, NULL);
+}
+
+int (PyRun_AnyFileFlags)(FILE *fp, const char *name, PyCompilerFlags *flags)
+{
+    return PyRun_AnyFileExFlags(fp, name, 0, flags);
+}
+
 PyObject *Py_CompileStringObject(const char *str, PyObject *filename, int start,
                                  PyCompilerFlags *flags, int optimize)
 {
@@ -1387,6 +1730,8 @@ PyObject *Py_CompileStringObject(const char *str, PyObject *filename, int start,
     qp_error err;
     JSValue bc;
 
+    if (qp_capi_check_start(start) < 0)
+        return NULL;
     fname = PyUnicode_AsUTF8(filename);
     if (fname == NULL)
         return NULL;
@@ -2265,21 +2610,25 @@ PyObject *PyImport_AddModuleRef(const char *name)
 
 PyObject *PyImport_AddModuleObject(PyObject *name)
 {
-    PyObject *mod = qp_capi_import_add_module(name), *r;
+    PyObject *mod = qp_capi_import_add_module(name), *r, *key;
     const char *s;
     Py_ssize_t len;
 
     if (mod == NULL)
         return NULL;
-    /* borrowed: the module stays referenced by sys.modules; the pin keeps
-       the pointer valid if it is removed from there */
-    s = PyUnicode_AsUTF8AndSize(name, &len);
+    /* borrowed: the module stays referenced by sys.modules; the pin (one
+       per name; any hashable name is accepted, keyed by its repr) keeps the
+       pointer valid if it is removed from there */
+    key = PyObject_Repr(name);
+    s = key ? PyUnicode_AsUTF8AndSize(key, &len) : NULL;
     if (s == NULL) {
+        Py_XDECREF(key);
         Py_DECREF(mod);
         return NULL;
     }
     r = qp_capi_rt_borrow(qp_capi_rt_key("addmodule", s, (size_t)len),
                           qp_capi_value(qp_capi.ctx, mod));
+    Py_DECREF(key);
     Py_DECREF(mod);
     return r;
 }
@@ -2297,7 +2646,7 @@ PyObject *PyImport_AddModule(const char *name)
 PyObject *PyImport_Import(PyObject *module_name)
 {
     JSContext *ctx = qp_capi.ctx;
-    const char *s;
+    JSValue v;
 
     if (module_name == NULL) {
         PyErr_BadInternalCall();
@@ -2307,10 +2656,10 @@ PyObject *PyImport_Import(PyObject *module_name)
         PyErr_Format(PyExc_TypeError, "module name must be a string, not %T", module_name);
         return NULL;
     }
-    s = PyUnicode_AsUTF8(module_name);
-    if (s == NULL)
+    v = qp_capi_value(ctx, module_name);
+    if (JS_IsException(v))
         return NULL;
-    return qp_capi_from_js_result(ctx, qp_import_module(ctx, s));
+    return qp_capi_from_js_result(ctx, qp_import_module_obj(ctx, v));
 }
 
 PyObject *PyImport_ImportModule(const char *name)
@@ -2411,6 +2760,44 @@ int _PyImport_SetModuleString(const char *name, PyObject *m)
     r = _PyImport_SetModule(nameobj, m);
     Py_DECREF(nameobj);
     return r;
+}
+
+/* PEP 810 lazy imports: QPState.lazy_imports_mode (0 normal, 1 all, the
+   PyImport_LazyImportsMode values) and QPState.lazy_imports_filter, the
+   state of sys.set_lazy_imports() / sys.set_lazy_imports_filter(). */
+int PyImport_SetLazyImportsMode(PyImport_LazyImportsMode mode)
+{
+    QP_STATE(qp_capi.ctx)->lazy_imports_mode = mode;
+    return 0;
+}
+
+PyImport_LazyImportsMode PyImport_GetLazyImportsMode(void)
+{
+    return (PyImport_LazyImportsMode)QP_STATE(qp_capi.ctx)->lazy_imports_mode;
+}
+
+int PyImport_SetLazyImportsFilter(PyObject *filter)
+{
+    JSContext *ctx = qp_capi.ctx;
+    JSValue v = JS_UNDEFINED;
+
+    if (filter != NULL && filter != Py_None) {
+        v = qp_capi_value(ctx, filter);
+        if (JS_IsException(v))
+            return -1;
+    }
+    return qp_sys_lazy_imports_filter_set(ctx, v);
+}
+
+/* New reference, or NULL without an exception when no filter is set. */
+PyObject *PyImport_GetLazyImportsFilter(void)
+{
+    JSContext *ctx = qp_capi.ctx;
+    JSValueConst filter = QP_STATE(ctx)->lazy_imports_filter;
+
+    if (JS_IsUndefined(filter))
+        return NULL;
+    return qp_capi_new_ref(ctx, filter);
 }
 
 /* ========================================================================= */
@@ -2901,6 +3288,484 @@ int PySys_AddAuditHook(Py_AuditHookFunction hook, void *userData)
 }
 
 /* ========================================================================= */
+/* PEP 741 runtime configuration (CPython 3.15.2 Python/initconfig.c          */
+/* PYCONFIG_SPEC + PYPRECONFIG_SPEC, config_get, PyConfig_Set) over QPConfig  */
+/* ========================================================================= */
+
+typedef enum {
+    QP_CFG_INT, QP_CFG_UINT, QP_CFG_ULONG, QP_CFG_BOOL,
+    QP_CFG_WSTR, QP_CFG_WSTR_OPT, QP_CFG_WSTR_LIST,
+} QPConfigType;
+
+/* PyConfig_MEMBER_READ_ONLY / PUBLIC (the INIT_ONLY members are not
+   reachable by name: config_generic_find_spec skips them) */
+typedef enum { QP_CFG_READ_ONLY, QP_CFG_PUBLIC } QPConfigVisibility;
+
+/* Members read from the state (QP_CFGM_NONE: the value is the sys
+   attribute of the spec) */
+typedef enum {
+    QP_CFGM_NONE,
+    /* public */
+    QP_CFGM_bytes_warning, QP_CFGM_cpu_count, QP_CFGM_lazy_imports, QP_CFGM_inspect,
+    QP_CFGM_int_max_str_digits, QP_CFGM_interactive, QP_CFGM_optimization_level,
+    QP_CFGM_parser_debug, QP_CFGM_quiet, QP_CFGM_use_environment, QP_CFGM_verbose,
+    QP_CFGM_write_bytecode,
+    /* read-only */
+    QP_CFGM_buffered_stdio, QP_CFGM_check_hash_pycs_mode, QP_CFGM_code_debug_ranges,
+    QP_CFGM_dev_mode, QP_CFGM_filesystem_encoding, QP_CFGM_filesystem_errors,
+    QP_CFGM_hash_seed, QP_CFGM_home, QP_CFGM_import_time, QP_CFGM_isolated,
+    QP_CFGM_parse_argv, QP_CFGM_program_name, QP_CFGM_run_command, QP_CFGM_run_filename,
+    QP_CFGM_run_module, QP_CFGM_safe_path, QP_CFGM_site_import,
+    QP_CFGM_skip_source_first_line, QP_CFGM_stdio_encoding, QP_CFGM_stdio_errors,
+    QP_CFGM_tracemalloc, QP_CFGM_use_frozen_modules, QP_CFGM_use_hash_seed,
+    QP_CFGM_user_site_directory, QP_CFGM_warn_default_encoding,
+    QP_CFGM_configure_locale, QP_CFGM_utf8_mode,
+    /* features this build does not have: their fixed value is spec->value */
+    QP_CFGM_CONST,
+} QPConfigMember;
+
+typedef struct {
+    const char *name;
+    unsigned char type;         /* QPConfigType */
+    unsigned char visibility;   /* QPConfigVisibility */
+    unsigned char member;       /* QPConfigMember */
+    unsigned char sys_flag;     /* PyConfig_Set updates sys.flags (qp_sys_make_flags reads the member) */
+    const char *sys_attr;       /* the value is this sys attribute (get and set) */
+    int *global_var;            /* deprecated global configuration variable (Py_VerboseFlag...) */
+    unsigned char global_not;   /* the global variable is the negation */
+    signed char value;          /* QP_CFGM_CONST value */
+} QPConfigSpec;
+
+#define QP_CFG_SYS(name, type, vis, attr) \
+    { #name, QP_CFG_##type, QP_CFG_##vis, QP_CFGM_NONE, 0, attr, NULL, 0, 0 }
+#define QP_CFG_MEMBER(name, type, vis) \
+    { #name, QP_CFG_##type, QP_CFG_##vis, QP_CFGM_##name, 0, NULL, NULL, 0, 0 }
+#define QP_CFG_FLAG(name, type, global, not) \
+    { #name, QP_CFG_##type, QP_CFG_PUBLIC, QP_CFGM_##name, 1, NULL, global, not, 0 }
+#define QP_CFG_CONST(name, type, value) \
+    { #name, QP_CFG_##type, QP_CFG_READ_ONLY, QP_CFGM_CONST, 0, NULL, NULL, 0, value }
+
+_Py_COMP_DIAG_PUSH
+_Py_COMP_DIAG_IGNORE_DEPR_DECLS
+static const QPConfigSpec qp_config_spec[] = {
+    /* --- public options (PYCONFIG_SPEC) --- */
+    QP_CFG_SYS(argv, WSTR_LIST, PUBLIC, "argv"),
+    QP_CFG_SYS(base_exec_prefix, WSTR_OPT, PUBLIC, "base_exec_prefix"),
+    QP_CFG_SYS(base_executable, WSTR_OPT, PUBLIC, "_base_executable"),
+    QP_CFG_SYS(base_prefix, WSTR_OPT, PUBLIC, "base_prefix"),
+    QP_CFG_FLAG(bytes_warning, UINT, &Py_BytesWarningFlag, 0),
+    QP_CFG_MEMBER(cpu_count, INT, PUBLIC),
+    QP_CFG_MEMBER(lazy_imports, INT, PUBLIC),
+    QP_CFG_SYS(exec_prefix, WSTR_OPT, PUBLIC, "exec_prefix"),
+    QP_CFG_SYS(executable, WSTR_OPT, PUBLIC, "executable"),
+    QP_CFG_FLAG(inspect, BOOL, &Py_InspectFlag, 0),
+    QP_CFG_MEMBER(int_max_str_digits, UINT, PUBLIC),
+    QP_CFG_FLAG(interactive, BOOL, &Py_InteractiveFlag, 0),
+    QP_CFG_SYS(module_search_paths, WSTR_LIST, PUBLIC, "path"),
+    QP_CFG_FLAG(optimization_level, UINT, &Py_OptimizeFlag, 0),
+    QP_CFG_FLAG(parser_debug, BOOL, &Py_DebugFlag, 0),
+    QP_CFG_SYS(platlibdir, WSTR, PUBLIC, "platlibdir"),
+    QP_CFG_SYS(prefix, WSTR_OPT, PUBLIC, "prefix"),
+    QP_CFG_SYS(pycache_prefix, WSTR_OPT, PUBLIC, "pycache_prefix"),
+    QP_CFG_FLAG(quiet, BOOL, &Py_QuietFlag, 0),
+    QP_CFG_SYS(stdlib_dir, WSTR_OPT, PUBLIC, "_stdlib_dir"),
+    QP_CFG_FLAG(use_environment, BOOL, &Py_IgnoreEnvironmentFlag, 1),
+    QP_CFG_FLAG(verbose, UINT, &Py_VerboseFlag, 0),
+    QP_CFG_SYS(warnoptions, WSTR_LIST, PUBLIC, "warnoptions"),
+    QP_CFG_FLAG(write_bytecode, BOOL, &Py_DontWriteBytecodeFlag, 1),
+    QP_CFG_SYS(xoptions, WSTR_LIST, PUBLIC, "_xoptions"),
+
+    /* --- read-only options --- */
+    QP_CFG_MEMBER(buffered_stdio, BOOL, READ_ONLY),
+    QP_CFG_MEMBER(check_hash_pycs_mode, WSTR, READ_ONLY),
+    QP_CFG_MEMBER(code_debug_ranges, BOOL, READ_ONLY),
+    QP_CFG_CONST(configure_c_stdio, BOOL, 0),       /* the C streams keep their libc setup */
+    QP_CFG_MEMBER(dev_mode, BOOL, READ_ONLY),
+    QP_CFG_CONST(dump_refs, BOOL, 0),               /* no Py_TRACE_REFS */
+    QP_CFG_CONST(dump_refs_file, WSTR_OPT, 0),
+    QP_CFG_CONST(faulthandler, BOOL, 0),            /* no faulthandler module */
+    QP_CFG_MEMBER(filesystem_encoding, WSTR, READ_ONLY),
+    QP_CFG_MEMBER(filesystem_errors, WSTR, READ_ONLY),
+    QP_CFG_MEMBER(hash_seed, ULONG, READ_ONLY),
+    QP_CFG_MEMBER(home, WSTR_OPT, READ_ONLY),
+    QP_CFG_CONST(thread_inherit_context, INT, 0),   /* sys.flags.thread_inherit_context */
+    QP_CFG_CONST(context_aware_warnings, INT, 0),   /* sys.flags.context_aware_warnings */
+    QP_CFG_MEMBER(import_time, UINT, READ_ONLY),
+    QP_CFG_CONST(install_signal_handlers, BOOL, 1), /* the importlib boot imports _signal */
+    QP_CFG_MEMBER(isolated, BOOL, READ_ONLY),
+    QP_CFG_CONST(malloc_stats, BOOL, 0),            /* no pymalloc */
+    QP_CFG_CONST(pymalloc_hugepages, BOOL, 0),
+    QP_CFG_SYS(orig_argv, WSTR_LIST, READ_ONLY, "orig_argv"),
+    QP_CFG_MEMBER(parse_argv, BOOL, READ_ONLY),
+    QP_CFG_CONST(pathconfig_warnings, BOOL, 1),     /* !Py_FrozenFlag */
+    QP_CFG_CONST(perf_profiling, UINT, 0),          /* no perf trampoline */
+    QP_CFG_CONST(remote_debug, BOOL, 0),            /* no sys.remote_exec */
+    QP_CFG_MEMBER(program_name, WSTR, READ_ONLY),
+    QP_CFG_MEMBER(run_command, WSTR_OPT, READ_ONLY),
+    QP_CFG_MEMBER(run_filename, WSTR_OPT, READ_ONLY),
+    QP_CFG_MEMBER(run_module, WSTR_OPT, READ_ONLY),
+    QP_CFG_MEMBER(safe_path, BOOL, READ_ONLY),
+    QP_CFG_CONST(show_ref_count, BOOL, 0),          /* no Py_REF_DEBUG */
+    QP_CFG_MEMBER(site_import, BOOL, READ_ONLY),
+    QP_CFG_MEMBER(skip_source_first_line, BOOL, READ_ONLY),
+    QP_CFG_MEMBER(stdio_encoding, WSTR, READ_ONLY),
+    QP_CFG_MEMBER(stdio_errors, WSTR, READ_ONLY),
+    QP_CFG_MEMBER(tracemalloc, UINT, READ_ONLY),
+    QP_CFG_MEMBER(use_frozen_modules, BOOL, READ_ONLY),
+    QP_CFG_MEMBER(use_hash_seed, BOOL, READ_ONLY),
+#ifdef __APPLE__
+    QP_CFG_CONST(use_system_logger, BOOL, 0),       /* stdout/stderr are not copied to the system log */
+#endif
+    QP_CFG_MEMBER(user_site_directory, BOOL, READ_ONLY),
+    QP_CFG_MEMBER(warn_default_encoding, BOOL, READ_ONLY),
+
+    /* --- read-only options of PYPRECONFIG_SPEC --- */
+    QP_CFG_CONST(allocator, INT, 0),                /* PYMEM_ALLOCATOR_NOT_SET: no PYTHONMALLOC */
+    QP_CFG_CONST(coerce_c_locale, BOOL, 0),         /* no PEP 538 locale coercion */
+    QP_CFG_CONST(coerce_c_locale_warn, BOOL, 0),
+    QP_CFG_MEMBER(configure_locale, BOOL, READ_ONLY),
+    QP_CFG_MEMBER(utf8_mode, BOOL, READ_ONLY),
+    { NULL },
+};
+_Py_COMP_DIAG_POP
+
+#undef QP_CFG_SYS
+#undef QP_CFG_MEMBER
+#undef QP_CFG_FLAG
+#undef QP_CFG_CONST
+
+static const QPConfigSpec *qp_config_find_spec(const char *name)
+{
+    const QPConfigSpec *spec;
+
+    for (spec = qp_config_spec; spec->name; spec++) {
+        if (strcmp(spec->name, name) == 0)
+            return spec;
+    }
+    return NULL;
+}
+
+static void qp_config_unknown_name_error(const char *name)
+{
+    PyErr_Format(PyExc_ValueError, "unknown config option name: %s", name);
+}
+
+/* PYTHONHASHSEED value: 0 when unset or "random" */
+static unsigned long qp_config_hash_seed(const QPConfig *c)
+{
+    if (c->hash_seed == NULL || strcmp(c->hash_seed, "random") == 0)
+        return 0;
+    return strtoul(c->hash_seed, NULL, 10);
+}
+
+/* config_get(config, spec, use_sys=1) */
+static PyObject *qp_config_get(const QPConfigSpec *spec)
+{
+    JSContext *ctx = qp_capi.ctx;
+    QPState *st = QP_STATE(ctx);
+    const QPConfig *c = &st->config;
+    char encoding_buf[QP_IO_ENCODING_BUF], errors_buf[QP_IO_ERRORS_BUF];
+    const char *s = NULL, *encoding, *errors;
+    PyObject *attr;
+    long v = 0;
+    int is_true;
+
+    if (spec->sys_attr)
+        return PySys_GetAttrString(spec->sys_attr);
+    switch ((QPConfigMember)spec->member) {
+    case QP_CFGM_bytes_warning: v = c->bytes_warning; break;
+    case QP_CFGM_cpu_count: v = c->cpu_count > 0 ? c->cpu_count : -1; break;
+    case QP_CFGM_lazy_imports: v = c->lazy_imports; break;
+    case QP_CFGM_inspect: v = c->inspect; break;
+    case QP_CFGM_int_max_str_digits: v = st->int_max_str_digits; break;
+    case QP_CFGM_interactive: v = c->interactive; break;
+    case QP_CFGM_optimization_level: v = c->optimize; break;
+    case QP_CFGM_parser_debug: v = c->parser_debug; break;
+    case QP_CFGM_quiet: v = c->quiet; break;
+    case QP_CFGM_use_environment: v = !c->ignore_environment; break;
+    case QP_CFGM_verbose: v = c->verbose; break;
+    case QP_CFGM_write_bytecode:
+        /* config_get_sys_write_bytecode: not sys.dont_write_bytecode */
+        attr = PySys_GetAttrString("dont_write_bytecode");
+        if (attr == NULL)
+            return NULL;
+        is_true = PyObject_IsTrue(attr);
+        Py_DECREF(attr);
+        if (is_true < 0)
+            return NULL;
+        v = !is_true;
+        break;
+    case QP_CFGM_buffered_stdio: v = !c->unbuffered; break;
+    case QP_CFGM_check_hash_pycs_mode:
+        s = c->check_hash_based_pycs ? c->check_hash_based_pycs : "default";
+        break;
+    case QP_CFGM_code_debug_ranges: v = !c->no_debug_ranges; break;
+    case QP_CFGM_dev_mode: v = c->dev_mode; break;
+    /* sys.getfilesystemencoding() / getfilesystemencodeerrors() */
+    case QP_CFGM_filesystem_encoding: s = "utf-8"; break;
+    case QP_CFGM_filesystem_errors: s = "surrogateescape"; break;
+    case QP_CFGM_hash_seed: return PyLong_FromUnsignedLong(qp_config_hash_seed(c));
+    case QP_CFGM_home: s = c->home; break;
+    case QP_CFGM_import_time: v = c->import_time; break;
+    case QP_CFGM_isolated: v = c->isolated; break;
+    case QP_CFGM_parse_argv: v = c->parse_argv; break;
+    case QP_CFGM_program_name:
+        /* config_init_program_name: argv[0], else "python3" */
+        s = c->orig_argc > 0 && c->orig_argv[0] && c->orig_argv[0][0] ? c->orig_argv[0]
+                                                                       : "python3";
+        break;
+    case QP_CFGM_run_command: s = c->run_command; break;  /* the -c text and "\n" */
+    case QP_CFGM_run_filename: s = c->run_filename; break;
+    case QP_CFGM_run_module: s = c->run_module; break;
+    case QP_CFGM_safe_path: v = c->safe_path; break;
+    case QP_CFGM_site_import: v = !c->no_site; break;
+    case QP_CFGM_skip_source_first_line: v = c->skip_source_first_line; break;
+    case QP_CFGM_stdio_encoding:
+    case QP_CFGM_stdio_errors:
+        if (qp_io_stdio_config(ctx, c, encoding_buf, errors_buf, &encoding, &errors) < 0)
+            return NULL;
+        return PyUnicode_FromString(spec->member == QP_CFGM_stdio_encoding ? encoding : errors);
+    case QP_CFGM_tracemalloc: v = c->tracemalloc; break;
+    case QP_CFGM_use_frozen_modules: v = c->use_frozen_modules; break;
+    case QP_CFGM_use_hash_seed:
+        v = c->hash_seed != NULL && strcmp(c->hash_seed, "random") != 0;
+        break;
+    case QP_CFGM_user_site_directory: v = !c->no_user_site; break;
+    case QP_CFGM_warn_default_encoding: v = c->warn_default_encoding; break;
+    case QP_CFGM_configure_locale: v = qp_preconfig_configure_locale; break;
+    case QP_CFGM_utf8_mode: v = c->utf8_mode > 0; break;
+    case QP_CFGM_CONST: v = spec->value; break;
+    case QP_CFGM_NONE: break;
+    }
+    switch ((QPConfigType)spec->type) {
+    case QP_CFG_BOOL:
+        return PyBool_FromLong(v != 0);
+    case QP_CFG_WSTR:
+    case QP_CFG_WSTR_OPT:
+        if (s == NULL)
+            Py_RETURN_NONE;
+        return PyUnicode_DecodeFSDefault(s);
+    default:
+        return PyLong_FromLong(v);
+    }
+}
+
+PyObject *PyConfig_Get(const char *name)
+{
+    const QPConfigSpec *spec = qp_config_find_spec(name);
+
+    if (spec == NULL) {
+        qp_config_unknown_name_error(name);
+        return NULL;
+    }
+    return qp_config_get(spec);
+}
+
+int PyConfig_GetInt(const char *name, int *value)
+{
+    PyObject *obj = PyConfig_Get(name);
+    int as_int;
+
+    if (obj == NULL)
+        return -1;
+    if (!PyLong_Check(obj)) {
+        Py_DECREF(obj);
+        PyErr_Format(PyExc_TypeError, "config option %s is not an int", name);
+        return -1;
+    }
+    as_int = PyLong_AsInt(obj);
+    Py_DECREF(obj);
+    if (as_int == -1 && PyErr_Occurred()) {
+        PyErr_Format(PyExc_OverflowError,
+                     "config option %s value does not fit into a C int", name);
+        return -1;
+    }
+    *value = as_int;
+    return 0;
+}
+
+PyObject *PyConfig_Names(void)
+{
+    const QPConfigSpec *spec;
+    PyObject *names = PyList_New(0), *name, *frozen;
+    int res;
+
+    if (names == NULL)
+        return NULL;
+    for (spec = qp_config_spec; spec->name; spec++) {
+        name = PyUnicode_FromString(spec->name);
+        if (name == NULL)
+            goto error;
+        res = PyList_Append(names, name);
+        Py_DECREF(name);
+        if (res < 0)
+            goto error;
+    }
+    frozen = PyFrozenSet_New(names);
+    Py_DECREF(names);
+    return frozen;
+ error:
+    Py_DECREF(names);
+    return NULL;
+}
+
+/* Set the QPConfig field of an int member (config_set_int_attr and the
+   member half of config_set_sys_flag). */
+static void qp_config_set_member(const QPConfigSpec *spec, int value)
+{
+    QPConfig *c = &QP_STATE(qp_capi.ctx)->config;
+
+    switch ((QPConfigMember)spec->member) {
+    case QP_CFGM_bytes_warning: c->bytes_warning = value; break;
+    case QP_CFGM_cpu_count: c->cpu_count = value; break;
+    case QP_CFGM_lazy_imports: c->lazy_imports = value; break;
+    case QP_CFGM_inspect: c->inspect = value; break;
+    case QP_CFGM_interactive: c->interactive = value; break;
+    case QP_CFGM_optimization_level: c->optimize = value; break;
+    case QP_CFGM_parser_debug: c->parser_debug = value; break;
+    case QP_CFGM_quiet: c->quiet = value; break;
+    case QP_CFGM_use_environment: c->ignore_environment = !value; break;
+    case QP_CFGM_verbose: c->verbose = value; break;
+    case QP_CFGM_write_bytecode: c->dont_write_bytecode = !value; break;
+    default: Py_UNREACHABLE();
+    }
+}
+
+/* config_set_sys_flag: the member, then sys.flags (rebuilt from the
+   configuration like _PySys_SetFlagObj replaces it) and, for
+   write_bytecode, sys.dont_write_bytecode. */
+static int qp_config_set_sys_flag(const QPConfigSpec *spec, int int_value)
+{
+    JSContext *ctx = qp_capi.ctx;
+    PyObject *value;
+    int res;
+
+    if (spec->type == QP_CFG_BOOL && int_value != 0)
+        int_value = 1;  /* convert values < 0 and values > 1 to 1 */
+    qp_config_set_member(spec, int_value);
+    if (qp_sys_update_flags(ctx) < 0)
+        return -1;
+    if (spec->member != QP_CFGM_write_bytecode)
+        return 0;
+    /* the value of sys.flags.dont_write_bytecode (config_sys_flag_not) */
+    value = PyLong_FromLong(!int_value);
+    if (value == NULL)
+        return -1;
+    res = PySys_SetObject("dont_write_bytecode", value);
+    Py_DECREF(value);
+    return res;
+}
+
+int PyConfig_Set(const char *name, PyObject *value)
+{
+    const QPConfigSpec *spec;
+    PyObject *key, *item;
+    Py_ssize_t i, pos;
+    int int_value = 0, has_int_value = 0;
+
+    if (PySys_Audit("cpython.PyConfig_Set", "sO", name, value) < 0)
+        return -1;
+    spec = qp_config_find_spec(name);
+    if (spec == NULL) {
+        qp_config_unknown_name_error(name);
+        return -1;
+    }
+    if (spec->visibility != QP_CFG_PUBLIC) {
+        PyErr_Format(PyExc_ValueError, "cannot set read-only option %s", name);
+        return -1;
+    }
+
+    switch ((QPConfigType)spec->type) {
+    case QP_CFG_INT:
+    case QP_CFG_UINT:
+    case QP_CFG_BOOL:
+        if (!PyLong_Check(value)) {
+            PyErr_Format(PyExc_TypeError, "expected int or bool, got %T", value);
+            return -1;
+        }
+        int_value = PyLong_AsInt(value);
+        if (int_value == -1 && PyErr_Occurred())
+            return -1;
+        if (int_value < 0 && spec->type != QP_CFG_INT) {
+            PyErr_Format(PyExc_ValueError, "value must be >= 0");
+            return -1;
+        }
+        has_int_value = 1;
+        break;
+    case QP_CFG_ULONG:
+        /* not implemented: only hash_seed uses this type, and it's read-only */
+        goto cannot_set;
+    case QP_CFG_WSTR:
+        if (!PyUnicode_CheckExact(value)) {
+            PyErr_Format(PyExc_TypeError, "expected str, got %T", value);
+            return -1;
+        }
+        break;
+    case QP_CFG_WSTR_OPT:
+        if (value != Py_None && !PyUnicode_CheckExact(value)) {
+            PyErr_Format(PyExc_TypeError, "expected str or None, got %T", value);
+            return -1;
+        }
+        break;
+    case QP_CFG_WSTR_LIST:
+        if (strcmp(spec->name, "xoptions") != 0) {
+            if (!PyList_Check(value)) {
+                PyErr_Format(PyExc_TypeError, "expected list[str], got %T", value);
+                return -1;
+            }
+            for (i = 0; i < PyList_GET_SIZE(value); i++) {
+                item = PyList_GET_ITEM(value, i);
+                if (!PyUnicode_Check(item)) {
+                    PyErr_Format(PyExc_TypeError, "expected str, list item %zd has type %T",
+                                 i, item);
+                    return -1;
+                }
+            }
+        } else {
+            /* xoptions type is dict[str, str] */
+            if (!PyDict_Check(value)) {
+                PyErr_Format(PyExc_TypeError, "expected dict[str, str | bool], got %T", value);
+                return -1;
+            }
+            pos = 0;
+            while (PyDict_Next(value, &pos, &key, &item)) {
+                if (!PyUnicode_Check(key)) {
+                    PyErr_Format(PyExc_TypeError, "expected str, got dict key type %T", key);
+                    return -1;
+                }
+                if (!PyUnicode_Check(item) && !PyBool_Check(item)) {
+                    /* CPython reports the type of the key here */
+                    PyErr_Format(PyExc_TypeError, "expected str or bool, got dict value type %T",
+                                 key);
+                    return -1;
+                }
+            }
+        }
+        break;
+    }
+
+    /* Set the global variable */
+    if (spec->global_var != NULL)
+        *spec->global_var = spec->global_not ? !int_value : int_value;  /* deprecated */
+
+    if (spec->sys_attr != NULL) {
+        /* Set the sys attribute (like CPython, not the configuration) */
+        return PySys_SetObject(spec->sys_attr, value);
+    }
+    if (has_int_value) {
+        if (spec->sys_flag)
+            return qp_config_set_sys_flag(spec, int_value);
+        if (spec->member == QP_CFGM_int_max_str_digits)
+            return qp_sys_int_max_str_digits_set(qp_capi.ctx, int_value);
+        qp_config_set_member(spec, int_value);
+        return 0;
+    }
+ cannot_set:
+    PyErr_Format(PyExc_ValueError, "cannot set option %s", name);
+    return -1;
+}
+
+/* ========================================================================= */
 /* pylifecycle.h, PyStatus, fatal errors                                      */
 /* ========================================================================= */
 
@@ -2934,6 +3799,57 @@ static void qp_capi_call_ll_exitfuncs(void)
     fflush(stderr);
 }
 
+/* PyUnstable_AtExit (Modules/atexitmodule.c): low-level callbacks of the
+   interpreter, last registered first, run by qp_atexit_run after the
+   Python atexit functions (_PyAtExit_Call) */
+typedef struct QPCapiAtExitCallback {
+    atexit_datacallbackfunc func;
+    void *data;
+    struct QPCapiAtExitCallback *next;
+} QPCapiAtExitCallback;
+static QPCapiAtExitCallback *qp_capi_ll_callbacks;
+
+int PyUnstable_AtExit(PyInterpreterState *interp, atexit_datacallbackfunc func, void *data)
+{
+    QPCapiAtExitCallback *cb;
+
+    if (interp != PyInterpreterState_Get()) {
+        PyErr_SetString(PyExc_SystemError, "PyUnstable_AtExit: not the current interpreter");
+        return -1;
+    }
+    cb = PyMem_RawMalloc(sizeof(*cb));
+    if (!cb) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    cb->func = func;
+    cb->data = data;
+    pthread_mutex_lock(&qp_capi_pending_lock);
+    cb->next = qp_capi_ll_callbacks;
+    qp_capi_ll_callbacks = cb;
+    pthread_mutex_unlock(&qp_capi_pending_lock);
+    return 0;
+}
+
+static void qp_capi_atexit_ll_run(JSContext *ctx)
+{
+    QPCapiAtExitCallback *cb;
+
+    if (ctx != qp_capi.ctx)
+        return;
+    for (;;) {
+        pthread_mutex_lock(&qp_capi_pending_lock);
+        cb = qp_capi_ll_callbacks;
+        if (cb)
+            qp_capi_ll_callbacks = cb->next;
+        pthread_mutex_unlock(&qp_capi_pending_lock);
+        if (!cb)
+            break;
+        cb->func(cb->data);
+        PyMem_RawFree(cb);
+    }
+}
+
 int Py_AtExit(void (*func)(void))
 {
     if (qp_capi_nexitfuncs >= QP_CAPI_NEXITFUNCS)
@@ -2958,38 +3874,10 @@ void _Py_NO_RETURN Py_Exit(int sts)
     exit(sts);
 }
 
+/* fatal_error (python/mod_faulthandler.c) */
 static void _Py_NO_RETURN qp_capi_fatal_error(const char *func, const char *msg)
 {
-    static int reentrant;
-    JSContext *ctx = qp_capi.ctx;
-    FILE *f = stderr;
-
-    if (reentrant)
-        abort();  /* Py_FatalError() caused a second fatal error */
-    reentrant = 1;
-    fflush(stdout);
-    fputs("Fatal Python error: ", f);
-    if (func) {
-        fputs(func, f);
-        fputs(": ", f);
-    }
-    fputs(msg ? msg : "<message not set>", f);
-    fputc('\n', f);
-    fprintf(f, "Python runtime state: %s\n",
-            qp_capi_finalizing ? "finalizing" :
-            qp_capi.initialized == 2 ? "initialized" :
-            qp_capi.initialized == 1 ? "initializing" : "unknown");
-    if (ctx != NULL && qp_capi.tstate_current != NULL && qp_capi_rt_is_main_thread() &&
-        JS_HasException(ctx)) {
-        JSValue exc = qp_exc_fetch(ctx);
-        fflush(f);
-        if (qp_exc_display(ctx, exc, QP_NULL) < 0)
-            JS_FreeValue(ctx, JS_GetException(ctx));
-        JS_FreeValue(ctx, exc);
-    }
-    fputc('\n', f);
-    fflush(f);
-    abort();
+    qp_fatal_error(qp_capi.ctx, func, msg);
 }
 
 void _Py_NO_RETURN _Py_FatalErrorFunc(const char *func, const char *message)
@@ -3183,6 +4071,105 @@ int PyContextVar_Reset(PyObject *ovar, PyObject *otok)
     return qp_contextvar_reset(ctx, var, tok);
 }
 
+/* ---- context watchers (Python/context.c) -------------------------------- */
+
+#define QP_CAPI_CONTEXT_MAX_WATCHERS 8      /* CONTEXT_MAX_WATCHERS */
+static PyContext_WatchCallback qp_capi_context_watchers[QP_CAPI_CONTEXT_MAX_WATCHERS];
+
+static const char *qp_capi_context_event_name(PyContextEvent event)
+{
+    switch (event) {
+    case Py_CONTEXT_SWITCHED:
+        return "Py_CONTEXT_SWITCHED";
+    default:
+        return "?";
+    }
+}
+
+/* notify_context_watchers(ts, Py_CONTEXT_SWITCHED, ts->context), called
+   by _PyContext_Enter / _PyContext_Exit (mod_misc.c) */
+static void qp_capi_context_switched(JSContext *ctx, JSValueConst current)
+{
+    unsigned bits = qp_capi_context_watchers_set;
+    PyObject *co;
+    int i;
+
+    if (!bits || qp_capi_dead)
+        return;
+    /* None after exiting the last context of the stack (no base context
+       was created) */
+    co = QP_IS_NULL(current) ? Py_NewRef(Py_None) : qp_capi_new_ref(ctx, current);
+    if (!co) {
+        PyErr_FormatUnraisable("Exception ignored in %s watcher callback",
+                               qp_capi_context_event_name(Py_CONTEXT_SWITCHED));
+        return;
+    }
+    for (i = 0; bits; i++, bits >>= 1) {
+        PyContext_WatchCallback cb;
+        if (!(bits & 1))
+            continue;
+        /* A previous callback may have cleared this watcher. */
+        cb = qp_capi_context_watchers[i];
+        if (cb && cb(Py_CONTEXT_SWITCHED, co) < 0)
+            PyErr_FormatUnraisable("Exception ignored in %s watcher callback for %R",
+                                   qp_capi_context_event_name(Py_CONTEXT_SWITCHED), co);
+    }
+    Py_DECREF(co);
+}
+
+int PyContext_AddWatcher(PyContext_WatchCallback callback)
+{
+    int i;
+    for (i = 0; i < QP_CAPI_CONTEXT_MAX_WATCHERS; i++) {
+        if (!qp_capi_context_watchers[i]) {
+            qp_capi_context_watchers[i] = callback;
+            qp_capi_context_watchers_set |= (uint8_t)(1 << i);
+            return i;
+        }
+    }
+    PyErr_SetString(PyExc_RuntimeError, "no more context watcher IDs available");
+    return -1;
+}
+
+int PyContext_ClearWatcher(int watcher_id)
+{
+    if (watcher_id < 0 || watcher_id >= QP_CAPI_CONTEXT_MAX_WATCHERS) {
+        PyErr_Format(PyExc_ValueError, "Invalid context watcher ID %d", watcher_id);
+        return -1;
+    }
+    if (!qp_capi_context_watchers[watcher_id]) {
+        PyErr_Format(PyExc_ValueError, "No context watcher set for ID %d", watcher_id);
+        return -1;
+    }
+    qp_capi_context_watchers[watcher_id] = NULL;
+    qp_capi_context_watchers_set &= (uint8_t)~(1 << watcher_id);
+    return 0;
+}
+
+/* pycore_context.h (dquickts): _testcapi's clear_context_stack over our
+   context stack (QPModState.ctx_current, CPython tstate->context): 1 if a
+   non-base context is entered (the current one has a previous context;
+   nothing changes), else 0 after dropping the current context, so that the
+   next context access creates a fresh base context. */
+PyAPI_FUNC(int) _PyQp_ClearContextStack(void);
+int _PyQp_ClearContextStack(void)
+{
+    JSContext *ctx = qp_capi.ctx;
+    QPModState *ms = qp_ctxvar_state(ctx);
+    JSValue cur;
+
+    if (!ms)
+        return -1;
+    cur = ms->ctx_current;
+    if (QP_IS_NULL(cur))
+        return 0;
+    if (!QP_IS_NULL(qp_instance_slots(cur)[QP_CONTEXT_SLOT_PREV]))
+        return 1;
+    ms->ctx_current = QP_NULL;
+    JS_FreeValue(ctx, cur);
+    return 0;
+}
+
 /* ========================================================================= */
 /* generators (pycore_genobject.h helpers, genobject.h)                       */
 /* ========================================================================= */
@@ -3262,9 +4249,128 @@ static int qp_capi_code_int(JSContext *ctx, JSValueConst v, const char *name, in
     return 0;
 }
 
+/* PEP 523 co_extra (Objects/codeobject.c): co_extra of the code mirror
+   holds a QPCapiCodeExtra; the mirror is PERSIST once an extra is set, so
+   it lives as long as the code object, and the free functions run when it
+   is released (code_dealloc). */
+#define QP_CAPI_MAX_CO_EXTRA_USERS 255
+typedef struct {
+    Py_ssize_t ce_size;
+    void *ce_extras[1];
+} QPCapiCodeExtra;
+static freefunc qp_capi_co_extra_freefuncs[QP_CAPI_MAX_CO_EXTRA_USERS];
+static Py_ssize_t qp_capi_co_extra_user_count;
+
+static void qp_capi_code_free_extras(PyCodeObject *co)
+{
+    QPCapiCodeExtra *ce = co->co_extra;
+    Py_ssize_t i;
+    if (!ce)
+        return;
+    co->co_extra = NULL;
+    for (i = 0; i < ce->ce_size; i++) {
+        freefunc free_extra = qp_capi_co_extra_freefuncs[i];
+        if (free_extra && ce->ce_extras[i])
+            free_extra(ce->ce_extras[i]);
+    }
+    PyMem_RawFree(ce);
+}
+
+/* PyUnstable_GC_VisitObjects (Python/gc.c): every object gc.get_objects()
+   lists (a snapshot, so the callback may allocate), then the tracked
+   extension instances that have no Python identity yet; stops when the
+   callback returns 0 */
+void PyUnstable_GC_VisitObjects(gcvisitobjects_t callback, void *arg)
+{
+    JSContext *ctx = qp_capi.ctx;
+    JSValue *items = NULL;
+    Py_ssize_t n, i;
+    int go_on = 1;
+    struct list_head *el;
+
+    n = qp_gc_snapshot(ctx, &items);
+    if (n < 0) {
+        PyErr_Clear();
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        PyObject *op = go_on ? qp_capi_new_ref(ctx, items[i]) : NULL;
+        JS_FreeValue(ctx, items[i]);
+        if (!op) {
+            if (go_on)
+                PyErr_Clear();
+            continue;
+        }
+        go_on = callback(op, arg);
+        Py_DECREF(op);
+    }
+    qp_sys_free(items);
+    if (!go_on)
+        return;
+    list_for_each(el, &qp_capi.live_list) {
+        QPCapiHead *h = list_entry(el, QPCapiHead, live_link);
+        if ((h->flags & (QP_CAPI_F_NATIVE | QP_CAPI_F_TRACKED)) == (QP_CAPI_F_NATIVE | QP_CAPI_F_TRACKED) &&
+            QP_IS_NULL(h->v) && !callback(QP_CAPI_OBJ(h), arg))
+            return;
+    }
+}
+
+Py_ssize_t PyUnstable_Eval_RequestCodeExtraIndex(freefunc free)
+{
+    Py_ssize_t new_index;
+    if (qp_capi_co_extra_user_count >= QP_CAPI_MAX_CO_EXTRA_USERS - 1)
+        return -1;
+    new_index = qp_capi_co_extra_user_count++;
+    qp_capi_co_extra_freefuncs[new_index] = free;
+    return new_index;
+}
+
+int PyUnstable_Code_GetExtra(PyObject *code, Py_ssize_t index, void **extra)
+{
+    QPCapiCodeExtra *ce;
+    if (!PyCode_Check(code)) {
+        PyErr_BadInternalCall();
+        return -1;
+    }
+    ce = ((PyCodeObject *)code)->co_extra;
+    *extra = (ce && index >= 0 && index < ce->ce_size) ? ce->ce_extras[index] : NULL;
+    return 0;
+}
+
+int PyUnstable_Code_SetExtra(PyObject *code, Py_ssize_t index, void *extra)
+{
+    PyCodeObject *co = (PyCodeObject *)code;
+    QPCapiCodeExtra *ce;
+
+    if (!PyCode_Check(code) || index < 0 || index >= qp_capi_co_extra_user_count) {
+        PyErr_BadInternalCall();
+        return -1;
+    }
+    ce = co->co_extra;
+    if (!ce || ce->ce_size <= index) {
+        Py_ssize_t old = ce ? ce->ce_size : 0, i;
+        ce = PyMem_RawRealloc(ce, sizeof(QPCapiCodeExtra) + (size_t)qp_capi_co_extra_user_count * sizeof(void *));
+        if (!ce) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        for (i = old; i < qp_capi_co_extra_user_count; i++)
+            ce->ce_extras[i] = NULL;
+        ce->ce_size = qp_capi_co_extra_user_count;
+        co->co_extra = ce;
+        if (QP_CAPI_HAS_HEAD(co))
+            QP_CAPI_HEAD(co)->flags |= QP_CAPI_F_PERSIST;
+    }
+    if (ce->ce_extras[index] && qp_capi_co_extra_freefuncs[index])
+        qp_capi_co_extra_freefuncs[index](ce->ce_extras[index]);
+    ce->ce_extras[index] = extra;
+    return 0;
+}
+
 static void qp_capi_code_clear(JSRuntime *rt, PyObject *op)
 {
     PyCodeObject *co = (PyCodeObject *)op;
+    qp_capi_code_free_extras(co);
     Py_CLEAR(co->co_consts);
     Py_CLEAR(co->co_names);
     Py_CLEAR(co->co_exceptiontable);
@@ -3387,8 +4493,12 @@ static int qp_capi_code_init(JSContext *ctx, PyObject *op, JSValueConst v)
 {
     PyCodeObject *co = (PyCodeObject *)op;
     PyObject *varnames = NULL, *cellvars = NULL, *freevars = NULL;
+    QPCapiTupleFillSave fill;
     int r = -1;
 
+    /* the name tuples are read below: fill them now even when this code
+       object is materialized while filling a tuple (dis.Instruction) */
+    qp_capi_tuple_fill_suspend(&fill);
     if (qp_capi_code_int(ctx, v, "co_flags", &co->co_flags) < 0 ||
         qp_capi_code_int(ctx, v, "co_argcount", &co->co_argcount) < 0 ||
         qp_capi_code_int(ctx, v, "co_posonlyargcount", &co->co_posonlyargcount) < 0 ||
@@ -3418,6 +4528,7 @@ static int qp_capi_code_init(JSContext *ctx, PyObject *op, JSValueConst v)
     co->_co_firsttraceable = 0;
     r = 0;
 done:
+    qp_capi_tuple_fill_resume(&fill);
     Py_XDECREF(varnames);
     Py_XDECREF(cellvars);
     Py_XDECREF(freevars);
@@ -3451,8 +4562,8 @@ PyCodeObject *PyCode_NewEmpty(const char *filename, const char *funcname, int fi
 {
     JSContext *ctx = qp_capi.ctx;
     qp_error err;
-    JSValue bc, code;
-    PyObject *co, *replace, *kwargs = NULL, *empty = NULL, *res = NULL, *v;
+    JSValue bc, code, name;
+    QPCodeObject tmpl;
 
     memset(&err, 0, sizeof(err));
     bc = qp_compile_source(ctx, "", 0, filename, QP_NULL, Py_file_input, 0, -1, &err);
@@ -3463,48 +4574,165 @@ PyCodeObject *PyCode_NewEmpty(const char *filename, const char *funcname, int fi
         return NULL;
     }
     qp_error_clear(&err);
-    code = qp_code_new(ctx, bc);
+    name = qp_str_from_cstr(ctx, funcname);
+    if (JS_IsException(name)) {
+        JS_FreeValue(ctx, bc);
+        return NULL;
+    }
+    /* one code object, as code.replace(co_name=funcname,
+       co_qualname=funcname, co_firstlineno=firstlineno) would make it (a
+       code watcher sees a single PY_CODE_EVENT_CREATE) */
+    memset(&tmpl, 0, sizeof(tmpl));
+    tmpl.name = name;
+    tmpl.qualname = name;
+    tmpl.filename = QP_NULL;
+    tmpl.firstlineno = firstlineno;
+    tmpl.has_firstlineno = TRUE;
+    tmpl.fields = QP_NULL;
+    code = qp_co_alloc(ctx, bc, &tmpl);
+    JS_FreeValue(ctx, name);
     JS_FreeValue(ctx, bc);
-    co = qp_capi_from_js_result(ctx, code);
-    if (co == NULL)
-        return NULL;
-    /* code.replace(co_name=funcname, co_qualname=funcname,
-       co_firstlineno=firstlineno) */
-    replace = PyObject_GetAttrString(co, "replace");
+    return (PyCodeObject *)qp_capi_from_js_result(ctx, code);
+}
+
+/* ---- code watchers (Objects/codeobject.c) ------------------------------- */
+
+/* PY_CODE_EVENT_CREATE is reported when a code object is made
+   (qp_co_alloc: compile(), func.__code__, marshal, replace(), ...);
+   PY_CODE_EVENT_DESTROY from the finalizer queue, to which the free of
+   every code object is deferred while a code watcher is set
+   (qp_capi_dealloc_watched), as CPython's code_dealloc resurrects it for
+   the callbacks. */
+#define QP_CAPI_CODE_MAX_WATCHERS 8         /* CODE_MAX_WATCHERS */
+static PyCode_WatchCallback qp_capi_code_watchers[QP_CAPI_CODE_MAX_WATCHERS];
+
+static const char *qp_capi_code_event_name(PyCodeEvent event)
+{
+    switch (event) {
+#define QP_CAPI_CODE_EVENT_CASE(op) case PY_CODE_EVENT_##op: return "PY_CODE_EVENT_" #op;
+    PY_FOREACH_CODE_EVENT(QP_CAPI_CODE_EVENT_CASE)
+#undef QP_CAPI_CODE_EVENT_CASE
+    }
+    return "?";
+}
+
+/* notify_code_watchers */
+static void qp_capi_code_notify(JSContext *ctx, JSValueConst code, PyCodeEvent event)
+{
+    unsigned bits = qp_capi_code_watchers_set;
+    PyObject *co;
+    int i;
+
+    if (!bits || qp_capi_dead)
+        return;
+    co = qp_capi_new_ref(ctx, code);
+    if (!co) {
+        PyErr_FormatUnraisable("Exception ignored in %s watcher callback",
+                               qp_capi_code_event_name(event));
+        return;
+    }
+    for (i = 0; bits; i++, bits >>= 1) {
+        PyCode_WatchCallback cb;
+        if (!(bits & 1))
+            continue;
+        cb = qp_capi_code_watchers[i];
+        if (cb && cb(event, (PyCodeObject *)co) < 0)
+            PyErr_FormatUnraisable("Exception ignored in %s watcher callback for %R",
+                                   qp_capi_code_event_name(event), co);
+    }
     Py_DECREF(co);
-    if (replace == NULL)
+}
+
+static void qp_capi_code_created(JSContext *ctx, JSValueConst code)
+{
+    qp_capi_code_notify(ctx, code, PY_CODE_EVENT_CREATE);
+}
+
+int PyCode_AddWatcher(PyCode_WatchCallback callback)
+{
+    int i;
+    for (i = 0; i < QP_CAPI_CODE_MAX_WATCHERS; i++) {
+        if (!qp_capi_code_watchers[i]) {
+            qp_capi_code_watchers[i] = callback;
+            qp_capi_code_watchers_set |= (uint8_t)(1 << i);
+            return i;
+        }
+    }
+    PyErr_SetString(PyExc_RuntimeError, "no more code watcher IDs available");
+    return -1;
+}
+
+int PyCode_ClearWatcher(int watcher_id)
+{
+    if (watcher_id < 0 || watcher_id >= QP_CAPI_CODE_MAX_WATCHERS) {
+        PyErr_Format(PyExc_ValueError, "Invalid code watcher ID %d", watcher_id);
+        return -1;
+    }
+    if (!qp_capi_code_watchers[watcher_id]) {
+        PyErr_Format(PyExc_ValueError, "No code watcher set for ID %d", watcher_id);
+        return -1;
+    }
+    qp_capi_code_watchers[watcher_id] = NULL;
+    qp_capi_code_watchers_set &= (uint8_t)~(1 << watcher_id);
+    return 0;
+}
+
+/* object.h hooks of qp_del_context / qp_run_pending_finalizers (type,
+   function, dict and code deallocation events). */
+static JSContext *qp_capi_dealloc_watched(JSObject *p)
+{
+    BOOL watched;
+
+    if (qp_capi_dead || qp_capi.initialized != 2)
         return NULL;
-    kwargs = PyDict_New();
-    empty = PyTuple_New(0);
-    if (kwargs == NULL || empty == NULL)
-        goto done;
-    if (!(v = PyUnicode_FromString(funcname)))
-        goto done;
-    if (PyDict_SetItemString(kwargs, "co_name", v) < 0 ||
-        PyDict_SetItemString(kwargs, "co_qualname", v) < 0) {
-        Py_DECREF(v);
-        goto done;
+    switch (p->class_id) {
+    case JS_CLASS_PY_DICT: {
+        QPDict *d = p->u.opaque;
+        watched = d && (d->core.version & qp_capi_dict_watchers_set) != 0;
+        break;
     }
-    Py_DECREF(v);
-    if (!(v = PyLong_FromLong(firstlineno)))
-        goto done;
-    if (PyDict_SetItemString(kwargs, "co_firstlineno", v) < 0) {
-        Py_DECREF(v);
-        goto done;
+    case JS_CLASS_PY_CODE:
+        watched = qp_capi_code_watchers_set != 0;
+        break;
+    case JS_CLASS_PY_TYPE:
+        watched = qp_capi_type_dealloc_watched(p);
+        break;
+    case JS_CLASS_BYTECODE_FUNCTION:
+        watched = qp_capi_func_watchers_set && qp_function_data(JS_MKPTR(JS_TAG_OBJECT, p));
+        break;
+    default:
+        watched = FALSE;
+        break;
     }
-    Py_DECREF(v);
-    res = PyObject_Call(replace, empty, kwargs);
-done:
-    Py_DECREF(replace);
-    Py_XDECREF(kwargs);
-    Py_XDECREF(empty);
-    return (PyCodeObject *)res;
+    return watched ? qp_capi.ctx : NULL;
+}
+
+static void qp_capi_dealloc_notify(JSContext *ctx, JSValueConst obj)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(obj);
+    switch (p->class_id) {
+    case JS_CLASS_PY_DICT:
+        qp_capi_dict_dealloc_notify(ctx, p);
+        break;
+    case JS_CLASS_PY_CODE:
+        qp_capi_code_notify(ctx, obj, PY_CODE_EVENT_DESTROY);
+        break;
+    case JS_CLASS_PY_TYPE:
+        qp_capi_type_dealloc_notify(ctx, obj);
+        break;
+    case JS_CLASS_BYTECODE_FUNCTION:
+        qp_capi_func_event(ctx, PyFunction_EVENT_DESTROY, obj, QP_NULL);
+        break;
+    default:
+        break;
+    }
 }
 
 int PyCode_Addr2Line(PyCodeObject *co, int addrq)
 {
     struct JSFunctionBytecode *b;
     QPLoc loc;
+    int pc;
     if (addrq < 0)
         return co->co_firstlineno;
     b = qp_capi_code_bc(co);
@@ -3512,7 +4740,9 @@ int PyCode_Addr2Line(PyCodeObject *co, int addrq)
         PyErr_Clear();
         return -1;
     }
-    if (qp_code_addr2loc(b, (uint32_t)addrq, &loc) < 0)
+    /* addrq is a co_code offset (f_lasti) */
+    pc = qp_code_lasti2pc(b, addrq);
+    if (pc < 0 || qp_code_addr2loc(b, (uint32_t)pc, &loc) < 0)
         return -1;
     return loc.lineno;
 }
@@ -3522,6 +4752,7 @@ int PyCode_Addr2Location(PyCodeObject *co, int addrq, int *start_line, int *star
 {
     struct JSFunctionBytecode *b;
     QPLoc loc;
+    int pc;
     if (addrq < 0) {
         *start_line = *end_line = co->co_firstlineno;
         *start_column = *end_column = 0;
@@ -3531,7 +4762,8 @@ int PyCode_Addr2Location(PyCodeObject *co, int addrq, int *start_line, int *star
     if (b == NULL) {
         PyErr_Clear();
         loc.lineno = loc.end_lineno = loc.col = loc.end_col = -1;
-    } else if (qp_code_addr2loc(b, (uint32_t)addrq, &loc) < 0) {
+    } else if ((pc = qp_code_lasti2pc(b, addrq)) < 0 ||
+               qp_code_addr2loc(b, (uint32_t)pc, &loc) < 0) {
         loc.lineno = loc.end_lineno = loc.col = loc.end_col = -1;
     }
     *start_line = loc.lineno;
@@ -3959,9 +5191,8 @@ done:
    (func, obj); it maps the event name to its PyTrace_* code and calls
    func(obj, frame, what, arg).  On 'call' a trace hook returns a builtin of
    the same capsule as the local trace function, so the frame also reports
-   its 'line', 'return' and 'exception' events to it.  Deviations: sys.getprofile()/gettrace() return
-   the hook builtin (CPython: obj), and the *AllThreads variants set the
-   hook of the calling thread, like sys._setprofileallthreads. */
+   its 'line', 'return' and 'exception' events to it.  Deviation: sys.getprofile()/gettrace() return
+   the hook builtin (CPython: obj). */
 
 typedef struct {
     Py_tracefunc func;
@@ -4023,18 +5254,20 @@ static PyMethodDef qp_capi_trace_hook_def = {
     "C-level profile or trace function (PyEval_SetProfile, PyEval_SetTrace)."
 };
 
-static int qp_capi_set_trace_hook(int is_profile, Py_tracefunc func, PyObject *obj)
+/* which: 1 profile (else trace) | 2 all threads (*AllThreads) */
+static int qp_capi_set_trace_hook(int which, Py_tracefunc func, PyObject *obj)
 {
     JSContext *ctx = qp_capi.ctx;
     QPCapiTraceHook *h;
     PyObject *capsule, *hook;
     JSValue v;
-    int r;
+    int r, is_profile = which & 1;
 
     if (qp_sys_audit_event(ctx, is_profile ? "sys.setprofile" : "sys.settrace") < 0)
         return -1;
     if (!func)
-        return qp_trace_set(ctx, is_profile, QP_NULL);
+        return (which & 2) ? qp_trace_set_all(ctx, is_profile, QP_NULL) :
+            qp_trace_set(ctx, is_profile, QP_NULL);
     h = PyMem_RawCalloc(1, sizeof(*h));
     if (!h) {
         PyErr_NoMemory();
@@ -4053,7 +5286,8 @@ static int qp_capi_set_trace_hook(int is_profile, Py_tracefunc func, PyObject *o
     if (!hook)
         return -1;
     v = qp_capi_value(ctx, hook);
-    r = JS_IsException(v) ? -1 : qp_trace_set(ctx, is_profile, v);
+    r = JS_IsException(v) ? -1 :
+        (which & 2) ? qp_trace_set_all(ctx, is_profile, v) : qp_trace_set(ctx, is_profile, v);
     Py_DECREF(hook);
     return r;
 }
@@ -4079,7 +5313,7 @@ void PyEval_SetProfile(Py_tracefunc func, PyObject *arg)
 
 void PyEval_SetProfileAllThreads(Py_tracefunc func, PyObject *arg)
 {
-    if (qp_capi_set_trace_hook(1, func, arg) < 0)
+    if (qp_capi_set_trace_hook(3, func, arg) < 0)
         PyErr_FormatUnraisable("Exception ignored in PyEval_SetProfileAllThreads");
 }
 
@@ -4091,7 +5325,7 @@ void PyEval_SetTrace(Py_tracefunc func, PyObject *arg)
 
 void PyEval_SetTraceAllThreads(Py_tracefunc func, PyObject *arg)
 {
-    if (qp_capi_set_trace_hook(0, func, arg) < 0)
+    if (qp_capi_set_trace_hook(2, func, arg) < 0)
         PyErr_FormatUnraisable("Exception ignored in PyEval_SetTraceAllThreads");
 }
 
@@ -4140,8 +5374,13 @@ PyObject *PyFrame_GetGenerator(PyFrameObject *frame)
 
 PyObject *PyFrame_GetVar(PyFrameObject *frame, PyObject *name)
 {
-    PyObject *locals = PyFrame_GetLocals(frame), *value;
+    PyObject *locals, *value;
     int rc;
+    if (!PyUnicode_Check(name)) {
+        PyErr_Format(PyExc_TypeError, "name must be str, not %s", Py_TYPE(name)->tp_name);
+        return NULL;
+    }
+    locals = PyFrame_GetLocals(frame);
     if (locals == NULL)
         return NULL;
     rc = PyMapping_GetOptionalItem(locals, name, &value);
@@ -4205,6 +5444,205 @@ void PyFrame_FastToLocals(PyFrameObject *frame)
 void PyFrame_LocalsToFast(PyFrameObject *frame, int clear)
 {
 }
+/* ========================================================================= */
+/* PEP 669 monitoring (cpython/monitoring.h, CPython Python/instrumentation.c) */
+/* ========================================================================= */
+
+/* Over sys.monitoring (python/instrumentation.c qp_mon_capi_*).  A
+   PyMonitoringState holds the tools that monitor one event of a code-like
+   object; PyMonitoring_EnterScope refreshes the states from the global
+   event sets when the global monitoring version moved, and a callback that
+   returns DISABLE removes its tool from the state of a location event. */
+
+int PyMonitoring_EnterScope(PyMonitoringState *state_array, uint64_t *version,
+                            const uint8_t *event_types, Py_ssize_t length)
+{
+    JSContext *ctx = qp_capi.ctx;
+    uint64_t v = qp_mon_capi_version(ctx);
+    Py_ssize_t i;
+
+    if (*version == v)
+        return 0;
+    for (i = 0; i < length; i++)
+        state_array[i].active = (uint8_t)qp_mon_capi_tools(ctx, event_types[i]);
+    *version = v;
+    return 0;
+}
+
+int PyMonitoring_ExitScope(void)
+{
+    return 0;
+}
+
+/* capi_call_instrumentation: the callbacks get (codelike, second,
+   extra...), second = offset (the line for LINE). */
+static int qp_capi_mon_call(PyMonitoringState *state, PyObject *codelike, int32_t offset,
+                            int event, int32_t second, PyObject *const *extra, int nextra)
+{
+    JSContext *ctx = qp_capi.ctx;
+    JSValue argv[4];
+    int i;
+
+    if (offset < 0) {
+        PyErr_SetString(PyExc_ValueError, "offset must be non-negative");
+        return -1;
+    }
+    argv[0] = qp_capi_value(ctx, codelike);
+    if (JS_IsException(argv[0]))
+        return -1;
+    argv[1] = JS_NewInt32(ctx, second);
+    for (i = 0; i < nextra; i++) {
+        argv[2 + i] = qp_capi_value(ctx, extra[i]);
+        if (JS_IsException(argv[2 + i]))
+            return -1;
+    }
+    return qp_mon_capi_fire(ctx, &state->active, event, (JSValueConst *)argv, 2 + nextra);
+}
+
+static int qp_capi_mon_fire(PyMonitoringState *state, PyObject *codelike, int32_t offset,
+                            int event, PyObject *arg)
+{
+    return qp_capi_mon_call(state, codelike, offset, event, offset, &arg, arg ? 1 : 0);
+}
+
+/* Exception events: the raised exception is the extra argument and stays
+   raised unless a callback fails (exception_event_setup/teardown). */
+static int qp_capi_mon_fire_exc(PyMonitoringState *state, PyObject *codelike, int32_t offset,
+                                int event)
+{
+    PyObject *exc = PyErr_GetRaisedException();
+    int err;
+
+    if (exc == NULL) {
+        PyErr_Format(PyExc_ValueError, "Firing event %d with no exception set", event);
+        return -1;
+    }
+    err = qp_capi_mon_fire(state, codelike, offset, event, exc);
+    if (err == 0)
+        PyErr_SetRaisedException(exc);
+    else
+        Py_DECREF(exc);
+    return err;
+}
+
+int _PyMonitoring_FirePyStartEvent(PyMonitoringState *state, PyObject *codelike, int32_t offset)
+{
+    return qp_capi_mon_fire(state, codelike, offset, PY_MONITORING_EVENT_PY_START, NULL);
+}
+
+int _PyMonitoring_FirePyResumeEvent(PyMonitoringState *state, PyObject *codelike, int32_t offset)
+{
+    return qp_capi_mon_fire(state, codelike, offset, PY_MONITORING_EVENT_PY_RESUME, NULL);
+}
+
+int _PyMonitoring_FirePyReturnEvent(PyMonitoringState *state, PyObject *codelike, int32_t offset,
+                                    PyObject *retval)
+{
+    return qp_capi_mon_fire(state, codelike, offset, PY_MONITORING_EVENT_PY_RETURN, retval);
+}
+
+int _PyMonitoring_FirePyYieldEvent(PyMonitoringState *state, PyObject *codelike, int32_t offset,
+                                   PyObject *retval)
+{
+    return qp_capi_mon_fire(state, codelike, offset, PY_MONITORING_EVENT_PY_YIELD, retval);
+}
+
+int _PyMonitoring_FireCallEvent(PyMonitoringState *state, PyObject *codelike, int32_t offset,
+                                PyObject *callable, PyObject *arg0)
+{
+    PyObject *extra[2] = { callable, arg0 };
+    return qp_capi_mon_call(state, codelike, offset, PY_MONITORING_EVENT_CALL, offset, extra, 2);
+}
+
+int _PyMonitoring_FireLineEvent(PyMonitoringState *state, PyObject *codelike, int32_t offset,
+                                int lineno)
+{
+    return qp_capi_mon_call(state, codelike, offset, PY_MONITORING_EVENT_LINE, lineno, NULL, 0);
+}
+
+int _PyMonitoring_FireJumpEvent(PyMonitoringState *state, PyObject *codelike, int32_t offset,
+                                PyObject *target_offset)
+{
+    return qp_capi_mon_fire(state, codelike, offset, PY_MONITORING_EVENT_JUMP, target_offset);
+}
+
+int _PyMonitoring_FireBranchEvent(PyMonitoringState *state, PyObject *codelike, int32_t offset,
+                                  PyObject *target_offset)
+{
+    return qp_capi_mon_fire(state, codelike, offset, PY_MONITORING_EVENT_BRANCH_RIGHT,
+                            target_offset);
+}
+
+int _PyMonitoring_FireBranchRightEvent(PyMonitoringState *state, PyObject *codelike,
+                                       int32_t offset, PyObject *target_offset)
+{
+    return qp_capi_mon_fire(state, codelike, offset, PY_MONITORING_EVENT_BRANCH_RIGHT,
+                            target_offset);
+}
+
+int _PyMonitoring_FireBranchLeftEvent(PyMonitoringState *state, PyObject *codelike,
+                                      int32_t offset, PyObject *target_offset)
+{
+    return qp_capi_mon_fire(state, codelike, offset, PY_MONITORING_EVENT_BRANCH_LEFT,
+                            target_offset);
+}
+
+int _PyMonitoring_FireCReturnEvent(PyMonitoringState *state, PyObject *codelike, int32_t offset,
+                                   PyObject *retval)
+{
+    return qp_capi_mon_fire(state, codelike, offset, PY_MONITORING_EVENT_C_RETURN, retval);
+}
+
+int _PyMonitoring_FirePyThrowEvent(PyMonitoringState *state, PyObject *codelike, int32_t offset)
+{
+    return qp_capi_mon_fire_exc(state, codelike, offset, PY_MONITORING_EVENT_PY_THROW);
+}
+
+int _PyMonitoring_FireRaiseEvent(PyMonitoringState *state, PyObject *codelike, int32_t offset)
+{
+    return qp_capi_mon_fire_exc(state, codelike, offset, PY_MONITORING_EVENT_RAISE);
+}
+
+int _PyMonitoring_FireCRaiseEvent(PyMonitoringState *state, PyObject *codelike, int32_t offset)
+{
+    return qp_capi_mon_fire_exc(state, codelike, offset, PY_MONITORING_EVENT_C_RAISE);
+}
+
+int _PyMonitoring_FireReraiseEvent(PyMonitoringState *state, PyObject *codelike, int32_t offset)
+{
+    return qp_capi_mon_fire_exc(state, codelike, offset, PY_MONITORING_EVENT_RERAISE);
+}
+
+int _PyMonitoring_FireExceptionHandledEvent(PyMonitoringState *state, PyObject *codelike,
+                                            int32_t offset)
+{
+    return qp_capi_mon_fire_exc(state, codelike, offset, PY_MONITORING_EVENT_EXCEPTION_HANDLED);
+}
+
+int _PyMonitoring_FirePyUnwindEvent(PyMonitoringState *state, PyObject *codelike, int32_t offset)
+{
+    return qp_capi_mon_fire_exc(state, codelike, offset, PY_MONITORING_EVENT_PY_UNWIND);
+}
+
+/* The StopIteration(value) is raised for the callbacks only. */
+int _PyMonitoring_FireStopIterationEvent(PyMonitoringState *state, PyObject *codelike,
+                                         int32_t offset, PyObject *value)
+{
+    PyObject *exc;
+    int err;
+
+    PyErr_SetObject(PyExc_StopIteration, value);
+    exc = PyErr_GetRaisedException();
+    if (exc == NULL) {
+        PyErr_Format(PyExc_ValueError, "Firing event %d with no exception set",
+                     PY_MONITORING_EVENT_STOP_ITERATION);
+        return -1;
+    }
+    err = qp_capi_mon_fire(state, codelike, offset, PY_MONITORING_EVENT_STOP_ITERATION, exc);
+    Py_DECREF(exc);
+    return err;
+}
+
 
 /* ========================================================================= */
 /* fileutils.h, pycore_fileutils.h                                            */
@@ -4214,6 +5652,7 @@ PyAPI_FUNC(int) _Py_get_inheritable(int fd);
 PyAPI_FUNC(int) _Py_set_inheritable(int fd, int inheritable, int *atomic_flag_works);
 PyAPI_FUNC(int) _Py_set_inheritable_async_safe(int fd, int inheritable, int *atomic_flag_works);
 PyAPI_FUNC(int) _Py_dup(int fd);
+PyAPI_FUNC(int) _Py_IsValidFD(int fd);
 
 static int qp_capi_get_inheritable(int fd, int raise)
 {
@@ -4274,6 +5713,14 @@ int _Py_set_inheritable(int fd, int inheritable, int *atomic_flag_works)
 int _Py_set_inheritable_async_safe(int fd, int inheritable, int *atomic_flag_works)
 {
     return qp_capi_set_inheritable(fd, inheritable, 0, atomic_flag_works);
+}
+
+/* Python/fileutils.c (POSIX): F_GETFD fails with EBADF on a closed fd */
+int _Py_IsValidFD(int fd)
+{
+    if (fd < 0)
+        return 0;
+    return fcntl(fd, F_GETFD) >= 0;
 }
 
 int _Py_dup(int fd)
@@ -5625,43 +7072,21 @@ _PyTime_TimeWithInfo(PyTime_t *t, _Py_clock_info_t *info)
 static int
 qp_capi_pytime_get_monotonic_clock(PyTime_t *tp, _Py_clock_info_t *info, int raise_exc)
 {
+    /* the clock of time.monotonic() (python/mod_time.c: mach_absolute_time()
+       on macOS, clock_gettime(CLOCK_MONOTONIC/CLOCK_HIGHRES) elsewhere) */
+    QPTimeClockInfo qinfo;
+    int64_t t;
+
     assert(info == NULL || raise_exc);
-    if (raise_exc) {
-        // raise_exc requires to hold a thread state
-    }
-
-
-#ifdef CLOCK_HIGHRES
-    const clockid_t clk_id = CLOCK_HIGHRES;
-    const char *implementation = "clock_gettime(CLOCK_HIGHRES)";
-#else
-    const clockid_t clk_id = CLOCK_MONOTONIC;
-    const char *implementation = "clock_gettime(CLOCK_MONOTONIC)";
-#endif
-
-    struct timespec ts;
-    if (clock_gettime(clk_id, &ts) != 0) {
-        if (raise_exc) {
-            PyErr_SetFromErrno(PyExc_OSError);
-            return -1;
-        }
+    if (qp_time_monotonic_clock(raise_exc ? qp_capi.ctx : NULL, &t,
+                                info ? &qinfo : NULL) < 0)
         return -1;
-    }
-
-    if (qp_capi_pytime_fromtimespec(tp, &ts, raise_exc) < 0) {
-        return -1;
-    }
-
+    *tp = (PyTime_t)t;
     if (info) {
-        info->monotonic = 1;
-        info->implementation = implementation;
-        info->adjustable = 0;
-        struct timespec res;
-        if (clock_getres(clk_id, &res) != 0) {
-            PyErr_SetFromErrno(PyExc_OSError);
-            return -1;
-        }
-        info->resolution = res.tv_sec + res.tv_nsec * 1e-9;
+        info->implementation = qinfo.implementation;
+        info->monotonic = qinfo.monotonic;
+        info->adjustable = qinfo.adjustable;
+        info->resolution = qinfo.resolution;
     }
     return 0;
 }
@@ -6407,6 +7832,12 @@ static void qp_capi_runtime_clear(void)
         qp_capi_tstate_clear(t);
     Py_CLEAR(interp->qp_dict);
     Py_CLEAR(qp_capi_rt_holder);
+    /* the watchers are per interpreter (CPython interpreter_clear) */
+    qp_capi_dict_watchers_clear();
+    memset(qp_capi_code_watchers, 0, sizeof(qp_capi_code_watchers));
+    qp_capi_code_watchers_set = 0;
+    memset(qp_capi_context_watchers, 0, sizeof(qp_capi_context_watchers));
+    qp_capi_context_watchers_set = 0;
 }
 
 /* qp_capi_context_free, last: the thread states and the interpreter state

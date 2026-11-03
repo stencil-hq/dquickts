@@ -231,6 +231,16 @@ static JSValue qp_wrap_unaryfunc(JSContext *ctx, JSValueConst self, JSValueConst
     return ((QPUnaryFunc *)wrapped)(ctx, self);
 }
 
+/* wrap_del */
+static JSValue qp_wrap_del(JSContext *ctx, JSValueConst self, JSValueConst *args,
+                           int nargs, JSValueConst kwnames, void *wrapped)
+{
+    if (qp_check_num_args(ctx, nargs, 0) < 0)
+        return JS_EXCEPTION;
+    ((QPFinalizeFunc *)wrapped)(ctx, self);
+    return JS_UNDEFINED;
+}
+
 static JSValue qp_wrap_indexargfunc(JSContext *ctx, JSValueConst self, JSValueConst *args,
                                     int nargs, JSValueConst kwnames, void *wrapped)
 {
@@ -1271,6 +1281,10 @@ static const QPSlotDef qp_slotdefs[] = {
     QP_TPSLOT(__new__, tp_new, qp_slot_tp_new, NULL,
               "__new__(type, /, *args, **kwargs)\n--\n\n"
               "Create and return new object.  See help(type) for accurate signature."),
+    /* no slot_tp_finalize dispatcher: heap types' __del__ is run by the
+       finalizer queue (QP_TPFLAGS_HAS_DEL) */
+    QP_TPSLOT(__del__, tp_finalize, NULL, qp_wrap_del,
+              "__del__($self, /)\n--\n\nCalled when the instance is about to be destroyed."),
 
     QP_TPSLOT(__buffer__, bf.bf_getbuffer, qp_slot_bf_getbuffer, qp_wrap_buffer,
               "__buffer__($self, flags, /)\n--\n\n"
@@ -1439,9 +1453,9 @@ static const QPSlotDef *qp_update_one_slot(JSContext *ctx, QPType *t, const QPSl
     qp_slotdefs_init();
 
     do {
-        JSValue descr = qp_find_name_in_mro(ctx, t, QP_STATE(ctx)->atoms[p->atom_id]);
+        JSValue descr;
         QPDescr *d;
-        if (QP_IS_NULL(descr))
+        if (qp_find_name_in_mro(ctx, t, QP_STATE(ctx)->atoms[p->atom_id], &descr) <= 0)
             continue;
         d = qp_descr_get(descr);
         if (d && d->kind == QP_DESCR_WRAPPER && d->u.wrapper.slot->atom_id == p->atom_id) {
@@ -1491,7 +1505,8 @@ static const QPSlotDef *qp_update_one_slot(JSContext *ctx, QPType *t, const QPSl
 static void qp_fixup_derived(JSContext *ctx, QPType *t)
 {
     Py_ssize_t i;
-    BOOL has_del = !QP_IS_NULL(qp_find_name_in_mro(ctx, t, QP_ATOM(ctx, __del__)));
+    JSValue del;
+    BOOL has_del = qp_find_name_in_mro(ctx, t, QP_ATOM(ctx, __del__), &del) > 0;
     if (!has_del && JS_VALUE_GET_TAG(t->mro) == JS_TAG_OBJECT) {
         for (i = 1; i < QP_TUPLE_SIZE(t->mro); i++) {
             QPType *b = qp_type_from_value(QP_TUPLE_ITEMS(t->mro)[i]);
@@ -1563,11 +1578,8 @@ static int qp_update_slot(JSContext *ctx, QPType *t, JSAtom name)
         if (j == n && n < QP_MAX_EQUIV)
             heads[n++] = i;
     }
-    if (n == 0) {
-        if (name == QP_ATOM(ctx, __del__))
-            qp_update_slot_rec(ctx, t, name, heads, 0);
+    if (n == 0)
         return 0;
-    }
     qp_update_slot_rec(ctx, t, name, heads, n);
     return 0;
 }

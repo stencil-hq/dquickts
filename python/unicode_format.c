@@ -54,6 +54,12 @@ static int qpf_fill(StringBuffer *b, Py_UCS4 ch, Py_ssize_t n)
 {
     if (n <= 0)
         return 0;
+    /* a width past the JS string length limit cannot be allocated
+       (CPython: MemoryError from the writer); n must not be truncated */
+    if (n > JS_STRING_LEN_MAX - b->len) {
+        qp_raise_memory_error(b->ctx);
+        return -1;
+    }
     if (ch < 0x10000)
         return string_buffer_fill(b, (int)ch, (int)n);
     while (n-- > 0) {

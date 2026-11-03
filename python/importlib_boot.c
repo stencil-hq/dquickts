@@ -22,17 +22,20 @@
  * sys.path = PYTHONPATH entries (made absolute), stdlib,
  * stdlib/site-packages; the launcher inserts sys.path[0] afterwards.
  *
- * importlib._bootstrap and importlib._bootstrap_external are not frozen:
- * their sources are compiled at startup (optimize=0 and co_filename
+ * importlib._bootstrap and importlib._bootstrap_external are the frozen
+ * modules _frozen_importlib and _frozen_importlib_external (python/frozen.c)
+ * as in CPython: init_importlib imports the first with
+ * PyImport_ImportFrozenModule, _install_external_importers() the second
+ * through FrozenImporter.  A build without frozen modules (qpy-nobase,
+ * qjs) compiles their sources instead (optimize=0 and co_filename
  * "<frozen importlib._bootstrap>" / "<frozen importlib._bootstrap_external>"
- * like CPython's frozen code, so tracebacks and the importlib frame
- * trimming look the same) into the modules _frozen_importlib and
- * _frozen_importlib_external, registered in sys.modules under those names
- * before execution exactly like PyImport_ImportFrozenModule does.
+ * like the frozen code, so tracebacks and the importlib frame trimming
+ * look the same) into those modules, registered in sys.modules under
+ * those names before execution like PyImport_ImportFrozenModule does;
  * _install_external_importers() then finds _frozen_importlib_external in
- * sys.modules.  Afterwards both get __spec__/__loader__/__file__ through
+ * sys.modules, and both get __spec__/__loader__/__file__ through
  * _bootstrap_external._fix_up_module (their source file), since no frozen
- * importer can describe them (_imp.is_frozen is always False).
+ * importer can describe them (_imp.is_frozen is False).
  *
  * Bytecode caches: sys.implementation.cache_tag is "quickpy-315"
  * (sysmodule.c) and marshal serialises code objects as QuickJS bytecode
@@ -569,6 +572,49 @@ static int qp_boot_fix_up_module(JSContext *ctx, const QPBootPaths *p, JSValueCo
     return ret;
 }
 
+/* zipimport is frozen in CPython; here it is imported from the stdlib
+   through sys.path, which already holds the PYTHONPATH entries: the zip
+   files among them were cached as having no finder (None) before its
+   hook existed.  Drop those entries of sys.path_importer_cache. */
+static int qp_boot_drop_none_finders(JSContext *ctx)
+{
+    JSValue cache, keys, v;
+    JSValue *items;
+    Py_ssize_t i, n;
+    JSAtom atom;
+    int r = 0;
+
+    atom = JS_NewAtom(ctx, "path_importer_cache");
+    if (atom == JS_ATOM_NULL)
+        return -1;
+    cache = qp_sys_get(ctx, atom);
+    JS_FreeAtom(ctx, atom);
+    if (JS_IsException(cache))
+        return -1;
+    if (QP_IS_NULL(cache) || !qp_dict_check(ctx, cache)) {
+        JS_FreeValue(ctx, cache);
+        return 0;
+    }
+    keys = qp_dict_keys_list(ctx, cache);
+    if (JS_IsException(keys)) {
+        JS_FreeValue(ctx, cache);
+        return -1;
+    }
+    items = qp_list_items(keys, &n);
+    for (i = 0; items && i < n && r == 0; i++) {
+        r = qp_dict_get_item(ctx, cache, items[i], &v);
+        if (r > 0) {
+            r = JS_IsUndefined(v) ? qp_dict_del_item(ctx, cache, items[i]) : 0;
+            JS_FreeValue(ctx, v);
+        }
+        if (r > 0)
+            r = 0;
+    }
+    JS_FreeValue(ctx, keys);
+    JS_FreeValue(ctx, cache);
+    return r < 0 ? -1 : 0;
+}
+
 /* init_zipimport: sys.path_hooks.insert(0, zipimport.zipimporter); a
    missing zipimport is not an error. */
 static int qp_boot_init_zipimport(JSContext *ctx, int verbose)
@@ -616,7 +662,7 @@ static int qp_boot_init_zipimport(JSContext *ctx, int verbose)
     }
     JS_FreeValue(ctx, zipimporter);
     JS_FreeValue(ctx, path_hooks);
-    if (r < 0)
+    if (r < 0 || qp_boot_drop_none_finders(ctx) < 0)
         return -1;
     if (verbose)
         qp_sys_write_stderr(ctx, "# installed zipimport hook\n");
@@ -632,6 +678,36 @@ static int qp_boot_import(JSContext *ctx, const char *name)
         return -1;
     JS_FreeValue(ctx, m);
     return 0;
+}
+
+/* The _io classes (_pyio, python/mod_io.c), before the first module that
+   can be compiled from its source (encodings; codecs, os... too with
+   frozen modules disabled): writing its bytecode cache needs _io.FileIO,
+   and loading _pyio from there finds the module being imported (which
+   _pyio imports) partially initialized.  The modules _pyio imports from
+   their source meanwhile cannot write theirs (_io is not usable while
+   _pyio loads), so sys.dont_write_bytecode is set until then. */
+static int qp_boot_load_io(JSContext *ctx)
+{
+    JSValue m, v = JS_EXCEPTION;
+    JSAtom atom;
+
+    if (qp_boot_sys_set(ctx, "dont_write_bytecode", qp_bool_new(TRUE)) < 0)
+        return -1;
+    m = qp_import_module(ctx, "_io");
+    if (!JS_IsException(m)) {
+        atom = JS_NewAtom(ctx, "TextIOWrapper");
+        if (atom != JS_ATOM_NULL) {
+            v = qp_getattr(ctx, m, atom);
+            JS_FreeAtom(ctx, atom);
+        }
+        JS_FreeValue(ctx, m);
+    }
+    if (JS_IsException(v))
+        return -1;
+    JS_FreeValue(ctx, v);
+    return qp_boot_sys_set(ctx, "dont_write_bytecode",
+                           qp_bool_new(QP_STATE(ctx)->config.dont_write_bytecode != 0));
 }
 
 /* stdlib location and the sys attributes of getpath (also re-applied to a
@@ -659,26 +735,47 @@ static int qp_importlib_boot_paths(JSContext *ctx)
 
 /* The part of the boot that does not depend on the process (the content
    of the base snapshot, see qp_write_base_snapshot): importlib, the
-   zipimport hook, encodings and _signal. */
+   zipimport hook, the _io classes, encodings and _signal. */
 static int qp_importlib_boot_core(JSContext *ctx)
 {
     QPState *st = QP_STATE(ctx);
     int verbose = st->config.verbose;
+    BOOL frozen = qp_frozen_has_bootstrap("_frozen_importlib") &&
+        qp_frozen_has_bootstrap("_frozen_importlib_external");
     QPBootPaths paths;
     JSValue bootstrap = JS_UNDEFINED, external = JS_UNDEFINED, imp = JS_UNDEFINED, r;
     JSValue args[2];
     int ret = -1;
 
-    if (qp_boot_paths(ctx, &paths) < 0)
+    if (qp_boot_compute_paths(ctx, &paths) < 0)
         return -1;
 
     /* init_importlib */
     if (verbose)
         qp_sys_write_stderr(ctx, "import _frozen_importlib # frozen\n");
-    bootstrap = qp_boot_exec_source(ctx, &paths, "importlib/_bootstrap.py",
-                                    "_frozen_importlib", "<frozen importlib._bootstrap>");
-    if (JS_IsException(bootstrap))
-        goto done;
+    if (frozen) {
+        /* PyImport_ImportFrozenModule("_frozen_importlib") */
+        JSValue name = qp_str_from_cstr(ctx, "_frozen_importlib");
+        int rc;
+        if (JS_IsException(name))
+            goto done;
+        rc = qp_import_frozen_module(ctx, name);
+        if (rc > 0) {
+            rc = qp_import_get_module(ctx, name, &bootstrap);
+            if (rc == 0)
+                qp_raise_runtime_error(ctx, "Unable to import _frozen_importlib");
+        }
+        JS_FreeValue(ctx, name);
+        if (rc <= 0) {
+            bootstrap = JS_UNDEFINED;
+            goto done;
+        }
+    } else {
+        bootstrap = qp_boot_exec_source(ctx, &paths, "importlib/_bootstrap.py",
+                                        "_frozen_importlib", "<frozen importlib._bootstrap>");
+        if (JS_IsException(bootstrap))
+            goto done;
+    }
     JS_FreeValue(ctx, st->importlib);
     st->importlib = JS_DupValue(ctx, bootstrap);
     if (verbose)
@@ -701,12 +798,22 @@ static int qp_importlib_boot_core(JSContext *ctx)
         goto done;
     JS_FreeValue(ctx, r);
 
-    /* _PyImport_InitExternal: init_importlib_external + init_zipimport */
-    external = qp_boot_exec_source(ctx, &paths, "importlib/_bootstrap_external.py",
-                                   "_frozen_importlib_external",
-                                   "<frozen importlib._bootstrap_external>");
-    if (JS_IsException(external))
+    /* _PySys_UpdateConfig: the getpath sys attributes (sys._stdlib_dir is
+       unset while _install() fixes up _frozen_importlib, which therefore
+       has no __file__, as in CPython) */
+    if (qp_boot_init_sys(ctx, &paths) < 0)
         goto done;
+
+    /* _PyImport_InitExternal: init_importlib_external + init_zipimport;
+       _install_external_importers() imports the frozen
+       _frozen_importlib_external, or the module compiled here */
+    if (!frozen) {
+        external = qp_boot_exec_source(ctx, &paths, "importlib/_bootstrap_external.py",
+                                       "_frozen_importlib_external",
+                                       "<frozen importlib._bootstrap_external>");
+        if (JS_IsException(external))
+            goto done;
+    }
     r = qp_boot_call_method(ctx, bootstrap, "_install_external_importers", 0, NULL);
     if (JS_IsException(r))
         goto done;
@@ -717,12 +824,16 @@ static int qp_importlib_boot_core(JSContext *ctx)
     if (qp_capi_install_ext_reject(ctx) < 0)
         goto done;
 #endif
-    if (qp_boot_fix_up_module(ctx, &paths, external, bootstrap, "_frozen_importlib",
-                              "importlib/_bootstrap.py") < 0 ||
-        qp_boot_fix_up_module(ctx, &paths, external, external, "_frozen_importlib_external",
-                              "importlib/_bootstrap_external.py") < 0)
+    if (!frozen &&
+        (qp_boot_fix_up_module(ctx, &paths, external, bootstrap, "_frozen_importlib",
+                               "importlib/_bootstrap.py") < 0 ||
+         qp_boot_fix_up_module(ctx, &paths, external, external, "_frozen_importlib_external",
+                               "importlib/_bootstrap_external.py") < 0))
         goto done;
     if (qp_boot_init_zipimport(ctx, verbose) < 0)
+        goto done;
+
+    if (qp_boot_load_io(ctx) < 0)
         goto done;
 
     /* _PyUnicode_InitEncodings -> _PyCodec_InitRegistry */

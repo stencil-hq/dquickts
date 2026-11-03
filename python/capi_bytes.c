@@ -255,10 +255,33 @@ PyObject *PyBytes_FromObject(PyObject *x)
     }
     if (PyBytes_CheckExact(x))
         return Py_NewRef(x);
+    if (!PyObject_CheckBuffer(x) && !PyList_CheckExact(x) && !PyTuple_CheckExact(x)) {
+        /* only buffers, lists, tuples and iterables: unlike bytes(), no
+           integer size, no __index__ */
+        PyObject *it, *r;
+        if (PyUnicode_Check(x))
+            goto cannot_convert;
+        it = PyObject_GetIter(x);
+        if (it == NULL) {
+            if (!PyErr_ExceptionMatches(PyExc_TypeError))
+                return NULL;
+            PyErr_Clear();
+            goto cannot_convert;
+        }
+        v = qp_capi_value(qp_capi.ctx, it);
+        r = JS_IsException(v) ? NULL :
+            qp_capi_from_js_result(qp_capi.ctx, qp_bytes_from_object(qp_capi.ctx, v));
+        Py_DECREF(it);
+        return r;
+    }
     v = qp_capi_value(qp_capi.ctx, x);
     if (JS_IsException(v))
         return NULL;
-    return qp_capi_from_js_result(qp_capi.ctx, qp_bytes_from_object(qp_capi.ctx, v));
+    return qp_capi_from_js_result(qp_capi.ctx, qp_bytes_from_object_plain(qp_capi.ctx, v));
+cannot_convert:
+    PyErr_Format(PyExc_TypeError, "cannot convert '%.200s' object to bytes",
+                 Py_TYPE(x)->tp_name);
+    return NULL;
 }
 
 Py_ssize_t PyBytes_Size(PyObject *op)
@@ -321,27 +344,30 @@ static int qpd_bytes_resize_keep(PyObject **pv, Py_ssize_t newsize)
 
     if (oldsize == newsize)
         return 0;
-    if (oldsize == 0 || newsize == 0 || !PyBytes_CheckExact(v) ||
-        !_PyQp_HasFlag(v, _Py_QP_BOUND_FLAG)) {
+    if (newsize == 0) {
+        Py_SETREF(*pv, qpd_bytes_empty());
+        return 0;
+    }
+    jv = JS_UNDEFINED;
+    if (oldsize != 0 && PyBytes_CheckExact(v) && _PyQp_HasFlag(v, _Py_QP_BOUND_FLAG))
+        jv = qpd_head_value(v);
+    /* In place only when uniquely referenced (no other C reference, the JS
+       object only held by the mirror: never a cached 1-byte singleton) and
+       the hash was not computed yet; else a fresh copy. */
+    if (qp_bk_kind(jv) != QP_BK_BYTES || Py_REFCNT(v) != 1 ||
+        js_rc(JS_VALUE_GET_OBJ(jv))->ref_count >
+            ((QP_CAPI_HEAD(v)->flags & QP_CAPI_F_OWNS_V) ? 1 : 0) ||
+        QP_BYTES_OBJ(jv)->hash != -1 || ((PyBytesObject *)v)->ob_shash != -1) {
         nv = PyBytes_FromStringAndSize(NULL, newsize);
         if (!nv)
             return -1;
-        if (newsize > 0)
+        if (oldsize > 0)
             memcpy(PyBytes_AS_STRING(nv), PyBytes_AS_STRING(v), (size_t)Py_MIN(oldsize, newsize));
         Py_SETREF(*pv, nv);
         return 0;
     }
-    if (Py_REFCNT(v) != 1) {
-        PyErr_BadInternalCall();
-        return -1;
-    }
     if ((size_t)newsize > (size_t)PY_SSIZE_T_MAX - sizeof(QPBytesObject) - 1) {
         PyErr_NoMemory();
-        return -1;
-    }
-    jv = qpd_head_value(v);
-    if (qp_bk_kind(jv) != QP_BK_BYTES) {
-        PyErr_BadInternalCall();
         return -1;
     }
     qb = QP_BYTES_OBJ(jv);
@@ -434,6 +460,12 @@ PyObject *PyBytes_DecodeEscape(const char *s, Py_ssize_t len, const char *errors
 {
     (void)unicode;
     (void)recode_encoding;
+    /* the result is written into a bytes object of len bytes
+       (PyBytesWriter_Create(len) -> _PyBytes_FromSize) */
+    if ((size_t)len > (size_t)PY_SSIZE_T_MAX - sizeof(QPBytesObject) - 1) {
+        PyErr_SetString(PyExc_OverflowError, "byte string is too large");
+        return NULL;
+    }
     return qp_capi_from_js_result(qp_capi.ctx,
                                   qp_cd_decode_escape_bytes(qp_capi.ctx, (const uint8_t *)s, len, errors));
 }
@@ -928,6 +960,12 @@ PyObject *PyByteArray_FromStringAndSize(const char *bytes, Py_ssize_t size)
         PyErr_SetString(PyExc_SystemError, "Negative size passed to PyByteArray_FromStringAndSize");
         return NULL;
     }
+    /* CPython stores the content in a bytes object of that size
+       (PyBytes_FromStringAndSize(NULL, size)) */
+    if ((size_t)size > (size_t)PY_SSIZE_T_MAX - sizeof(QPBytesObject) - 1) {
+        PyErr_SetString(PyExc_OverflowError, "byte string is too large");
+        return NULL;
+    }
     return qp_capi_from_js_result(qp_capi.ctx, qp_bytearray_new(qp_capi.ctx, bytes, size));
 }
 
@@ -1269,6 +1307,26 @@ static int qp_capi_buffer_shape(JSContext *ctx, const QPBuffer *view, const Py_s
     *pstrides = pv->ndim > 0 ? pv->strides : NULL;
     *pitemsize = pv->itemsize;
     return pv->ndim;
+}
+
+/* memoryview.obj of a C exporter's buffer: the Py_buffer.obj the exporter
+   set, as CPython's memoryview reports view.obj (PickleBuffer redirects to
+   the object it wraps).  New reference, JS_UNDEFINED when view does not
+   come from the forward bridge, JS_EXCEPTION on binding failure. */
+static JSValue qp_capi_buffer_base(JSContext *ctx, const QPBuffer *view)
+{
+    QPType *t;
+    PyObject *base;
+
+    if (!view->format || !JS_IsObject(view->obj))
+        return JS_UNDEFINED;
+    t = qp_type_of(ctx, view->obj);
+    if (!t || t->slots.bf.bf_getbuffer != qp_capi_bf_getbuffer_fwd)
+        return JS_UNDEFINED;
+    base = qpd_fwd_format(view)->blk->view.obj;
+    if (base == NULL)
+        return JS_UNDEFINED;
+    return qp_capi_to_js(ctx, base);
 }
 
 static void qpd_fwd_release(JSRuntime *rt, QPBuffer *view)
@@ -1684,31 +1742,6 @@ PyObject *PyMemoryView_FromObject(PyObject *v)
     return qp_capi_from_js_result(ctx, qp_memoryview_from_object(ctx, jv, QP_BUF_SIMPLE));
 }
 
-/* New managed buffer over raw memory (no exporter object). */
-static JSValue qpd_mbuf_raw(JSContext *ctx, void *buf, Py_ssize_t len, int readonly,
-                            Py_ssize_t itemsize, const char *format)
-{
-    QPManagedBuffer *mb;
-    JSValue obj;
-    mb = js_mallocz(ctx, sizeof(*mb));
-    if (!mb)
-        return JS_EXCEPTION;
-    mb->kind = QP_BK_MBUF;
-    mb->master.obj = JS_UNDEFINED;
-    mb->master.buf = buf;
-    mb->master.len = len;
-    mb->master.readonly = readonly;
-    mb->master.itemsize = itemsize > 0 ? itemsize : 1;
-    mb->master.format = format ? format : "B";
-    obj = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_PY_BYTEARRAY);
-    if (JS_IsException(obj)) {
-        js_free(ctx, mb);
-        return obj;
-    }
-    JS_VALUE_GET_OBJ(obj)->u.opaque = mb;
-    return obj;
-}
-
 /* memoryview over a managed buffer (consumed) with an explicit structure. */
 static JSValue qpd_mv_with_dims(JSContext *ctx, JSValue mbuf, void *buf, Py_ssize_t len,
                                 int readonly, Py_ssize_t itemsize, const char *format, int ndim,
@@ -1761,7 +1794,7 @@ PyObject *PyMemoryView_FromMemory(char *mem, Py_ssize_t size, int flags)
         return NULL;
     }
     readonly = (flags == PyBUF_WRITE) ? 0 : 1;
-    mbuf = qpd_mbuf_raw(ctx, mem, size, readonly, 1, "B");
+    mbuf = qp_mbuf_raw(ctx, mem, size, readonly, 1, "B");
     if (JS_IsException(mbuf))
         return NULL;
     return qp_capi_from_js_result(ctx, qp_mv_from_mbuf(ctx, mbuf));
@@ -1776,7 +1809,7 @@ PyObject *PyMemoryView_FromBuffer(const Py_buffer *info)
         PyErr_SetString(PyExc_ValueError, "PyMemoryView_FromBuffer(): info->buf must not be NULL");
         return NULL;
     }
-    mbuf = qpd_mbuf_raw(ctx, info->buf, info->len, info->readonly, info->itemsize, info->format);
+    mbuf = qp_mbuf_raw(ctx, info->buf, info->len, info->readonly, info->itemsize, info->format);
     if (JS_IsException(mbuf))
         return NULL;
     return qp_capi_from_js_result(ctx, qpd_mv_with_dims(ctx, mbuf, info->buf, info->len, info->readonly,

@@ -781,7 +781,8 @@ static JSValue qp_next(JSContext *ctx, JSValueConst it)
     if (JS_IsException(item)) {
         if (qp_exc_pending_matches(ctx, QP_EXC(ctx, StopIteration))) {
             /* M6: sys.settrace 'exception' of a for loop (FOR_ITER) */
-            if (unlikely(QP_STATE(ctx)->trace_active) && qp_trace_for_iter_stop(ctx) < 0)
+            if (unlikely(QP_STATE(ctx)->trace_active | QP_STATE(ctx)->mon_active) &&
+                qp_hook_for_iter_stop(ctx) < 0)
                 return JS_EXCEPTION;
             qp_obj_clear_exc(ctx);
             return QP_NULL;

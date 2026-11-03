@@ -92,6 +92,8 @@ static int qp_state_init(JSContext *ctx, const QPConfig *cfg)
     s->empty_tuple = JS_UNDEFINED;
     s->empty_frozenset = JS_UNDEFINED;
     s->empty_bytes = JS_UNDEFINED;
+    for (i = 0; i < countof(s->bytes_chars); i++)
+        s->bytes_chars[i] = JS_UNDEFINED;
     s->builtins_module = JS_UNDEFINED;
     s->builtins_dict = JS_UNDEFINED;
     s->sys_module = JS_UNDEFINED;
@@ -102,12 +104,15 @@ static int qp_state_init(JSContext *ctx, const QPConfig *cfg)
     s->modules = JS_UNDEFINED;
     s->import_func = JS_UNDEFINED;
     s->importlib = JS_UNDEFINED;
+    s->lazy_imports_filter = JS_UNDEFINED;
+    s->lazy_modules = JS_UNDEFINED;
     s->repr_stack = JS_UNDEFINED;
     s->pending_del = JS_UNDEFINED;
     s->asyncgen_firstiter = JS_UNDEFINED;
     s->asyncgen_finalizer = JS_UNDEFINED;
     s->trace_func = JS_UNDEFINED;
     s->profile_func = JS_UNDEFINED;
+    qp_mon_state_init(s);
     s->recursion_depth = 0;
     s->recursion_limit = s->config.recursion_limit > 0 ? s->config.recursion_limit : 1000;
     s->exc_info_base.exc_value = JS_UNDEFINED;
@@ -164,6 +169,7 @@ static void qp_state_free(JSContext *ctx)
     if (!s)
         return;
     qp_signal_forget_ctx(ctx);
+    qp_faulthandler_fini(ctx);
     /* the objects freed from now on, cycles included, are not resurrected
        for their __del__ (qp_del_hook, qp_del_queue_cyclic) */
     pending_del = s->pending_del;
@@ -177,6 +183,10 @@ static void qp_state_free(JSContext *ctx)
     JS_FreeValueRT(rt, s->empty_tuple);
     JS_FreeValueRT(rt, s->empty_frozenset);
     JS_FreeValueRT(rt, s->empty_bytes);
+    for (i = 0; i < countof(s->bytes_chars); i++) {
+        JS_FreeValueRT(rt, s->bytes_chars[i]);
+        s->bytes_chars[i] = JS_UNDEFINED;
+    }
     JS_FreeValueRT(rt, s->builtins_module);
     JS_FreeValueRT(rt, s->builtins_dict);
     JS_FreeValueRT(rt, s->sys_module);
@@ -187,6 +197,8 @@ static void qp_state_free(JSContext *ctx)
     JS_FreeValueRT(rt, s->modules);
     JS_FreeValueRT(rt, s->import_func);
     JS_FreeValueRT(rt, s->importlib);
+    JS_FreeValueRT(rt, s->lazy_imports_filter);
+    JS_FreeValueRT(rt, s->lazy_modules);
     JS_FreeValueRT(rt, s->repr_stack);
     JS_FreeValueRT(rt, s->asyncgen_firstiter);
     JS_FreeValueRT(rt, s->asyncgen_finalizer);
@@ -198,6 +210,7 @@ static void qp_state_free(JSContext *ctx)
     JS_FreeValueRT(rt, s->trace_func);
     JS_FreeValueRT(rt, s->profile_func);
     s->trace_func = s->profile_func = JS_UNDEFINED;
+    qp_mon_state_free(rt, s);
     for(item = s->exc_info; item; item = item->previous) {
         if (item == &s->exc_info_base)
             break;
@@ -235,6 +248,8 @@ static void qp_state_mark(JSRuntime *rt, QPState *s, JS_MarkFunc *mark_func)
     JS_MarkValue(rt, s->empty_tuple, mark_func);
     JS_MarkValue(rt, s->empty_frozenset, mark_func);
     JS_MarkValue(rt, s->empty_bytes, mark_func);
+    for (i = 0; i < countof(s->bytes_chars); i++)
+        JS_MarkValue(rt, s->bytes_chars[i], mark_func);
     JS_MarkValue(rt, s->builtins_module, mark_func);
     JS_MarkValue(rt, s->builtins_dict, mark_func);
     JS_MarkValue(rt, s->sys_module, mark_func);
@@ -245,12 +260,15 @@ static void qp_state_mark(JSRuntime *rt, QPState *s, JS_MarkFunc *mark_func)
     JS_MarkValue(rt, s->modules, mark_func);
     JS_MarkValue(rt, s->import_func, mark_func);
     JS_MarkValue(rt, s->importlib, mark_func);
+    JS_MarkValue(rt, s->lazy_imports_filter, mark_func);
+    JS_MarkValue(rt, s->lazy_modules, mark_func);
     JS_MarkValue(rt, s->repr_stack, mark_func);
     JS_MarkValue(rt, s->pending_del, mark_func);
     JS_MarkValue(rt, s->asyncgen_firstiter, mark_func);
     JS_MarkValue(rt, s->asyncgen_finalizer, mark_func);
     JS_MarkValue(rt, s->trace_func, mark_func);
     JS_MarkValue(rt, s->profile_func, mark_func);
+    qp_mon_state_mark(rt, s, mark_func);
     /* the generator items are marked by their generators */
     for(item = s->exc_info; item; item = item->previous) {
         if (item == &s->exc_info_base)
@@ -270,15 +288,6 @@ static void qp_state_mark(JSRuntime *rt, QPState *s, JS_MarkFunc *mark_func)
 /* ======================================================================= */
 /* Code metadata                                                            */
 /* ======================================================================= */
-
-enum {
-    QP_IC_KIND_NONE = 0,
-    QP_IC_KIND_ATTR = 1,
-    QP_IC_KIND_GLOBAL = 2,
-};
-
-/* kind of each inline cache, stored after ic[ic_count] */
-#define QP_IC_KINDS(ci) ((uint8_t *)((ci)->ic + (ci)->ic_count))
 
 static QPCodeInfo *qp_code_info(JSFunctionBytecode *b)
 {
@@ -300,71 +309,26 @@ static void qp_code_info_free(JSRuntime *rt, QPCodeInfo *ci)
 {
     if (!ci)
         return;
-    if (ci->ic) {
-        uint8_t *kinds = QP_IC_KINDS(ci);
-        int i;
-        for(i = 0; i < ci->ic_count; i++) {
-            if (kinds[i] == QP_IC_KIND_ATTR && ci->ic[i].attr.shape)
-                js_free_shape(rt, ci->ic[i].attr.shape);
-        }
-        js_free_rt(rt, ci->ic);
-    }
+    js_free_rt(rt, ci->ic);
     if (ci->qualname != JS_ATOM_NULL)
         JS_FreeAtomRT(rt, ci->qualname);
     js_free_rt(rt, ci->locs);
     js_free_rt(rt, ci->pcloc);
+    js_free_rt(rt, ci->consts);
+    qp_co_layout_free(rt, ci->co_layout);
+    qp_mon_code_free(rt, ci->mon);
     js_free_rt(rt, ci);
-}
-
-static void qp_code_info_mark(JSRuntime *rt, QPCodeInfo *ci, JS_MarkFunc *mark_func)
-{
-    if (ci->ic) {
-        uint8_t *kinds = QP_IC_KINDS(ci);
-        int i;
-        for(i = 0; i < ci->ic_count; i++) {
-            if (kinds[i] == QP_IC_KIND_ATTR && ci->ic[i].attr.shape)
-                mark_func(rt, &ci->ic[i].attr.shape->header);
-        }
-    }
 }
 
 static int qp_code_info_setup_ic(JSContext *ctx, JSFunctionBytecode *b)
 {
     QPCodeInfo *ci = b->py_code;
-    const uint8_t *bc = b->byte_code_buf;
-    int pos, len = b->byte_code_len, opnd, idx;
-    const JSOpCode *oi;
-    JSOpCode oi_tmp;
-    uint8_t *kinds;
 
     if (!ci || ci->ic || ci->ic_count == 0)
         return 0;
-    ci->ic = js_mallocz(ctx, (sizeof(QPInlineCache) + 1) * ci->ic_count);
+    ci->ic = js_mallocz(ctx, sizeof(QPInlineCache) * ci->ic_count);
     if (!ci->ic)
         return -1;
-    kinds = QP_IC_KINDS(ci);
-    for(pos = 0; pos < len; pos += oi->size) {
-        oi = js_get_op_info(bc, len, pos, TRUE, &oi_tmp, &opnd);
-        if (bc[pos] != OP_py)
-            continue;
-        switch(bc[pos + 1]) {
-        case QP_OP_getattr:
-        case QP_OP_load_method:
-        case QP_OP_setattr:
-            idx = get_u16(bc + opnd + 4);
-            if (idx < ci->ic_count)
-                kinds[idx] = QP_IC_KIND_ATTR;
-            break;
-        case QP_OP_load_global:
-        case QP_OP_load_from_dict_or_globals:
-            idx = get_u16(bc + opnd + 4);
-            if (idx < ci->ic_count)
-                kinds[idx] = QP_IC_KIND_GLOBAL;
-            break;
-        default:
-            break;
-        }
-    }
     return 0;
 }
 
@@ -389,7 +353,13 @@ static int qp_code_addr2loc(JSFunctionBytecode *b, uint32_t pc, QPLoc *loc)
     }
     if (found < 0)
         return -1;
-    *loc = ci->locs[ci->pcloc[found].loc];
+    *loc = ci->locs[QP_PCLOC_IDX(ci->pcloc[found].loc)];
+    if (unlikely(b->realm && b->realm->py && b->realm->py->config.no_debug_ranges) &&
+        loc->lineno >= 0) {
+        /* _PyCode_New: remove_column_info */
+        loc->end_lineno = loc->lineno;
+        loc->col = loc->end_col = -1;
+    }
     return 0;
 }
 

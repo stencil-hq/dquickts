@@ -22,6 +22,7 @@
 
 /* Provided by traceback.c / errors.c (unit i, M2ErrTb). */
 static int qp_init_traceback(JSContext *ctx);
+static JSValue qp_tb_from_current_frame(JSContext *ctx);
 static JSValue qp_calculate_suggestions(JSContext *ctx, JSValueConst dir_list, JSValueConst name);
 
 /* ========================================================================= */
@@ -1447,18 +1448,21 @@ static int qp_exc_group_match(JSContext *ctx, JSValueConst exc, JSValueConst mat
             match = JS_DupValue(ctx, exc);
         } else {
             /* naked exception - wrap it.  CPython gives the wrapper a
-               traceback of the current frame only; the frame is the head of
-               exc's own traceback, so the wrapper shares that chain. */
-            JSValue excs = qp_tuple_pack(ctx, 1, &exc);
+               traceback of the current frame only (at the except* clause) */
+            JSValue excs = qp_tuple_pack(ctx, 1, &exc), tb;
             if (JS_IsException(excs))
                 return -1;
             match = qp_exc_create_group(ctx, "", excs);
             JS_FreeValue(ctx, excs);
             if (JS_IsException(match))
                 return -1;
-            if (qp_exc_obj(match) && !QP_IS_NULL(qp_exc_obj(exc)->traceback))
-                qp_exc_slot_set(ctx, &qp_exc_obj(match)->traceback,
-                                JS_DupValue(ctx, qp_exc_obj(exc)->traceback), FALSE);
+            tb = qp_tb_from_current_frame(ctx);
+            if (JS_IsException(tb)) {
+                JS_FreeValue(ctx, match);
+                return -1;
+            }
+            if (!JS_IsUndefined(tb))
+                qp_exc_set_traceback_raw(ctx, match, tb);
         }
         rest = JS_UNDEFINED;
     } else if (qp_exc_is_group(ctx, exc)) {
@@ -2595,6 +2599,9 @@ static JSValue qp_raise_qp_error(JSContext *ctx, const qp_error *err, const char
         type = QP_EXC(ctx, _IncompleteInputError);
         break;
     case QP_ERR_MEMORY:
+        /* (a message: the parser's stack overflow; none: out of memory) */
+        if (err->msg && err->msg[0])
+            return qp_exc_raise_msg(ctx, QP_EXC(ctx, MemoryError), err->msg);
         return qp_raise_memory_error(ctx);
     case QP_ERR_VALUE:
         return qp_exc_raise_msg(ctx, QP_EXC(ctx, ValueError), err->msg);

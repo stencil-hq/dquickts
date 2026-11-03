@@ -2023,11 +2023,11 @@ static JSValue qp_sys_make_flags(JSContext *ctx)
     int i = 0;
 
 #define QP_FLAG(expr) (items[i++] = JS_NewInt32(ctx, (expr)))
-    QP_FLAG(0);                                     /* debug (parser debug) */
+    QP_FLAG(c->parser_debug != 0);                  /* debug (PyConfig bool parser_debug) */
     QP_FLAG(c->inspect);
     QP_FLAG(c->interactive);
     QP_FLAG(c->optimize);
-    QP_FLAG(c->dont_write_bytecode);
+    QP_FLAG(c->dont_write_bytecode != 0);           /* PyConfig bool write_bytecode */
     QP_FLAG(c->no_user_site);
     QP_FLAG(c->no_site);
     QP_FLAG(c->ignore_environment);
@@ -2050,6 +2050,33 @@ static JSValue qp_sys_make_flags(JSContext *ctx)
     return qp_sys_ss_make(ctx, QP_SYS_SS_FLAGS, items);
 }
 
+/* Replace sys.flags with a new instance from the configuration (CPython
+   _PySys_SetFlagObj: the flags object is immutable).  0 or -1. */
+static int qp_sys_update_flags(JSContext *ctx)
+{
+    JSValue flags = qp_sys_make_flags(ctx);
+
+    if (JS_IsException(flags))
+        return -1;
+    return qp_sys_dict_set(ctx, QP_STATE(ctx)->sys_dict, "flags", flags);
+}
+
+/* _PySys_SetIntMaxStrDigits.  0 or -1. */
+static int qp_sys_int_max_str_digits_set(JSContext *ctx, int maxdigits)
+{
+    QPState *st = QP_STATE(ctx);
+
+    if (maxdigits != 0 && maxdigits < QP_LONG_MAX_STR_DIGITS_THRESHOLD) {
+        qp_raise_value_error(ctx, "maxdigits must be >= %d or 0 for unlimited",
+                             QP_LONG_MAX_STR_DIGITS_THRESHOLD);
+        return -1;
+    }
+    st->int_max_str_digits = maxdigits;
+    st->config.int_max_str_digits = maxdigits;
+    /* sys.flags.int_max_str_digits follows (CPython _PySys_SetFlagInt) */
+    return qp_sys_update_flags(ctx);
+}
+
 QP_SYS_FN(qp_sys_get_int_max_str_digits)
 {
     return JS_NewInt32(ctx, QP_STATE(ctx)->int_max_str_digits);
@@ -2062,21 +2089,12 @@ QP_SYS_FN(qp_sys_set_int_max_str_digits)
     static const QPArgSpec spec = { "set_int_max_str_digits", kwlist, 1, 1, 0 };
     JSValueConst out[1];
     int maxdigits;
-    JSValue flags;
 
     if (qp_arg_parse(ctx, &spec, args, nargs, kwnames, out) < 0)
         return JS_EXCEPTION;
     if (qp_arg_int(ctx, out[0], &maxdigits) < 0)
         return JS_EXCEPTION;
-    if (maxdigits != 0 && maxdigits < QP_LONG_MAX_STR_DIGITS_THRESHOLD)
-        return qp_raise_value_error(ctx, "maxdigits must be >= %d or 0 for unlimited",
-                                    QP_LONG_MAX_STR_DIGITS_THRESHOLD);
-    QP_STATE(ctx)->int_max_str_digits = maxdigits;
-    /* sys.flags.int_max_str_digits follows (CPython _PySys_SetFlagInt) */
-    flags = qp_sys_make_flags(ctx);
-    if (JS_IsException(flags))
-        return flags;
-    if (qp_sys_dict_set(ctx, QP_STATE(ctx)->sys_dict, "flags", flags) < 0)
+    if (qp_sys_int_max_str_digits_set(ctx, maxdigits) < 0)
         return JS_EXCEPTION;
     return JS_UNDEFINED;
 }
@@ -2114,6 +2132,59 @@ QP_SYS_FN(qp_sys_is_interned)
         return qp_raise_type_error(ctx, "_is_interned() argument must be str, not %T", s);
     return qp_bool_new(JS_VALUE_GET_TAG(s) == JS_TAG_STRING &&
                        JS_VALUE_GET_STRING(s)->atom_type != 0);
+}
+
+/* _is_immortal(op, /): the objects CPython makes immortal that exist here
+   as singletons: None, True, False, Ellipsis, NotImplemented, the small
+   ints [-5, 1024], the empty tuple, bytes and str, the 1-byte bytes and
+   1-character latin-1 strs, and the static (non-heap) types. */
+QP_SYS_FN(qp_sys_is_immortal)
+{
+    JSValueConst o = args[0];
+    QPState *st = QP_STATE(ctx);
+    JSObject *p;
+
+    switch (JS_VALUE_GET_TAG(o)) {
+    case JS_TAG_UNDEFINED:
+    case JS_TAG_NULL:
+    case JS_TAG_BOOL:
+        return qp_bool_new(TRUE);
+    case JS_TAG_INT:
+        return qp_bool_new(JS_VALUE_GET_INT(o) >= -5 && JS_VALUE_GET_INT(o) <= 1024);
+    case JS_TAG_STRING: {
+        JSString *s = JS_VALUE_GET_STRING(o);
+        if (s->len == 0)
+            return qp_bool_new(TRUE);
+        return qp_bool_new(s->len == 1 && (s->is_wide_char ? s->u.str16[0] : s->u.str8[0]) < 256);
+    }
+    case JS_TAG_OBJECT:
+        break;
+    default:
+        return qp_bool_new(FALSE);
+    }
+    p = JS_VALUE_GET_OBJ(o);
+    if (JS_VALUE_GET_TAG(st->not_implemented) == JS_TAG_OBJECT &&
+        p == JS_VALUE_GET_OBJ(st->not_implemented))
+        return qp_bool_new(TRUE);
+    if (JS_VALUE_GET_TAG(st->ellipsis) == JS_TAG_OBJECT && p == JS_VALUE_GET_OBJ(st->ellipsis))
+        return qp_bool_new(TRUE);
+    if (JS_VALUE_GET_TAG(st->empty_tuple) == JS_TAG_OBJECT &&
+        p == JS_VALUE_GET_OBJ(st->empty_tuple))
+        return qp_bool_new(TRUE);
+    if (p->class_id == JS_CLASS_PY_BYTES) {
+        Py_ssize_t len;
+        const uint8_t *d = qp_bytes_data(o, &len);
+        if (len == 0)
+            return qp_bool_new(JS_VALUE_GET_TAG(st->empty_bytes) == JS_TAG_OBJECT &&
+                               p == JS_VALUE_GET_OBJ(st->empty_bytes));
+        return qp_bool_new(len == 1 && JS_VALUE_GET_TAG(st->bytes_chars[d[0]]) == JS_TAG_OBJECT &&
+                           p == JS_VALUE_GET_OBJ(st->bytes_chars[d[0]]));
+    }
+    if (p->class_id == JS_CLASS_PY_TYPE) {
+        QPType *t = qp_type_from_value(o);
+        return qp_bool_new(t && !(t->flags & QP_TPFLAGS_HEAPTYPE));
+    }
+    return qp_bool_new(FALSE);
 }
 
 /* getsizeof(object [, default]) */
@@ -2634,11 +2705,13 @@ static int qp_sys_audit_event(JSContext *ctx, const char *event)
 }
 
 /* settrace(function, /), setprofile(function, /) and the *allthreads
-   variants (one thread): magic = is_profile */
+   variants: magic = is_profile | (all threads ? 2 : 0) */
 QP_SYS_FN(qp_sys_settrace)
 {
-    if (qp_sys_audit_event(ctx, magic ? "sys.setprofile" : "sys.settrace") < 0 ||
-        qp_trace_set(ctx, magic, args[0]) < 0)
+    int is_profile = magic & 1;
+    if (qp_sys_audit_event(ctx, is_profile ? "sys.setprofile" : "sys.settrace") < 0 ||
+        ((magic & 2) ? qp_trace_set_all(ctx, is_profile, args[0]) :
+         qp_trace_set(ctx, is_profile, args[0])) < 0)
         return JS_EXCEPTION;
     return JS_UNDEFINED;
 }
@@ -2660,6 +2733,13 @@ QP_SYS_FN(qp_sys_is_finalizing)
 QP_SYS_FN(qp_sys_is_gil_enabled)
 {
     return qp_bool_new(TRUE);
+}
+
+/* _get_cpu_count_config(): config->cpu_count, -1 when not overridden */
+QP_SYS_FN(qp_sys_get_cpu_count_config)
+{
+    int n = QP_STATE(ctx)->config.cpu_count;
+    return JS_NewInt32(ctx, n > 0 ? n : -1);
 }
 
 QP_SYS_FN(qp_sys_is_remote_debug_enabled)
@@ -2702,6 +2782,40 @@ QP_SYS_FN(qp_sys_set_lazy_imports)
         return qp_raise_value_error(ctx, "mode must be 'normal' or 'all'");
     QP_STATE(ctx)->lazy_imports_mode = mode;
     return JS_UNDEFINED;
+}
+
+/* PyImport_SetLazyImportsFilter: None clears the filter. */
+static int qp_sys_lazy_imports_filter_set(JSContext *ctx, JSValueConst filter)
+{
+    QPState *s = QP_STATE(ctx);
+    JSValue old;
+
+    if (!JS_IsUndefined(filter) && !qp_sys_callable(ctx, filter)) {
+        qp_raise_value_error(ctx, "filter provided but is not callable");
+        return -1;
+    }
+    old = s->lazy_imports_filter;
+    s->lazy_imports_filter = JS_DupValue(ctx, filter);
+    JS_FreeValue(ctx, old);
+    return 0;
+}
+
+QP_SYS_FN(qp_sys_set_lazy_imports_filter)
+{
+    static const char *const kwlist[] = { "filter", NULL };
+    static const QPArgSpec spec = { "set_lazy_imports_filter", kwlist, 1, 1, 0 };
+    JSValueConst out[1];
+
+    if (qp_arg_parse(ctx, &spec, args, nargs, kwnames, out) < 0)
+        return JS_EXCEPTION;
+    if (qp_sys_lazy_imports_filter_set(ctx, out[0]) < 0)
+        return JS_EXCEPTION;
+    return JS_UNDEFINED;
+}
+
+QP_SYS_FN(qp_sys_get_lazy_imports_filter)
+{
+    return JS_DupValue(ctx, QP_STATE(ctx)->lazy_imports_filter);
 }
 
 QP_SYS_FN(qp_sys_get_lazy_imports)
@@ -2795,14 +2909,16 @@ static const QPMethodDef qp_sys_methods[] = {
     { "getprofile", qp_sys_gettrace, QP_METH_NOARGS, 1,
       "getprofile($module, /)\n--\n\nReturn the profiling function set with sys.setprofile.\n\n"
       "See the profiler chapter in the library manual." },
-    { "_settraceallthreads", qp_sys_settrace, QP_METH_O, 0,
+    { "_settraceallthreads", qp_sys_settrace, QP_METH_O, 2,
       "_settraceallthreads($module, function, /)\n--\n\nSet the global debug tracing function in all running threads belonging to the current interpreter.\n\n"
       "It will be called on each function call. See the debugger chapter\nin the library manual." },
-    { "_setprofileallthreads", qp_sys_settrace, QP_METH_O, 1,
+    { "_setprofileallthreads", qp_sys_settrace, QP_METH_O, 3,
       "_setprofileallthreads($module, function, /)\n--\n\nSet the profiling function in all running threads belonging to the current interpreter.\n\n"
       "It will be called on each function call and return.  See the profiler\nchapter in the library manual." },
     { "intern", qp_sys_intern, QP_METH_O, 0,
       "intern($module, string, /)\n--\n\n``Intern'' the given string." },
+    { "_is_immortal", qp_sys_is_immortal, QP_METH_O, 0,
+      "_is_immortal($module, op, /)\n--\n\nReturn True if the given object is \"immortal\" per PEP 683.\n\nThis function should be used for specialized purposes only." },
     { "_is_interned", qp_sys_is_interned, QP_METH_O, 0,
       "_is_interned($module, string, /)\n--\n\nReturn True if the given string is \"interned\"." },
     { "is_finalizing", qp_sys_is_finalizing, QP_METH_NOARGS, 0,
@@ -2838,6 +2954,18 @@ static const QPMethodDef qp_sys_methods[] = {
       "get_lazy_imports($module, /)\n--\n\nGets the global lazy imports mode." },
     { "set_lazy_imports", qp_sys_set_lazy_imports, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
       "set_lazy_imports($module, /, mode)\n--\n\nSets the global lazy imports mode." },
+    { "get_lazy_imports_filter", qp_sys_get_lazy_imports_filter, QP_METH_NOARGS, 0,
+      "get_lazy_imports_filter($module, /)\n--\n\nGet the current lazy imports filter callback.\n\n"
+      "Returns the filter callable or None if no filter is set." },
+    { "set_lazy_imports_filter", qp_sys_set_lazy_imports_filter, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      "set_lazy_imports_filter($module, /, filter)\n--\n\nSet the lazy imports filter callback.\n\n"
+      "The filter is a callable which disables lazy imports when they\n"
+      "would otherwise be enabled. Returns True if the import is still enabled\n"
+      "or False to disable it. The callable is called with:\n\n"
+      "(importing_module_name, resolved_imported_module_name, [fromlist])\n\n"
+      "Pass None to clear the filter." },
+    { "_get_cpu_count_config", qp_sys_get_cpu_count_config, QP_METH_NOARGS, 0,
+      "_get_cpu_count_config($module, /)\n--\n\nPrivate function for getting PyConfig.cpu_count" },
     { "_is_gil_enabled", qp_sys_is_gil_enabled, QP_METH_NOARGS, 0,
       "_is_gil_enabled($module, /)\n--\n\nReturn True if the GIL is currently enabled and False otherwise." },
     { NULL }
@@ -3178,11 +3306,8 @@ static JSValue qp_sys_make_thread_info(JSContext *ctx)
 {
     JSValue items[3];
     items[0] = qp_str_from_cstr(ctx, "pthread");
-#if defined(__APPLE__)
-    items[1] = qp_str_from_cstr(ctx, "mutex+cond");
-    items[2] = JS_UNDEFINED;
-#else
-    items[1] = qp_str_from_cstr(ctx, "semaphore");
+    /* PyThread_GetInfo (3.13+): every lock is a PyMutex */
+    items[1] = qp_str_from_cstr(ctx, "pymutex");
 #if defined(_CS_GNU_LIBPTHREAD_VERSION)
     {
         char buffer[255];
@@ -3194,7 +3319,6 @@ static JSValue qp_sys_make_thread_info(JSContext *ctx)
     }
 #else
     items[2] = JS_UNDEFINED;
-#endif
 #endif
     if (JS_IsException(items[0]) || JS_IsException(items[1]) || JS_IsException(items[2])) {
         JS_FreeValue(ctx, items[0]);
@@ -3480,6 +3604,16 @@ static int qp_sys_populate(JSContext *ctx, JSValueConst d)
 
     if (qp_sys_dict_set(ctx, d, "_jit", qp_module_from_def(ctx, &qp_moddef_sys__jit)) < 0 ||
         qp_sys_dict_set(ctx, d, "monitoring", qp_monitoring_create(ctx)) < 0)
+        return -1;
+
+    /* sys.lazy_modules: the names of the pending lazy imports, kept by the
+       import machinery in QPState.lazy_modules (_PyImport_InitLazyModules) */
+    st->lazy_modules = qp_set_new(ctx, QP_NULL);
+    if (JS_IsException(st->lazy_modules)) {
+        st->lazy_modules = JS_UNDEFINED;
+        return -1;
+    }
+    if (qp_sys_dict_set(ctx, d, "lazy_modules", JS_DupValue(ctx, st->lazy_modules)) < 0)
         return -1;
 
     /* paths */

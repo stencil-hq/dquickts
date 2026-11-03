@@ -508,14 +508,23 @@ static int qp_snap_write_type(SnapWriter *w, JSObject *p)
     e = QP_TEXT(t);
     if (t->flags & QP_TPFLAGS_READYING)
         return qp_snap_reject(w, p, "type is being created");
-    /* tp_name always comes from the spec (typeobject.c qp_type_ready) */
-    if (t->tp_name && (!t->spec || t->tp_name != t->spec->name))
+    /* tp_name comes from the spec (typeobject.c qp_type_ready) or is owned
+       by the type (QP_TPFLAGS_PRIV_OWNED_NAME, saved as text) */
+    if (t->tp_name && !(t->flags & QP_TPFLAGS_PRIV_OWNED_NAME) &&
+        (!t->spec || t->tp_name != t->spec->name))
         return qp_snap_reject(w, p, "type name not owned by its spec");
     bc_put_u8(&w->bc, 1);
     if (snap_put_ref(w, SNAP_CELL_CONTEXT, t->ctx) ||
         snap_put_native(w, t->spec))
         return -1;
-    bc_put_u8(&w->bc, t->tp_name != NULL);
+    if (t->tp_name && (t->flags & QP_TPFLAGS_PRIV_OWNED_NAME)) {
+        size_t n = strlen(t->tp_name);
+        bc_put_u8(&w->bc, 2);
+        bc_put_leb128(&w->bc, (uint32_t)n);
+        dbuf_put(&w->bc.dbuf, (const uint8_t *)t->tp_name, n);
+    } else {
+        bc_put_u8(&w->bc, t->tp_name != NULL);
+    }
     if (bc_put_atom(&w->bc, t->name) ||
         snap_put_value(w, t->qualname))
         return -1;
@@ -614,7 +623,23 @@ static int qp_snap_read_type(SnapReader *r, JSObject *p)
         bc_get_u8(&r->bc, &has_tp_name))
         return -1;
     t->spec = spec;
-    if (has_tp_name) {
+    if (has_tp_name == 2) {
+        uint32_t n;
+        char *tn;
+        if (bc_get_leb128(&r->bc, &n))
+            return -1;
+        tn = js_malloc_rt(r->rt, (size_t)n + 1);
+        if (!tn)
+            return snap_error(r, "out of memory");
+        if (bc_get_buf(&r->bc, (uint8_t *)tn, n)) {
+            js_free_rt(r->rt, tn);
+            return -1;
+        }
+        tn[n] = '\0';
+        t->tp_name = tn;
+        /* the saved flags carry it too */
+        t->flags |= QP_TPFLAGS_PRIV_OWNED_NAME;
+    } else if (has_tp_name) {
         if (!t->spec)
             return snap_error(r, "invalid Python type name");
         t->tp_name = t->spec->name;
@@ -1128,7 +1153,8 @@ static int qp_snap_read_code(SnapReader *r, JSFunctionBytecode *b)
     X(empty_bytes) X(builtins_module) X(builtins_dict) X(sys_module)         \
     X(sys_dict) X(typing_nodefault) X(audit_hooks) X(sys_structseq_types)    \
     X(modules) X(import_func) X(importlib) X(repr_stack) X(pending_del)      \
-    X(asyncgen_firstiter) X(asyncgen_finalizer) X(exc_info_base.exc_value)
+    X(asyncgen_firstiter) X(asyncgen_finalizer) X(exc_info_base.exc_value)   \
+    X(lazy_imports_filter) X(lazy_modules)
 
 /* int fields of QPState (config: the launcher's options; its string
    pointers belong to the launcher process and are not restored) */
@@ -1139,7 +1165,8 @@ static int qp_snap_read_code(SnapReader *r, JSFunctionBytecode *b)
     X(config.int_max_str_digits) X(config.lazy_imports)                      \
     X(config.recursion_limit) X(config.no_user_site) X(config.no_site)       \
     X(config.bytes_warning) X(config.utf8_mode) X(config.dev_mode)           \
-    X(config.warn_default_encoding)                                          \
+    X(config.warn_default_encoding) X(config.parser_debug)                   \
+    X(config.cpu_count)                                                      \
     X(recursion_limit) X(int_max_str_digits) X(lazy_imports_mode)           \
     X(import_lock_level) X(override_frozen_modules) X(dlopenflags)
 
@@ -1150,10 +1177,10 @@ static int qp_snap_read_code(SnapReader *r, JSFunctionBytecode *b)
     X(warn_once_registry) X(warn_default_action) X(warn_context)             \
     X(ctx_current) X(thread_shutdown_handles) X(codec_search_path)           \
     X(codec_search_cache) X(codec_error_registry) X(codec_encoding_map_type) \
-    X(ast_state) X(mon_callbacks) X(mon_local_events) X(async_exc)
+    X(ast_state) X(mon_disable) X(mon_missing) X(async_exc)
 #define QP_SNAP_MS_ARRAYS(X)                                                 \
     X(sig_handlers) X(ctx_types) X(thread_types) X(wr_types)                 \
-    X(codec_builtin_handlers) X(mon_tool_names)
+    X(codec_builtin_handlers) X(mon_tool_names) X(mon_callbacks)
 #define QP_SNAP_MS_INTS(X)                                                   \
     X(sig_wakeup_warn_on_full_buffer) X(gc_enabled) X(gc_debug)              \
     X(gc_threshold[0]) X(gc_threshold[1]) X(gc_threshold[2])                 \
@@ -1275,6 +1302,10 @@ static int qp_snap_write_state(SnapWriter *w, JSContext *ctx)
 #define X(f) if (snap_put_value(w, s->f)) return -1;
     QP_SNAP_STATE_VALUES(X)
 #undef X
+    for (i = 0; i < (int)countof(s->bytes_chars); i++) {
+        if (snap_put_value(w, s->bytes_chars[i]))
+            return -1;
+    }
 #define X(f) bc_put_sleb128(&w->bc, s->f);
     QP_SNAP_STATE_INTS(X)
 #undef X
@@ -1341,7 +1372,10 @@ static int qp_snap_read_state(SnapReader *r, JSContext *ctx)
 #define X(f) s->f = JS_UNDEFINED;
     QP_SNAP_STATE_VALUES(X)
 #undef X
+    for (i = 0; i < (int)countof(s->bytes_chars); i++)
+        s->bytes_chars[i] = JS_UNDEFINED;
     s->exc_info = &s->exc_info_base;
+    qp_mon_state_init(s);
     if (!rs->py_ctx)
         rs->py_ctx = ctx;
     c = js_malloc(ctx, sizeof(*c));
@@ -1376,6 +1410,10 @@ static int qp_snap_read_state(SnapReader *r, JSContext *ctx)
 #define X(f) if (snap_get_value(r, &s->f)) return -1;
     QP_SNAP_STATE_VALUES(X)
 #undef X
+    for (i = 0; i < (int)countof(s->bytes_chars); i++) {
+        if (snap_get_value(r, &s->bytes_chars[i]))
+            return -1;
+    }
 #define X(f) if (qp_snap_get_int(r, &s->f)) return -1;
     QP_SNAP_STATE_INTS(X)
 #undef X

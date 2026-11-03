@@ -1043,8 +1043,7 @@ static const QPTypeSpec qp_complex_spec = {
            "If a single number is given, convert it to a complex number.\n"
            "If the 'real' or 'imag' arguments are given, create a complex number\n"
            "with the specified real and imaginary components.",
-    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_BASETYPE | QP_TPFLAGS_MATCH_SELF |
-             QP_TPFLAGS_IMMUTABLETYPE,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_BASETYPE | QP_TPFLAGS_IMMUTABLETYPE,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_COMPLEX,

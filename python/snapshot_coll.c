@@ -7,7 +7,8 @@
  *   PY_RANGE       QPRange                    (rangeobject.c)
  *   PY_SLICE       QPSlice                    (sliceobject.c)
  *   PY_ITER        QPIterObj                  (iterobject.c)
- *   PY_DICT        QPDict over qp_dictcore    (dictobject.c / dictcore.c)
+ *   PY_DICT        QPDict over qp_dictcore    (dictobject.c / dictcore.c),
+ *                  then the OrderedDict list QPDict.od (odictobject.c)
  *   PY_FROZENDICT  QPDict
  *   PY_SET         QPSet over qp_setcore      (setobject.c / dictcore.c)
  *   PY_FROZENSET   QPSet
@@ -55,6 +56,11 @@
  * qp_hash may run Python __hash__ code; if that code mutates the table
  * being re-validated the restore fails with RuntimeError instead of
  * re-indexing a table that changed under it.
+ *
+ * OrderedDict list (PY_DICT only): a presence byte, then `state`, the node
+ * count and the node keys in list order.  The node hashes are recomputed
+ * by a deferred step (they are the hashes of the dict entries, address
+ * dependent ones included) and fast_nodes is rebuilt by the first lookup.
  *
  * Caches restored empty: tuple hash, frozendict hash, frozenset hash
  * (QPSet.hash and qp_setcore.hash) are -1.
@@ -433,7 +439,7 @@ static int qp_snap_coll_dict_rehash(JSContext *ctx, JSObject *p)
             ep->hash = hashes[i];
             qp_dc_set_index(keys, qp_dc_find_empty_slot(keys, ep->hash), i);
         }
-        d->core.version++;
+        d->core.version += QP_DC_VERSION_INC;
     }
     ret = 0;
  done:
@@ -463,6 +469,7 @@ static int qp_snap_coll_read_dict(SnapReader *r, JSObject *p)
     qp_dictcore_init(&d->core);
     d->uid = 0;
     d->hash = -1;
+    d->od = NULL;
     p->u.opaque = d;
     snap_payload_ready(r);
 
@@ -488,7 +495,8 @@ static int qp_snap_coll_read_dict(SnapReader *r, JSObject *p)
         qp_snap_get_i64(r, &version) ||
         qp_snap_get_i64(r, &uid))
         return -1;
-    d->core.version = (uint64_t)version;
+    /* watchers (C API) are process state: not restored */
+    d->core.version = (uint64_t)version & ~(uint64_t)QP_DC_WATCHER_MASK;
     d->uid = (uint64_t)uid;
     if (log2_size == 0) {
         if (used != 0)
@@ -565,6 +573,101 @@ static int qp_snap_coll_read_dict(SnapReader *r, JSObject *p)
     d->core.used = used;
     if (used > 0)
         return qp_snap_defer(r, p, qp_snap_coll_dict_rehash);
+    return 0;
+}
+
+/* The OrderedDict list of a PY_DICT (see the file comment). */
+static int qp_snap_coll_write_odict(SnapWriter *w, JSObject *p)
+{
+    QPDict *d = p->u.opaque;
+    const QPODict *o = d ? d->od : NULL;
+    const QPODictNode *node;
+    int64_t n = 0;
+
+    bc_put_u8(&w->bc, o != NULL);
+    if (!o)
+        return 0;
+    for (node = o->first; node; node = node->next)
+        n++;
+    if (qp_snap_put_i64(w, (int64_t)o->state) ||
+        qp_snap_put_i64(w, n))
+        return -1;
+    for (node = o->first; node; node = node->next) {
+        if (snap_put_value(w, node->key))
+            return -1;
+    }
+    return 0;
+}
+
+/* Deferred: the node hashes of a restored OrderedDict list. */
+static int qp_snap_coll_odict_rehash(JSContext *ctx, JSObject *p)
+{
+    QPDict *d = p->u.opaque;
+    QPODict *o = d ? d->od : NULL;
+    QPODictNode *node;
+    uint64_t state;
+    JSValue obj;
+    int ret = -1;
+
+    if (!o)
+        return 0;
+    /* __hash__ code may drop the last reference to the dict */
+    obj = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
+    state = o->state;
+    for (node = o->first; node; node = node->next) {
+        JSValue key = JS_DupValue(ctx, node->key);
+        Py_hash_t h = qp_hash(ctx, key);
+        JS_FreeValue(ctx, key);
+        if (h == -1)
+            goto done;
+        if (o->state != state) {
+            qp_raise(ctx, QP_EXC(ctx, RuntimeError),
+                     "OrderedDict mutated during snapshot restore");
+            goto done;
+        }
+        node->hash = h;
+    }
+    ret = 0;
+ done:
+    JS_FreeValue(ctx, obj);
+    return ret;
+}
+
+static int qp_snap_coll_read_odict(SnapReader *r, JSObject *p)
+{
+    JSContext *ctx = r->ctx;
+    QPDict *d = p->u.opaque;
+    QPODict *o;
+    int64_t state;
+    Py_ssize_t n, i;
+    int ret;
+
+    ret = qp_snap_coll_get_present(r);
+    if (ret <= 0)
+        return ret;
+    if (!d)
+        return snap_error(r, "invalid OrderedDict");
+    if (qp_snap_get_i64(r, &state) || qp_snap_coll_get_ssize(r, &n))
+        return -1;
+    if (n < 0 || (size_t)n > qp_snap_coll_left(r))
+        return snap_error(r, "invalid OrderedDict size");
+    o = js_mallocz(ctx, sizeof(*o));
+    if (!o)
+        return -1;
+    d->od = o;
+    for (i = 0; i < n; i++) {
+        QPODictNode *node = js_malloc(ctx, sizeof(*node));
+        if (!node)
+            return -1;
+        node->key = QP_NULL;
+        node->hash = -1;
+        qp_odict_add_tail(o, node);
+        if (snap_get_value(r, &node->key))
+            return -1;
+    }
+    o->state = (uint64_t)state;
+    if (n > 0)
+        return qp_snap_defer(r, p, qp_snap_coll_odict_rehash);
     return 0;
 }
 
@@ -1168,6 +1271,9 @@ static int qp_snap_write_coll(SnapWriter *w, JSObject *p)
     case JS_CLASS_PY_ITER:
         return qp_snap_coll_write_iter(w, p);
     case JS_CLASS_PY_DICT:
+        if (qp_snap_coll_write_dict(w, p) < 0)
+            return -1;
+        return qp_snap_coll_write_odict(w, p);
     case JS_CLASS_PY_FROZENDICT:
         return qp_snap_coll_write_dict(w, p);
     case JS_CLASS_PY_SET:
@@ -1196,6 +1302,9 @@ static int qp_snap_read_coll(SnapReader *r, JSObject *p)
     case JS_CLASS_PY_ITER:
         return qp_snap_coll_read_iter(r, p);
     case JS_CLASS_PY_DICT:
+        if (qp_snap_coll_read_dict(r, p) < 0)
+            return -1;
+        return qp_snap_coll_read_odict(r, p);
     case JS_CLASS_PY_FROZENDICT:
         return qp_snap_coll_read_dict(r, p);
     case JS_CLASS_PY_SET:

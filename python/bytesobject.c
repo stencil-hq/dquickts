@@ -195,7 +195,7 @@ static const uint8_t *qp_bytes_data(JSValueConst v, Py_ssize_t *plen)
 static JSValue qp_bytes_new_type(JSContext *ctx, QPType *subtype, const void *data, Py_ssize_t len)
 {
     QPBytesObject *b;
-    JSValue obj;
+    JSValue obj, *pchar = NULL;
     QPType *bt = QP_TYPE(ctx, bytes);
 
     if (len < 0 || (size_t)len > (size_t)PY_SSIZE_T_MAX - sizeof(QPBytesObject) - 1)
@@ -204,6 +204,13 @@ static JSValue qp_bytes_new_type(JSContext *ctx, QPType *subtype, const void *da
         subtype = NULL;
         if (len == 0 && JS_VALUE_GET_TAG(QP_STATE(ctx)->empty_bytes) == JS_TAG_OBJECT)
             return JS_DupValue(ctx, QP_STATE(ctx)->empty_bytes);
+        /* PyBytes_FromStringAndSize(str, 1): the singleton of the byte
+           (not for data == NULL: the caller fills the new object) */
+        if (len == 1 && data) {
+            pchar = &QP_STATE(ctx)->bytes_chars[*(const uint8_t *)data];
+            if (JS_VALUE_GET_TAG(*pchar) == JS_TAG_OBJECT)
+                return JS_DupValue(ctx, *pchar);
+        }
     }
     b = js_malloc(ctx, sizeof(QPBytesObject) + len + 1);
     if (!b)
@@ -230,6 +237,8 @@ static JSValue qp_bytes_new_type(JSContext *ctx, QPType *subtype, const void *da
         return obj;
     }
     JS_VALUE_GET_OBJ(obj)->u.opaque = b;
+    if (pchar)
+        *pchar = JS_DupValue(ctx, obj);
     return obj;
 }
 
@@ -2946,6 +2955,11 @@ static JSValue qp_bytes_format(JSContext *ctx, const uint8_t *format, Py_ssize_t
             }
             if (width < len)
                 width = len;
+            /* the whole field at once (CPython _PyBytesWriter_Prepare): a
+               width that cannot be allocated is a MemoryError, not a
+               byte-by-byte padding loop */
+            if (dbuf_claim(&db, (size_t)width + 1))
+                goto nomem_item;
             if (sign) {
                 if (fill != ' ' && dbuf_putc(&db, (uint8_t)sign))
                     goto nomem_item;
@@ -3104,6 +3118,9 @@ static const QPMethodDef qp_bytes_methods[] = {
     { "fromhex", qp_bm_fromhex, QP_METH_O | QP_METH_CLASS, 0,
       "fromhex($type, string, /)\n--\n\nCreate a bytes object from a string of hexadecimal numbers.\n\n"
       "Spaces between two numbers are accepted.\nExample: bytes.fromhex('B9 01EF') -> b'\\\\xb9\\\\x01\\\\xef'." },
+    { "hex", qp_bm_hex, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      QP_HEX_DOC("Create a string of hexadecimal numbers from a bytes object.",
+                 "b'\\xb9\\x01\\xef'") },
     QP_BM_SHARED_METHODS,
     { NULL, NULL, 0, 0, NULL },
 };

@@ -227,6 +227,11 @@ static JSValue qp_tup_repr(JSContext *ctx, JSValueConst self)
     for (i = 0; i < n; i++) {
         if (i > 0)
             string_buffer_puts8(&b, ", ");
+        /* an item C code has not set yet (PyTuple_New) */
+        if (QP_IS_NULL(t->items[i])) {
+            string_buffer_puts8(&b, "<NULL>");
+            continue;
+        }
         r = qp_repr(ctx, t->items[i]);
         if (JS_IsException(r))
             goto error;

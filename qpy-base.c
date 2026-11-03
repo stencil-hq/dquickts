@@ -1,17 +1,19 @@
 /*
- * The base snapshot embedded in qpy (python/pythonrun.c, "the base
- * snapshot"; doc/python-plan.md section 1).
+ * The base snapshot and the frozen modules embedded in qpy
+ * (python/pythonrun.c, "the base snapshot"; python/frozen.c;
+ * doc/python-plan.md section 1).
  *
  * Compiled twice by the Makefile: without QPY_BASE_FILE for qpy-nobase,
- * the qpy that writes the snapshot at build time (it has none), and with
- * QPY_BASE_FILE, the path of that snapshot as a string literal, for qpy:
- * the file is included in the read-only data with the assembler's
- * .incbin.
+ * the qpy that writes them at build time (it has none), and with
+ * QPY_BASE_FILE and QPY_FROZEN_FILE, the paths of the snapshot and of the
+ * frozen modules as string literals, for qpy: the files are included in
+ * the read-only data with the assembler's .incbin.
  */
 #include <stddef.h>
 #include <stdint.h>
 
 const uint8_t *qpy_base_snapshot(size_t *psize);
+const uint8_t *qpy_frozen_modules(size_t *psize);
 
 #ifdef QPY_BASE_FILE
 
@@ -31,12 +33,19 @@ __asm__(
     ".incbin \"" QPY_BASE_FILE "\"\n"
     ".globl " QPY_SYM(qpy_base_data_end) "\n"
     QPY_SYM(qpy_base_data_end) ":\n"
+    ".globl " QPY_SYM(qpy_frozen_data) "\n"
+    ".p2align 4\n"
+    QPY_SYM(qpy_frozen_data) ":\n"
+    ".incbin \"" QPY_FROZEN_FILE "\"\n"
+    ".globl " QPY_SYM(qpy_frozen_data_end) "\n"
+    QPY_SYM(qpy_frozen_data_end) ":\n"
 #ifndef __APPLE__
     ".previous\n"
 #endif
 );
 
 extern const uint8_t qpy_base_data[], qpy_base_data_end[];
+extern const uint8_t qpy_frozen_data[], qpy_frozen_data_end[];
 
 const uint8_t *qpy_base_snapshot(size_t *psize)
 {
@@ -44,9 +53,21 @@ const uint8_t *qpy_base_snapshot(size_t *psize)
     return qpy_base_data;
 }
 
+const uint8_t *qpy_frozen_modules(size_t *psize)
+{
+    *psize = (size_t)(qpy_frozen_data_end - qpy_frozen_data);
+    return qpy_frozen_data;
+}
+
 #else
 
 const uint8_t *qpy_base_snapshot(size_t *psize)
+{
+    *psize = 0;
+    return NULL;
+}
+
+const uint8_t *qpy_frozen_modules(size_t *psize)
 {
     *psize = 0;
     return NULL;

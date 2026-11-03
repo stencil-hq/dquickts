@@ -85,9 +85,11 @@ static BOOL qp_misc_callable(JSContext *ctx, JSValueConst v)
  * weakref holders, generator frames, whose locals are visited even while
  * they run) to the Python objects behind them.  DEBUG_SAVEALL
  * cannot keep cycles alive (QuickJS frees them inside JS_RunGC), so
- * gc.garbage stays empty; the cycle collector never refuses to free a
- * cycle (cycles with __del__ are freed without calling it, m2-design §6),
- * so the uncollectable count is always 0.  Audit events (gc.get_objects,
+ * gc.garbage stays empty.  Cycles with finalizers follow PEP 442: the
+ * collection runs their __del__ methods, then frees what they did not
+ * resurrect (qp_gc_collect_main), so the uncollectable count is always 0.
+ * Automatic collections are QuickJS's (heap growth), not object-count
+ * thresholds: set_threshold() values are reported only.  Audit events (gc.get_objects,
  * gc.get_referrers, gc.get_referents) are not raised: native modules have
  * no C-level audit entry point.
  */
@@ -489,10 +491,17 @@ static void qp_gc_invoke_callbacks(JSContext *ctx, QPModState *ms, const char *p
 /* gc_collect_main: a full QuickJS collection, then the queued __del__
    methods and weakref callbacks.  Returns the number of unreachable
    objects freed. */
+static BOOL qp_gc_finalizers_pending(JSContext *ctx)
+{
+    QPState *s = QP_STATE(ctx);
+    return JS_VALUE_GET_TAG(s->pending_del) == JS_TAG_OBJECT && qp_list_size(s->pending_del) > 0;
+}
+
 static Py_ssize_t qp_gc_collect_main(JSContext *ctx, QPModState *ms, int generation)
 {
     int64_t before, after, collected;
     double t0, duration;
+    int pass;
 
     if (ms->gc_collecting)
         return 0;
@@ -508,6 +517,16 @@ static Py_ssize_t qp_gc_collect_main(JSContext *ctx, QPModState *ms, int generat
                             (long long)before, (long long)ms->gc_frozen);
     }
     JS_RunGC(ctx->rt);
+    /* PEP 442: a collection that found cycles with finalizers kept them;
+       run the finalizers, then free what they did not resurrect, within
+       this collection like CPython (bounded: finalizers that keep making
+       new cyclic garbage leave it to the next collection) */
+    for (pass = 0; pass < 4 && qp_gc_finalizers_pending(ctx); pass++) {
+        /* gc.c: the weakref callbacks, then the finalizers */
+        qp_weakref_run_pending(ctx);
+        qp_run_pending_finalizers(ctx);
+        JS_RunGC(ctx->rt);
+    }
     after = qp_gc_count_tracked(ctx->rt);
     collected = before > after ? before - after : 0;
     duration = qp_gc_now() - t0;
@@ -779,32 +798,53 @@ static JSValue qp_gc_get_stats(JSContext *ctx, JSValueConst self, JSValueConst *
 }
 
 /* PyObject_GC_IsTracked: containers are tracked; atomic values (None,
-   bool, int, float, str, bytes, complex), bytearray, the empty tuple and
-   static builtin types are not. */
-static JSValue qp_gc_is_tracked(JSContext *ctx, JSValueConst self, JSValueConst *args,
-                                int nargs, JSValueConst kwnames, int magic)
+   bool, int, float, str, bytes, complex), bytearray and static builtin
+   types are not.  An exact tuple is tracked as CPython's tuple constructors
+   and collector leave it (maybe_tracked, _PyTuple_MaybeUntrack): when an
+   item is tracked or still NULL (PyTuple_New); tuple subclasses always. */
+static BOOL qp_gc_tracked(JSContext *ctx, JSValueConst obj, int depth)
 {
-    JSValueConst obj = args[0];
     JSObject *p;
 
     if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
-        return qp_bool_new(FALSE);
+        return FALSE;
     p = JS_VALUE_GET_OBJ(obj);
     switch (p->class_id) {
     case JS_CLASS_PY_COMPLEX:
     case JS_CLASS_PY_BYTES:
     case JS_CLASS_PY_BYTEARRAY:
     case JS_CLASS_PY_RANGE:
-        return qp_bool_new(FALSE);
-    case JS_CLASS_PY_TUPLE:
-        return qp_bool_new(QP_TUPLE_SIZE(obj) != 0);
+        return FALSE;
+    case JS_CLASS_PY_TUPLE: {
+        uint32_t i, n = QP_TUPLE_SIZE(obj);
+        if (qp_type_of(ctx, obj) != QP_TYPE(ctx, tuple))
+            return TRUE;
+        /* nesting beyond the bound counts as tracked (C stack) */
+        if (depth >= 64)
+            return n != 0;
+        for (i = 0; i < n; i++) {
+            JSValueConst item = QP_TUPLE_ITEMS(obj)[i];
+            if (QP_IS_NULL(item) || qp_gc_tracked(ctx, item, depth + 1))
+                return TRUE;
+        }
+        return FALSE;
+    }
     case JS_CLASS_PY_TYPE: {
         QPType *t = qp_type_from_value(obj);
-        return qp_bool_new(t && (t->flags & QP_TPFLAGS_HEAPTYPE));
+        return t && (t->flags & QP_TPFLAGS_HEAPTYPE);
     }
     default:
-        return qp_bool_new(qp_gc_visible(p));
+        /* object is not a GC type: plain object() instances are untracked */
+        if (qp_type_of(ctx, obj) == QP_TYPE(ctx, object))
+            return FALSE;
+        return qp_gc_visible(p);
     }
+}
+
+static JSValue qp_gc_is_tracked(JSContext *ctx, JSValueConst self, JSValueConst *args,
+                                int nargs, JSValueConst kwnames, int magic)
+{
+    return qp_bool_new(qp_gc_tracked(ctx, args[0], 0));
 }
 
 static JSValue qp_gc_is_finalized(JSContext *ctx, JSValueConst self, JSValueConst *args,
@@ -1036,9 +1076,12 @@ static void qp_atexit_callfuncs(JSContext *ctx, QPModState *ms)
 static void qp_atexit_run(JSContext *ctx)
 {
     QPModState *ms = QP_STATE(ctx) ? QP_STATE(ctx)->mod_state : NULL;
-    if (!ms || QP_IS_NULL(ms->atexit_callbacks))
-        return;
-    qp_atexit_callfuncs(ctx, ms);
+    if (ms && !QP_IS_NULL(ms->atexit_callbacks))
+        qp_atexit_callfuncs(ctx, ms);
+#ifdef CONFIG_PYTHON_CAPI
+    /* then the low-level callbacks of PyUnstable_AtExit */
+    qp_capi_atexit_ll_run(ctx);
+#endif
 }
 
 static JSValue qp_atexit_register(JSContext *ctx, JSValueConst self, JSValueConst *args,
@@ -1231,9 +1274,10 @@ static const QPModuleDef qp_moddef_atexit = {
  * The current context is QPModState.ctx_current (CPython
  * PyThreadState.context; one per context until real OS threads exist in
  * M5, where it becomes per thread).  Context watchers
- * (PyContext_AddWatcher) and the per-variable lookup cache are C-API /
- * performance features without observable Python behaviour and are not
- * ported.
+ * (PyContext_AddWatcher) are notified by the C API
+ * (qp_capi_context_switched) after each enter / exit.  The per-variable
+ * lookup cache is a performance feature without observable Python
+ * behaviour and is not ported.
  *
  * C API for the other modules of the translation unit (the types are
  * created lazily on first use, so these work before `_contextvars` is
@@ -1414,6 +1458,10 @@ static int qp_context_enter_ms(JSContext *ctx, QPModState *ms, JSValueConst cont
        it the same way: ts->context is overwritten without a decref) */
     slots[QP_CONTEXT_SLOT_PREV] = ms->ctx_current;
     ms->ctx_current = JS_DupValue(ctx, context);
+#ifdef CONFIG_PYTHON_CAPI
+    if (unlikely(qp_capi_context_watchers_set))
+        qp_capi_context_switched(ctx, ms->ctx_current);
+#endif
     return 0;
 }
 
@@ -1443,6 +1491,10 @@ static int qp_context_exit_ms(JSContext *ctx, QPModState *ms, JSValueConst conte
     slots[QP_CONTEXT_SLOT_PREV] = QP_NULL;
     slots[QP_CONTEXT_SLOT_ENTERED] = JS_NewInt32(ctx, 0);
     JS_FreeValue(ctx, old);
+#ifdef CONFIG_PYTHON_CAPI
+    if (unlikely(qp_capi_context_watchers_set))
+        qp_capi_context_switched(ctx, ms->ctx_current);
+#endif
     return 0;
 }
 
@@ -2529,7 +2581,8 @@ static JSValue qp_warnings_get_warnings_attr(JSContext *ctx, const char *attr, i
     JSValue warnings_module, obj;
     QPState *s = QP_STATE(ctx);
 
-    if (try_import) {
+    /* don't try to import after the start of the Python finalization */
+    if (try_import && !s->finalizing) {
         warnings_module = qp_import_module(ctx, "warnings");
         if (JS_IsException(warnings_module)) {
             /* Fallback to the C implementation if we cannot get
@@ -2894,8 +2947,16 @@ static JSValue qp_tb_source_line_stripped(JSContext *ctx, JSValueConst filename,
 static void qp_warnings_display_source_line(JSContext *ctx, JSValueConst f,
                                             JSValueConst filename, int lineno)
 {
-    JSValue stripped = qp_tb_source_line_stripped(ctx, filename, lineno);
+    JSValue stripped;
 
+    /* CPython reads the line from the file, not from linecache: the source
+       of a pseudo-file ("<string>" of -c, "<stdin>", ...) is not shown */
+    if (JS_VALUE_GET_TAG(filename) == JS_TAG_STRING) {
+        JSString *fs = JS_VALUE_GET_STRING(filename);
+        if (fs->len > 0 && (fs->is_wide_char ? fs->u.str16[0] : fs->u.str8[0]) == '<')
+            return;
+    }
+    stripped = qp_tb_source_line_stripped(ctx, filename, lineno);
     if (QP_IS_NULL(stripped) || JS_IsException(stripped))
         return;
     if (qp_str_len(ctx, stripped) > 0 &&
@@ -3994,6 +4055,12 @@ static int qp_signal_check_signals(JSContext *ctx)
     return 0;
 }
 
+static BOOL qp_signal_handlers_pending(JSContext *ctx)
+{
+    return qp_signal_is_tripped && ctx == qp_signal_main_ctx &&
+        qp_thread_is_main_rt(ctx->rt);
+}
+
 /* _Py_HandlePending: Python signal handlers, then __del__ of the objects
    freed since the last poll and weakref callbacks */
 static int qp_signal_check(JSContext *ctx)
@@ -4008,9 +4075,10 @@ static int qp_signal_check(JSContext *ctx)
         JS_FreeValue(ctx, exc);
         return -1;
     }
-    if (qp_signal_is_tripped && ctx == qp_signal_main_ctx &&
-        qp_thread_is_main_rt(ctx->rt)) {
-        if (qp_signal_check_signals(ctx) < 0)
+    if (qp_signal_handlers_pending(ctx)) {
+        if (unlikely(QP_STATE(ctx)->signals_deferred))
+            ctx->interrupt_counter = 1;     /* poll again soon */
+        else if (qp_signal_check_signals(ctx) < 0)
             return -1;
     }
 #ifdef CONFIG_PYTHON_CAPI
@@ -4076,6 +4144,31 @@ static void (*qp_signal_attach(JSContext *ctx))(int)
             handler = qp_signal_handler;
     }
     return qp_signal_setsig(SIGINT, handler);
+}
+
+/* _PySignal_Fini (Py_FinalizeEx, before the modules are finalized): the
+   Python handlers are removed and the signals they handled get their
+   default action back; a signal tripped later (_thread.interrupt_main()
+   in a __del__) is reported as ignored due to a race condition. */
+static void qp_signal_fini(JSContext *ctx)
+{
+    QPModState *ms = QP_STATE(ctx)->mod_state;
+    int signum;
+
+    if (!ms)
+        return;
+    for (signum = 1; signum < QP_NSIG; signum++) {
+        JSValue func = ms->sig_handlers[signum];
+        qp_signal_tripped[signum] = 0;
+        ms->sig_handlers[signum] = QP_NULL;
+        if (QP_IS_NULL(func))
+            continue;
+        if (!JS_IsUndefined(func) &&
+            !qp_signal_compare_handler(func, ms->sig_dfl) &&
+            !qp_signal_compare_handler(func, ms->sig_ign))
+            qp_signal_setsig(signum, SIG_DFL);
+        JS_FreeValue(ctx, func);
+    }
 }
 
 /* ctx goes away (qp_state_free): the signal handlers no longer poll it */
@@ -4265,7 +4358,9 @@ static JSValue qp_signal_alarm(JSContext *ctx, JSValueConst self, JSValueConst *
 static JSValue qp_signal_pause(JSContext *ctx, JSValueConst self, JSValueConst *args,
                                int nargs, JSValueConst kwnames, int magic)
 {
+    QP_BEGIN_ALLOW_THREADS(ctx)
     (void)pause();
+    QP_END_ALLOW_THREADS(ctx)
     /* make sure that any exceptions that got raised are propagated
        back into Python */
     return qp_signal_none_or_exc(ctx, qp_signal_check_signals(ctx));
@@ -4543,7 +4638,9 @@ static JSValue qp_signal_sigwait(JSContext *ctx, JSValueConst self, JSValueConst
     int err, signum;
     if (qp_signal_sigset_conv(ctx, args[0], &set) < 0)
         return JS_EXCEPTION;
+    QP_BEGIN_ALLOW_THREADS(ctx)
     err = sigwait(&set, &signum);
+    QP_END_ALLOW_THREADS(ctx)
     if (err)
         return qp_raise_os_error(ctx, err, QP_NULL);
     return JS_NewInt32(ctx, signum);
@@ -4617,7 +4714,9 @@ static JSValue qp_signal_sigwaitinfo(JSContext *ctx, JSValueConst self, JSValueC
     if (qp_signal_sigset_conv(ctx, args[0], &set) < 0)
         return JS_EXCEPTION;
     do {
+        QP_BEGIN_ALLOW_THREADS(ctx)
         err = sigwaitinfo(&set, &si);
+        QP_END_ALLOW_THREADS(ctx)
     } while (err == -1 && errno == EINTR &&
              !(async_err = (qp_signal_check_signals(ctx) < 0)));
     if (err == -1)
@@ -4642,9 +4741,13 @@ static JSValue qp_signal_sigtimedwait(JSContext *ctx, JSValueConst self, JSValue
     deadline = (int64_t)now.tv_sec * 1000000000 + now.tv_nsec + timeout;
     for (;;) {
         struct timespec ts;
+        int res;
         ts.tv_sec = (time_t)(timeout / 1000000000);
         ts.tv_nsec = (long)(timeout % 1000000000);
-        if (sigtimedwait(&set, &si, &ts) != -1)
+        QP_BEGIN_ALLOW_THREADS(ctx)
+        res = sigtimedwait(&set, &si, &ts);
+        QP_END_ALLOW_THREADS(ctx)
+        if (res != -1)
             break;
         if (errno != EINTR) {
             if (errno == EAGAIN)
@@ -6054,6 +6157,9 @@ typedef struct qp_marshal_RFILE {
     JSContext *ctx;
     int depth;
     JSValueConst readable;      /* QP_NULL for loads() */
+#ifdef CONFIG_PYTHON_CAPI
+    FILE *fp;                   /* PyMarshal_Read*FromFile (python/capi_stable.c) */
+#endif
     const uint8_t *ptr;
     const uint8_t *end;
     uint8_t *buf;
@@ -6089,6 +6195,11 @@ static const uint8_t *qp_marshal_r_string(Py_ssize_t n, qp_marshal_RFILE *p)
         p->buf = tmp;
         p->buf_size = n;
     }
+#ifdef CONFIG_PYTHON_CAPI
+    if (p->fp) {
+        read = (Py_ssize_t)fread(p->buf, 1, (size_t)n, p->fp);
+    } else
+#endif
     {
         JSValue ba, res;
         JSAtom a;

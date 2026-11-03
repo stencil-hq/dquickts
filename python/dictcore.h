@@ -141,11 +141,15 @@ typedef struct qp_dictkeys {
 typedef struct qp_dictcore {
     qp_dictkeys *keys;          /* never NULL; the shared empty table if empty */
     Py_ssize_t used;            /* number of live items (len(d)) */
-    /* Incremented by every mutation that changes a key, a value, the set of
-     * entries or entry positions (insert, value replacement by a different
-     * value, delete, pop, popitem, clear, resize/compaction, copy/merge).
-     * Never decremented; 0 only for a never-mutated dict.  Caches keyed on
-     * (dict, version) stay valid while it is unchanged. */
+    /* CPython's _ma_watcher_tag layout: the low bits are the tag
+     * (QP_DC_WATCHER_MASK, QP_DC_TAG_SPLIT), the version proper counts in
+     * units of QP_DC_VERSION_INC.  It is incremented by every mutation that
+     * changes a key, a value, the set of entries or entry positions (insert,
+     * value replacement by a different value, delete, pop, popitem, clear,
+     * resize/compaction, copy/merge).  Never decremented; below
+     * QP_DC_VERSION_INC only for a never-mutated dict.  Caches keyed on
+     * (dict, version) stay valid while it is unchanged (watching a dict
+     * changes it too). */
     uint64_t version;
     /* Incremented whenever `keys` is replaced (lookup restart detection). */
     uint64_t keys_gen;
@@ -163,6 +167,31 @@ typedef struct qp_dictcore_iter {
                                          the state is now sticky; CPython keeps the dict reference */
 #define QP_DICTITER_KEYS_CHANGED (-2) /* RuntimeError("dictionary keys changed during iteration");
                                          CPython drops the dict reference (iterator exhausted) */
+
+/* qp_dictcore.version tag bits (CPython pycore_dict.h DICT_WATCHER_MASK,
+ * DICT_VERSION_INCREMENT). */
+#define QP_DC_WATCHER_MASK  0xffu       /* PyDict_Watch bits (DICT_MAX_WATCHERS 8) */
+/* Instance __dict__ (CPython split table): a watched store of a value
+ * identical to the old one is still a MODIFIED event.  Set when __dict__ is
+ * materialized; cleared when CPython would make the table combined (a
+ * non-str key, clear, popitem). */
+#define QP_DC_TAG_SPLIT     0x100u
+#define QP_DC_TAG_MASK      0xfffu
+#define QP_DC_VERSION_INC   ((uint64_t)1 << 12)
+
+/* Watcher events (CPython PyDict_WatchEvent, same values).  With the C API
+ * the core reports them for dicts with watcher bits to
+ * qp_capi_dict_notify(ctx, d, event, key, value) (object.h C-API hooks),
+ * before the mutation as CPython does; `key` is the source dict for
+ * CLONED. */
+enum {
+    QP_DC_EVENT_ADDED = 0,
+    QP_DC_EVENT_MODIFIED,
+    QP_DC_EVENT_DELETED,
+    QP_DC_EVENT_CLONED,
+    QP_DC_EVENT_CLEARED,
+    QP_DC_EVENT_DEALLOCATED,
+};
 
 /* qp_dictcore_merge / qp_dictcore_copy results besides 0 / -1. */
 #define QP_DICT_MERGE_DUP     (-2)  /* duplicate key with override == 2; *dupkey set (owned) */
@@ -254,10 +283,12 @@ static __maybe_unused Py_ssize_t qp_dictcore_iter_length_hint(const qp_dictcore 
  * non-NULL iff override == 2).  Returns 0, -1 (exception), QP_DICT_MERGE_DUP
  * or QP_DICT_MERGE_MUTATED (other changed size while merging; caller raises
  * RuntimeError("dict mutated during update")).  The caller handles the
- * non-dict / dict-subclass-with-__iter__ paths of dict_merge. */
+ * non-dict / dict-subclass-with-__iter__ paths of dict_merge.  other_obj is
+ * the object embedding `other`, reported to the watchers of `d` by a CLONED
+ * event. */
 static __maybe_unused int qp_dictcore_merge(JSContext *ctx, qp_dictcore *d,
-                             qp_dictcore *other, int override,
-                             JSValue *dupkey,
+                             qp_dictcore *other, JSValueConst other_obj,
+                             int override, JSValue *dupkey,
                              qp_dictcore_eq_fn *eq, void *opaque);
 /* dict.copy core (copy_lock_held_untracked for combined dicts whose type does
  * not override __iter__): `dst` must be a freshly initialized empty dict.

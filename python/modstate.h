@@ -44,6 +44,7 @@ typedef struct QPWeakRec {
     struct QPWeakRec *prev, *next;   /* per-target list (CPython wr_prev/wr_next) */
     struct QPWeakRec *pending_next;  /* callback queue link */
     uint8_t pending;            /* queued in QPModState.wr_pending */
+    uint8_t pending_from_gc;    /* queued by the cycle collector (CPython handle_weakrefs) */
     uint8_t kind;               /* QP_WR_KIND_* */
     Py_hash_t hash;             /* cached hash of the referent, -1 = not computed */
     JSValue callback;           /* __callback__ (owned, marked by the holder), QP_NULL = none */
@@ -118,6 +119,7 @@ typedef struct QPModState {
     JSValue codec_error_registry;       /* dict name -> handler */
     JSValue codec_builtin_handlers[8];  /* strict, ignore, replace, xmlcharrefreplace, backslashreplace, namereplace, surrogatepass, surrogateescape function objects */
     JSValue codec_encoding_map_type;    /* EncodingMap type object */
+    BOOL ucnhash_loaded;                /* unicodedata imported (mod_codecs.c qp_unicode_name_capi) */
 
     /* _ast (mod_ast.c; CPython interp->ast): tuple of the node classes and
        operator singletons, QP_NULL until first used */
@@ -125,9 +127,12 @@ typedef struct QPModState {
 
     /* sys.monitoring (instrumentation.c; CPython interp->monitoring_*) */
     JSValue mon_tool_names[6];          /* str, QP_NULL = tool id free */
-    JSValue mon_callbacks;              /* dict (tool_id << 8 | event_id) -> callable */
-    JSValue mon_local_events;           /* dict (code, tool_id) -> event set */
-    uint32_t mon_events[6];             /* global event set per tool */
+    JSValue mon_callbacks[6 * 19];      /* [tool_id * 19 + event_id] callable, QP_NULL = none */
+    JSValue mon_disable;                /* sys.monitoring.DISABLE, QP_NULL until the module exists */
+    JSValue mon_missing;                /* sys.monitoring.MISSING */
+    uint32_t mon_events[6];             /* global event set per tool (the local sets are in QPMonCode) */
+    uint8_t mon_branch_legacy[6];       /* bit 0 / 1: the BRANCH_LEFT / BRANCH_RIGHT callback was
+                                           registered for BRANCH (a DISABLE disables both) */
 
     /* asynchronous exception type raised at the next poll (CPython
        tstate->async_exc, _PY_ASYNC_EXCEPTION_BIT), QP_NULL = none */
@@ -185,8 +190,10 @@ static QPModState *qp_modstate(JSContext *ctx)
     ms->ast_state = QP_NULL;
     for (i = 0; i < (int)countof(ms->mon_tool_names); i++)
         ms->mon_tool_names[i] = QP_NULL;
-    ms->mon_callbacks = QP_NULL;
-    ms->mon_local_events = QP_NULL;
+    for (i = 0; i < (int)countof(ms->mon_callbacks); i++)
+        ms->mon_callbacks[i] = QP_NULL;
+    ms->mon_disable = QP_NULL;
+    ms->mon_missing = QP_NULL;
     ms->async_exc = QP_NULL;
     s->mod_state = ms;
     return ms;
@@ -242,8 +249,10 @@ static void qp_modstate_mark(JSRuntime *rt, QPState *s, JS_MarkFunc *mark_func)
     qp_modstate_mark_value(rt, ms->ast_state, mark_func);
     for (i = 0; i < (int)countof(ms->mon_tool_names); i++)
         qp_modstate_mark_value(rt, ms->mon_tool_names[i], mark_func);
-    qp_modstate_mark_value(rt, ms->mon_callbacks, mark_func);
-    qp_modstate_mark_value(rt, ms->mon_local_events, mark_func);
+    for (i = 0; i < (int)countof(ms->mon_callbacks); i++)
+        qp_modstate_mark_value(rt, ms->mon_callbacks[i], mark_func);
+    qp_modstate_mark_value(rt, ms->mon_disable, mark_func);
+    qp_modstate_mark_value(rt, ms->mon_missing, mark_func);
     qp_modstate_mark_value(rt, ms->async_exc, mark_func);
 }
 
@@ -336,8 +345,10 @@ static void qp_modstate_free(JSContext *ctx)
     qp_modstate_free_value(ctx, &ms->ast_state);
     for (i = 0; i < countof(ms->mon_tool_names); i++)
         qp_modstate_free_value(ctx, &ms->mon_tool_names[i]);
-    qp_modstate_free_value(ctx, &ms->mon_callbacks);
-    qp_modstate_free_value(ctx, &ms->mon_local_events);
+    for (i = 0; i < countof(ms->mon_callbacks); i++)
+        qp_modstate_free_value(ctx, &ms->mon_callbacks[i]);
+    qp_modstate_free_value(ctx, &ms->mon_disable);
+    qp_modstate_free_value(ctx, &ms->mon_missing);
     qp_modstate_free_value(ctx, &ms->async_exc);
     s->mod_state = NULL;
     js_free(ctx, ms);

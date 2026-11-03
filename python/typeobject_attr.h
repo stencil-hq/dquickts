@@ -142,6 +142,10 @@ static JSValue qp_obj_dict_get(JSContext *ctx, JSObject *p)
 {
     JSShapeProperty *prs;
     JSProperty *pr;
+#ifdef CONFIG_PYTHON_CAPI
+    if (p->class_id == JS_CLASS_PY_NATIVE)
+        return qp_capi_native_dict_sync(ctx, p);
+#endif
     prs = find_own_property(&pr, p, QP_STATE(ctx)->atom_dict_slot);
     if (!prs)
         return QP_NULL;
@@ -172,6 +176,9 @@ static JSValue qp_obj_materialize_dict(JSContext *ctx, JSObject *p)
     d = qp_dict_new(ctx);
     if (JS_IsException(d))
         return d;
+    /* CPython materializes the managed dict over the inline values: a
+       split table (what dict watchers observe) */
+    QP_DICT(d)->core.version |= QP_DC_TAG_SPLIT;
     if (p->class_id != JS_CLASS_ARRAY) {
         sh = p->shape;
         cnt = sh->prop_count;
@@ -326,8 +333,11 @@ static int qp_subtype_dict_set(JSContext *ctx, JSValueConst self, JSValueConst v
     d = qp_obj_materialize_dict(ctx, p);
     prs = JS_IsException(d) ? NULL :
         find_own_property(&pr, p, QP_STATE(ctx)->atom_dict_slot);
-    if (prs)
+    if (prs) {
         set_value(ctx, &pr->u.value, JS_DupValue(ctx, value));
+        if (p->class_id == JS_CLASS_PY_NATIVE)
+            qp_capi_native_dict_made(ctx, p, value);
+    }
     JS_FreeValue(ctx, empty);
     return prs ? 0 : -1;
 }
@@ -416,7 +426,7 @@ static JSValue qp_generic_getattr_ex(JSContext *ctx, JSValueConst obj, JSAtom na
         } else {
             JSShapeProperty *prs;
             JSProperty *pr;
-            prs = find_own_property(&pr, p, name);
+                            prs = find_own_property(&pr, p, name);
             if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL) {
                 JS_FreeValue(ctx, descr);
                 return JS_DupValue(ctx, pr->u.value);
@@ -571,23 +581,35 @@ static int qp_generic_setattr(JSContext *ctx, JSValueConst obj, JSAtom name, JSV
 /* Inline caches                                                             */
 /* ========================================================================= */
 
-static void qp_ic_store(JSContext *ctx, QPAttrCache *ic, JSObject *p, uint32_t version,
-                        int kind, uint32_t index, JSValueConst value)
+/* Fill ic for the receiver p of type tp, classified by a lookup started at
+   tp's version tag `version`.  Not stored (FALSE) if that lookup ran code
+   (a dict key's __eq__) that modified tp or a base, or changed the class of
+   p or left it with an unhashed shape. */
+static BOOL qp_ic_store(JSContext *ctx, QPAttrCache *ic, QPType *tp, JSObject *p,
+                        uint32_t version, int kind, uint32_t index, JSValueConst value)
 {
-    JSShape *old = ic->shape;
-    ic->shape = js_dup_shape(p->shape);
-    if (old)
-        js_free_shape(ctx->rt, old);
+    JSShape *sh = p->shape;
+
+    if (version == 0 || tp->version_tag != version || !sh->is_hashed || sh->proto != tp->obj)
+        return FALSE;
+    if (tp->ic_shape != sh) {
+        JSShape *old = tp->ic_shape;
+        tp->ic_shape = js_dup_shape(sh);
+        if (old)
+            js_free_shape(ctx->rt, old);
+    }
+    ic->shape_uid = sh->py_uid;
     ic->type_version = version;
     ic->kind = (uint8_t)kind;
     ic->index = index;
     ic->value = value;
+    return TRUE;
 }
 
 /* Type of an IC-eligible receiver (proto is a PY_TYPE, shape storage, not
    dict mode, hashed shape), else NULL.  An unhashed shape (after a property
-   deletion) is owned by its object and modified in place by add_property,
-   so it can neither be keyed on nor have an extra reference. */
+   deletion) is owned by its object and modified in place without a new uid
+   (deletions, flag changes), so it cannot be keyed on. */
 static QPType *qp_ic_receiver(JSValueConst obj)
 {
     JSObject *p, *proto;
@@ -605,15 +627,17 @@ static QPType *qp_ic_receiver(JSValueConst obj)
 
 static inline BOOL qp_ic_hit(QPAttrCache *ic, JSValueConst obj, QPType **ptp)
 {
-    JSObject *p;
+    JSShape *sh;
     QPType *tp;
-    if (!ic->shape || JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
         return FALSE;
-    p = JS_VALUE_GET_OBJ(obj);
-    if (p->shape != ic->shape)
+    /* a matching uid is the shape stored, unchanged: its proto is a
+       PY_TYPE; an empty entry (0) matches no shape */
+    sh = JS_VALUE_GET_OBJ(obj)->shape;
+    if (sh->py_uid != ic->shape_uid)
         return FALSE;
-    tp = (QPType *)p->shape->proto->u.opaque;
-    if (!tp || tp->version_tag != ic->type_version || ic->type_version == 0)
+    tp = (QPType *)sh->proto->u.opaque;
+    if (!tp || tp->version_tag != ic->type_version)
         return FALSE;
     *ptp = tp;
     return TRUE;
@@ -669,24 +693,36 @@ static JSValue qp_ic_get_hit(JSContext *ctx, QPAttrCache *ic, JSValueConst obj, 
     }
 }
 
-static JSValue qp_getattr_ic(JSContext *ctx, JSValueConst obj, JSAtom name, QPAttrCache *ic)
+/* the inline caches miss out of line: the hits are inlined in the
+   interpreter loop (python/ceval_ops.h) */
+static no_inline JSValue qp_getattr_ic_miss(JSContext *ctx, JSValueConst obj, JSAtom name,
+                                            QPAttrCache *ic)
 {
     QPType *tp;
     JSValue value;
     uint32_t index = 0, version;
     int kind;
 
-    if (qp_ic_hit(ic, obj, &tp))
-        return qp_ic_get_hit(ctx, ic, obj, tp);
     tp = qp_ic_receiver(obj);
     if (!tp || tp->slots.tp_getattro != qp_generic_getattr)
         return qp_getattr(ctx, obj, name);
-    kind = qp_ic_classify_get(ctx, tp, JS_VALUE_GET_OBJ(obj), name, 0, &index, &value);
+    /* tag before the lookup: user code it runs may modify the type, and the
+       entry is then not stored (the lookup is redone) */
     version = qp_type_version(ctx, tp);
-    if (kind == QP_ATTR_IC_NONE || version == 0)
+    kind = qp_ic_classify_get(ctx, tp, JS_VALUE_GET_OBJ(obj), name, 0, &index, &value);
+    if (kind == QP_ATTR_IC_NONE ||
+        !qp_ic_store(ctx, ic, tp, JS_VALUE_GET_OBJ(obj), version, kind, index, value))
         return qp_generic_getattr(ctx, obj, name);
-    qp_ic_store(ctx, ic, JS_VALUE_GET_OBJ(obj), version, kind, index, value);
     return qp_ic_get_hit(ctx, ic, obj, tp);
+}
+
+static JSValue qp_getattr_ic(JSContext *ctx, JSValueConst obj, JSAtom name, QPAttrCache *ic)
+{
+    QPType *tp;
+
+    if (likely(qp_ic_hit(ic, obj, &tp)))
+        return qp_ic_get_hit(ctx, ic, obj, tp);
+    return qp_getattr_ic_miss(ctx, obj, name, ic);
 }
 
 /* _PyObject_GetMethod */
@@ -774,24 +810,11 @@ static int qp_load_method(JSContext *ctx, JSValueConst obj, JSAtom name,
     return -1;
 }
 
-static int qp_load_method_ic(JSContext *ctx, JSValueConst obj, JSAtom name, QPAttrCache *ic,
-                             JSValue *pmeth, JSValue *pself)
+static inline int qp_load_method_ic_hit(JSContext *ctx, QPAttrCache *ic, JSValueConst obj,
+                                        QPType *tp, JSValue *pmeth, JSValue *pself)
 {
-    QPType *tp;
-    JSValue value, r;
-    uint32_t index = 0, version;
-    int kind;
+    JSValue r;
 
-    if (!qp_ic_hit(ic, obj, &tp)) {
-        tp = qp_ic_receiver(obj);
-        if (!tp || tp->slots.tp_getattro != qp_generic_getattr)
-            return qp_load_method(ctx, obj, name, pmeth, pself);
-        kind = qp_ic_classify_get(ctx, tp, JS_VALUE_GET_OBJ(obj), name, 1, &index, &value);
-        version = qp_type_version(ctx, tp);
-        if (kind == QP_ATTR_IC_NONE || version == 0)
-            return qp_load_method(ctx, obj, name, pmeth, pself);
-        qp_ic_store(ctx, ic, JS_VALUE_GET_OBJ(obj), version, kind, index, value);
-    }
     if (ic->kind == QP_ATTR_IC_METHOD) {
         *pmeth = JS_DupValue(ctx, ic->value);
         *pself = JS_DupValue(ctx, obj);
@@ -807,15 +830,71 @@ static int qp_load_method_ic(JSContext *ctx, JSValueConst obj, JSAtom name, QPAt
     return 0;
 }
 
-static int qp_setattr_ic(JSContext *ctx, JSValueConst obj, JSAtom name, JSValueConst v,
-                         QPAttrCache *ic)
+static no_inline int qp_load_method_ic_miss(JSContext *ctx, JSValueConst obj, JSAtom name,
+                                            QPAttrCache *ic, JSValue *pmeth, JSValue *pself)
+{
+    QPType *tp;
+    JSValue value;
+    uint32_t index = 0, version;
+    int kind;
+
+    tp = qp_ic_receiver(obj);
+    if (!tp || tp->slots.tp_getattro != qp_generic_getattr)
+        return qp_load_method(ctx, obj, name, pmeth, pself);
+    version = qp_type_version(ctx, tp);
+    kind = qp_ic_classify_get(ctx, tp, JS_VALUE_GET_OBJ(obj), name, 1, &index, &value);
+    if (kind == QP_ATTR_IC_NONE ||
+        !qp_ic_store(ctx, ic, tp, JS_VALUE_GET_OBJ(obj), version, kind, index, value))
+        return qp_load_method(ctx, obj, name, pmeth, pself);
+    return qp_load_method_ic_hit(ctx, ic, obj, tp, pmeth, pself);
+}
+
+static int qp_load_method_ic(JSContext *ctx, JSValueConst obj, JSAtom name, QPAttrCache *ic,
+                             JSValue *pmeth, JSValue *pself)
+{
+    QPType *tp;
+
+    if (likely(qp_ic_hit(ic, obj, &tp)))
+        return qp_load_method_ic_hit(ctx, ic, obj, tp, pmeth, pself);
+    return qp_load_method_ic_miss(ctx, obj, name, ic, pmeth, pself);
+}
+
+static no_inline int qp_setattr_ic_miss(JSContext *ctx, JSValueConst obj, JSAtom name,
+                                        JSValueConst v, QPAttrCache *ic)
 {
     QPType *tp;
     JSValue descr;
     QPType *dt;
     uint32_t version;
 
-    if (qp_ic_hit(ic, obj, &tp)) {
+    tp = qp_ic_receiver(obj);
+    if (!tp || tp->slots.tp_setattro != qp_generic_setattr)
+        return qp_setattr(ctx, obj, name, v);
+    version = qp_type_version(ctx, tp);
+    if (version) {
+        JSObject *p = JS_VALUE_GET_OBJ(obj);
+        descr = qp_type_lookup(ctx, tp, name);
+        dt = QP_IS_NULL(descr) ? NULL : qp_type_of(ctx, descr);
+        if (dt && dt->slots.tp_descr_set) {
+            qp_ic_store(ctx, ic, tp, p, version, QP_ATTR_IC_CLASS_DESCR, 0, descr);
+        } else if (tp->flags & QP_TPFLAGS_MANAGED_DICT) {
+            JSShapeProperty *prs;
+            JSProperty *pr;
+            prs = find_own_property(&pr, p, name);
+            if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL)
+                qp_ic_store(ctx, ic, tp, p, version, QP_ATTR_IC_INST_PROP,
+                            (uint32_t)(prs - get_shape_prop(p->shape)), JS_UNDEFINED);
+        }
+    }
+    return qp_generic_setattr(ctx, obj, name, v);
+}
+
+static int qp_setattr_ic(JSContext *ctx, JSValueConst obj, JSAtom name, JSValueConst v,
+                         QPAttrCache *ic)
+{
+    QPType *tp;
+
+    if (likely(qp_ic_hit(ic, obj, &tp))) {
         if (ic->kind == QP_ATTR_IC_INST_PROP) {
             set_value(ctx, &JS_VALUE_GET_OBJ(obj)->prop[ic->index].u.value, JS_DupValue(ctx, v));
             return 0;
@@ -826,26 +905,7 @@ static int qp_setattr_ic(JSContext *ctx, JSValueConst obj, JSAtom name, JSValueC
             return r;
         }
     }
-    tp = qp_ic_receiver(obj);
-    if (!tp || tp->slots.tp_setattro != qp_generic_setattr)
-        return qp_setattr(ctx, obj, name, v);
-    version = qp_type_version(ctx, tp);
-    if (version) {
-        JSObject *p = JS_VALUE_GET_OBJ(obj);
-        descr = qp_type_lookup(ctx, tp, name);
-        dt = QP_IS_NULL(descr) ? NULL : qp_type_of(ctx, descr);
-        if (dt && dt->slots.tp_descr_set) {
-            qp_ic_store(ctx, ic, p, version, QP_ATTR_IC_CLASS_DESCR, 0, descr);
-        } else if (tp->flags & QP_TPFLAGS_MANAGED_DICT) {
-            JSShapeProperty *prs;
-            JSProperty *pr;
-            prs = find_own_property(&pr, p, name);
-            if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL)
-                qp_ic_store(ctx, ic, p, version, QP_ATTR_IC_INST_PROP,
-                            (uint32_t)(prs - get_shape_prop(p->shape)), JS_UNDEFINED);
-        }
-    }
-    return qp_generic_setattr(ctx, obj, name, v);
+    return qp_setattr_ic_miss(ctx, obj, name, v, ic);
 }
 
 /* ========================================================================= */
@@ -1012,10 +1072,13 @@ static JSValue qp_supercheck(JSContext *ctx, QPType *type, JSValueConst obj)
 static JSValue qp_super_lookup_descr(JSContext *ctx, QPType *su_type, QPType *su_obj_type,
                                      JSAtom name)
 {
-    JSValue mro = su_obj_type->mro, v;
+    JSValue mro = su_obj_type->mro, v = QP_NULL;
     Py_ssize_t i, n;
     if (JS_VALUE_GET_TAG(mro) != JS_TAG_OBJECT)
         return QP_NULL;
+    /* Keep a strong reference to the MRO: su_obj_type->mro can be replaced
+       during the dict lookup (a non-str key's __eq__ assigning __bases__). */
+    mro = JS_DupValue(ctx, mro);
     n = QP_TUPLE_SIZE(mro);
     for (i = 0; i + 1 < n; i++) {
         if (qp_type_from_value(QP_TUPLE_ITEMS(mro)[i]) == su_type)
@@ -1029,13 +1092,14 @@ static JSValue qp_super_lookup_descr(JSContext *ctx, QPType *su_type, QPType *su
             continue;
         r = qp_dict_get_item_atom(ctx, b->dict, name, &v);
         if (r > 0)
-            return v;
+            break;
         if (r < 0) {
             qp_tw_clear_exc(ctx);
-            return QP_NULL;
+            break;
         }
     }
-    return QP_NULL;
+    JS_FreeValue(ctx, mro);
+    return v;
 }
 
 static JSValue qp_super_vectorcall(JSContext *ctx, JSValueConst callable, JSValueConst *args,
@@ -1317,7 +1381,8 @@ static int qp_super_lookup(JSContext *ctx, JSValueConst global_super, JSValueCon
 /* ========================================================================= */
 
 /* the context of the Python object 'p' if its __del__ (or finalizer) is
-   due: its type has one, it has not run and the finalizer queue exists */
+   due: its type has one, it has not run and the finalizer queue exists
+   (list instances are JS arrays whose prototype is their type) */
 static JSContext *qp_del_context(JSObject *p)
 {
     JSObject *proto;
@@ -1325,15 +1390,28 @@ static JSContext *qp_del_context(JSObject *p)
     JSContext *ctx;
     QPState *s;
 
-    if (!QP_IS_PY_CLASS(p->class_id) || p->py_finalized)
-        return NULL;
-    proto = p->shape ? p->shape->proto : NULL;
-    if (!proto || proto->class_id != JS_CLASS_PY_TYPE || !proto->u.opaque)
-        return NULL;
-    t = (QPType *)proto->u.opaque;
-    if (!(t->flags & QP_TPFLAGS_HAS_DEL))
-        return NULL;
-    ctx = t->ctx;
+#ifdef CONFIG_PYTHON_CAPI
+    /* Python functions: their destruction is reported to function watchers */
+    if (p->class_id == JS_CLASS_BYTECODE_FUNCTION)
+        ctx = !p->py_finalized && qp_capi_func_watchers_set ? qp_capi_dealloc_watched(p) : NULL;
+    else
+#endif
+    {
+        if ((!QP_IS_PY_CLASS(p->class_id) && p->class_id != JS_CLASS_ARRAY) || p->py_finalized)
+            return NULL;
+        proto = p->shape ? p->shape->proto : NULL;
+        if (!proto || proto->class_id != JS_CLASS_PY_TYPE || !proto->u.opaque)
+            return NULL;
+        t = (QPType *)proto->u.opaque;
+        ctx = t->ctx;
+        if (!(t->flags & QP_TPFLAGS_HAS_DEL)) {
+#ifdef CONFIG_PYTHON_CAPI
+            /* a deallocation reported to C-API watchers */
+            if (!QP_CAPI_DEALLOC_WATCHERS_SET() || !qp_capi_dealloc_watched(p))
+#endif
+                return NULL;
+        }
+    }
     s = ctx ? QP_STATE(ctx) : NULL;
     if (!s || JS_VALUE_GET_TAG(s->pending_del) != JS_TAG_OBJECT)
         return NULL;
@@ -1423,19 +1501,21 @@ static void qp_run_pending_finalizers(JSContext *ctx)
                 if (u >= 0) {
                     JSValueConst a[1] = { obj };
                     r = qp_call_unbound(ctx, u, del, a, 1);
-                    if (JS_IsException(r)) {
-                        JSValue exc = qp_exc_fetch(ctx);
-                        qp_exc_write_unraisable(ctx, exc, del);
-                        JS_FreeValue(ctx, exc);
-                    } else {
+                    if (JS_IsException(r))
+                        qp_format_unraisable(ctx, "Exception ignored while calling deallocator %R", del);
+                    else
                         JS_FreeValue(ctx, r);
-                    }
                     JS_FreeValue(ctx, del);
                 } else if (u == -1) {
-                    JSValue exc = qp_exc_fetch(ctx);
-                    qp_exc_write_unraisable(ctx, exc, obj);
-                    JS_FreeValue(ctx, exc);
+                    /* slot_tp_finalize drops a failed __del__ lookup */
+                    JS_FreeValue(ctx, qp_exc_fetch(ctx));
                 }
+#ifdef CONFIG_PYTHON_CAPI
+                /* the deallocation events of C-API watchers (type_dealloc,
+                   func_dealloc, dict_dealloc, code_dealloc run after
+                   tp_finalize) */
+                qp_capi_dealloc_notify(ctx, obj);
+#endif
             }
             JS_FreeValue(ctx, obj);
         }

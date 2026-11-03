@@ -909,6 +909,11 @@ int PySequence_Contains(PyObject *seq, PyObject *ob)
     JSValue vs, vo;
     QPType *t;
 
+    /* list/tuple sq_contains compare ob with each item: an empty one
+       never looks at ob (CPython returns 0 for a NULL ob there) */
+    if (seq != NULL && ob == NULL && (PyList_Check(seq) || PyTuple_Check(seq)) &&
+        PySequence_Size(seq) == 0)
+        return 0;
     if (seq == NULL || ob == NULL) {
         qp_capi_num_null_error();
         return -1;

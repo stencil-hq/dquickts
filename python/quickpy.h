@@ -74,6 +74,18 @@ int qp_main(int argc, char **argv);
 int qp_write_base_snapshot(const char *path, const char *dir);
 void qp_set_base_snapshot(const uint8_t *data, size_t size);
 
+/* The frozen modules of qp_main (python/frozen.c): the marshalled code of
+   CPython's frozen modules (importlib._bootstrap, os, site, __hello__...),
+   written at build time by qp_write_frozen_modules() (`qpy
+   --write-frozen-modules FILE DIR`: compiled from the stdlib of the qpy of
+   directory DIR, plus the make dependencies of FILE in FILE.d; returns
+   the exit status) and embedded in qpy, which gives it to
+   qp_set_frozen_modules() before qp_main() (and before
+   qp_write_base_snapshot(), whose base is made with them).  Without it
+   there are no frozen modules.  'data' must stay valid. */
+int qp_write_frozen_modules(const char *path, const char *dir);
+void qp_set_frozen_modules(const uint8_t *data, size_t size);
+
 /* `qjs --drepl FILE --python` (python/pythonrun.c): qjs keeps the line
    editor and runs each input in the session context `ctx`, whose runtime
    it saves with JS_WriteSnapshot() as a delta of a new session.

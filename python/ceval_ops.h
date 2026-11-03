@@ -29,6 +29,20 @@
 #endif
 
 #define PY_SYNC()   (sf->cur_pc = pc)
+/* _CHECK_PERIODIC_AT_END of CALL (check_periodics_at_end): a poll
+   requested while the callee ran (signal, _thread.interrupt_main(), GIL
+   drop request) is done before the next instruction, so that the
+   exception of a Python signal handler is raised by the call (inside its
+   `try`/`with`), not by the next one; but not after the call of __enter__
+   (`skip`: the call follows a load_special), whose with block is not set
+   up yet.  The result is already on the stack (released by the
+   unwinding). */
+#define PY_CALL_POLL(skip)                                              \
+    do {                                                                \
+        if (unlikely(ctx->interrupt_counter <= 1) && !(skip) &&         \
+            js_poll_interrupts(ctx))                                    \
+            goto exception;                                             \
+    } while (0)
 #define PY_CODE_IC(idx) (&b->py_code->ic[idx])
 
         PYCASE(invalid):
@@ -305,6 +319,10 @@
                 JSValue res, self = QP_NULL;
                 pc += 5;
                 PY_SYNC();
+                if (unlikely(sf->py_mon_flags & QP_MON_SF_SUPER_GENERIC)) {
+                    sf->py_mon_flags &= ~QP_MON_SF_SUPER_GENERIC;
+                    is_method = FALSE;      /* (self pushed as NULL) */
+                }
                 if (unlikely(qp_super_lookup(ctx, sp[-3], sp[-2], sp[-1], atom, sflags,
                                              &res, is_method ? &self : NULL) < 0))
                     goto exception;
@@ -313,7 +331,7 @@
                 JS_FreeValue(ctx, sp[-1]);
                 sp -= 3;
                 *sp++ = res;
-                if (is_method)
+                if (pc[-6] == QP_OP_load_super_method)
                     *sp++ = self;
             }
             PY_NEXT;
@@ -503,6 +521,9 @@
                     JS_FreeValue(ctx, call_argv[i]);
                 sp -= call_argc + 2;
                 *sp++ = ret_val;
+                /* pc: after this 4-byte call; a load_special is 3 bytes */
+                PY_CALL_POLL(pc - 7 >= b->byte_code_buf && pc[-7] == OP_py &&
+                             pc[-6] == QP_OP_load_special);
             }
             PY_NEXT;
         PYCASE(call_kw):
@@ -533,6 +554,7 @@
                     JS_FreeValue(ctx, call_argv[i]);
                 sp -= call_argc + 3;
                 *sp++ = ret_val;
+                PY_CALL_POLL(0);
             }
             PY_NEXT;
         PYCASE(call_ex):
@@ -544,6 +566,7 @@
                 JS_FreeValue(ctx, sp[i]);
             sp -= 4;
             *sp++ = ret_val;
+            PY_CALL_POLL(0);
             PY_NEXT;
 
         /* ---- building ------------------------------------------------ */
@@ -833,9 +856,10 @@
                 JS_FreeValue(ctx, sp[-1]);
                 sp[-1] = res;
                 if (r == QP_SEND_RETURN) {
-                    /* M6: sys.settrace 'exception' StopIteration (END_SEND) */
-                    if (unlikely(ctx->py->trace_active) &&
-                        qp_trace_send_return(ctx, sf, sp[-4], res) < 0)
+                    /* M6: sys.settrace 'exception' StopIteration (END_SEND),
+                       sys.monitoring STOP_ITERATION */
+                    if (unlikely(ctx->py->trace_active | ctx->py->mon_active) &&
+                        qp_hook_send_return(ctx, sf, sp[-4], res) < 0)
                         goto exception;
                     pc += (int32_t)get_u32(pc);
                 } else {
@@ -914,6 +938,7 @@
                 goto exception;
             }
         PYCASE(reraise):
+            pc += 1;
             JS_Throw(ctx, *--sp);
             ctx->py->reraise = 1;
             goto exception;
@@ -1090,4 +1115,5 @@
 #undef PYCASE
 #undef PY_NEXT
 #undef PY_SYNC
+#undef PY_CALL_POLL
 #undef PY_CODE_IC

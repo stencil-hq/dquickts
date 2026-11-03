@@ -55,14 +55,21 @@ L0_ERRORS = PY_DIR / "l0_errors.txt"
 L3_CONF = PY_DIR / "cpython.conf"
 L3_ERRORS = PY_DIR / "cpython_errors.txt"
 CPYTHON_TEST_DIR = REPO_ROOT / "cpython" / "Lib" / "test"
+# pylib/test -> ../cpython/Lib/test (gitignored): in a CPython install `test`
+# is part of the stdlib, so `qpy -I` subprocesses of the tests (script_helper)
+# import it from there; PYTHONPATH (TESTROOT) serves the test runs themselves.
+PYLIB_TEST_LINK = REPO_ROOT / "pylib" / "test"
+PYLIB_TEST_TARGET = os.path.join(os.pardir, "cpython", "Lib", "test")
 BUILD_DIR = REPO_ROOT / "build" / "testpy"
 TESTROOT = BUILD_DIR / "testroot"
-# test-only C extension modules (_testlimitedcapi): `make capi-testmods`
+# test-only C extension modules (_testcapi, _testlimitedcapi, ...): `make
+# capi-testmods`.  Like CPython's lib-dynload they are also importable by
+# `qpy -I` subprocesses of the tests: pylib/<module>.so symlinks (gitignored)
 CAPI_TESTMODS_DIR = BUILD_DIR / "capi-testmods"
 L3_RESULTS = BUILD_DIR / "l3-results.json"
 
 GOLDEN_GROUPS = ("syntax", "types", "objects", "stdlib")
-L3_SETS = ("l3a", "l3b")
+L3_SETS = ("l3a", "l3b", "l3c")
 L3_CONF_SECTIONS = (*L3_SETS, "exclude")
 PASSING_OUTCOMES = frozenset({"pass", "skip", "xfail"})
 DONE_ID = "__done__"
@@ -514,7 +521,7 @@ def cmd_l0(args: argparse.Namespace) -> int:
 
 
 def parse_conf(path: Path) -> dict[str, list[str]]:
-    """Parse cpython.conf into ``{"l3a": [...], "l3b": [...], "exclude": [...]}``."""
+    """Parse cpython.conf into ``{"l3a": [...], ..., "exclude": [...]}``."""
     if not path.exists():
         raise HarnessError(f"missing {path}")
     sections: dict[str, list[str]] = {name: [] for name in L3_CONF_SECTIONS}
@@ -535,20 +542,30 @@ def parse_conf(path: Path) -> dict[str, list[str]]:
     return sections
 
 
-def ensure_testroot() -> Path:
-    """Make ``build/testpy/testroot/test`` a symlink to ``cpython/Lib/test``."""
-    if not CPYTHON_TEST_DIR.is_dir():
-        raise HarnessError(f"CPython test package not found at {CPYTHON_TEST_DIR} "
-                           "(check out CPython v3.15.2 into cpython/)")
-    link = TESTROOT / "test"
-    TESTROOT.mkdir(parents=True, exist_ok=True)
+def ensure_symlink(link: Path, target: str) -> None:
+    """Make ``link`` a symlink to ``target`` (replacing another symlink)."""
     if link.is_symlink():
-        if os.readlink(link) == str(CPYTHON_TEST_DIR):
-            return TESTROOT
+        if os.readlink(link) == target:
+            return
         link.unlink()
     elif link.exists():
         raise HarnessError(f"{link} exists and is not a symlink")
-    link.symlink_to(CPYTHON_TEST_DIR, target_is_directory=True)
+    link.symlink_to(target, target_is_directory=True)
+
+
+def ensure_testroot() -> Path:
+    """Make ``build/testpy/testroot/test`` and ``pylib/test`` symlinks to
+    ``cpython/Lib/test``, and ``pylib/<module>.so`` symlinks to the built
+    test-only C extension modules."""
+    if not CPYTHON_TEST_DIR.is_dir():
+        raise HarnessError(f"CPython test package not found at {CPYTHON_TEST_DIR} "
+                           "(check out CPython v3.15.2 into cpython/)")
+    TESTROOT.mkdir(parents=True, exist_ok=True)
+    ensure_symlink(TESTROOT / "test", str(CPYTHON_TEST_DIR))
+    ensure_symlink(PYLIB_TEST_LINK, PYLIB_TEST_TARGET)
+    for so in CAPI_TESTMODS_DIR.glob("_test*.so"):
+        ensure_symlink(PYLIB_TEST_LINK.parent / so.name,
+                       os.path.relpath(so, PYLIB_TEST_LINK.parent))
     return TESTROOT
 
 

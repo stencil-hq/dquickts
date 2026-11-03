@@ -1121,7 +1121,8 @@ tok_underflow_string(struct tok_state *tok) {
     }
     else {
         end = strchr(tok->inp, '\0');
-        if (end == tok->inp) {
+        /* the null byte line starts with it: an empty line, not EOF */
+        if (end == tok->inp && tok->lineno + 1 != tok->qp_nul_lineno) {
             tok->done = E_EOF;
             return 0;
         }
@@ -1324,7 +1325,8 @@ tok_nextc(struct tok_state *tok)
         }
         tok->line_start = tok->cur;
 
-        if (contains_null_bytes(tok->line_start, tok->inp - tok->line_start)) {
+        if (contains_null_bytes(tok->line_start, tok->inp - tok->line_start) ||
+            (tok->qp_nul_lineno && tok->lineno == tok->qp_nul_lineno)) {
             _PyTokenizer_syntaxerror(tok, "source code cannot contain null bytes");
             tok->cur = tok->inp;
             return EOF;

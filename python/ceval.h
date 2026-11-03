@@ -10,8 +10,8 @@
 struct JSStackFrame;
 struct JSFunctionBytecode;
 
-/* allocate the inline caches of a new Python bytecode (kinds from the
-   IC operands of its subops); 0 or -1 (exception pending) */
+/* allocate the (empty) inline caches of a new Python bytecode; 0 or -1
+   (exception pending) */
 static int qp_code_info_setup_ic(JSContext *ctx, struct JSFunctionBytecode *b);
 
 static JSValue qp_load_common_const(JSContext *ctx, struct JSStackFrame *sf, int id);
@@ -52,6 +52,11 @@ static void qp_modstate_mark(JSRuntime *rt, QPState *s, JS_MarkFunc *mark_func);
 static void qp_modstate_free(JSContext *ctx);
 static void qp_weakref_object_freed(JSRuntime *rt, struct JSObject *p);
 static int qp_signal_check(JSContext *ctx);
+/* python/mod_misc.c: qp_signal_check would run Python signal handlers
+   (a signal arrived and ctx's thread is the one that handles them) */
+static BOOL qp_signal_handlers_pending(JSContext *ctx);
+/* python/mod_faulthandler.c: disable what the context configured */
+static void qp_faulthandler_fini(JSContext *ctx);
 
 /* ---- python/ceval.c "Threads and the GIL" (M5) ---------------------------
    Types shared by ceval.c, mod_thread.c, sysmodule.c and the C API

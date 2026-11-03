@@ -10,7 +10,8 @@
  * pair): f_lineno and f_locals are those at creation, f_back is the
  * snapshot of the calling Python frame.  CPython's write-through
  * FrameLocalsProxy is not provided: f_locals of a function frame is a dict
- * snapshot (as locals() returns since PEP 667).
+ * snapshot (as locals() returns since PEP 667) that also carries the
+ * non-variable keys stored into earlier snapshots (qp_fr_live_locals).
  *
  * Frame layout of Python code (object.h QPCodeInfo): parameters are
  * arg_buf[0..arg_count), locals var_buf[0..var_count) (vardefs[arg_count +
@@ -45,6 +46,7 @@ typedef struct QPFrameObject {
     uint32_t prev_pc;           /* its offset (backward jumps), 0 after an exception */
     uint32_t loc_lo, loc_hi;    /* cached pc range [loc_lo, loc_hi) of loc_line */
     int loc_line;
+    uint8_t loc_art;            /* its location is not the code's own (QP_PCLOC_IS_ART) */
     JSValue c_callable;         /* builtin called under the profiler (c_return / c_exception), an object while pending */
     uint32_t c_pc;              /* offset of that call */
     /* Artificial code (compile.c NO_LOCATION) inherits the location of the
@@ -56,10 +58,12 @@ typedef struct QPFrameObject {
     uint8_t noline;
     uint8_t notrace;            /* runs as C code: QP_CO_NATIVE code or called by it (qp_trace_call) */
     int exc_line;               /* line of the last exception in the frame (CPython RERAISE lasti) */
+    uint32_t exc_pc;            /* offset of its instruction */
+    uint32_t lasti_pc;          /* f_lasti of the event being reported + 1, 0 = from the pc */
     uint32_t next_pc;           /* offset following prev_pc's instruction */
     uint8_t jump;               /* QP_FR_JUMP_*: f_lineno setter permission of the event being reported */
     uint32_t jump_to;           /* f_lineno setter: target offset + 1, 0 = none */
-    uint32_t jump_pop;          /* operand stack values popped by that jump */
+    uint32_t jump_src;          /* offset of the instruction of the event (the jump's origin) */
 } QPFrameObject;
 
 enum {
@@ -142,15 +146,18 @@ static JSValue qp_frame_new(JSContext *ctx, JSValueConst func, uint32_t pc,
     f->prev_line = -1;
     f->prev_pc = 0;
     f->loc_lo = f->loc_hi = 0;
+    f->loc_art = 0;
     f->loc_line = -1;
     f->c_callable = JS_UNDEFINED;
     f->c_pc = 0;
     f->jump = QP_FR_JUMP_NONE;
     f->jump_to = 0;
-    f->jump_pop = 0;
+    f->jump_src = 0;
     f->notrace = 0;
     f->noline = 0;
     f->exc_line = -1;
+    f->exc_pc = 0;
+    f->lasti_pc = 0;
     f->next_pc = 0;
     JS_VALUE_GET_OBJ(obj)->u.opaque = f;
     return obj;
@@ -252,6 +259,67 @@ static JSValue qp_frame_locals(JSContext *ctx, struct JSStackFrame *sf)
     return dict;
  fail:
     JS_FreeValue(ctx, dict);
+    return JS_EXCEPTION;
+}
+
+/* TRUE if name is a parameter, local, cell or free variable of b. */
+static BOOL qp_fr_is_var_name(JSFunctionBytecode *b, JSAtom name)
+{
+    int i;
+
+    for (i = 0; i < b->arg_count + b->var_count; i++) {
+        if (b->vardefs[i].var_name == name)
+            return TRUE;
+    }
+    for (i = 0; i < b->closure_var_count; i++) {
+        if (b->closure_var[i].var_name == name)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* f_locals of a live function frame: a snapshot of the variables plus the
+   keys that are not variable names stored into an earlier f_locals of the
+   frame (CPython keeps them in the frame's f_extra_locals; pdb stores
+   '__return__' and '__exception__' this way).  The last snapshot is kept
+   in f->locals to carry them.  sf is the activation of f. */
+static JSValue qp_fr_live_locals(JSContext *ctx, QPFrameObject *f,
+                                 struct JSStackFrame *sf)
+{
+    JSFunctionBytecode *b = JS_VALUE_GET_OBJ(f->func)->u.func.function_bytecode;
+    JSValue d, k, v;
+    Py_ssize_t pos = 0;
+    int ret;
+
+    d = qp_frame_locals(ctx, sf);
+    if (JS_IsException(d) || !(b->py_code->co_flags & CO_NEWLOCALS))
+        return d;
+    if (qp_dict_check_exact(ctx, f->locals)) {
+        while (qp_dict_next(f->locals, &pos, &k, &v)) {
+            if (qp_str_check_exact(k)) {
+                JSAtom name = JS_ValueToAtom(ctx, k);
+                BOOL is_var;
+                if (name == JS_ATOM_NULL)
+                    goto fail;
+                is_var = qp_fr_is_var_name(b, name);
+                JS_FreeAtom(ctx, name);
+                if (is_var)
+                    continue;
+            }
+            k = JS_DupValue(ctx, k);
+            v = JS_DupValue(ctx, v);
+            ret = qp_dict_set_item(ctx, d, k, v);
+            JS_FreeValue(ctx, k);
+            JS_FreeValue(ctx, v);
+            if (ret < 0)
+                goto fail;
+        }
+    }
+    JS_FreeValue(ctx, f->locals);
+    f->locals = JS_DupValue(ctx, d);
+    return d;
+ fail:
+    JS_FreeValue(ctx, d);
     return JS_EXCEPTION;
 }
 
@@ -358,6 +426,13 @@ static void qp_frame_detach(JSRuntime *rt, JSContext *ctx, JSStackFrame *sf)
         JSFunctionBytecode *b = JS_VALUE_GET_OBJ(f->func)->u.func.function_bytecode;
 
         f->pc = qp_fr_sf_pc(sf, b);
+        if (rt->current_exception_is_uncatchable == FALSE &&
+            JS_VALUE_GET_TAG(rt->current_exception) == JS_TAG_OBJECT &&
+            sf->py_raise_pc < b->byte_code_len) {
+            /* ended by an exception: the last instruction that raised
+               (CPython's RERAISE n != 0 restored f_lasti to it) */
+            f->pc = sf->py_raise_pc;
+        }
         f->sf = NULL;
         f->lineno = 0;
         JS_FreeValueRT(rt, f->c_callable);
@@ -367,7 +442,7 @@ static void qp_frame_detach(JSRuntime *rt, JSContext *ctx, JSStackFrame *sf)
                take_ownership): keep f_locals and f_back */
             exc = JS_GetException(ctx);
             uncatchable = rt->current_exception_is_uncatchable;
-            v = qp_frame_locals(ctx, sf);
+            v = qp_fr_live_locals(ctx, f, sf);
             if (JS_IsException(v)) {
                 JS_FreeValue(ctx, JS_GetException(ctx));
             } else {
@@ -492,10 +567,15 @@ enum {
 /* f_lasti */
 static uint32_t qp_fr_lasti(QPFrameObject *f)
 {
+    if (f->lasti_pc)
+        return f->lasti_pc - 1;
     if (f->sf)
         return qp_fr_sf_pc(f->sf, JS_VALUE_GET_OBJ(f->func)->u.func.function_bytecode);
     return f->pc;
 }
+
+static int qp_code_resume_offset(JSFunctionBytecode *b, uint32_t pc);
+static int qp_jump_resume_line(JSContext *ctx, JSFunctionBytecode *b);
 
 static int qp_fr_lineno(QPFrameObject *f)
 {
@@ -504,10 +584,12 @@ static int qp_fr_lineno(QPFrameObject *f)
 
     if (f->lineno > 0)
         return f->lineno;
+    if (f->sf && b->realm->py->mon_event_sf == f->sf && b->realm->py->mon_event_line > 0)
+        return b->realm->py->mon_event_line;   /* sys.monitoring BRANCH: the branch's line */
     if (f->sf && f->sf->cur_pc <= b->byte_code_buf)
-        return b->py_code->firstlineno;     /* not started */
-    if (qp_code_addr2loc(b, qp_fr_lasti(f), &loc) == 0 && loc.lineno >= 0)
-        return loc.lineno;
+        return qp_jump_resume_line(b->realm, b);   /* not started: the RESUME */
+    if (qp_code_addr2loc(b, qp_fr_lasti(f), &loc) == 0)
+        return loc.lineno;      /* (-1: no location, f_lineno is None) */
     return b->py_code->firstlineno;
 }
 
@@ -526,7 +608,7 @@ static JSValue qp_fr_get(JSContext *ctx, JSValueConst self, int magic)
         return JS_DupValue(ctx, f->back);
     case QP_FRA_LOCALS:
         if (f->sf)
-            return qp_frame_locals(ctx, f->sf);
+            return qp_fr_live_locals(ctx, f, f->sf);
         if (QP_IS_NULL(f->locals)) {
             JSFunctionBytecode *b = JS_VALUE_GET_OBJ(f->func)->u.func.function_bytecode;
             if (!(b->py_code->co_flags & CO_NEWLOCALS))
@@ -538,13 +620,22 @@ static JSValue qp_fr_get(JSContext *ctx, JSValueConst self, int magic)
             }
         }
         return JS_DupValue(ctx, f->locals);
-    case QP_FRA_LINENO:
-        return JS_NewInt32(ctx, qp_fr_lineno(f));
+    case QP_FRA_LINENO: {
+        int lineno = qp_fr_lineno(f);
+        return lineno < 0 ? JS_UNDEFINED : JS_NewInt32(ctx, lineno);
+    }
     case QP_FRA_TRACE:
         return JS_DupValue(ctx, f->trace);
-    case QP_FRA_LASTI:
-        return JS_NewInt32(ctx, qp_code_pc2lasti(JS_VALUE_GET_OBJ(f->func)->u.func.function_bytecode,
-                                                 qp_fr_lasti(f)));
+    case QP_FRA_LASTI: {
+        JSFunctionBytecode *b = JS_VALUE_GET_OBJ(f->func)->u.func.function_bytecode;
+        /* not started ('call' / PY_START): the RESUME ending the prologue */
+        if (f->sf && f->sf->cur_pc <= b->byte_code_buf) {
+            int off = qp_code_resume_offset(b, 0);
+            if (off >= 0)
+                return JS_NewInt32(ctx, off);
+        }
+        return JS_NewInt32(ctx, qp_code_pc2lasti(b, qp_fr_lasti(f)));
+    }
     case QP_FRA_GLOBALS:
         return JS_DupValue(ctx, d->globals);
     case QP_FRA_BUILTINS:
@@ -567,26 +658,379 @@ static JSValue qp_fr_get(JSContext *ctx, JSValueConst self, int magic)
     }
 }
 
-/* frame.f_lineno = n (CPython frame_setlineno): only from a 'line' event
-   of the frame's trace function (CPython also allows the 'call' of a
-   resumed generator and the 'return' of a yield).  The target is the
-   first instruction of the first line >= n; it must have the operand stack
-   of the current instruction or a prefix of it (jumps out of blocks pop
-   the extra values) and the same or an enclosing try block (stack
-   analysis of compute_stack_size).  The jump is made by qp_trace_jump()
-   when the trace function returns. */
+/* ---- frame.f_lineno = n (CPython frame_setlineno) --------------------------
+ *
+ * The target is a start of the first line >= n that has code; among the
+ * starts of that line, the deepest one whose operand stack is compatible
+ * with the current one (CPython mark_stacks / compatible_stack: the target
+ * stack is the current one or a prefix of it, kind by kind).  The stacks
+ * are modeled on the QuickJS bytecode with CPython's kinds (the iterator of
+ * a for loop, the exceptions of a handler, objects, NULL) plus the catch
+ * offsets of the try blocks (OP_catch), which CPython has no equivalent of:
+ * they are invisible to the compatibility rules (jumping into a try block
+ * is allowed: in CPython a try block is an exception table range) and
+ * qp_trace_jump makes them for the target.
+ */
+enum {
+    QP_JK_ITERATOR = 1,
+    QP_JK_EXCEPT = 2,
+    QP_JK_OBJECT = 3,
+    QP_JK_NULL = 4,
+    QP_JK_LASTI = 5,
+    QP_JK_MARKER = 6,       /* catch offset of a try block */
+};
+#define QP_JK_BITS          3
+#define QP_JK_UNINITIALIZED (-2)
+#define QP_JK_OVERFLOWED    (-1)
+#define QP_JK_WILL_OVERFLOW (1ULL << ((63 / QP_JK_BITS - 1) * QP_JK_BITS))
+
+typedef struct QPJumpStacks {
+    uint16_t *levels;       /* depth before each pc (compute_stack_size_tabs), 0xffff unreachable */
+    int32_t *catches;       /* innermost OP_catch of each pc, -1 none */
+    uint8_t *kinds;         /* kinds[pc * width + i]: entry i (bottom first) before pc */
+    uint8_t *seen;          /* kinds[pc * width] is set */
+    int width;
+} QPJumpStacks;
+
+static void qp_jump_stacks_free(JSContext *ctx, QPJumpStacks *js)
+{
+    js_free(ctx, js->levels);
+    js_free(ctx, js->catches);
+    js_free(ctx, js->kinds);
+    js_free(ctx, js->seen);
+}
+
+/* Size and operand counts of the instruction at pos (compute_stack_size_tabs). */
+static int qp_jump_insn(const uint8_t *buf, uint32_t pos, int *n_pop, int *n_push)
+{
+    int op = buf[pos], cnt;
+
+    if (op == OP_py) {
+        const QPSubopInfo *si = &qp_subop_info[buf[pos + 1]];
+        *n_pop = si->n_pop;
+        *n_push = si->n_push;
+        switch (si->fmt) {
+        case OP_FMT_npop:
+            *n_pop += get_u16(buf + pos + 2);
+            break;
+        case OP_FMT_npop2:
+            *n_pop += 2 * get_u16(buf + pos + 2);
+            break;
+        case OP_FMT_npush:
+            *n_push += get_u16(buf + pos + 2);
+            break;
+        case OP_FMT_unpack_ex:
+            cnt = get_u16(buf + pos + 2);
+            *n_push += (cnt & 0xff) + (cnt >> 8);
+            break;
+        default:
+            break;
+        }
+        return si->size;
+    } else {
+        const JSOpCode *oi = &short_opcode_info(op);
+        *n_pop = oi->n_pop;
+        *n_push = oi->n_push;
+        if (oi->fmt == OP_FMT_npop || oi->fmt == OP_FMT_npop_u16)
+            *n_pop += get_u16(buf + pos + 1);
+#if SHORT_OPCODES
+        else if (oi->fmt == OP_FMT_npopx)
+            *n_pop += op - OP_call0;
+#endif
+        return oi->size;
+    }
+}
+
+/* kinds k[0..n) flow into pos (the first flow wins at joins) */
+static int qp_jump_flow(JSContext *ctx, QPJumpStacks *js, int **work, int *nwork, int *work_size,
+                        uint32_t pos, const uint8_t *k, int n)
+{
+    if (js->seen[pos] || n != js->levels[pos])
+        return 0;
+    js->seen[pos] = 1;
+    memcpy(js->kinds + (size_t)pos * js->width, k, n);
+    if (js_resize_array(ctx, (void **)work, sizeof(**work), work_size, *nwork + 1))
+        return -1;
+    (*work)[(*nwork)++] = pos;
+    return 0;
+}
+
+/* The kinds of the operand stack entries before every instruction of b
+   (CPython mark_stacks).  -1 on error (exception pending). */
+static int qp_jump_stacks(JSContext *ctx, JSFunctionBytecode *b, QPJumpStacks *js)
+{
+    const uint8_t *buf = b->byte_code_buf;
+    int len = b->byte_code_len, stack_size, *work = NULL, nwork = 0, work_size = 0;
+    uint8_t *k = NULL, *tk;
+
+    memset(js, 0, sizeof(*js));
+    if (compute_stack_size_tabs(ctx, buf, len, &stack_size, &js->levels, &js->catches) < 0)
+        return -1;
+    js->width = stack_size + 1;
+    js->kinds = js_malloc(ctx, (size_t)len * js->width);
+    js->seen = js_mallocz(ctx, len);
+    k = js_malloc(ctx, 2 * (js->width + 2));
+    if (!js->kinds || !js->seen || !k)
+        goto fail;
+    tk = k + js->width + 2;
+    if (qp_jump_flow(ctx, js, &work, &nwork, &work_size, 0, k, 0) < 0)
+        goto fail;
+    while (nwork > 0) {
+        uint32_t pos = work[--nwork], next, target = 0;
+        int n = js->levels[pos], n_pop, n_push, op = buf[pos], tn = -1, d;
+        BOOL falls = TRUE;
+        uint8_t c;
+
+        memcpy(k, js->kinds + (size_t)pos * js->width, n);
+        next = pos + qp_jump_insn(buf, pos, &n_pop, &n_push);
+        if (op == OP_py) {
+            int subop = buf[pos + 1], tdelta, flow = qp_subop_flow_kind(subop, &tdelta);
+            switch (subop) {
+            case QP_OP_push_null:
+                k[n++] = QP_JK_NULL;
+                break;
+            case QP_OP_copy:
+                d = buf[pos + 2];
+                k[n] = k[n - d];
+                n++;
+                break;
+            case QP_OP_swap:
+                d = buf[pos + 2];
+                c = k[n - 1];
+                k[n - 1] = k[n - d];
+                k[n - d] = c;
+                break;
+            case QP_OP_get_iter:
+                k[n - 1] = QP_JK_ITERATOR;
+                k[n++] = QP_JK_ITERATOR;
+                break;
+            case QP_OP_get_aiter:
+                k[n - 1] = QP_JK_ITERATOR;
+                break;
+            case QP_OP_for_iter:
+                k[n++] = QP_JK_OBJECT;      /* (exhausted: tdelta drops it) */
+                break;
+            case QP_OP_end_async_for:
+                n -= 2;
+                break;
+            case QP_OP_push_exc_info:
+                k[n - 1] = QP_JK_EXCEPT;
+                k[n++] = QP_JK_EXCEPT;
+                break;
+            case QP_OP_load_method:
+                k[n - 1] = QP_JK_OBJECT;
+                k[n++] = QP_JK_NULL;
+                break;
+            default:
+                n = max_int(n - n_pop, 0);
+                while (n_push-- > 0)
+                    k[n++] = QP_JK_OBJECT;
+                break;
+            }
+            if (flow == QP_FLOW_EXIT) {
+                falls = FALSE;
+            } else if (flow == QP_FLOW_BRANCH) {
+                target = pos + 2 + get_u32(buf + pos + 2);
+                tn = n + tdelta;
+            }
+        } else {
+            switch (op) {
+            case OP_catch:
+                /* the handler gets the exception in the marker's slot */
+                target = pos + 1 + get_u32(buf + pos + 1);
+                memcpy(tk, k, n);
+                tk[n] = QP_JK_EXCEPT;
+                if (qp_jump_flow(ctx, js, &work, &nwork, &work_size, target, tk, n + 1) < 0)
+                    goto fail;
+                k[n++] = QP_JK_MARKER;
+                break;
+            case OP_nip_catch:
+                /* catch_offset ... v -> v */
+                c = k[n - 1];
+                n--;
+                while (n > 0 && k[n - 1] != QP_JK_MARKER)
+                    n--;
+                if (n > 0)
+                    k[n - 1] = c;
+                break;
+            case OP_drop:
+                n--;
+                break;
+            case OP_nip:
+                k[n - 2] = k[n - 1];
+                n--;
+                break;
+            case OP_nip1:
+                k[n - 3] = k[n - 2];
+                k[n - 2] = k[n - 1];
+                n--;
+                break;
+            case OP_dup:
+                k[n] = k[n - 1];
+                n++;
+                break;
+            case OP_swap:
+                c = k[n - 1];
+                k[n - 1] = k[n - 2];
+                k[n - 2] = c;
+                break;
+            case OP_goto:
+                target = pos + 1 + get_u32(buf + pos + 1);
+                tn = n;
+                falls = FALSE;
+                break;
+#if SHORT_OPCODES
+            case OP_goto16:
+                target = pos + 1 + (int16_t)get_u16(buf + pos + 1);
+                tn = n;
+                falls = FALSE;
+                break;
+            case OP_goto8:
+                target = pos + 1 + (int8_t)buf[pos + 1];
+                tn = n;
+                falls = FALSE;
+                break;
+            case OP_if_true8:
+            case OP_if_false8:
+                n--;
+                target = pos + 1 + (int8_t)buf[pos + 1];
+                tn = n;
+                break;
+#endif
+            case OP_if_true:
+            case OP_if_false:
+                n--;
+                target = pos + 1 + get_u32(buf + pos + 1);
+                tn = n;
+                break;
+            case OP_return:
+            case OP_return_undef:
+            case OP_return_async:
+            case OP_throw:
+            case OP_throw_error:
+            case OP_tail_call:
+            case OP_tail_call_method:
+            case OP_ret:
+                falls = FALSE;
+                break;
+            default:
+                n = max_int(n - n_pop, 0);
+                while (n_push-- > 0)
+                    k[n++] = QP_JK_OBJECT;
+                break;
+            }
+        }
+        if (tn >= 0 && target < (uint32_t)len &&
+            qp_jump_flow(ctx, js, &work, &nwork, &work_size, target, k, tn) < 0)
+            goto fail;
+        if (falls && next < (uint32_t)len &&
+            qp_jump_flow(ctx, js, &work, &nwork, &work_size, next, k, n) < 0)
+            goto fail;
+    }
+    js_free(ctx, work);
+    js_free(ctx, k);
+    return 0;
+ fail:
+    js_free(ctx, work);
+    js_free(ctx, k);
+    qp_jump_stacks_free(ctx, js);
+    return -1;
+}
+
+/* CPython's int64 encoding of the visible entries of the stack before pc */
+static int64_t qp_jump_visible(QPJumpStacks *js, uint32_t pc)
+{
+    const uint8_t *k = js->kinds + (size_t)pc * js->width;
+    int64_t s = 0;
+    int i;
+
+    if (!js->seen[pc])
+        return QP_JK_UNINITIALIZED;
+    for (i = 0; i < js->levels[pc]; i++) {
+        if (k[i] == QP_JK_MARKER)
+            continue;
+        if ((uint64_t)s >= QP_JK_WILL_OVERFLOW)
+            return QP_JK_OVERFLOWED;
+        s = (s << QP_JK_BITS) | k[i];
+    }
+    return s;
+}
+
+static int qp_jump_compatible_kind(int from, int to)
+{
+    if (to == 0)
+        return 0;
+    if (to == QP_JK_OBJECT)
+        return from != QP_JK_NULL;
+    if (to == QP_JK_NULL)
+        return 1;
+    return from == to;
+}
+
+static int qp_jump_compatible_stack(int64_t from_stack, int64_t to_stack)
+{
+    const int64_t mask = (1 << QP_JK_BITS) - 1;
+
+    if (from_stack < 0 || to_stack < 0)
+        return 0;
+    while (from_stack > to_stack)
+        from_stack >>= QP_JK_BITS;
+    while (from_stack) {
+        if (!qp_jump_compatible_kind((int)(from_stack & mask), (int)(to_stack & mask)))
+            return 0;
+        from_stack >>= QP_JK_BITS;
+        to_stack >>= QP_JK_BITS;
+    }
+    return to_stack == 0;
+}
+
+static const char *qp_jump_explain_incompatible(int64_t to_stack)
+{
+    if (to_stack == QP_JK_OVERFLOWED)
+        return "stack is too deep to analyze";
+    if (to_stack == QP_JK_UNINITIALIZED)
+        return "can't jump into an exception handler, or code may be unreachable";
+    switch (to_stack & ((1 << QP_JK_BITS) - 1)) {
+    case QP_JK_EXCEPT:
+        return "can't jump into an 'except' block as there's no exception";
+    case QP_JK_LASTI:
+        return "can't jump into a re-raising block as there's no location";
+    case QP_JK_ITERATOR:
+        return "can't jump into the body of a for loop";
+    default:
+        return "incompatible stacks";
+    }
+}
+
+/* Line of the RESUME ending the prologue (line start at pc 0): co_firstlineno,
+   0 in a module (qp_co_linetable) */
+static int qp_jump_resume_line(JSContext *ctx, JSFunctionBytecode *b)
+{
+    QPCodeInfo *ci = b->py_code;
+
+    if (!(ci->co_flags & CO_NEWLOCALS) && b->func_name == QP_ATOM(ctx, anon_module))
+        return 0;
+    return ci->firstlineno;
+}
+
+/* The jump is made by qp_trace_jump() when the event's callbacks return
+   (frame_setlineno moves instr_ptr; ours moves cur_pc and the operand
+   stack then).  Allowed in the events of CPython: 'line' (LINE / JUMP /
+   BRANCH), the 'return' of a yield (PY_YIELD), from the frame's trace
+   function or the monitoring callbacks of these events. */
 static int qp_fr_set_lineno(JSContext *ctx, QPFrameObject *f, JSValueConst value)
 {
     JSFunctionBytecode *b = JS_VALUE_GET_OBJ(f->func)->u.func.function_bytecode;
     QPCodeInfo *ci = b->py_code;
-    uint16_t *levels = NULL;
-    int32_t *catches = NULL;
-    int64_t n;
-    int first = -1, prev, line, stack_size, cur_catch, c, best = -1;
-    uint32_t k, cur, t;
-    const char *msg = NULL;
+    QPJumpStacks js;
+    int64_t n, start_stack, target_stack, best_stack = QP_JK_OVERFLOWED;
+    int new_lineno = INT_MAX, last, line, err = -1, best = -1, unbound, i;
+    uint32_t k, cur;
+    const char *msg = "cannot find bytecode for specified line";
 
-    switch (f->sf ? f->jump : QP_FR_JUMP_NONE) {
+    switch (!f->sf ? QP_FR_JUMP_NONE :
+            f->jump == QP_FR_JUMP_NONE && qp_mon_jump_allowed(ctx, f->sf) ? QP_FR_JUMP_OK :
+            f->jump) {
     case QP_FR_JUMP_OK:
         break;
     case QP_FR_JUMP_START:
@@ -602,71 +1046,107 @@ static int qp_fr_set_lineno(JSContext *ctx, QPFrameObject *f, JSValueConst value
         qp_raise_value_error(ctx, "f_lineno can only be set in a trace function");
         return -1;
     }
-    if (qp_long_as_int64(ctx, value, &n) < 0)
+    if (qp_long_as_int64(ctx, value, &n) < 0 || n > INT_MAX || n < INT_MIN) {
+        if (JS_HasException(ctx))
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        qp_raise_value_error(ctx, "lineno out of range");
         return -1;
+    }
     if (n < ci->firstlineno) {
         qp_raise_value_error(ctx, "line %d comes before the current code block", (int)n);
         return -1;
     }
-    /* first line >= n that starts at some instruction (marklines) */
-    prev = -1;
+    /* first line >= n with a line start (marklines: the RESUME, then each
+       change of line, no-location code excluded) */
+    last = qp_jump_resume_line(ctx, b);
+    if (last >= n)
+        new_lineno = last;
     for (k = 0; k < ci->pcloc_count; k++) {
+        if (QP_PCLOC_IS_ART(ci->pcloc[k].loc))
+            continue;   /* (no location in CPython) */
         line = ci->locs[ci->pcloc[k].loc].lineno;
-        if (line != prev && line >= 0 && line >= n && (first < 0 || line < first))
-            first = line;
-        prev = line;
+        if (line != last && line >= 0) {
+            if (line >= n && line < new_lineno)
+                new_lineno = line;
+            last = line;
+        }
     }
-    if (first < 0) {
+    if (new_lineno == INT_MAX) {
         qp_raise_value_error(ctx, "line %d comes after the current code block", (int)n);
         return -1;
     }
-    if (compute_stack_size_tabs(ctx, b->byte_code_buf, b->byte_code_len, &stack_size,
-                                &levels, &catches) < 0)
+    if (qp_jump_stacks(ctx, b, &js) < 0)
         return -1;
-    cur = qp_fr_sf_pc(f->sf, b);   /* the instruction of the 'line' event */
-    if (levels[cur] == 0xffff) {
-        msg = "can't jump from unreachable code";
-        goto fail;
-    }
-    cur_catch = catches[cur];
-    prev = -1;
-    for (k = 0; k < ci->pcloc_count; k++) {
-        line = ci->locs[ci->pcloc[k].loc].lineno;
-        if (line == first && line != prev) {
-            t = ci->pcloc[k].pc;
-            if (levels[t] == 0xffff) {
-                if (!msg)
-                    msg = "can't jump into an exception handler, or code may be unreachable";
+    /* (a second assignment in the same event starts from the first target) */
+    cur = f->jump_to ? f->jump_to - 1 : qp_fr_sf_pc(f->sf, b);
+    start_stack = qp_jump_visible(&js, cur);
+    last = qp_jump_resume_line(ctx, b);
+    for (k = 0; k <= ci->pcloc_count; k++) {
+        uint32_t t;
+        if (k == 0) {
+            line = last;            /* the RESUME */
+            t = 0;
+        } else {
+            if (QP_PCLOC_IS_ART(ci->pcloc[k - 1].loc))
+                continue;
+            line = ci->locs[ci->pcloc[k - 1].loc].lineno;
+            t = ci->pcloc[k - 1].pc;
+            if (line == last || line < 0)
+                continue;
+            last = line;
+        }
+        if (line != new_lineno || t >= (uint32_t)b->byte_code_len)
+            continue;
+        target_stack = qp_jump_visible(&js, t);
+        if (qp_jump_compatible_stack(start_stack, target_stack)) {
+            err = 0;
+            if (target_stack > best_stack) {
+                best_stack = target_stack;
+                best = t;
+            }
+        } else if (err < 0) {
+            if (start_stack == QP_JK_OVERFLOWED) {
+                msg = "stack to deep to analyze";
+            } else if (start_stack == QP_JK_UNINITIALIZED) {
+                msg = "can't jump from unreachable code";
             } else {
-                /* the target's try block must enclose the current one */
-                for (c = cur_catch; c >= 0 && c != catches[t]; c = catches[c])
-                    ;
-                if (c != catches[t] || levels[t] > levels[cur]) {
-                    if (!msg)
-                        msg = "can't jump into a block";
-                } else if (best < 0 || levels[t] > levels[best]) {
-                    best = t;
-                }
+                msg = qp_jump_explain_incompatible(target_stack);
+                err = 1;
             }
         }
-        prev = line;
     }
-    if (best < 0) {
-        if (!msg)
-            msg = "cannot find bytecode for specified line";
-        goto fail;
+    qp_jump_stacks_free(ctx, &js);
+    if (err) {
+        qp_raise_value_error(ctx, "%s", msg);
+        return -1;
     }
+    /* bind None to the unbound locals the target may use (counting every
+       one, like CPython; cells always exist there) */
+    unbound = 0;
+    for (i = 0; i < b->arg_count + b->var_count; i++) {
+        JSBytecodeVarDef *vd = &b->vardefs[i];
+        JSValue *slot = i < b->arg_count ? &f->sf->arg_buf[i] : &f->sf->var_buf[i - b->arg_count];
+        if (vd->var_name != JS_ATOM_NULL && !vd->is_captured &&
+            JS_VALUE_GET_TAG(*slot) == JS_TAG_UNINITIALIZED)
+            unbound++;
+    }
+    if (unbound) {
+        if (qp_warn(ctx, QP_EXC(ctx, RuntimeWarning), 0, "assigning None to %d unbound local%s",
+                    unbound, unbound == 1 ? "" : "s") < 0)
+            return -1;
+        for (i = 0; i < b->arg_count + b->var_count; i++) {
+            JSBytecodeVarDef *vd = &b->vardefs[i];
+            JSValue *slot = i < b->arg_count ? &f->sf->arg_buf[i] : &f->sf->var_buf[i - b->arg_count];
+            if (vd->var_name != JS_ATOM_NULL && !vd->is_captured &&
+                JS_VALUE_GET_TAG(*slot) == JS_TAG_UNINITIALIZED)
+                *slot = JS_UNDEFINED;
+        }
+    }
+    if (!f->jump_to)
+        f->jump_src = cur;
     f->jump_to = (uint32_t)best + 1;
-    f->jump_pop = levels[cur] - levels[best];
-    f->lineno = first;      /* f_lineno for the rest of the trace function */
-    js_free(ctx, levels);
-    js_free(ctx, catches);
+    f->lineno = new_lineno;     /* f_lineno for the rest of the callback */
     return 0;
- fail:
-    js_free(ctx, levels);
-    js_free(ctx, catches);
-    qp_raise_value_error(ctx, "%s", msg);
-    return -1;
 }
 
 static int qp_fr_set_attr(JSContext *ctx, JSValueConst self, JSValueConst value, int magic)
@@ -910,6 +1390,35 @@ static int qp_trace_set(JSContext *ctx, int is_profile, JSValueConst func)
     return 0;
 }
 
+/* _PyEval_SetTraceAllThreads / _PyEval_SetProfileAllThreads: the running
+   thread, then the saved state of the other threads */
+static int qp_trace_set_all(JSContext *ctx, int is_profile, JSValueConst func)
+{
+    QPThreads *thr = ctx->rt->py_threads;
+    struct list_head *el;
+
+    if (qp_trace_set(ctx, is_profile, func) < 0)
+        return -1;
+    if (!thr)
+        return 0;
+    list_for_each(el, &thr->tstates) {
+        QPThreadState *ts = list_entry(el, QPThreadState, link);
+        JSValue *slot = is_profile ? &ts->profile_func : &ts->trace_func;
+        JSValue old = *slot;
+        BOOL active;
+        if (ts == thr->current)
+            continue;
+        *slot = QP_TRACE_IS_SET(func) ? JS_DupValue(ctx, func) : JS_UNDEFINED;
+        active = QP_TRACE_IS_SET(ts->trace_func) || QP_TRACE_IS_SET(ts->profile_func);
+        if (active != ts->trace_active) {
+            ts->trace_active = active;
+            qp_trace_dispatch(active);
+        }
+        JS_FreeValue(ctx, old);
+    }
+    return 0;
+}
+
 /* Line of the instruction at off, with the pc range of the location
    cached in the frame object. */
 static int qp_trace_line(QPFrameObject *f, JSFunctionBytecode *b, uint32_t off)
@@ -934,10 +1443,12 @@ static int qp_trace_line(QPFrameObject *f, JSFunctionBytecode *b, uint32_t off)
         f->loc_lo = 0;
         f->loc_hi = ci->pcloc_count ? ci->pcloc[0].pc : UINT32_MAX;
         f->loc_line = -1;
+        f->loc_art = 0;
     } else {
         f->loc_lo = ci->pcloc[found].pc;
         f->loc_hi = (uint32_t)found + 1 < ci->pcloc_count ? ci->pcloc[found + 1].pc : UINT32_MAX;
-        f->loc_line = ci->locs[ci->pcloc[found].loc].lineno;
+        f->loc_line = ci->locs[QP_PCLOC_IDX(ci->pcloc[found].loc)].lineno;
+        f->loc_art = QP_PCLOC_IS_ART(ci->pcloc[found].loc);
     }
     return f->loc_line;
 }
@@ -1055,9 +1566,9 @@ static int qp_trace_call(JSContext *ctx, JSStackFrame *sf)
     if (f->notrace)
         return 0;
     frame = JS_DupValue(ctx, frame);
-    /* f_lineno: co_firstlineno at start (RESUME), the yield on resumption */
+    /* f_lineno: the RESUME's line at start, the yield on resumption */
     r = qp_trace_event(ctx, frame, QP_TRACE_CALL, JS_UNDEFINED,
-                       start ? b->py_code->firstlineno : 0,
+                       start ? qp_jump_resume_line(ctx, b) : 0,
                        start ? QP_FR_JUMP_START : QP_FR_JUMP_OTHER,
                        QP_TRACE_TO_PROFILE | QP_TRACE_TO_TRACE);
     JS_FreeValue(ctx, frame);
@@ -1186,8 +1697,10 @@ static int qp_trace_instr(JSContext *ctx, JSStackFrame *sf, const uint8_t *pc, J
         f->noline = QP_FR_NOLINE_JUMP;  /* forward jump to artificial code */
     else if (off <= f->prev_pc && f->noline == QP_FR_NOLINE_JUMP)
         f->noline = 0;                  /* backward jump: a loop head */
+    else if (f->loc_art && off > f->prev_pc && !f->noline)
+        f->noline = QP_FR_NOLINE_JUMP;  /* code without a location of its own */
     if (f->noline) {
-        if (off == f->loc_lo && line >= 0)
+        if (off == f->loc_lo && line >= 0 && !f->loc_art)
             f->noline = 0;      /* an instruction with its own location */
         else if (f->noline == QP_FR_NOLINE_JUMP)
             line = f->prev_line;
@@ -1231,9 +1744,15 @@ static int qp_trace_instr(JSContext *ctx, JSStackFrame *sf, const uint8_t *pc, J
     }
 
     if (is_return) {
+        /* the 'return' of a yield (PY_YIELD) can jump */
         r = qp_trace_event(ctx, frame, QP_TRACE_RETURN, sp[-1],
-                           f->noline == QP_FR_NOLINE_JUMP ? f->prev_line : 0, QP_FR_JUMP_OTHER,
+                           f->noline == QP_FR_NOLINE_JUMP ? f->prev_line : 0,
+                           subop == QP_OP_yield_value ? QP_FR_JUMP_OK : QP_FR_JUMP_OTHER,
                            QP_TRACE_TO_PROFILE | QP_TRACE_TO_TRACE);
+        if (r < 0)
+            f->jump_to = 0;
+        else if (f->jump_to)
+            r = 1;
     } else if (is_call && profiling) {
         r = qp_trace_c_call(ctx, frame, f, pc, off, sp);
     }
@@ -1255,10 +1774,13 @@ static void qp_trace_exception(JSContext *ctx, JSStackFrame *sf, const uint8_t *
     if (!f || f->notrace)
         return;     /* no f_trace and no profiled call, or C code */
     f->prev_pc = 0; /* an exception is not a jump */
-    if (!f->noline)
-        f->exc_line = qp_fr_line_at(b, qp_trace_off(b, pc));
-    else if (f->noline == QP_FR_NOLINE_JUMP)
+    if (!f->noline) {
+        f->exc_pc = qp_trace_off(b, pc);
+        f->exc_line = qp_fr_line_at(b, f->exc_pc);
+    } else if (f->noline == QP_FR_NOLINE_JUMP) {
+        f->exc_pc = qp_trace_off(b, pc);
         f->exc_line = f->prev_line;
+    }
     f->noline = QP_FR_NOLINE_EXC;   /* entering a handler (or unwinding) */
     report = !reraise && QP_TRACE_IS_SET(qs->trace_func) && QP_TRACE_IS_SET(f->trace);
     if (!report && !QP_TRACE_IS_SET(f->c_callable))
@@ -1317,9 +1839,15 @@ static void qp_trace_unwind(JSContext *ctx, JSStackFrame *sf, const uint8_t *pc)
         return;
     }
     frame = JS_DupValue(ctx, frame);
+    /* in a handler: the instruction of the exception (CPython RERAISE
+       restores its lasti) */
+    if (f && f->noline)
+        f->lasti_pc = f->exc_pc + 1;
     r = qp_trace_event(ctx, frame, QP_TRACE_RETURN, JS_UNDEFINED,
                        f && f->noline ? f->exc_line : qp_fr_line_at(b, qp_trace_off(b, pc)),
                        QP_FR_JUMP_OTHER, to);
+    if (f)
+        f->lasti_pc = 0;
     if (r < 0)
         JS_FreeValue(ctx, exc);
     else
@@ -1331,12 +1859,85 @@ static JSValue *qp_trace_jump(JSContext *ctx, JSStackFrame *sf, JSValue *sp)
 {
     QPFrameObject *f = qp_fr_data(sf->py_frame);
     JSFunctionBytecode *b = JS_VALUE_GET_OBJ(sf->cur_func)->u.func.function_bytecode;
-    uint32_t t = f->jump_to - 1, i;
+    uint32_t t = f->jump_to - 1, src = f->jump_src;
+    QPJumpStacks js;
+    const uint8_t *S, *T;
+    JSValue *base, *nv;
+    uint8_t *used;
+    int32_t *chain;
+    int ls, lt, p, i, j, nm, mi;
 
-    for (i = 0; i < f->jump_pop; i++)
-        JS_FreeValue(ctx, *--sp);
     f->jump_to = 0;
-    f->jump_pop = 0;
+    f->jump_src = 0;
+    if (qp_jump_stacks(ctx, b, &js) < 0)
+        return NULL;
+    ls = js.levels[src];
+    lt = js.levels[t];
+    S = js.kinds + (size_t)src * js.width;
+    T = js.kinds + (size_t)t * js.width;
+    base = sp - ls;
+    nv = js_malloc(ctx, sizeof(*nv) * (lt + 1) + ls + 1 + sizeof(*chain) * (lt + 1));
+    if (!nv) {
+        qp_jump_stacks_free(ctx, &js);
+        return NULL;
+    }
+    chain = (int32_t *)(nv + lt + 1);
+    used = (uint8_t *)(chain + lt + 1);
+    memset(used, 0, ls);
+    /* the try blocks of the target, outermost first: its markers */
+    nm = 0;
+    for (i = js.catches[t]; i >= 0 && nm <= lt; i = js.catches[i])
+        nm++;
+    mi = nm;
+    for (i = js.catches[t]; i >= 0 && mi > 0; i = js.catches[i])
+        chain[--mi] = i;
+    /* common prefix: kept in place (the same try blocks for markers) */
+    mi = 0;
+    for (p = 0; p < ls && p < lt && S[p] == T[p]; p++) {
+        if (T[p] == QP_JK_MARKER) {
+            if (mi >= nm || JS_VALUE_GET_TAG(base[p]) != JS_TAG_CATCH_OFFSET ||
+                JS_VALUE_GET_INT(base[p]) != (int)(chain[mi] + 1 + get_u32(b->byte_code_buf + chain[mi] + 1)))
+                break;
+            mi++;
+        }
+        nv[p] = base[p];
+        used[p] = 1;
+    }
+    /* above it: the target's visible entries are the current visible ones
+       in order (CPython keeps the bottom of the stack), markers are made
+       for the target's try blocks */
+    j = p;
+    for (i = p; i < lt; i++) {
+        if (T[i] == QP_JK_MARKER) {
+            int32_t c = mi < nm ? chain[mi++] : -1;
+            nv[i] = c < 0 ? JS_UNDEFINED :
+                JS_NewCatchOffset(ctx, c + 1 + get_u32(b->byte_code_buf + c + 1));
+        } else {
+            while (j < ls && S[j] == QP_JK_MARKER)
+                j++;
+            if (j < ls) {
+                nv[i] = base[j];
+                used[j++] = 1;
+            } else {
+                nv[i] = JS_UNDEFINED;   /* (cannot happen: compatible stacks) */
+            }
+        }
+    }
+    /* the rest is popped, top first; an exception of a handler restores
+       the handled exception (POP_EXCEPT) */
+    for (i = ls - 1; i >= 0; i--) {
+        if (used[i])
+            continue;
+        if (S[i] == QP_JK_EXCEPT)
+            qp_exc_info_pop(ctx, base[i]);
+        else
+            JS_FreeValue(ctx, base[i]);
+    }
+    for (i = 0; i < lt; i++)
+        base[i] = nv[i];
+    sp = base + lt;
+    js_free(ctx, nv);
+    qp_jump_stacks_free(ctx, &js);
     /* no 'line' event for the target line (CPython) */
     f->prev_line = qp_trace_line(f, b, t);
     f->prev_pc = t;

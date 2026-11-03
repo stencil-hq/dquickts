@@ -39,6 +39,8 @@ static JSValue qp_str_format_dunder(JSContext *ctx, JSValueConst self, JSValueCo
 static JSValue qp_str_remainder(JSContext *ctx, JSValueConst a, JSValueConst b);
 static int qp_init_templatelib(JSContext *ctx);
 static int qp_unicode_get_name(uint32_t code, char *buffer, int buflen);
+/* python/mod_codecs.c: imports unicodedata on the first name lookup */
+static int qp_unicode_name_capi(JSContext *ctx);
 /* python/mod_codecs.c: codec registry (_PyCodec_EncodeText /
    _PyCodec_DecodeText with PyUnicode_AsEncodedString / PyUnicode_Decode
    result checks), used for codecs and error handlers not built in here. */
@@ -2491,6 +2493,8 @@ static int qp_enc_error(QPEncoder *e, Py_ssize_t start, Py_ssize_t end, const ch
         return 0;
     case QP_EH_BACKSLASHREPLACE:
     case QP_EH_NAMEREPLACE:
+        if (e->eh == QP_EH_NAMEREPLACE && qp_unicode_name_capi(e->ctx) < 0)
+            return -1;
         for (i = start; i < end; i++) {
             Py_UCS4 ch = QP_SL_READ(e->v.kind, e->v.data, i);
             if (e->eh == QP_EH_NAMEREPLACE) {

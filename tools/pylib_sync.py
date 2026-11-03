@@ -20,7 +20,9 @@ one exception is WHEEL_EDITS: members of the wheels bundled with ensurepip
 that quickpy has to adjust (see there); the wheel is rewritten with the
 edited members and its RECORD updated, and ``--check`` compares the
 members' contents.  pylib/site-packages/ (where pip installs into the
-default environment) is never touched.
+default environment) and pylib/test (a symlink to cpython/Lib/test that
+``tests/py/run.py l3`` creates, so that ``qpy -I`` subprocesses of the
+tests find the ``test`` package as in a CPython install) are never touched.
 
 Usage:
   tools/pylib_sync.py                 sync pylib/ from pylib/MANIFEST.txt
@@ -58,6 +60,9 @@ KEEP = {MANIFEST, SOURCE}
 # Top-level pylib/ directories owned by the user (pip's default install
 # target, on sys.path after the stdlib): never listed as stale or removed.
 USER_DIRS = {"site-packages"}
+# pylib/test: symlink to cpython/Lib/test made by tests/py/run.py l3
+# (gitignored); never listed as stale or removed.
+TEST_LINK = "test"
 
 # Subdirectories never copied when a package directory is copied.
 EXCLUDED_DIRS = {"test", "tests", "idle_test", "__pycache__"}
@@ -70,7 +75,6 @@ EXCLUDED = {
     "tkinter": "Tk GUI bindings",
     "turtle": "Tk turtle graphics",
     "turtledemo": "turtle demos",
-    "__phello__": "frozen-module test package",
     "site-packages": "pip's install target (README.txt only)",
 }
 
@@ -330,7 +334,9 @@ def existing_files():
         # __pycache__/: bytecode caches qpy writes at import time
         dirnames[:] = [d for d in dirnames if d != "__pycache__"]
         if rel == ".":
-            dirnames[:] = [d for d in dirnames if d not in USER_DIRS]
+            dirnames[:] = [d for d in dirnames
+                           if d not in USER_DIRS and d != TEST_LINK]
+            filenames = [f for f in filenames if f != TEST_LINK]
         for name in sorted(filenames):
             found.append(name if rel == "." else os.path.join(rel, name)
                          .replace(os.sep, "/"))

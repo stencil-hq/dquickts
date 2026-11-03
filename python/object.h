@@ -79,7 +79,7 @@ QP_CLASS(PY_COMPLEX,        qp_complex_finalizer,     NULL)                 /* c
 QP_CLASS(PY_TUPLE,          qp_tuple_finalizer,       qp_tuple_mark)        /* e: QPTuple* */
 QP_CLASS(PY_RANGE,          qp_range_finalizer,       qp_range_mark)        /* e: private payload */
 QP_CLASS(PY_SLICE,          qp_slice_finalizer,       qp_slice_mark)        /* e: private payload */
-QP_CLASS(PY_ITER,           qp_iter_finalizer,        qp_iter_mark)         /* e: private payload (sequence/callable/list/tuple/range/str/bytes iterators) */
+QP_CLASS(PY_ITER,           qp_iter_finalizer,        qp_iter_mark)         /* e: private payload (sequence/callable/list/tuple/range/str/bytes iterators; f: odict_iterator) */
 QP_CLASS(PY_DICT,           qp_dict_finalizer,        qp_dict_mark)         /* f: QPDict* */
 QP_CLASS(PY_FROZENDICT,     qp_dict_finalizer,        qp_dict_mark)         /* f: QPDict* */
 QP_CLASS(PY_SET,            qp_set_finalizer,         qp_set_mark)          /* f: QPSet* */
@@ -206,6 +206,9 @@ typedef struct QPState QPState;
    pointers do not mean inheritance: add_operators' inherited-slot skip
    (CPython: _Py_TPFLAGS_STATIC_BUILTIN types only) does not apply */
 #define QP_TPFLAGS_PRIV_CAPI            ((uint64_t)1 << 42)
+/* private: tp_name is a js_malloc'd copy owned by the type (struct
+   sequence types: PyStructSequence's tp_name is the dotted desc name) */
+#define QP_TPFLAGS_PRIV_OWNED_NAME      ((uint64_t)1 << 43)
 #define QP_TPFLAGS_DEFAULT              0
 
 /* ========================================================================= */
@@ -242,6 +245,9 @@ typedef struct QPState QPState;
     X(dict_itemiterator, f) X(dict_reversekeyiterator, f)                    \
     X(dict_reversevalueiterator, f) X(dict_reverseitemiterator, f)           \
     X(mappingproxy, f) X(set, f) X(frozenset, f) X(set_iterator, f)          \
+    /* f: odictobject.c (collections.OrderedDict) */                        \
+    X(OrderedDict, f) X(odict_keys, f) X(odict_values, f) X(odict_items, f)  \
+    X(odict_iterator, f)                                                     \
     /* g: bytesobject.c, bytearrayobject.c, memoryobject.c */               \
     X(bytes, g) X(bytearray, g) X(memoryview, g)                             \
     /* i: exceptions.c, traceback.c (exception types: QP_EXCEPTIONS) */     \
@@ -423,6 +429,7 @@ typedef enum QPExcId {
     X(__all__) X(__main__) X(__cached__) X(__lazy_modules__) X(modules)      \
     X(meta_path) X(argv) X(has_location) X(origin) X(parent)                \
     X(_initializing) X(_uninitialized_submodules) X(loader)                  \
+    X(_lock_unlock_module)                                                   \
     X(ps1) X(ps2) X(last_exc) X(last_type) X(last_value) X(last_traceback)   \
     X(__lazy_import__) X(encoding) X(resolve) X(_path)                       \
     X(stdlib_module_names) X(_run_module_as_main) X(_handle_fromlist)
@@ -470,6 +477,7 @@ typedef int QPInitProc(JSContext *ctx, JSValueConst self, JSValueConst *args,
 typedef JSValue QPNewFunc(JSContext *ctx, QPType *subtype, JSValueConst *args,
                           size_t nargsf, JSValueConst kwnames);                      /* newfunc */
 typedef int QPSendFunc(JSContext *ctx, JSValueConst iter, JSValueConst arg, JSValue *presult); /* sendfunc: QP_SEND_* */
+typedef void QPFinalizeFunc(JSContext *ctx, JSValueConst self);                     /* destructor (tp_finalize) */
 
 typedef struct QPBuffer QPBuffer;
 typedef int QPGetBufferProc(JSContext *ctx, JSValueConst obj, QPBuffer *view, int flags);
@@ -541,6 +549,9 @@ typedef struct QPTypeSlots {
     QPDescrSetFunc *tp_descr_set;
     QPInitProc *tp_init;
     QPNewFunc *tp_new;
+    /* builtin types only: the __del__ slot wrapper; heap types' __del__
+       runs through QP_TPFLAGS_HAS_DEL (typeobject_attr.h) */
+    QPFinalizeFunc *tp_finalize;
     QPNumberMethods nb;
     QPSequenceMethods sq;
     QPMappingMethods mp;
@@ -645,6 +656,12 @@ struct QPType {
     int subclass_count, subclass_size;
     const QPTypeSpec *spec;     /* builtin types: the spec they were readied from, else NULL */
     QPTypeSlots slots;
+    /* counted: the instance shape (proto = this type) last keyed on by an
+       attribute inline cache, as CPython's type owns the shared keys of its
+       instances (ht_cached_keys): the shape and the cache entries keyed on
+       it outlive short-lived instances.  Marked by the type (a type <->
+       shape cycle that the GC collects); not saved by snapshots. */
+    struct JSShape *ic_shape;
 };
 
 #define QP_TYPE_VALUE(t) JS_MKPTR(JS_TAG_OBJECT, (t)->obj)   /* borrowed JSValue of a QPType */
@@ -678,6 +695,27 @@ typedef struct QPTuple {
 #define QP_TUPLE_SIZE(v)  ((Py_ssize_t)QP_TUPLE(v)->len)
 #define QP_TUPLE_ITEMS(v) (QP_TUPLE(v)->items)   /* borrowed */
 
+/* collections.OrderedDict (unit f, odictobject.c): the doubly-linked list
+   of keys of CPython's PyODictObject, kept beside the dict table of an
+   OrderedDict instance.  Every node owns a reference to its key.
+   fast_nodes maps a dict entry index to its node (CPython od_fast_nodes);
+   it is rebuilt when the dict's keys table changed since (keys_gen /
+   table pointer / size differ). */
+typedef struct QPODictNode {
+    JSValue key;
+    Py_hash_t hash;
+    struct QPODictNode *next, *prev;
+} QPODictNode;
+
+typedef struct QPODict {
+    QPODictNode *first, *last;
+    QPODictNode **fast_nodes;
+    Py_ssize_t fast_nodes_size;
+    const qp_dictkeys *resize_keys;     /* od_resize_sentinel */
+    uint64_t resize_gen;                /* core.keys_gen when fast_nodes was built */
+    uint64_t state;                     /* incremented whenever the list changes */
+} QPODict;
+
 /* dict / frozendict (unit f).  `uid` is unique per dict for the lifetime of
    the context (never reused), so (uid, core.version) identifies a dict
    state for global inline caches. */
@@ -685,6 +723,9 @@ typedef struct QPDict {
     qp_dictcore core;
     uint64_t uid;
     Py_hash_t hash;             /* frozendict hash cache, -1 = not computed */
+    /* OrderedDict instances: the linked list, created by the first
+       OrderedDict operation (odictobject.c); NULL for other dicts */
+    QPODict *od;
 } QPDict;
 #define QP_DICT(v) ((QPDict *)JS_VALUE_GET_OBJ(v)->u.opaque)
 
@@ -805,11 +846,15 @@ typedef struct QPLoc {
 } QPLoc;
 
 /* Attribute inline cache (semantics: unit h, storage: unit a).  Valid when
-   the receiver's JSObject shape == shape AND its type's version_tag ==
-   type_version.  `shape` is a COUNTED reference marked by the owning
-   bytecode (pointer reuse would otherwise validate stale entries). */
+   the receiver's JSObject shape has py_uid == shape_uid AND its type's
+   version_tag == type_version.  Like CPython's caches it holds no
+   reference (it never extends the life of a shape, its prototype or a
+   class attribute): shape uids are never reused and a shape gets a new
+   one when its layout or prototype changes in place (quickjs.c
+   js_shape_new_uid), type version tags are never reused.  The type keeps
+   the shape last keyed on (QPType.ic_shape). */
 typedef struct QPAttrCache {
-    struct JSShape *shape;      /* NULL = empty entry */
+    uint64_t shape_uid;         /* 0 = empty entry (never a shape's uid) */
     uint32_t type_version;
     uint8_t kind;               /* QP_ATTR_IC_* (unit h) */
     uint32_t index;             /* shape property index / QPInstance slot */
@@ -841,6 +886,13 @@ typedef union QPInlineCache {
    exec) has exactly one hidden argument: the locals mapping.  Locals are
    vars; cell variables are captured vars (JSVarRef); free variables are
    closure_var entries in co_freevars order.  Unbound = JS_UNINITIALIZED. */
+#define QP_LOC_ARTIFICIAL 0x80000000u
+/* pcloc[].loc: the locs[] index, with QP_LOC_ARTIFICIAL for the location
+   of code without one of its own (a join's or one propagated from a
+   jump): it reports no 'line' event (CPython has no location there, or
+   a copy of the code in each predecessor) */
+#define QP_PCLOC_IDX(v)     ((v) & ~QP_LOC_ARTIFICIAL)
+#define QP_PCLOC_IS_ART(v)  (((v) & QP_LOC_ARTIFICIAL) != 0)
 typedef struct QPCodeInfo {
     uint32_t co_flags;          /* CO_* */
     uint16_t argcount;          /* co_argcount (positional incl. posonly) */
@@ -848,9 +900,21 @@ typedef struct QPCodeInfo {
     uint16_t kwonlyargcount;
     int firstlineno;
     JSAtom qualname;            /* co_qualname (owned); co_name is b->func_name */
-    int doc_cpool_idx;          /* co_consts index of the docstring, -1 if none */
+    int doc_cpool_idx;          /* cpool index of the docstring (__doc__), -1 if none */
+    /* co_consts: cpool indexes of CPython's constant table in its order
+       (compile.c qpc_consts_finish); co_consts is consts[0] and the other
+       entries the bytecode loads (codeobject.c qp_co_layout) */
+    uint32_t *consts;
+    uint32_t nconsts;
+#define QP_CODE_CONST_ALIAS 0x80000000u /* consts[i]: another cpool index of the
+                                           code object of the entry before */
     /* location table: line_num operands index locs[] (compile time);
-       resolve_labels turns them into the sorted pc -> loc map */
+       resolve_labels turns them into the sorted pc -> loc map.  An
+       operand with QP_LOC_ARTIFICIAL is the location given to a block
+       without one after a join (compile.c qpc_join_end): resolve_labels
+       copies such a block's `return None` into the jumps to it, with
+       their location (CPython duplicate_exits_without_lineno /
+       inline_small_or_no_lineno_blocks) */
     QPLoc *locs;
     uint32_t loc_count, loc_size;
     struct { uint32_t pc; uint32_t loc; } *pcloc;
@@ -858,6 +922,15 @@ typedef struct QPCodeInfo {
     /* inline caches indexed by the IC operands */
     QPInlineCache *ic;
     uint16_t ic_count;
+    /* co_code layout (codeobject.c), computed on first use; runtime cache,
+       never serialized */
+    struct QPCoLayout *co_layout;
+    /* sys.monitoring data of the code (instrumentation.c), NULL until a
+       tool monitors it */
+    struct QPMonCode *mon;
+    /* the code object of the bytecode (qp_code_new): one per bytecode, as
+       CPython's code constants; weak, cleared by its finalizer */
+    struct JSObject *co_facade;
 } QPCodeInfo;
 
 /* ---- exceptions state (unit i; generators link their own item, unit j) */
@@ -909,6 +982,13 @@ typedef struct QPConfig {
     const char *pycache_prefix; /* -X pycache_prefix / PYTHONPYCACHEPREFIX (sys.pycache_prefix), NULL = None */
     int import_time;            /* -X importtime[=2] / PYTHONPROFILEIMPORTTIME: 0, 1 or 2 (import.c) */
     int tracemalloc;            /* -X tracemalloc[=N] / PYTHONTRACEMALLOC: traceback limit tracemalloc starts with, 0 = not started (pythonrun.c) */
+    int parser_debug;           /* -d / PYTHONDEBUG (sys.flags.debug; no parser debug output in this build) */
+    int cpu_count;              /* -X cpu_count=N / PYTHON_CPU_COUNT: os.cpu_count() override, <= 0 = none (sys._get_cpu_count_config() -1) */
+    int no_debug_ranges;        /* -X no_debug_ranges / PYTHONNODEBUGRANGES (!config.code_debug_ranges): locations without columns */
+    int use_frozen_modules;     /* -X frozen_modules / PYTHON_FROZEN_MODULES (default on in qp_main): the frozen stdlib and test modules of python/frozen.c are used; also the switch for the base snapshot (python/pythonrun.c) */
+    int faulthandler;           /* -X faulthandler / PYTHONFAULTHANDLER / dev mode: faulthandler.enable() at startup (pythonrun.c) */
+    int parse_argv;             /* the command line was parsed into these options (qp_main; PyConfig.parse_argv) */
+    int skip_source_first_line; /* -x: the first line of the script is skipped (PyConfig.skip_source_first_line) */
 } QPConfig;
 
 
@@ -926,6 +1006,7 @@ struct QPState {
     JSValue empty_tuple;                    /* (e) */
     JSValue empty_frozenset;                /* (f) */
     JSValue empty_bytes;                    /* (g) */
+    JSValue bytes_chars[256];               /* (g) 1-byte bytes singletons (CPython characters[]), made on first use */
 
     /* modules (k, l) */
     JSValue builtins_module, builtins_dict; /* (k) */
@@ -936,6 +1017,8 @@ struct QPState {
     JSValue modules;                        /* sys.modules dict (l) */
     JSValue import_func;                    /* original builtins.__import__ for the import_name fast path (l) */
     JSValue importlib;                      /* importlib._bootstrap module, set by M3 boot code; JS_UNDEFINED until then (l: qp_import_name calls its _find_and_load like CPython import_find_and_load; unset -> ModuleNotFoundError) */
+    JSValue lazy_imports_filter;            /* sys.set_lazy_imports_filter callable, JS_UNDEFINED when unset (l: CPython interp->imports.lazy_imports_filter) */
+    JSValue lazy_modules;                   /* set of the names of pending lazy imports, also sys.lazy_modules (l: CPython interp->imports.lazy_modules) */
 
     /* interpreter (a).  Per-thread fields (CPython PyThreadState): the
        running thread's values live here; python/ceval.c "Threads and the
@@ -949,11 +1032,26 @@ struct QPState {
     JSValue trace_func;
     JSValue profile_func;
     uint8_t trace_active;                   /* trace_func or profile_func set: Python frames report events */
-    uint8_t tracing;                        /* a trace/profile function is running: no events (tstate->tracing) */
+    uint8_t tracing;                        /* a trace/profile/monitoring callback is running: no events (tstate->tracing) */
+    /* sys.monitoring (instrumentation.c; interpreter-wide, not saved per
+       thread): mon_active while some tool has an event set (global or
+       local), the interpreter hooks then report events */
+    uint8_t mon_active;
+    uint32_t mon_version;                   /* bumped by every event set change: QPMonCode.version */
+    uint32_t mon_restart_version;           /* bumped by restart_events(): DISABLEd locations reset */
+    struct list_head mon_codes;             /* QPMonCode with some local event set */
+    struct QPMonCCall *mon_ccalls;          /* builtin calls whose C_RETURN / C_RAISE is pending */
+    int mon_ccall_count, mon_ccall_size;
+    struct JSStackFrame *mon_event_sf;      /* frame of the LINE / JUMP / BRANCH event being reported */
+    int mon_event_line;                     /* its f_lineno during the callbacks, 0 = from f_lasti */
 
     /* exceptions (i) */
     QPExcStackItem exc_info_base;
     QPExcStackItem *exc_info;               /* innermost; generators push their own item (j) */
+    uint8_t signals_deferred;               /* a generator suspended in a yield from / await is resumed: the
+                                               Python signal handlers wait for the resumption of its delegate
+                                               (CPython RESUME after yield from + JUMP_BACKWARD_NO_INTERRUPT;
+                                               genobject.c qp__gen_send_ex, qp_signal_check) */
 
     /* type system (h) */
     uint32_t next_type_version;             /* 0 after exhaustion: no more caching */
@@ -1109,13 +1207,38 @@ static void qp_code_mark_native(JSValueConst code_or_func);
    PyCode_Addr2Location).  0 found, -1 none (loc set to -1s). */
 static int qp_code_addr2loc(struct JSFunctionBytecode *b, uint32_t pc, QPLoc *loc);
 /* Python-visible instruction offsets (co_code, co_positions(), co_lines(),
-   f_lasti, tb_lasti): every instruction is one 2-byte code unit, so the
-   offset of the instruction containing byte offset pc is 2 * its index.
-   -1 when pc is outside the bytecode. */
+   co_exceptiontable, f_lasti, tb_lasti) are byte offsets in the synthesized
+   CPython instruction stream of co_code (codeobject.c, "co_code"): the
+   offset of the instruction containing byte offset pc is the offset of the
+   main CPython opcode of its group.  -1 when pc is outside the bytecode. */
 static int qp_code_pc2lasti(struct JSFunctionBytecode *b, uint32_t pc);
-/* Inverse: byte offset of the instruction at Python offset lasti, -1 when
-   lasti is negative or past the last instruction. */
+/* Inverse: byte offset of the instruction whose group contains Python
+   offset lasti (the prologue maps to the first instruction), -1 when lasti
+   is negative or past the end of co_code. */
 static int qp_code_lasti2pc(struct JSFunctionBytecode *b, int lasti);
+/* Python offset of the first code unit (EXTENDED_ARG prefixes included) of
+   the instruction starting at byte offset pc: CPython's jump target offset
+   and the not_taken / target offsets of co_branches(); -1 outside. */
+static int qp_code_target_offset(struct JSFunctionBytecode *b, uint32_t pc);
+/* Python offset of the POP_JUMP_IF_* / FOR_ITER instruction of the
+   conditional jump or for_iter at byte offset pc (the src of its
+   co_branches() entry), -1 if it is not a branch. */
+static int qp_code_branch_src(struct JSFunctionBytecode *b, uint32_t pc);
+/* Python offset of the JUMP_BACKWARD that a conditional jump at byte pc
+   with a backward target takes (co_code: the inverted POP_JUMP_IF_* over
+   it; the not_taken of its co_branches() entry), -1 otherwise. */
+static int qp_code_branch_back(struct JSFunctionBytecode *b, uint32_t pc);
+/* Python offset of the RESUME of the prologue (pc 0) or of the yield_value
+   subop at byte offset pc (sys.monitoring PY_START / PY_RESUME); -1
+   otherwise. */
+static int qp_code_resume_offset(struct JSFunctionBytecode *b, uint32_t pc);
+/* Python offsets (execution order, no EXTENDED_ARG / CACHE units) of the
+   CPython instructions synthesized for the instruction at byte offset pc
+   (pc 0: the prologue's first), at most max into out; the count, -1 if pc
+   is outside the bytecode. */
+static int qp_code_insn_offsets(struct JSFunctionBytecode *b, uint32_t pc, int *out, int max);
+/* Frees QPCodeInfo.co_layout (qp_code_info_free). */
+static void qp_co_layout_free(JSRuntime *rt, struct QPCoLayout *L);
 
 /* Cells: var_ref NULL makes a new empty cell (cell()). */
 static JSValue qp_cell_new(JSContext *ctx, struct JSVarRef *var_ref);
@@ -1154,8 +1277,6 @@ static int qp_frame_super_args(JSContext *ctx, struct JSStackFrame *sf,
 static QPCodeInfo *qp_code_info_new(JSContext *ctx);
 /* Called by free_function_bytecode / JSFunctionDef freeing. */
 static void qp_code_info_free(JSRuntime *rt, QPCodeInfo *ci);
-/* Called by mark_children for function bytecode (IC shape references). */
-static void qp_code_info_mark(JSRuntime *rt, QPCodeInfo *ci, JS_MarkFunc *mark_func);
 /* Append a location; returns its index (the OP_line_num operand), -1 OOM. */
 static int qp_fd_add_loc(JSContext *ctx, struct JSFunctionDef *fd, const QPLoc *loc);
 /* Emit OP_py <subop> [operands] into s->cur_func (bookkeeping like
@@ -1185,6 +1306,9 @@ static JSValue qp_create_function(JSContext *ctx, struct JSFunctionDef *fd);
    removes the function and propagates).  The C API layer builds
    PyEval_SetTrace / PyEval_SetProfile on it.  0 or -1. */
 static int qp_trace_set(JSContext *ctx, int is_profile, JSValueConst func);
+/* qp_trace_set for every thread (sys._settraceallthreads,
+   PyEval_SetTraceAllThreads).  0 or -1. */
+static int qp_trace_set_all(JSContext *ctx, int is_profile, JSValueConst func);
 /* Interpreter hooks (quickjs.c), called for Python frames only while
    ctx->py->trace_active and not ctx->py->tracing.  pc is the start of the
    instruction concerned.  'call' at frame start / generator resumption
@@ -1215,6 +1339,39 @@ static int qp_trace_send_return(JSContext *ctx, struct JSStackFrame *sf,
    a for_iter: 'exception' (CPython FOR_ITER).  -1 if a trace function
    raised (its exception replaced the StopIteration). */
 static int qp_trace_for_iter_stop(JSContext *ctx);
+/* frame.f_lineno setter: sf is reporting a LINE / JUMP / BRANCH event to a
+   sys.monitoring callback (the jump is allowed there). */
+static BOOL qp_mon_jump_allowed(JSContext *ctx, struct JSStackFrame *sf);
+/* ---- sys.monitoring (instrumentation.c, PEP 669) ------------------------ */
+/* The interpreter hooks of quickjs.c, called for Python frames while
+   ctx->py->trace_active or ctx->py->mon_active and not ctx->py->tracing.
+   They report the sys.monitoring events, then the legacy sys.settrace /
+   sys.setprofile ones (qp_trace_*).  Same contracts as the qp_trace_*
+   functions above; qp_hook_call gets the generator throw flag, and
+   qp_hook_handled (an exception handler of sf at handler_pc is entered
+   with rt->current_exception) reports EXCEPTION_HANDLED. */
+static int qp_hook_call(JSContext *ctx, struct JSStackFrame *sf, BOOL throw_flag);
+static int qp_hook_instr(JSContext *ctx, struct JSStackFrame *sf, const uint8_t *pc,
+                         JSValue *sp);
+static void qp_hook_exception(JSContext *ctx, struct JSStackFrame *sf, const uint8_t *pc,
+                              BOOL reraise);
+static void qp_hook_handled(JSContext *ctx, struct JSStackFrame *sf, const uint8_t *handler_pc);
+static void qp_hook_unwind(JSContext *ctx, struct JSStackFrame *sf, const uint8_t *pc);
+static int qp_hook_send_return(JSContext *ctx, struct JSStackFrame *sf,
+                               JSValueConst receiver, JSValueConst value);
+static int qp_hook_for_iter_stop(JSContext *ctx);
+/* JSStackFrame.py_mon_flags bit set by qp_hook_instr for a
+   load_super_method whose CALL event is monitored: CPython's instrumented
+   LOAD_SUPER_ATTR is the generic one (super() call, then getattr: the
+   bound attribute and NULL, no method form); cleared by the instruction */
+#define QP_MON_SF_SUPER_GENERIC 16
+/* Release the monitoring data of a code object (qp_code_info_free). */
+static void qp_mon_code_free(JSRuntime *rt, struct QPMonCode *m);
+/* QPState setup / teardown of the monitoring fields (ceval.c). */
+static void qp_mon_state_init(QPState *s);
+static void qp_mon_state_free(JSRuntime *rt, QPState *s);
+static void qp_mon_state_mark(JSRuntime *rt, QPState *s, JS_MarkFunc *mark_func);
+
 /* (frameobject.c) The frame sf ends: release sf->py_frame; if the frame
    object survives and ctx is not NULL, it keeps f_back, f_lasti and a
    f_locals snapshot (ctx = NULL in GC/teardown paths). */
@@ -1294,6 +1451,7 @@ static int qp_long_as_ssize(JSContext *ctx, JSValueConst v, Py_ssize_t *out);
 static int qp_long_as_double(JSContext *ctx, JSValueConst v, double *out);
 static int qp_long_sign(JSValueConst v);                       /* exact ints: -1/0/1 */
 static int qp_long_compare(JSValueConst a, JSValueConst b);    /* exact ints: -1/0/1 */
+static uint64_t qp_long_numbits(JSValueConst v);               /* ints and bools: bit length of |v| */
 static Py_hash_t qp_long_hash(JSValueConst v);                 /* exact ints/bools, numfmt hashes */
 /* str of an exact int in base 2/8/10/16 with CPython's prefixes for 2/8/16
    when alternate (bin/oct/hex) and the int_max_str_digits check for 10. */
@@ -1420,6 +1578,8 @@ static __maybe_unused JSValue qp_range_new(JSContext *ctx, JSValueConst start, J
                                            JSValueConst step);
 static JSValue qp_slice_new(JSContext *ctx, JSValueConst start, JSValueConst stop, JSValueConst step);
 static BOOL qp_slice_check(JSValueConst v);
+/* start, stop, step of a slice (borrowed; None when absent) */
+static void qp_slice_fields(JSValueConst v, JSValueConst fields[3]);
 /* PySlice_Unpack (indices clamped to Py_ssize_t, "slice step cannot be
    zero") and PySlice_AdjustIndices (returns the slice length). */
 static int qp_slice_unpack(JSContext *ctx, JSValueConst slice, Py_ssize_t *start,
@@ -1438,7 +1598,7 @@ static int qp_unpack_iterable(JSContext *ctx, JSValueConst v, int before, int af
 
 /* ========================================================================= */
 /* (f) DICT, FROZENDICT, SET, FROZENSET, VIEWS: python/dictobject.c,          */
-/*     python/setobject.c                                                     */
+/*     python/setobject.c, python/odictobject.c (collections.OrderedDict)     */
 /* ========================================================================= */
 
 static int qp_init_dicts(JSContext *ctx);     /* dict types, mappingproxy, set types */
@@ -1486,6 +1646,18 @@ static JSValue qp_dict_values_list(JSContext *ctx, JSValueConst d);
 static JSValue qp_dict_items_list(JSContext *ctx, JSValueConst d);
 /* types.MappingProxyType(mapping) (type.__dict__). */
 static JSValue qp_mappingproxy_new(JSContext *ctx, JSValueConst mapping);
+
+/* collections.OrderedDict (python/odictobject.c).  qp_init_odicts is run by
+   qp_init_dicts; the state functions are the QPDict.od part of the dict
+   finalizer / gc_mark. */
+static int qp_init_odicts(JSContext *ctx);
+static void qp_odict_state_free(JSRuntime *rt, QPODict *o);
+static void qp_odict_state_mark(JSRuntime *rt, const QPODict *o, JS_MarkFunc *mark_func);
+static BOOL qp_odict_check(JSContext *ctx, JSValueConst v);        /* PyODict_Check */
+static JSValue qp_odict_new(JSContext *ctx);                        /* PyODict_New */
+/* PyODict_SetItem / PyODict_DelItem (KeyError when absent): 0 / -1. */
+static int qp_odict_set_item(JSContext *ctx, JSValueConst od, JSValueConst key, JSValueConst value);
+static int qp_odict_del_item(JSContext *ctx, JSValueConst od, JSValueConst key);
 
 static BOOL qp_set_check(JSContext *ctx, JSValueConst v);          /* set or subclass */
 static BOOL qp_anyset_check(JSContext *ctx, JSValueConst v);       /* set, frozenset or subclasses */
@@ -1826,8 +1998,9 @@ static JSValue qp_exc_stopiteration_value(JSContext *ctx, JSValueConst exc);
    source lines and carets, chains, notes, groups) to file (QP_NULL =
    sys.stderr, or C stderr if unusable).  0 or -1. */
 static int qp_exc_display(JSContext *ctx, JSValueConst exc, JSValueConst file);
-/* sys.unraisablehook-style report ("Exception ignored in: %R"). */
-static void qp_exc_write_unraisable(JSContext *ctx, JSValueConst exc, JSValueConst obj);
+/* PyErr_FormatUnraisable(fmt, obj) for the pending exception (fmt has at
+   most one %R, of obj). */
+static void qp_format_unraisable(JSContext *ctx, const char *fmt, JSValueConst obj);
 /* warnings.warn in C (CPython default filters; printed to stderr as
    "%s:%d: %s: %s"). */
 static int qp_warn(JSContext *ctx, QPType *category, int stacklevel, const char *fmt, ...);
@@ -1953,6 +2126,8 @@ static JSValue qp_import_from(JSContext *ctx, JSValueConst module, JSAtom name);
 static int qp_import_star(JSContext *ctx, JSValueConst module, JSValueConst locals);
 /* PyImport_ImportModule("a.b"). */
 static JSValue qp_import_module(JSContext *ctx, const char *name);
+/* PyImport_Import(name) for a str value (need not be encodable). */
+static JSValue qp_import_module_obj(JSContext *ctx, JSValueConst name);
 /* PEP 810: value of a global after reification if it is a lazy-import
    object (consumes v), else v. */
 static JSValue qp_lazy_import_resolve(JSContext *ctx, JSValue v);
@@ -2001,6 +2176,11 @@ static void qp_modstate_free(JSContext *ctx);
    block) when p->weakref_count != 0; clears Python weakrefs to p, queues
    their callbacks, never runs code. */
 static void qp_weakref_object_freed(JSRuntime *rt, JSObject *p);
+/* python/mod_weakref.c: called by quickjs.c gc_py_finalize_cycles for the
+   unreachable objects before their finalizers run (CPython gc.c
+   handle_weakref_callbacks): clears the Python weakrefs with a callback
+   to p, queues their callbacks, never runs code. */
+static void qp_weakref_clear_callback_refs(JSRuntime *rt, JSObject *p);
 /* python/mod_weakref.c: head of obj's weakref list (new reference; the
    subtype __weakref__ getter) or None. */
 static JSValue qp_weakref_get_first(JSContext *ctx, JSValueConst obj);
@@ -2050,10 +2230,14 @@ static BOOL qp_capi_native_same_layout(QPType *a, QPType *b);
    PyTypeObject of t if it has one (static builtin type, builtin exception
    class, C extension type). */
 static BOOL qp_capi_type_layout(JSContext *ctx, QPType *t, QPTypeLayout *l);
-/* (B) qp_obj_materialize_dict (typeobject_attr.h) made the instance dict d
-   of extension object p (JS_CLASS_PY_NATIVE): stored in the C instance's
-   tp_dictoffset slot when that is empty. */
+/* (B) the runtime made or replaced the instance dict d of extension object
+   p (JS_CLASS_PY_NATIVE; qp_obj_materialize_dict, __dict__ assignment):
+   stored in the C instance's tp_dictoffset slot. */
 static void qp_capi_native_dict_made(JSContext *ctx, JSObject *p, JSValueConst d);
+/* (B) qp_obj_dict_get (typeobject_attr.h) of extension object p: the
+   borrowed instance dict, following the C instance's tp_dictoffset slot
+   (which C code may have replaced or cleared); QP_NULL if none. */
+static JSValue qp_capi_native_dict_sync(JSContext *ctx, JSObject *p);
 /* (A) sys.getrefcount: the references C code holds to v through its C
    mirror (ob_refcnt less the mirror's own reference to v), 0 if none. */
 static Py_ssize_t qp_capi_c_refs(JSContext *ctx, JSValueConst v);
@@ -2082,6 +2266,65 @@ static int qp_capi_install_ext_reject(JSContext *ctx);
    PyThreadState_SetAsyncExc for the current thread state (the interpreter
    poll, qp_signal_check).  0, or -1 with it raised. */
 static int qp_capi_async_exc_check(JSContext *ctx);
+/* python/capi_runtime.c: the C-API side of the interpreter poll (the
+   pending calls of Py_AddPendingCall, run by the poll of quickjs.c after
+   qp_signal_check, not by the signal checks of blocking calls), and the
+   PyUnstable_AtExit callbacks run by qp_atexit_run after the Python ones.
+   Both are no-ops when ctx is not the C-API context. */
+static int qp_capi_pending_check(JSContext *ctx);
+static void qp_capi_atexit_ll_run(JSContext *ctx);
+/* (B/E1/E2) watchers.  The bits of the type, function, dict, code and
+   context watchers that are set (python/capi_type.c, capi_dict.c,
+   capi_runtime.c): 0 while none is, so that the runtime hooks below cost
+   one test. */
+static uint8_t qp_capi_type_watchers_set;
+static uint8_t qp_capi_func_watchers_set;
+static uint8_t qp_capi_dict_watchers_set;
+static uint8_t qp_capi_code_watchers_set;
+static uint8_t qp_capi_context_watchers_set;
+#define QP_CAPI_DEALLOC_WATCHERS_SET() \
+    (qp_capi_type_watchers_set | qp_capi_func_watchers_set | qp_capi_dict_watchers_set | \
+     qp_capi_code_watchers_set)
+/* (E1) _PyDict_NotifyEvent for a dict with watcher bits (dictcore.c):
+   d is the core of a QPDict; key / value are JS_UNINITIALIZED when the
+   event has none (key is the source dict for CLONED). */
+static void qp_capi_dict_notify(JSContext *ctx, qp_dictcore *d, int event,
+                                JSValueConst key, JSValueConst value);
+/* (E1) qp_dict_finalizer of a dict with watcher bits: forget it. */
+static void qp_capi_dict_forget(qp_dictcore *d);
+/* (B/E1/E2) qp_del_context, while QP_CAPI_DEALLOC_WATCHERS_SET(): the C-API
+   context if the free of p must be deferred to the finalizer queue to
+   report it to watchers first (CPython type_dealloc, func_dealloc,
+   dict_dealloc, code_dealloc resurrect the object for the callbacks): a
+   watched type or dict, a Python function while function watchers are
+   set, a code object while code watchers are set; else NULL. */
+static JSContext *qp_capi_dealloc_watched(JSObject *p);
+/* (B/E1/E2) the finalizer queue (qp_run_pending_finalizers) runs the
+   deallocation event of obj (type watchers, PyFunction_EVENT_DESTROY,
+   PyDict_EVENT_DEALLOCATED, PY_CODE_EVENT_DESTROY). */
+static void qp_capi_dealloc_notify(JSContext *ctx, JSValueConst obj);
+/* (B) function watchers (funcobject.c): PyFunction_EVENT_CREATE /
+   MODIFY_* of the Python function func; new_value QP_NULL or undefined =
+   none (NULL).  The events have PyFunction_WatchEvent's values. */
+enum {
+    QP_FUNC_EVENT_CREATE = 0,
+    QP_FUNC_EVENT_DESTROY,
+    QP_FUNC_EVENT_MODIFY_CODE,
+    QP_FUNC_EVENT_MODIFY_DEFAULTS,
+    QP_FUNC_EVENT_MODIFY_KWDEFAULTS,
+    QP_FUNC_EVENT_MODIFY_QUALNAME,
+};
+#define QP_FUNC_EVENT(ctx, event, func, value) do {                         \
+        if (unlikely(qp_capi_func_watchers_set))                            \
+            qp_capi_func_event(ctx, QP_FUNC_EVENT_##event, func, value);    \
+    } while (0)
+static void qp_capi_func_event(JSContext *ctx, int event, JSValueConst func,
+                               JSValueConst new_value);
+/* (E2) PY_CODE_EVENT_CREATE of the new code object (qp_co_alloc). */
+static void qp_capi_code_created(JSContext *ctx, JSValueConst code);
+/* (E2) Py_CONTEXT_SWITCHED: the current context (QP_NULL: none) after
+   _PyContext_Enter / _PyContext_Exit (mod_misc.c). */
+static void qp_capi_context_switched(JSContext *ctx, JSValueConst current);
 #else
 /* without the C API: no C-held references, the QP defs' own docs */
 #define qp_capi_native_dict_made(ctx, p, d) ((void)0)

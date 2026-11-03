@@ -920,6 +920,47 @@ static PyObject *qp_capi_tm_get_traceback(unsigned int domain, const uintptr_t *
     return qp_capi_from_js_result(ctx, r);
 }
 
+static void qp_capi_tm_puts(int fd, const char *s)
+{
+    size_t n = strlen(s);
+    while (n > 0) {
+        ssize_t w = write(fd, s, n);
+        if (w <= 0)
+            return;
+        s += w;
+        n -= (size_t)w;
+    }
+}
+
+/* _PyMem_DumpTraceback: the allocation traceback of the block at ptr, for
+   the reports of the debug hooks on the allocators (capi_mirror.c) */
+static void qp_capi_tm_dump_traceback(int fd, const void *ptr)
+{
+    QPCapiTmTraceback *traceback;
+    char buf[32];
+    int i;
+
+    QP_CAPI_TM_LOCK();
+    if (!qp_capi_tm.tracing) {
+        qp_capi_tm_puts(fd, "Enable tracemalloc to get the memory block "
+                            "allocation traceback\n\n");
+        goto done;
+    }
+    traceback = qp_capi_tm_get_traceback_unlocked(QP_CAPI_TM_DEFAULT_DOMAIN, (uintptr_t)ptr);
+    if (traceback == NULL)
+        goto done;
+    qp_capi_tm_puts(fd, "Memory block allocated at (most recent call first):\n");
+    for (i = 0; i < traceback->nframe; i++) {
+        qp_capi_tm_puts(fd, "  File \"");
+        qp_capi_tm_puts(fd, traceback->frames[i].filename);
+        snprintf(buf, sizeof(buf), "\", line %u\n", traceback->frames[i].lineno);
+        qp_capi_tm_puts(fd, buf);
+    }
+    qp_capi_tm_puts(fd, "\n");
+done:
+    QP_CAPI_TM_UNLOCK();
+}
+
 PyObject *_PyTraceMalloc_GetTraceback(unsigned int domain, uintptr_t ptr)
 {
     return qp_capi_tm_get_traceback(domain, &ptr, 1);

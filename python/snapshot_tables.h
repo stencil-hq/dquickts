@@ -13,7 +13,8 @@
  * each local header it includes (recursively, first inclusion only), every
  * line matching
  *   ^static const (QPMethodDef|QPGetSetDef|QPMemberDef|QPTypeSpec|QPModuleDef) NAME([...])?( __maybe_unused)? =
- * (not inside a macro definition) or ^(QP_ITER_SPEC|QP_DICTITER_SPEC)(NAME,
+ * (not inside a macro definition) or
+ * ^(QP_ITER_SPEC|QP_DICTITER_SPEC|QP_ODICTVIEW_SPEC)(NAME,
  * gives A(Type, NAME) for arrays and S(Type, NAME) for single objects,
  * grouped by type in the order QPTypeSpec, QPModuleDef, QPMethodDef,
  * QPGetSetDef, QPMemberDef.
@@ -86,6 +87,11 @@
     S(QPTypeSpec, qp_property_spec) /* descrobject.c */ \
     S(QPTypeSpec, qp_classmethod_spec) /* descrobject.c */ \
     S(QPTypeSpec, qp_staticmethod_spec) /* descrobject.c */ \
+    S(QPTypeSpec, qp_odict_spec) /* odictobject.c */ \
+    S(QPTypeSpec, qp_odict_iterator_spec) /* odictobject.c */ \
+    S(QPTypeSpec, qp_odict_keys_spec) /* odictobject.c */ \
+    S(QPTypeSpec, qp_odict_values_spec) /* odictobject.c */ \
+    S(QPTypeSpec, qp_odict_items_spec) /* odictobject.c */ \
     A(QPTypeSpec, qp_exc_specs) /* exceptions.c */ \
     S(QPTypeSpec, qp_tb_spec) /* traceback.c */ \
     S(QPTypeSpec, qp__generator_spec) /* genobject.c */ \
@@ -140,6 +146,7 @@
     S(QPTypeSpec, qp_ste_spec) /* mod_symtable.c */ \
     S(QPTypeSpec, qp_tic_sicm_spec) /* mod_testinternalcapi.c */ \
     S(QPModuleDef, qp_moddef__suggestions) /* errors.c */ \
+    S(QPModuleDef, qp_moddef__missing_stdlib_info) /* traceback.c */ \
     S(QPModuleDef, qp_moddef_builtins) /* bltinmodule.c */ \
     S(QPModuleDef, qp_moddef_sys__jit) /* sysmodule.c */ \
     S(QPModuleDef, qp_moddef_sys) /* sysmodule.c */ \
@@ -217,6 +224,9 @@
     A(QPMethodDef, qp_descr_methods) /* descrobject.c */ \
     A(QPMethodDef, qp_property_methods) /* descrobject.c */ \
     A(QPMethodDef, qp_funcwrap_methods) /* descrobject.c */ \
+    A(QPMethodDef, qp_odict_methods) /* odictobject.c */ \
+    A(QPMethodDef, qp_odictiter_methods) /* odictobject.c */ \
+    A(QPMethodDef, qp_odictview_methods) /* odictobject.c */ \
     A(QPMethodDef, qp_exc_base_methods) /* exceptions.c */ \
     A(QPMethodDef, qp_exc_eg_methods) /* exceptions.c */ \
     A(QPMethodDef, qp_exc_importerror_methods) /* exceptions.c */ \
@@ -323,6 +333,7 @@
     A(QPGetSetDef, qp_methodwrapper_getsets) /* descrobject.c */ \
     A(QPGetSetDef, qp_property_getsets) /* descrobject.c */ \
     A(QPGetSetDef, qp_funcwrap_getsets) /* descrobject.c */ \
+    A(QPGetSetDef, qp_odict_getsets) /* odictobject.c */ \
     A(QPGetSetDef, qp_exc_base_getsets) /* exceptions.c */ \
     A(QPGetSetDef, qp_exc_stopiteration_getsets) /* exceptions.c */ \
     A(QPGetSetDef, qp_exc_systemexit_getsets) /* exceptions.c */ \

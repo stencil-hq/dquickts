@@ -479,7 +479,7 @@ static JSValue qp_capi_float_kind_to_js(JSContext *ctx, PyObject *op)
     QPType *sub;
 
     if (Py_IS_TYPE(op, &PyFloat_Type))
-        return qp_float_new(ctx, ((PyFloatObject *)op)->ob_fval);
+        return qp_float_result(ctx, ((PyFloatObject *)op)->ob_fval);
     sub = qp_capi_type_qp(Py_TYPE(op));
     if (!sub)
         return JS_EXCEPTION;
@@ -519,15 +519,16 @@ static JSValue qp_capi_complex_kind_to_js(JSContext *ctx, PyObject *op)
 /* tp_methods of the static int and float types.  The runtime types own the
    methods; these entries exist for C code that takes a PyCFunction out of
    the table and calls it directly (_decimal: cfunc_noargs() of
-   float.as_integer_ratio and int.bit_length). */
+   float.as_integer_ratio and int.bit_length).  They run the int / float
+   method, not an override of a subclass of self. */
 static PyObject *qp_capi_long_bit_length(PyObject *self, PyObject *Py_UNUSED(ignored))
 {
-    return PyObject_CallMethod(self, "bit_length", NULL);
+    return PyObject_CallMethod((PyObject *)&PyLong_Type, "bit_length", "O", self);
 }
 
 static PyObject *qp_capi_float_as_integer_ratio(PyObject *self, PyObject *Py_UNUSED(ignored))
 {
-    return PyObject_CallMethod(self, "as_integer_ratio", NULL);
+    return PyObject_CallMethod((PyObject *)&PyFloat_Type, "as_integer_ratio", "O", self);
 }
 
 static PyMethodDef qp_capi_long_methods[] = {
@@ -2362,6 +2363,84 @@ Py_complex _Py_c_diff(Py_complex a, Py_complex b)
     Py_complex r;
     r.real = a.real - b.real;
     r.imag = a.imag - b.imag;
+    return r;
+}
+
+/* pycore_complexobject.h: mixed complex/real operands */
+Py_complex _Py_cr_sum(Py_complex a, double b)
+{
+    Py_complex r = a;
+    r.real += b;
+    return r;
+}
+
+Py_complex _Py_cr_diff(Py_complex a, double b)
+{
+    Py_complex r = a;
+    r.real -= b;
+    return r;
+}
+
+Py_complex _Py_rc_diff(double a, Py_complex b)
+{
+    Py_complex r;
+    r.real = a - b.real;
+    r.imag = -b.imag;
+    return r;
+}
+
+Py_complex _Py_cr_prod(Py_complex a, double b)
+{
+    Py_complex r = a;
+    r.real *= b;
+    r.imag *= b;
+    return r;
+}
+
+Py_complex _Py_cr_quot(Py_complex a, double b)
+{
+    Py_complex r = a;
+    if (b) {
+        r.real /= b;
+        r.imag /= b;
+    } else {
+        errno = EDOM;
+        r.real = r.imag = 0.0;
+    }
+    return r;
+}
+
+/* _Py_c_quot() with a real dividend */
+Py_complex _Py_rc_quot(double a, Py_complex b)
+{
+    Py_complex r;
+    const double abs_breal = b.real < 0 ? -b.real : b.real;
+    const double abs_bimag = b.imag < 0 ? -b.imag : b.imag;
+
+    if (abs_breal >= abs_bimag) {
+        if (abs_breal == 0.0) {
+            errno = EDOM;
+            r.real = r.imag = 0.0;
+        } else {
+            const double ratio = b.imag / b.real;
+            const double denom = b.real + b.imag * ratio;
+            r.real = a / denom;
+            r.imag = (-a * ratio) / denom;
+        }
+    } else if (abs_bimag >= abs_breal) {
+        const double ratio = b.real / b.imag;
+        const double denom = b.real * ratio + b.imag;
+        r.real = (a * ratio) / denom;
+        r.imag = (-a) / denom;
+    } else {
+        r.real = r.imag = Py_NAN;
+    }
+    if (isnan(r.real) && isnan(r.imag) && isfinite(a) && (isinf(abs_breal) || isinf(abs_bimag))) {
+        const double x = copysign(isinf(b.real) ? 1.0 : 0.0, b.real);
+        const double y = copysign(isinf(b.imag) ? 1.0 : 0.0, b.imag);
+        r.real = 0.0 * (a * x);
+        r.imag = 0.0 * (-a * y);
+    }
     return r;
 }
 

@@ -76,6 +76,7 @@
 #include "descrobject.c"
 #include "object.c"
 #include "abstract.c"
+#include "odictobject.c"
 #include "exceptions.c"
 #include "errors.c"
 #include "traceback.c"
@@ -107,12 +108,14 @@
 #include "mod_codecs.c"
 #include "mod_locale.c"
 #include "mod_io.c"
+#include "frozen.c"
 #include "mod_imp.c"
 #include "mod_ast.c"
 #include "mod_tokenize.c"
 #include "mod_symtable.c"
 #include "mod_types.c"
 #include "mod_testinternalcapi.c"
+#include "mod_faulthandler.c"
 #include "importlib_boot.c"
 #include "config.c"
 /* heap snapshot hooks of quickjs-snapshot.c (M4Snapshot); after config.c */
@@ -138,6 +141,7 @@
 #include "capi_stable.c"
 #include "capi_dynload.c"
 #include "capi_snapshot.c"   /* heap snapshots of C-extension state */
+#include "capi_testinternal.c"   /* the C-API half of _testinternalcapi */
 #endif
 
 /* _Py_SourceAsString(): compile() rejects sources with embedded NUL bytes

@@ -659,6 +659,10 @@ static PyObject *qp_capi_alloc(PyTypeObject *type, size_t size, QPCapiKind kind)
     return op;
 }
 
+/* debug hooks on the allocators (PyMem section, below) */
+static int qp_capi_memdbg_obj_on;
+static void qp_capi_memdbg_poison(JSRuntime *rt, QPCapiHead *h);
+
 static void qp_capi_release(JSRuntime *rt, QPCapiHead *h)
 {
     JSValue v = JS_UNDEFINED;
@@ -678,6 +682,8 @@ static void qp_capi_release(JSRuntime *rt, QPCapiHead *h)
     h->flags &= ~QP_CAPI_F_OWNS_V;
     qp_capi_head_drop_pins(h);
     h->tag = QP_CAPI_TAG_FREED;
+    if (unlikely(qp_capi_memdbg_obj_on))
+        qp_capi_memdbg_poison(rt, h);
     js_free_rt(rt, h);
     /* last: may free the JS object and run hooks */
     if (free_v)
@@ -1731,6 +1737,26 @@ static void qp_capi_mark_object(JSRuntime *rt, JSObject *p, JS_MarkFunc *mark_fu
     }
 }
 
+/* A weak mirror revived by a bare Py_INCREF (qp_capi_is_revived) whose J
+   loses its last JS reference before any crossing or collection relinked
+   it: numpy's PyArray_FromInterface drops its reference to
+   __array_interface__["data"] and takes the array's base reference with
+   Py_INCREF while the dict still holds it; the dict dies next.  The
+   mirror is made LIVE, which takes a reference to J, so J is not freed and
+   the C reference keeps both. */
+static BOOL qp_capi_object_revived(JSRuntime *rt, JSObject *p)
+{
+    QPCapiHead *h;
+    (void)rt;
+    if (qp_capi_dead)
+        return FALSE;
+    h = qp_capi_head_of_jobj(p);
+    if (!h || !qp_capi_is_revived(h) || QP_IS_NULL(h->v) || JS_VALUE_GET_OBJ(h->v) != p)
+        return FALSE;
+    qp_capi_make_live(h);
+    return TRUE;
+}
+
 static void qp_capi_free_cycle_node(JSRuntime *rt, JSGCObjectHeader *gp)
 {
     QPCapiHead *h = container_of(gp, QPCapiHead, gc);
@@ -1753,9 +1779,13 @@ static void qp_capi_free_cycle_node(JSRuntime *rt, JSGCObjectHeader *gp)
        only empties containers; the kind-owned references of a heap type
        (tp_dict, tp_mro, ...) or a C tuple subclass are released here, as
        CPython's type_clear / tuple dealloc would */
-    if (h->kind < QP_CAPI_K__COUNT && qp_capi.kind_ops[h->kind].clear &&
-        !(h->flags & QP_CAPI_F_DEALLOC))
-        qp_capi.kind_ops[h->kind].clear(rt, op);
+    if (h->kind < QP_CAPI_K__COUNT && !(h->flags & QP_CAPI_F_DEALLOC)) {
+        const QPCapiKindOps *ops = &qp_capi.kind_ops[h->kind];
+        if (ops->gc_clear)
+            ops->gc_clear(rt, op);
+        else if (ops->clear)
+            ops->clear(rt, op);
+    }
     Py_DECREF(op);
 }
 
@@ -2157,9 +2187,17 @@ Py_hash_t _Py_HashBytes(const void *src, Py_ssize_t len)
     return Py_HashBuffer(src, len);
 }
 
+/* object.__hash__ of the object (typeobject.c): the identity of a Python
+   value is the address of its JS object, not of the C mirror */
 Py_hash_t PyObject_GenericHash(PyObject *obj)
 {
-    return Py_HashPointer(obj);
+    JSContext *ctx = qp_capi.ctx;
+    JSValue v = qp_capi_value(ctx, obj);
+    if (JS_IsException(v)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return Py_HashPointer(obj);
+    }
+    return (Py_hash_t)qp_hash_pointer((uintptr_t)qp_obj_addr(v));
 }
 
 static PyHash_FuncDef qp_capi_hash_funcdef = { NULL, "siphash13", 64, 128 };
@@ -2173,19 +2211,26 @@ PyHash_FuncDef *PyHash_GetFuncDef(void)
 /* PyMem_* (context-free) and PyObject_Malloc (head blocks)                   */
 /* ========================================================================= */
 
-void *PyMem_RawMalloc(size_t size)
+/* The allocators of the three domains (CPython _PyMem_Raw, _PyMem and
+   _PyObject) are function tables: PyMem_SetAllocator replaces them and
+   PyMem_SetupDebugHooks (PYTHONMALLOC=debug) wraps them.  The default RAW
+   and MEM allocator is the system malloc (tracemalloc's while tracing,
+   qp_capi_tm_tracing); the default OBJ allocator hands out head blocks
+   (QPCapiHead + object, qp_capi_obj_*, below), so a hook of the OBJ
+   domain passes the blocks of the allocator it wraps through, as CPython's
+   hooks do. */
+
+static void *qp_capi_raw_malloc(void *actx, size_t size)
 {
-    if (size > (size_t)PY_SSIZE_T_MAX)
-        return NULL;
+    (void)actx;
     if (unlikely(__atomic_load_n(&qp_capi_tm_tracing, __ATOMIC_RELAXED)))
         return qp_capi_tm_raw_alloc(1, size, FALSE);
     return qp_sys_malloc(size ? size : 1);
 }
 
-void *PyMem_RawCalloc(size_t nelem, size_t elsize)
+static void *qp_capi_raw_calloc(void *actx, size_t nelem, size_t elsize)
 {
-    if (elsize != 0 && nelem > (size_t)PY_SSIZE_T_MAX / elsize)
-        return NULL;
+    (void)actx;
     if (unlikely(__atomic_load_n(&qp_capi_tm_tracing, __ATOMIC_RELAXED)))
         return qp_capi_tm_raw_alloc(nelem, elsize, TRUE);
     if (nelem == 0 || elsize == 0) {
@@ -2195,17 +2240,17 @@ void *PyMem_RawCalloc(size_t nelem, size_t elsize)
     return qp_sys_calloc(nelem, elsize);
 }
 
-void *PyMem_RawRealloc(void *ptr, size_t new_size)
+static void *qp_capi_raw_realloc(void *actx, void *ptr, size_t new_size)
 {
-    if (new_size > (size_t)PY_SSIZE_T_MAX)
-        return NULL;
+    (void)actx;
     if (unlikely(__atomic_load_n(&qp_capi_tm_tracing, __ATOMIC_RELAXED)))
         return qp_capi_tm_raw_realloc(ptr, new_size);
     return qp_sys_realloc(ptr, new_size ? new_size : 1);
 }
 
-void PyMem_RawFree(void *ptr)
+static void qp_capi_raw_free(void *actx, void *ptr)
 {
+    (void)actx;
     if (unlikely(__atomic_load_n(&qp_capi_tm_tracing, __ATOMIC_RELAXED))) {
         qp_capi_tm_raw_free(ptr);
         return;
@@ -2213,24 +2258,516 @@ void PyMem_RawFree(void *ptr)
     qp_sys_free(ptr);
 }
 
+/* malloc() and co. are macros in this translation unit: the members of a
+   PyMemAllocatorEx are called through these */
+#define QP_CAPI_A_MALLOC(a, n) (((a)->malloc)((a)->ctx, (n)))
+#define QP_CAPI_A_CALLOC(a, m, n) (((a)->calloc)((a)->ctx, (m), (n)))
+#define QP_CAPI_A_REALLOC(a, p, n) (((a)->realloc)((a)->ctx, (p), (n)))
+#define QP_CAPI_A_FREE(a, p) (((a)->free)((a)->ctx, (p)))
+
+static void *qp_capi_obj_malloc(void *actx, size_t size);
+static void *qp_capi_obj_calloc(void *actx, size_t nelem, size_t elsize);
+static void *qp_capi_obj_realloc(void *actx, void *ptr, size_t new_size);
+static void qp_capi_obj_free(void *actx, void *ptr);
+
+static PyMemAllocatorEx qp_capi_allocators[3] = {
+    [PYMEM_DOMAIN_RAW] = { NULL, qp_capi_raw_malloc, qp_capi_raw_calloc, qp_capi_raw_realloc,
+                           qp_capi_raw_free },
+    [PYMEM_DOMAIN_MEM] = { NULL, qp_capi_raw_malloc, qp_capi_raw_calloc, qp_capi_raw_realloc,
+                           qp_capi_raw_free },
+    [PYMEM_DOMAIN_OBJ] = { NULL, qp_capi_obj_malloc, qp_capi_obj_calloc, qp_capi_obj_realloc,
+                           qp_capi_obj_free },
+};
+
+/* ---- debug hooks: CPython Objects/obmalloc.c "A x-platform debugging
+   allocator" (without PYMEM_DEBUG_SERIALNO).  A RAW or MEM block is
+   [SSSS IFFF CCCC...CCCC FFFF]: the requested size (big-endian size_t),
+   the API id ('r' / 'm') and SST-1 FORBIDDENBYTEs, the data (CLEANBYTE
+   when allocated, DEADBYTE when freed) and SST FORBIDDENBYTEs; a bad pad
+   or API id is a fatal error after a dump of the block.  An OBJ block is
+   a head block: no prefix, the data is CLEANBYTE when allocated and SST
+   FORBIDDENBYTEs follow it; freed objects are poisoned with DEADBYTE
+   (qp_capi_memdbg_poison).  The MEM and OBJ hooks check that the caller
+   holds the GIL. */
+
+#define QP_MEMDBG_SST ((int)sizeof(size_t))
+#define QP_MEMDBG_EXTRA (3 * sizeof(size_t))    /* PYMEM_DEBUG_EXTRA_BYTES */
+#define QP_MEMDBG_CLEANBYTE 0xCD                /* PYMEM_CLEANBYTE */
+#define QP_MEMDBG_DEADBYTE 0xDD                 /* PYMEM_DEADBYTE */
+#define QP_MEMDBG_FORBIDDENBYTE 0xFD            /* PYMEM_FORBIDDENBYTE */
+
+typedef struct QPCapiMemDbgApi {
+    char api_id;
+    PyMemAllocatorEx alloc;     /* the wrapped allocator */
+} QPCapiMemDbgApi;
+
+static QPCapiMemDbgApi qp_capi_memdbg_raw = { 'r' };
+static QPCapiMemDbgApi qp_capi_memdbg_mem = { 'm' };
+static QPCapiMemDbgApi qp_capi_memdbg_obj = { 'o' };
+
+PyAPI_FUNC(void) _Py_NO_RETURN _Py_FatalErrorFormat(const char *func, const char *format, ...);
+
+/* Read sizeof(size_t) bytes at p as a big-endian size_t. */
+static size_t qp_capi_memdbg_read_size(const uint8_t *q)
+{
+    size_t result = *q++;
+    int i;
+    for (i = QP_MEMDBG_SST; --i > 0; ++q)
+        result = (result << 8) | *q;
+    return result;
+}
+
+/* Write n as a big-endian size_t at p. */
+static void qp_capi_memdbg_write_size(uint8_t *p, size_t n)
+{
+    uint8_t *q = p + QP_MEMDBG_SST - 1;
+    int i;
+    for (i = QP_MEMDBG_SST; --i >= 0; --q) {
+        *q = (uint8_t)(n & 0xff);
+        n >>= 8;
+    }
+}
+
+/* _PyObject_DebugDumpAddress: display info to stderr about the block at
+   p, then the traceback of its allocation (_PyMem_DumpTraceback; the
+   blocks are traced at their start, p - 2*SST). */
+static void qp_capi_memdbg_dump(const void *p)
+{
+    const uint8_t *q = (const uint8_t *)p;
+    const uint8_t *tail;
+    size_t nbytes;
+    int i, ok;
+    char id;
+
+    fprintf(stderr, "Debug memory block at address p=%p:", p);
+    if (p == NULL) {
+        fprintf(stderr, "\n");
+        return;
+    }
+    id = (char)q[-QP_MEMDBG_SST];
+    fprintf(stderr, " API '%c'\n", id);
+
+    nbytes = qp_capi_memdbg_read_size(q - 2 * QP_MEMDBG_SST);
+    fprintf(stderr, "    %zu bytes originally requested\n", nbytes);
+
+    /* In case this is nuts, check the leading pad bytes first. */
+    fprintf(stderr, "    The %d pad bytes at p-%d are ", QP_MEMDBG_SST - 1, QP_MEMDBG_SST - 1);
+    ok = 1;
+    for (i = 1; i <= QP_MEMDBG_SST - 1; ++i) {
+        if (*(q - i) != QP_MEMDBG_FORBIDDENBYTE) {
+            ok = 0;
+            break;
+        }
+    }
+    if (ok) {
+        fputs("FORBIDDENBYTE, as expected.\n", stderr);
+    } else {
+        fprintf(stderr, "not all FORBIDDENBYTE (0x%02x):\n", QP_MEMDBG_FORBIDDENBYTE);
+        for (i = QP_MEMDBG_SST - 1; i >= 1; --i) {
+            const uint8_t byte = *(q - i);
+            fprintf(stderr, "        at p-%d: 0x%02x", i, byte);
+            if (byte != QP_MEMDBG_FORBIDDENBYTE)
+                fputs(" *** OUCH", stderr);
+            fputc('\n', stderr);
+        }
+        fputs("    Because memory is corrupted at the start, the "
+              "count of bytes requested\n"
+              "       may be bogus, and checking the trailing pad "
+              "bytes may segfault.\n", stderr);
+    }
+
+    tail = q + nbytes;
+    fprintf(stderr, "    The %d pad bytes at tail=%p are ", QP_MEMDBG_SST, (const void *)tail);
+    ok = 1;
+    for (i = 0; i < QP_MEMDBG_SST; ++i) {
+        if (tail[i] != QP_MEMDBG_FORBIDDENBYTE) {
+            ok = 0;
+            break;
+        }
+    }
+    if (ok) {
+        fputs("FORBIDDENBYTE, as expected.\n", stderr);
+    } else {
+        fprintf(stderr, "not all FORBIDDENBYTE (0x%02x):\n", QP_MEMDBG_FORBIDDENBYTE);
+        for (i = 0; i < QP_MEMDBG_SST; ++i) {
+            const uint8_t byte = tail[i];
+            fprintf(stderr, "        at tail+%d: 0x%02x", i, byte);
+            if (byte != QP_MEMDBG_FORBIDDENBYTE)
+                fputs(" *** OUCH", stderr);
+            fputc('\n', stderr);
+        }
+    }
+
+    if (nbytes > 0) {
+        i = 0;
+        fputs("    Data at p:", stderr);
+        /* print up to 8 bytes at the start */
+        while (q < tail && i < 8) {
+            fprintf(stderr, " %02x", *q);
+            ++i;
+            ++q;
+        }
+        /* and up to 8 at the end */
+        if (q < tail) {
+            if (tail - q > 8) {
+                fputs(" ...", stderr);
+                q = tail - 8;
+            }
+            while (q < tail) {
+                fprintf(stderr, " %02x", *q);
+                ++q;
+            }
+        }
+        fputc('\n', stderr);
+    }
+    fputc('\n', stderr);
+    fflush(stderr);
+    qp_capi_tm_dump_traceback(fileno(stderr), (const uint8_t *)p - 2 * QP_MEMDBG_SST);
+}
+
+/* _PyMem_DebugCheckAddress: the forbidden bytes on both ends of p and its
+   API id, else a dump and a fatal error. */
+static void qp_capi_memdbg_check(const char *func, char api, const void *p)
+{
+    const uint8_t *q = (const uint8_t *)p;
+    const uint8_t *tail;
+    size_t nbytes;
+    int i;
+    char id;
+
+    id = (char)q[-QP_MEMDBG_SST];
+    if (id != api) {
+        qp_capi_memdbg_dump(p);
+        _Py_FatalErrorFormat(func, "bad ID: Allocated using API '%c', verified using API '%c'",
+                             id, api);
+    }
+    /* the start first: with an underwrite, the size may be nuts */
+    for (i = QP_MEMDBG_SST - 1; i >= 1; --i) {
+        if (*(q - i) != QP_MEMDBG_FORBIDDENBYTE) {
+            qp_capi_memdbg_dump(p);
+            _Py_FatalErrorFunc(func, "bad leading pad byte");
+        }
+    }
+    nbytes = qp_capi_memdbg_read_size(q - 2 * QP_MEMDBG_SST);
+    tail = q + nbytes;
+    for (i = 0; i < QP_MEMDBG_SST; ++i) {
+        if (tail[i] != QP_MEMDBG_FORBIDDENBYTE) {
+            qp_capi_memdbg_dump(p);
+            _Py_FatalErrorFunc(func, "bad trailing pad byte");
+        }
+    }
+}
+
+/* _PyMem_DebugRawAlloc */
+static void *qp_capi_memdbg_raw_alloc(int use_calloc, void *actx, size_t nbytes)
+{
+    QPCapiMemDbgApi *api = actx;
+    uint8_t *p, *data, *tail;
+    size_t total;
+
+    if (nbytes > (size_t)PY_SSIZE_T_MAX - QP_MEMDBG_EXTRA)
+        return NULL;
+    total = nbytes + QP_MEMDBG_EXTRA;
+    if (use_calloc)
+        p = QP_CAPI_A_CALLOC(&api->alloc, 1, total);
+    else
+        p = QP_CAPI_A_MALLOC(&api->alloc, total);
+    if (p == NULL)
+        return NULL;
+    data = p + 2 * QP_MEMDBG_SST;
+    qp_capi_memdbg_write_size(p, nbytes);
+    p[QP_MEMDBG_SST] = (uint8_t)api->api_id;
+    memset(p + QP_MEMDBG_SST + 1, QP_MEMDBG_FORBIDDENBYTE, QP_MEMDBG_SST - 1);
+    if (nbytes > 0 && !use_calloc)
+        memset(data, QP_MEMDBG_CLEANBYTE, nbytes);
+    tail = data + nbytes;
+    memset(tail, QP_MEMDBG_FORBIDDENBYTE, QP_MEMDBG_SST);
+    return data;
+}
+
+static void *qp_capi_memdbg_raw_malloc(void *actx, size_t nbytes)
+{
+    return qp_capi_memdbg_raw_alloc(0, actx, nbytes);
+}
+
+static void *qp_capi_memdbg_raw_calloc(void *actx, size_t nelem, size_t elsize)
+{
+    return qp_capi_memdbg_raw_alloc(1, actx, nelem * elsize);
+}
+
+/* _PyMem_DebugRawFree: checks the pads, fills the block with DEADBYTE,
+   then frees it */
+static void qp_capi_memdbg_raw_free_named(const char *func, void *actx, void *p)
+{
+    QPCapiMemDbgApi *api = actx;
+    uint8_t *q;
+    size_t nbytes;
+
+    if (p == NULL)
+        return;
+    q = (uint8_t *)p - 2 * QP_MEMDBG_SST;
+    qp_capi_memdbg_check(func, api->api_id, p);
+    nbytes = qp_capi_memdbg_read_size(q);
+    nbytes += QP_MEMDBG_EXTRA - 2 * QP_MEMDBG_SST;
+    memset(q, QP_MEMDBG_DEADBYTE, 2 * QP_MEMDBG_SST);
+    memset(p, QP_MEMDBG_DEADBYTE, nbytes);
+    QP_CAPI_A_FREE(&api->alloc, q);
+}
+
+static void qp_capi_memdbg_raw_free(void *actx, void *p)
+{
+    qp_capi_memdbg_raw_free_named("_PyMem_DebugRawFree", actx, p);
+}
+
+/* _PyMem_DebugRawRealloc */
+static void *qp_capi_memdbg_raw_realloc(void *actx, void *p, size_t nbytes)
+{
+    enum { ERASED_SIZE = 64 };
+    QPCapiMemDbgApi *api = actx;
+    uint8_t *head, *data, *r, *tail;
+    uint8_t save[2 * ERASED_SIZE];  /* a copy of the erased bytes */
+    size_t total, original_nbytes;
+
+    if (p == NULL)
+        return qp_capi_memdbg_raw_alloc(0, actx, nbytes);
+    qp_capi_memdbg_check("_PyMem_DebugRawRealloc", api->api_id, p);
+    data = (uint8_t *)p;
+    head = data - 2 * QP_MEMDBG_SST;
+    original_nbytes = qp_capi_memdbg_read_size(head);
+    if (nbytes > (size_t)PY_SSIZE_T_MAX - QP_MEMDBG_EXTRA)
+        return NULL;
+    total = nbytes + QP_MEMDBG_EXTRA;
+    tail = data + original_nbytes;
+    /* Mark the header, the trailer, ERASED_SIZE bytes at the begin and
+       ERASED_SIZE bytes at the end as dead and save the copy of erased
+       bytes. */
+    if (original_nbytes <= sizeof(save)) {
+        memcpy(save, data, original_nbytes);
+        memset(data - 2 * QP_MEMDBG_SST, QP_MEMDBG_DEADBYTE, original_nbytes + QP_MEMDBG_EXTRA);
+    } else {
+        memcpy(save, data, ERASED_SIZE);
+        memset(head, QP_MEMDBG_DEADBYTE, ERASED_SIZE + 2 * QP_MEMDBG_SST);
+        memcpy(&save[ERASED_SIZE], tail - ERASED_SIZE, ERASED_SIZE);
+        memset(tail - ERASED_SIZE, QP_MEMDBG_DEADBYTE,
+               ERASED_SIZE + QP_MEMDBG_EXTRA - 2 * QP_MEMDBG_SST);
+    }
+    /* Resize and add decorations. */
+    r = QP_CAPI_A_REALLOC(&api->alloc, head, total);
+    if (r == NULL) {
+        /* rewrite the header and footer which have just been erased */
+        nbytes = original_nbytes;
+    } else {
+        head = r;
+    }
+    data = head + 2 * QP_MEMDBG_SST;
+    qp_capi_memdbg_write_size(head, nbytes);
+    head[QP_MEMDBG_SST] = (uint8_t)api->api_id;
+    memset(head + QP_MEMDBG_SST + 1, QP_MEMDBG_FORBIDDENBYTE, QP_MEMDBG_SST - 1);
+    tail = data + nbytes;
+    memset(tail, QP_MEMDBG_FORBIDDENBYTE, QP_MEMDBG_SST);
+    /* Restore saved bytes. */
+    if (original_nbytes <= sizeof(save)) {
+        memcpy(data, save, Py_MIN(nbytes, original_nbytes));
+    } else {
+        size_t i = original_nbytes - ERASED_SIZE;
+        memcpy(data, save, Py_MIN(nbytes, (size_t)ERASED_SIZE));
+        if (nbytes > i)
+            memcpy(data + i, &save[ERASED_SIZE], Py_MIN(nbytes - i, (size_t)ERASED_SIZE));
+    }
+    if (r == NULL)
+        return NULL;
+    if (nbytes > original_nbytes) {
+        /* growing: mark new extra memory clean */
+        memset(data + original_nbytes, QP_MEMDBG_CLEANBYTE, nbytes - original_nbytes);
+    }
+    return data;
+}
+
+/* _PyMem_DebugCheckGIL: the caller holds the GIL (before the C API is
+   initialized and after it is finalized there is no thread state to hold) */
+static void qp_capi_memdbg_check_gil(const char *func)
+{
+    if (!PyGILState_Check())
+        _Py_FatalErrorFunc(func, "Python memory allocator called without holding the GIL");
+}
+
+/* _PyMem_DebugMalloc / Calloc / Realloc / Free (MEM domain) */
+static void *qp_capi_memdbg_mem_malloc(void *actx, size_t nbytes)
+{
+    qp_capi_memdbg_check_gil("_PyMem_DebugMalloc");
+    return qp_capi_memdbg_raw_alloc(0, actx, nbytes);
+}
+
+static void *qp_capi_memdbg_mem_calloc(void *actx, size_t nelem, size_t elsize)
+{
+    qp_capi_memdbg_check_gil("_PyMem_DebugCalloc");
+    return qp_capi_memdbg_raw_alloc(1, actx, nelem * elsize);
+}
+
+static void *qp_capi_memdbg_mem_realloc(void *actx, void *p, size_t nbytes)
+{
+    qp_capi_memdbg_check_gil("_PyMem_DebugRealloc");
+    return qp_capi_memdbg_raw_realloc(actx, p, nbytes);
+}
+
+static void qp_capi_memdbg_mem_free(void *actx, void *p)
+{
+    qp_capi_memdbg_check_gil("_PyMem_DebugFree");
+    qp_capi_memdbg_raw_free_named("_PyMem_DebugRawFree", actx, p);
+}
+
+/* The OBJ domain hooks (head blocks, see above). */
+static void *qp_capi_memdbg_obj_alloc(int use_calloc, void *actx, size_t nbytes)
+{
+    QPCapiMemDbgApi *api = actx;
+    uint8_t *data;
+
+    if (nbytes > (size_t)PY_SSIZE_T_MAX - QP_MEMDBG_SST)
+        return NULL;
+    if (use_calloc)
+        data = QP_CAPI_A_CALLOC(&api->alloc, 1, nbytes + QP_MEMDBG_SST);
+    else
+        data = QP_CAPI_A_MALLOC(&api->alloc, nbytes + QP_MEMDBG_SST);
+    if (data == NULL)
+        return NULL;
+    if (!use_calloc)
+        memset(data, QP_MEMDBG_CLEANBYTE, nbytes);
+    memset(data + nbytes, QP_MEMDBG_FORBIDDENBYTE, QP_MEMDBG_SST);
+    return data;
+}
+
+static void *qp_capi_memdbg_obj_malloc(void *actx, size_t nbytes)
+{
+    qp_capi_memdbg_check_gil("_PyMem_DebugMalloc");
+    return qp_capi_memdbg_obj_alloc(0, actx, nbytes);
+}
+
+static void *qp_capi_memdbg_obj_calloc(void *actx, size_t nelem, size_t elsize)
+{
+    qp_capi_memdbg_check_gil("_PyMem_DebugCalloc");
+    return qp_capi_memdbg_obj_alloc(1, actx, nelem * elsize);
+}
+
+static void *qp_capi_memdbg_obj_realloc(void *actx, void *p, size_t nbytes)
+{
+    QPCapiMemDbgApi *api = actx;
+    uint8_t *data;
+
+    qp_capi_memdbg_check_gil("_PyMem_DebugRealloc");
+    if (p == NULL)
+        return qp_capi_memdbg_obj_alloc(0, actx, nbytes);
+    if (nbytes > (size_t)PY_SSIZE_T_MAX - QP_MEMDBG_SST)
+        return NULL;
+    data = QP_CAPI_A_REALLOC(&api->alloc, p, nbytes + QP_MEMDBG_SST);
+    if (data)
+        memset(data + nbytes, QP_MEMDBG_FORBIDDENBYTE, QP_MEMDBG_SST);
+    return data;
+}
+
+static void qp_capi_memdbg_obj_free(void *actx, void *p)
+{
+    QPCapiMemDbgApi *api = actx;
+    qp_capi_memdbg_check_gil("_PyMem_DebugFree");
+    QP_CAPI_A_FREE(&api->alloc, p);
+}
+
+/* A head block is freed while the OBJ hook is installed: the object part
+   is filled with DEADBYTE (_PyMem_DebugRawFree), so that _PyObject_IsFreed
+   sees it. */
+static void qp_capi_memdbg_poison(JSRuntime *rt, QPCapiHead *h)
+{
+    size_t n = js_malloc_usable_size_rt(rt, h);
+    if (n > sizeof(QPCapiHead))
+        memset(QP_CAPI_OBJ(h), QP_MEMDBG_DEADBYTE, n - sizeof(QPCapiHead));
+}
+
+/* PYTHONMALLOC (ignored with -E and -I) is read before the first block of
+   any domain is allocated: "debug" and the "<allocator>_debug" names
+   install the debug hooks; there is no pymalloc or mimalloc here, the
+   other names keep the system malloc. */
+static int qp_capi_mem_configured;
+
+static void qp_capi_mem_configure(void)
+{
+    JSContext *ctx = qp_capi.ctx;
+    const char *s = NULL;
+    size_t n;
+
+    qp_capi_mem_configured = 1;
+    if (!(ctx && ctx->py && (QP_STATE(ctx)->config.ignore_environment ||
+                             QP_STATE(ctx)->config.isolated)))
+        s = getenv("PYTHONMALLOC");
+    if (!s)
+        return;
+    n = strlen(s);
+    if (strcmp(s, "debug") == 0 || (n > 6 && strcmp(s + n - 6, "_debug") == 0))
+        PyMem_SetupDebugHooks();
+}
+
+#define QP_CAPI_MEM_CONFIGURE()                   \
+    do {                                          \
+        if (unlikely(!qp_capi_mem_configured))    \
+            qp_capi_mem_configure();              \
+    } while (0)
+
+void *PyMem_RawMalloc(size_t size)
+{
+    QP_CAPI_MEM_CONFIGURE();
+    if (size > (size_t)PY_SSIZE_T_MAX)
+        return NULL;
+    return QP_CAPI_A_MALLOC(&qp_capi_allocators[PYMEM_DOMAIN_RAW], size);
+}
+
+void *PyMem_RawCalloc(size_t nelem, size_t elsize)
+{
+    QP_CAPI_MEM_CONFIGURE();
+    if (elsize != 0 && nelem > (size_t)PY_SSIZE_T_MAX / elsize)
+        return NULL;
+    return QP_CAPI_A_CALLOC(&qp_capi_allocators[PYMEM_DOMAIN_RAW], nelem, elsize);
+}
+
+void *PyMem_RawRealloc(void *ptr, size_t new_size)
+{
+    QP_CAPI_MEM_CONFIGURE();
+    if (new_size > (size_t)PY_SSIZE_T_MAX)
+        return NULL;
+    return QP_CAPI_A_REALLOC(&qp_capi_allocators[PYMEM_DOMAIN_RAW], ptr, new_size);
+}
+
+void PyMem_RawFree(void *ptr)
+{
+    QP_CAPI_MEM_CONFIGURE();
+    QP_CAPI_A_FREE(&qp_capi_allocators[PYMEM_DOMAIN_RAW], ptr);
+}
+
 void *PyMem_Malloc(size_t size)
 {
-    return PyMem_RawMalloc(size);
+    QP_CAPI_MEM_CONFIGURE();
+    if (size > (size_t)PY_SSIZE_T_MAX)
+        return NULL;
+    return QP_CAPI_A_MALLOC(&qp_capi_allocators[PYMEM_DOMAIN_MEM], size);
 }
 
 void *PyMem_Calloc(size_t nelem, size_t elsize)
 {
-    return PyMem_RawCalloc(nelem, elsize);
+    QP_CAPI_MEM_CONFIGURE();
+    if (elsize != 0 && nelem > (size_t)PY_SSIZE_T_MAX / elsize)
+        return NULL;
+    return QP_CAPI_A_CALLOC(&qp_capi_allocators[PYMEM_DOMAIN_MEM], nelem, elsize);
 }
 
 void *PyMem_Realloc(void *ptr, size_t new_size)
 {
-    return PyMem_RawRealloc(ptr, new_size);
+    QP_CAPI_MEM_CONFIGURE();
+    if (new_size > (size_t)PY_SSIZE_T_MAX)
+        return NULL;
+    return QP_CAPI_A_REALLOC(&qp_capi_allocators[PYMEM_DOMAIN_MEM], ptr, new_size);
 }
 
 void PyMem_Free(void *ptr)
 {
-    PyMem_RawFree(ptr);
+    QP_CAPI_MEM_CONFIGURE();
+    QP_CAPI_A_FREE(&qp_capi_allocators[PYMEM_DOMAIN_MEM], ptr);
 }
 
 char *_PyMem_Strdup(const char *str)
@@ -2245,51 +2782,129 @@ char *_PyMem_Strdup(const char *str)
 
 char *_PyMem_RawStrdup(const char *str)
 {
-    return _PyMem_Strdup(str);
+    size_t n = strlen(str) + 1;
+    char *copy = PyMem_RawMalloc(n);
+    if (!copy)
+        return NULL;
+    memcpy(copy, str, n);
+    return copy;
 }
-
-/* PyMem_SetAllocator/GetAllocator: the allocators are fixed (system malloc
-   for PyMem_*, runtime blocks with a head for PyObject_*); Get reports
-   them, Set is accepted only before the C API is used and then ignored. */
-static void *qp_capi_alloc_malloc(void *ctx, size_t n) { (void)ctx; return PyMem_RawMalloc(n); }
-static void *qp_capi_alloc_calloc(void *ctx, size_t n, size_t s) { (void)ctx; return PyMem_RawCalloc(n, s); }
-static void *qp_capi_alloc_realloc(void *ctx, void *p, size_t n) { (void)ctx; return PyMem_RawRealloc(p, n); }
-static void qp_capi_alloc_free(void *ctx, void *p) { (void)ctx; PyMem_RawFree(p); }
-static void *qp_capi_obj_malloc(void *ctx, size_t n) { (void)ctx; return PyObject_Malloc(n); }
-static void *qp_capi_obj_calloc(void *ctx, size_t n, size_t s) { (void)ctx; return PyObject_Calloc(n, s); }
-static void *qp_capi_obj_realloc(void *ctx, void *p, size_t n) { (void)ctx; return PyObject_Realloc(p, n); }
-static void qp_capi_obj_free(void *ctx, void *p) { (void)ctx; PyObject_Free(p); }
 
 void PyMem_GetAllocator(PyMemAllocatorDomain domain, PyMemAllocatorEx *allocator)
 {
-    if (domain == PYMEM_DOMAIN_OBJ) {
-        allocator->ctx = NULL;
-        allocator->malloc = qp_capi_obj_malloc;
-        allocator->calloc = qp_capi_obj_calloc;
-        allocator->realloc = qp_capi_obj_realloc;
-        allocator->free = qp_capi_obj_free;
-    } else {
-        allocator->ctx = NULL;
-        allocator->malloc = qp_capi_alloc_malloc;
-        allocator->calloc = qp_capi_alloc_calloc;
-        allocator->realloc = qp_capi_alloc_realloc;
-        allocator->free = qp_capi_alloc_free;
-    }
+    QP_CAPI_MEM_CONFIGURE();
+    if ((unsigned)domain <= PYMEM_DOMAIN_OBJ)
+        *allocator = qp_capi_allocators[domain];
+    else
+        memset(allocator, 0, sizeof(*allocator));
 }
 
 void PyMem_SetAllocator(PyMemAllocatorDomain domain, PyMemAllocatorEx *allocator)
 {
-    (void)domain;
-    (void)allocator;
+    QP_CAPI_MEM_CONFIGURE();
+    if ((unsigned)domain <= PYMEM_DOMAIN_OBJ)
+        qp_capi_allocators[domain] = *allocator;
 }
 
+/* PyMem_SetupDebugHooks: wrap the allocator of each domain (once) */
 void PyMem_SetupDebugHooks(void)
 {
+    PyMemAllocatorEx *a;
+
+    qp_capi_mem_configured = 1;
+    a = &qp_capi_allocators[PYMEM_DOMAIN_RAW];
+    if (a->malloc != qp_capi_memdbg_raw_malloc) {
+        qp_capi_memdbg_raw.alloc = *a;
+        *a = (PyMemAllocatorEx){ &qp_capi_memdbg_raw, qp_capi_memdbg_raw_malloc,
+                                 qp_capi_memdbg_raw_calloc, qp_capi_memdbg_raw_realloc,
+                                 qp_capi_memdbg_raw_free };
+    }
+    a = &qp_capi_allocators[PYMEM_DOMAIN_MEM];
+    if (a->malloc != qp_capi_memdbg_mem_malloc) {
+        qp_capi_memdbg_mem.alloc = *a;
+        *a = (PyMemAllocatorEx){ &qp_capi_memdbg_mem, qp_capi_memdbg_mem_malloc,
+                                 qp_capi_memdbg_mem_calloc, qp_capi_memdbg_mem_realloc,
+                                 qp_capi_memdbg_mem_free };
+    }
+    a = &qp_capi_allocators[PYMEM_DOMAIN_OBJ];
+    if (a->malloc != qp_capi_memdbg_obj_malloc) {
+        qp_capi_memdbg_obj.alloc = *a;
+        *a = (PyMemAllocatorEx){ &qp_capi_memdbg_obj, qp_capi_memdbg_obj_malloc,
+                                 qp_capi_memdbg_obj_calloc, qp_capi_memdbg_obj_realloc,
+                                 qp_capi_memdbg_obj_free };
+        qp_capi_memdbg_obj_on = 1;
+    }
 }
 
-void *PyObject_Malloc(size_t size)
+/* _PyMem_IsPtrFreed (pycore_pymem.h): NULL or a debug hook fill pattern */
+static inline int qp_capi_mem_is_ptr_freed(const void *ptr)
+{
+    uintptr_t value = (uintptr_t)ptr;
+#if UINTPTR_MAX > 0xFFFFFFFFu
+    return (value == 0 || value == (uintptr_t)0xCDCDCDCDCDCDCDCDull ||
+            value == (uintptr_t)0xDDDDDDDDDDDDDDDDull || value == (uintptr_t)0xFDFDFDFDFDFDFDFDull ||
+            value == (uintptr_t)0xFFFFFFFFFFFFFFFFull);
+#else
+    return (value == 0 || value == 0xCDCDCDCDu || value == 0xDDDDDDDDu ||
+            value == 0xFDFDFDFDu || value == 0xFFFFFFFFu);
+#endif
+}
+
+/* Objects/object.c (pycore_object.h): the object memory looks freed */
+PyAPI_FUNC(int) _PyObject_IsFreed(PyObject *op);
+int _PyObject_IsFreed(PyObject *op)
+{
+    if (qp_capi_mem_is_ptr_freed(op) || qp_capi_mem_is_ptr_freed(Py_TYPE(op)))
+        return 1;
+    return 0;
+}
+
+/* _testinternalcapi.check_pyobject_{null,uninitialized,forbidden_bytes,
+   freed}_is_freed (which 0..3, mod_testinternalcapi.c): objects that the
+   debug hooks make look freed (the blocks are leaked on purpose, the
+   caller exits at once). */
+static JSValue qp_capi_tic_check_pyobject_is_freed(JSContext *ctx, int which)
+{
+    PyObject *op = NULL;
+
+    if (qp_capi_init(ctx) < 0)
+        return JS_EXCEPTION;
+    switch (which) {
+    case 0:
+        break;
+    case 1:
+        /* object fields like ob_type are uninitialized */
+        op = PyObject_Malloc(sizeof(PyObject));
+        if (op == NULL)
+            return qp_raise_memory_error(ctx);
+        op->ob_refcnt = 1;
+        break;
+    case 2:
+        /* ob_type is after the block: part of the forbidden bytes */
+        op = PyObject_Malloc(offsetof(PyObject, ob_type));
+        if (op == NULL)
+            return qp_raise_memory_error(ctx);
+        op->ob_refcnt = 1;
+        break;
+    default:
+        op = PyObject_CallNoArgs((PyObject *)&PyBaseObject_Type);
+        if (op == NULL)
+            return JS_EXCEPTION;
+        Py_TYPE(op)->tp_dealloc(op);
+        /* the object memory is freed */
+        op->ob_refcnt = 1;
+        break;
+    }
+    if (!_PyObject_IsFreed(op))
+        return qp_raise(ctx, QP_EXC(ctx, AssertionError), "object is not seen as freed");
+    return JS_UNDEFINED;
+}
+
+/* the default OBJ allocator: head blocks (zeroed) */
+static void *qp_capi_obj_malloc(void *actx, size_t size)
 {
     QPCapiHead *h = qp_capi_block_alloc(size ? size : 1);
+    (void)actx;
     if (!h)
         return NULL;
     h->tag = QP_CAPI_TAG_RAW;
@@ -2297,20 +2912,18 @@ void *PyObject_Malloc(size_t size)
     return QP_CAPI_OBJ(h);
 }
 
-void *PyObject_Calloc(size_t nelem, size_t elsize)
+static void *qp_capi_obj_calloc(void *actx, size_t nelem, size_t elsize)
 {
-    if (elsize != 0 && nelem > (size_t)PY_SSIZE_T_MAX / elsize)
-        return NULL;
-    return PyObject_Malloc(nelem * elsize);    /* blocks are zeroed */
+    return qp_capi_obj_malloc(actx, nelem * elsize);    /* blocks are zeroed */
 }
 
-void *PyObject_Realloc(void *ptr, size_t new_size)
+static void *qp_capi_obj_realloc(void *actx, void *ptr, size_t new_size)
 {
     QPCapiHead *h, *nh;
     size_t old_total;
     BOOL live, weak, mapped;
     if (!ptr)
-        return PyObject_Malloc(new_size);
+        return qp_capi_obj_malloc(actx, new_size);
     if (!new_size)
         new_size = 1;
     if (new_size > (size_t)PY_SSIZE_T_MAX - sizeof(QPCapiHead))
@@ -2357,9 +2970,10 @@ void *PyObject_Realloc(void *ptr, size_t new_size)
     return QP_CAPI_OBJ(nh);
 }
 
-void PyObject_Free(void *ptr)
+static void qp_capi_obj_free(void *actx, void *ptr)
 {
     QPCapiHead *h;
+    (void)actx;
     if (!ptr)
         return;
     h = QP_CAPI_HEAD(ptr);
@@ -2367,12 +2981,44 @@ void PyObject_Free(void *ptr)
         return;             /* runtime gone: leaked */
     if (h->tag == QP_CAPI_TAG_RAW) {
         h->tag = QP_CAPI_TAG_FREED;
+        if (unlikely(qp_capi_memdbg_obj_on))
+            qp_capi_memdbg_poison(qp_capi.rt, h);
         js_free_rt(qp_capi.rt, h);
         return;
     }
     if (h->tag != QP_CAPI_TAG_OBJECT)
         return;             /* double free: ignored */
     qp_capi_release(qp_capi.rt, h);
+}
+
+void *PyObject_Malloc(size_t size)
+{
+    QP_CAPI_MEM_CONFIGURE();
+    if (size > (size_t)PY_SSIZE_T_MAX)
+        return NULL;
+    return QP_CAPI_A_MALLOC(&qp_capi_allocators[PYMEM_DOMAIN_OBJ], size);
+}
+
+void *PyObject_Calloc(size_t nelem, size_t elsize)
+{
+    QP_CAPI_MEM_CONFIGURE();
+    if (elsize != 0 && nelem > (size_t)PY_SSIZE_T_MAX / elsize)
+        return NULL;
+    return QP_CAPI_A_CALLOC(&qp_capi_allocators[PYMEM_DOMAIN_OBJ], nelem, elsize);
+}
+
+void *PyObject_Realloc(void *ptr, size_t new_size)
+{
+    QP_CAPI_MEM_CONFIGURE();
+    if (new_size > (size_t)PY_SSIZE_T_MAX)
+        return NULL;
+    return QP_CAPI_A_REALLOC(&qp_capi_allocators[PYMEM_DOMAIN_OBJ], ptr, new_size);
+}
+
+void PyObject_Free(void *ptr)
+{
+    QP_CAPI_MEM_CONFIGURE();
+    QP_CAPI_A_FREE(&qp_capi_allocators[PYMEM_DOMAIN_OBJ], ptr);
 }
 
 /* ========================================================================= */

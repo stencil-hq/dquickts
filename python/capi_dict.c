@@ -190,13 +190,26 @@ static PyObject *qp_capi_dict_getitem_quiet(JSContext *ctx, PyObject *op, PyObje
                                             const char *warnmsg)
 {
     QPCapiErrSave saved;
-    PyObject *res;
-    int err;
+    PyObject *res = NULL;
+    JSValue k, fk;
+    Py_hash_t h = -1;
+    int err = 1;
 
     if (!PyAnyDict_Check(op))
         return NULL;
     qp_capi_err_save(ctx, &saved);
-    res = qp_capi_dict_get_borrowed(ctx, op, key, NULL, &err);
+    /* _PyObject_HashFast: a hash error is reported as is (no
+       dict_unhashable_type rewrap). */
+    k = qp_capi_value(ctx, key);
+    if (!JS_IsException(k)) {
+        fk = qp_capi_dict_flat_key(ctx, k);
+        if (!JS_IsException(fk)) {
+            h = JS_VALUE_GET_TAG(fk) == JS_TAG_STRING ? qp_str_hash(ctx, fk) : qp_hash(ctx, fk);
+            JS_FreeValue(ctx, fk);
+        }
+    }
+    if (h != -1)
+        res = qp_capi_dict_get_borrowed(ctx, op, key, &h, &err);
     if (err) {
         if (PyErr_ExceptionMatches(PyExc_KeyError))
             qp_err_clear(ctx);
@@ -566,7 +579,7 @@ PyObject *PyDict_Copy(PyObject *o)
     JSContext *ctx = qp_capi.ctx;
     JSValue d;
 
-    if (o == NULL || !PyAnyDict_Check(o)) {
+    if (o == NULL || !PyDict_Check(o)) {
         PyErr_BadInternalCall();
         return NULL;
     }
@@ -625,10 +638,13 @@ int PyDict_Merge(PyObject *a, PyObject *b, int override)
     JSContext *ctx = qp_capi.ctx;
     JSValue d, o;
 
-    if (a == NULL || !PyDict_Check(a) || b == NULL) {
+    /* dict_merge_api: a frozendict `a` is reported before a NULL `b` */
+    if (a == NULL || (b == NULL && PyDict_Check(a))) {
         PyErr_BadInternalCall();
         return -1;
     }
+    if (qp_capi_dict_mutable(a, "assignment") < 0)
+        return -1;
     d = qp_capi_e1_jv(ctx, a);
     if (JS_IsException(d))
         return -1;
@@ -648,10 +664,12 @@ int PyDict_MergeFromSeq2(PyObject *a, PyObject *seq2, int override)
     JSContext *ctx = qp_capi.ctx;
     JSValue d, s;
 
-    if (a == NULL || !PyDict_Check(a) || seq2 == NULL) {
+    if (a == NULL || seq2 == NULL) {
         PyErr_BadInternalCall();
         return -1;
     }
+    if (qp_capi_dict_mutable(a, "assignment") < 0)
+        return -1;
     d = qp_capi_e1_jv(ctx, a);
     if (JS_IsException(d))
         return -1;
@@ -673,10 +691,8 @@ static int qp_capi_dict_setdefault(JSContext *ctx, PyObject *op, PyObject *key,
 
     if (pres)
         *pres = NULL;
-    if (!PyDict_Check(op)) {
-        PyErr_BadInternalCall();
+    if (qp_capi_dict_mutable(op, "assignment") < 0)
         return -1;
-    }
     d = qp_capi_e1_jv(ctx, op);
     if (JS_IsException(d))
         return -1;
@@ -735,21 +751,20 @@ static int qp_capi_dict_pop(JSContext *ctx, PyObject *op, PyObject *key, const P
 
     if (result)
         *result = NULL;
-    if (!PyDict_Check(op)) {
-        PyErr_BadInternalCall();
+    if (qp_capi_dict_mutable(op, "deletion") < 0)
         return -1;
-    }
     d = qp_capi_e1_jv(ctx, op);
     if (JS_IsException(d))
         return -1;
+    /* An empty dict answers 0 before the key is looked at. */
+    if (QP_DICT(d)->core.used == 0)
+        return 0;
     k = qp_capi_value(ctx, key);
     if (JS_IsException(k))
         return -1;
     if (!known) {
         r = qp_dict_pop_impl(ctx, d, k, &v);
     } else {
-        if (QP_DICT(d)->core.used == 0)
-            return 0;
         if (qp_capi_dict_prep(ctx, d, k, known, &fk, &h) < 0)
             return -1;
         r = qp_dictcore_pop(ctx, &QP_DICT(d)->core, fk, h, qp_dict_eq_cb, NULL, &v);
@@ -799,6 +814,204 @@ PyObject *_PyDict_Pop(PyObject *dict, PyObject *key, PyObject *default_value)
         return NULL;
     }
     return result;
+}
+
+/* ---- dict watchers (Objects/dictobject.c) ------------------------------- */
+
+/* The watcher bits of a dict are the low bits of its qp_dictcore.version
+   (CPython _ma_watcher_tag), so mutations made by Python code reach
+   qp_capi_dict_notify from the table code (dictcore.c).  A watched dict is
+   found from its core through qp_capi_dict_watched (core -> JSObject*,
+   entries added by PyDict_Watch and dropped by PyDict_Unwatch of the last
+   bit or by the dict's finalizer).  PyDict_EVENT_DEALLOCATED is reported
+   from the finalizer queue: the free of a watched dict is deferred there
+   (qp_capi_dealloc_watched), as CPython's dict_dealloc resurrects it for
+   the callbacks. */
+#define QP_CAPI_DICT_MAX_WATCHERS 8         /* DICT_MAX_WATCHERS */
+#define QP_CAPI_DICT_FIRST_WATCHER 3        /* FIRST_AVAILABLE_WATCHER: 0-2 are CPython's */
+
+static_assert(PyDict_EVENT_ADDED == QP_DC_EVENT_ADDED &&
+              PyDict_EVENT_MODIFIED == QP_DC_EVENT_MODIFIED &&
+              PyDict_EVENT_DELETED == QP_DC_EVENT_DELETED &&
+              PyDict_EVENT_CLONED == QP_DC_EVENT_CLONED &&
+              PyDict_EVENT_CLEARED == QP_DC_EVENT_CLEARED &&
+              PyDict_EVENT_DEALLOCATED == QP_DC_EVENT_DEALLOCATED,
+              "dictcore watcher events");
+static_assert((1 << QP_CAPI_DICT_MAX_WATCHERS) - 1 == QP_DC_WATCHER_MASK,
+              "dict watcher bits");
+
+static PyDict_WatchCallback qp_capi_dict_watchers[QP_CAPI_DICT_MAX_WATCHERS];
+static QPCapiMap *qp_capi_dict_watched;
+
+static const char *qp_capi_dict_event_name(int event)
+{
+    switch (event) {
+#define QP_CAPI_DICT_EVENT_CASE(op) case PyDict_EVENT_##op: return "PyDict_EVENT_" #op;
+    PY_FOREACH_DICT_EVENT(QP_CAPI_DICT_EVENT_CASE)
+#undef QP_CAPI_DICT_EVENT_CASE
+    }
+    return "?";
+}
+
+/* _PyDict_SendEvent */
+static void qp_capi_dict_notify(JSContext *ctx, qp_dictcore *d, int event,
+                                JSValueConst key, JSValueConst value)
+{
+    unsigned bits = (unsigned)(d->version & QP_DC_WATCHER_MASK) & qp_capi_dict_watchers_set;
+    JSObject *p;
+    PyObject *mp, *k = NULL, *v = NULL;
+    int i;
+
+    if (!bits || qp_capi_dead)
+        return;
+    p = qp_capi_map_get(qp_capi_dict_watched, (uintptr_t)d);
+    if (!p)
+        return;
+    mp = qp_capi_new_ref(ctx, JS_MKPTR(JS_TAG_OBJECT, p));
+    if (mp && JS_VALUE_GET_TAG(key) != JS_TAG_UNINITIALIZED && !(k = qp_capi_new_ref(ctx, key)))
+        Py_CLEAR(mp);
+    if (mp && JS_VALUE_GET_TAG(value) != JS_TAG_UNINITIALIZED &&
+        !(v = qp_capi_new_ref(ctx, value)))
+        Py_CLEAR(mp);
+    if (!mp) {
+        Py_XDECREF(k);
+        PyErr_FormatUnraisable("Exception ignored in %s watcher callback for <dict at %p>",
+                               qp_capi_dict_event_name(event), (void *)p);
+        return;
+    }
+    for (i = 0; bits; i++, bits >>= 1) {
+        PyDict_WatchCallback cb;
+        if (!(bits & 1))
+            continue;
+        cb = qp_capi_dict_watchers[i];
+        if (cb && cb((PyDict_WatchEvent)event, mp, k, v) < 0) {
+            /* CPython does not pass the dict as the context (its repr can
+               run arbitrary code) */
+            PyErr_FormatUnraisable("Exception ignored in %s watcher callback for <dict at %p>",
+                                   qp_capi_dict_event_name(event), (void *)mp);
+        }
+    }
+    Py_XDECREF(v);
+    Py_XDECREF(k);
+    Py_DECREF(mp);
+}
+
+static void qp_capi_dict_forget(qp_dictcore *d)
+{
+    qp_capi_map_del(qp_capi_dict_watched, (uintptr_t)d);
+}
+
+/* dict_dealloc's PyDict_EVENT_DEALLOCATED (finalizer queue, p alive). */
+static void qp_capi_dict_dealloc_notify(JSContext *ctx, JSObject *p)
+{
+    QPDict *d = p->u.opaque;
+    if (d && (d->core.version & QP_DC_WATCHER_MASK))
+        qp_capi_dict_notify(ctx, &d->core, QP_DC_EVENT_DEALLOCATED,
+                            JS_UNINITIALIZED, JS_UNINITIALIZED);
+}
+
+static int qp_capi_dict_validate_watcher(int watcher_id)
+{
+    if (watcher_id < 0 || watcher_id >= QP_CAPI_DICT_MAX_WATCHERS) {
+        PyErr_Format(PyExc_ValueError, "Invalid dict watcher ID %d", watcher_id);
+        return -1;
+    }
+    if (!qp_capi_dict_watchers[watcher_id]) {
+        PyErr_Format(PyExc_ValueError, "No dict watcher set for ID %d", watcher_id);
+        return -1;
+    }
+    return 0;
+}
+
+/* The dict core of a watch / unwatch target, NULL + ValueError. */
+static QPDict *qp_capi_dict_watch_target(JSContext *ctx, PyObject *dict, int watcher_id,
+                                         JSObject **pp)
+{
+    JSValue v;
+    if (!PyDict_Check(dict)) {
+        PyErr_SetString(PyExc_ValueError, "Cannot watch non-dictionary");
+        return NULL;
+    }
+    if (qp_capi_dict_validate_watcher(watcher_id) < 0)
+        return NULL;
+    v = qp_capi_value(ctx, dict);
+    if (JS_IsException(v))
+        return NULL;
+    if (!qp_dict_check(ctx, v) || !QP_DICT(v)) {
+        PyErr_SetString(PyExc_ValueError, "Cannot watch non-dictionary");
+        return NULL;
+    }
+    *pp = JS_VALUE_GET_OBJ(v);
+    return QP_DICT(v);
+}
+
+int PyDict_Watch(int watcher_id, PyObject *dict)
+{
+    JSContext *ctx = qp_capi.ctx;
+    JSObject *p;
+    QPDict *d = qp_capi_dict_watch_target(ctx, dict, watcher_id, &p);
+
+    if (!d)
+        return -1;
+    if (!qp_capi_dict_watched && !(qp_capi_dict_watched = qp_capi_map_new())) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    if (qp_capi_map_put(qp_capi_dict_watched, (uintptr_t)&d->core, p) < 0) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    d->core.version |= (uint64_t)1 << watcher_id;
+    return 0;
+}
+
+int PyDict_Unwatch(int watcher_id, PyObject *dict)
+{
+    JSContext *ctx = qp_capi.ctx;
+    JSObject *p;
+    QPDict *d = qp_capi_dict_watch_target(ctx, dict, watcher_id, &p);
+
+    if (!d)
+        return -1;
+    d->core.version &= ~((uint64_t)1 << watcher_id);
+    if (!(d->core.version & QP_DC_WATCHER_MASK))
+        qp_capi_dict_forget(&d->core);
+    return 0;
+}
+
+int PyDict_AddWatcher(PyDict_WatchCallback callback)
+{
+    int i;
+    /* Some watchers are reserved for CPython, start at the first available one */
+    for (i = QP_CAPI_DICT_FIRST_WATCHER; i < QP_CAPI_DICT_MAX_WATCHERS; i++) {
+        if (!qp_capi_dict_watchers[i]) {
+            qp_capi_dict_watchers[i] = callback;
+            qp_capi_dict_watchers_set |= (uint8_t)(1 << i);
+            return i;
+        }
+    }
+    PyErr_SetString(PyExc_RuntimeError, "no more dict watcher IDs available");
+    return -1;
+}
+
+/* The dicts keep their watcher bits (CPython); events of a cleared ID are
+   no longer delivered. */
+int PyDict_ClearWatcher(int watcher_id)
+{
+    if (qp_capi_dict_validate_watcher(watcher_id) < 0)
+        return -1;
+    qp_capi_dict_watchers[watcher_id] = NULL;
+    qp_capi_dict_watchers_set &= (uint8_t)~(1 << watcher_id);
+    return 0;
+}
+
+/* qp_capi_runtime_clear: the watchers are per interpreter. */
+static void qp_capi_dict_watchers_clear(void)
+{
+    memset(qp_capi_dict_watchers, 0, sizeof(qp_capi_dict_watchers));
+    qp_capi_dict_watchers_set = 0;
+    qp_capi_map_free(qp_capi_dict_watched);
+    qp_capi_dict_watched = NULL;
 }
 
 /* ========================================================================= */
@@ -880,6 +1093,18 @@ int PySet_Contains(PyObject *anyset, PyObject *key)
 {
     if (!PyAnySet_Check(anyset)) {
         PyErr_BadInternalCall();
+        return -1;
+    }
+    /* set.__contains__ looks an (unhashable) set key up as a frozenset;
+       PySet_Contains does not: set_unhashable_type */
+    if (PySet_Check(key) && PyObject_Hash(key) == -1) {
+        PyObject *exc = PyErr_GetRaisedException();
+        if (!Py_IS_TYPE(exc, (PyTypeObject *)PyExc_TypeError)) {
+            PyErr_SetRaisedException(exc);
+            return -1;
+        }
+        PyErr_Format(PyExc_TypeError, "cannot use '%T' as a set element (%S)", key, exc);
+        Py_DECREF(exc);
         return -1;
     }
     return qp_capi_set_key_op(anyset, key, 0);
@@ -973,7 +1198,7 @@ int _PySet_Update(PyObject *set, PyObject *iterable)
     JSContext *ctx = qp_capi.ctx;
     JSValue s, it;
 
-    if (!PyAnySet_Check(set)) {
+    if (!PySet_Check(set)) {
         PyErr_BadInternalCall();
         return -1;
     }
@@ -1313,10 +1538,15 @@ PyObject *PyWeakref_NewProxy(PyObject *ob, PyObject *callback)
 int PyWeakref_GetRef(PyObject *ref, PyObject **pobj)
 {
     JSContext *ctx = qp_capi.ctx;
-    QPWeakRec *rec = qp_capi_weakref_rec(ctx, ref, TRUE);
+    QPWeakRec *rec;
     JSValue v;
 
     *pobj = NULL;
+    if (ref == NULL) {
+        PyErr_BadInternalCall();
+        return -1;
+    }
+    rec = qp_capi_weakref_rec(ctx, ref, TRUE);
     if (!rec)
         return -1;
     if (!rec->target)
@@ -1338,6 +1568,19 @@ PyObject *PyWeakref_GetObject(PyObject *ref)
     if (!rec->target) {
         qp_capi_pin_drop(ref, key);
         return Py_None;
+    }
+    {
+        /* the referent is held by C already (ob_refcnt >= 1): borrow that
+           reference, as CPython does, without counting one more */
+        QPCapiHead *h = qp_capi_head_of_jobj(rec->target);
+        if (h && (h->flags & QP_CAPI_F_LIVE) && !(h->flags & QP_CAPI_F_ORPHAN)) {
+            PyObject *pinned = qp_capi_pin_get(ref, key);
+            if (pinned == QP_CAPI_OBJ(h))
+                return pinned;
+            if (pinned)
+                qp_capi_pin_drop(ref, key);
+            return QP_CAPI_OBJ(h);
+        }
     }
     return qp_capi_borrow(ctx, ref, key, JS_MKPTR(JS_TAG_OBJECT, rec->target));
 }

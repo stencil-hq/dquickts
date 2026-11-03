@@ -164,6 +164,9 @@ struct tok_state {
     int pendin;         /* Pending indents (if > 0) or dedents (if < 0) */
     const char *prompt, *nextprompt;    /* Always NULL (no interactive prompting) */
     int lineno;         /* Current line number */
+    int qp_nul_lineno;  /* dquickts: line of the first null byte of a source
+                           file (the string ends there; tok_nextc reports it
+                           when it reads that line, as for a file), 0 = none */
     int first_lineno;   /* First line of a single line or multi line string
                            expression (cf. issue 16806) */
     int starting_col_offset; /* The column offset at the beginning of a token */

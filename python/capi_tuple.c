@@ -60,8 +60,7 @@ static void qp_exc_set_traceback_raw(JSContext *ctx, JSValueConst exc, JSValue t
 static JSValue qp_exc_args(JSValueConst exc);
 /* traceback.c (unit i) */
 static JSValue qp_tb_alloc(JSContext *ctx, JSValueConst next, JSValueConst func,
-                           JSValueConst frame, int lasti, int lineno,
-                           JSValueConst self_hint, JSValueConst locals);
+                           JSValueConst frame, int lasti, int lineno);
 static JSValue qp_tb_source_line_stripped(JSContext *ctx, JSValueConst filename, int lineno);
 /* sysmodule.c (unit k) */
 static JSValue qp_sys_get(JSContext *ctx, JSAtom name);
@@ -172,6 +171,30 @@ static struct {
     int depth;
 } qp_capi_tuple_fill = { qp_capi_tuple_fill_small, 0, QP_CAPI_TUPLE_FILL_SMALL, 0, 0 };
 
+/* A non-tuple kind init that reads the items of the tuple mirrors it
+   creates (code: co_varnames, ...) may run inside a tuple fill (depth > 0),
+   where new tuple mirrors would only be queued for the outer loop and have
+   NULL items: suspend makes them fill immediately (the re-entry path of
+   qp_capi_tuple_init: their work entries start at the current count),
+   resume restores the outer loop's state. */
+typedef struct QPCapiTupleFillSave {
+    size_t done;
+    int depth;
+} QPCapiTupleFillSave;
+
+static void qp_capi_tuple_fill_suspend(QPCapiTupleFillSave *s)
+{
+    s->done = qp_capi_tuple_fill.done;
+    s->depth = qp_capi_tuple_fill.depth;
+    qp_capi_tuple_fill.depth = 0;
+}
+
+static void qp_capi_tuple_fill_resume(const QPCapiTupleFillSave *s)
+{
+    qp_capi_tuple_fill.done = s->done;
+    qp_capi_tuple_fill.depth = s->depth;
+}
+
 static int qp_capi_tuple_push(JSContext *ctx, PyObject *op)
 {
     if (qp_capi_tuple_fill.count == qp_capi_tuple_fill.size) {
@@ -209,7 +232,26 @@ static int qp_capi_tuple_fill_one(JSContext *ctx, PyObject *op)
     Py_ssize_t i, n = Py_SIZE(op);
 
     for (i = 0; i < n; i++) {
-        PyObject *item = qp_capi_new_ref(ctx, QP_TUPLE_ITEMS(v)[i]);
+        JSValueConst iv = QP_TUPLE_ITEMS(v)[i];
+        PyObject *item;
+        if (QP_IS_NULL(iv)) {
+            t->ob_item[i] = NULL;   /* a slot C code has not set yet */
+            continue;
+        }
+        if (qp_tuple_check_exact(ctx, iv)) {
+            /* a nested tuple only queues itself (filled by the outer loop) */
+            item = qp_capi_new_ref(ctx, iv);
+        } else {
+            /* another kind may read the items of the tuples its init
+               makes (code: co_varnames): they are filled by a loop of
+               their own, which must not disturb this one */
+            size_t done = qp_capi_tuple_fill.done;
+            int depth = qp_capi_tuple_fill.depth;
+            qp_capi_tuple_fill.depth = 0;
+            item = qp_capi_new_ref(ctx, iv);
+            qp_capi_tuple_fill.depth = depth;
+            qp_capi_tuple_fill.done = done;
+        }
         if (!item)
             return -1;
         t->ob_item[i] = item;
@@ -284,9 +326,9 @@ static JSValue qp_capi_tuple_to_js(JSContext *ctx, PyObject *op)
                lists store the pointer, and the owner fills the items
                afterwards with PyTuple_SetItem (Modules/_scproxy.c), which
                updates the bound JS tuple (qp_capi_tuple_store_js).  The
-               empty slot reads as None until then, like store_js of
-               NULL. */
-            vals[i] = JS_UNDEFINED;
+               empty slot stays NULL in the JS tuple (repr "<NULL>"), like
+               store_js of NULL. */
+            vals[i] = QP_NULL;
             continue;
         }
         vals[i] = qp_capi_to_js(ctx, t->ob_item[i]);
@@ -340,6 +382,11 @@ static void qp_capi_tuple_refresh(JSContext *ctx, PyObject *op)
     for (i = 0; i < n; i++) {
         JSValueConst jv = QP_TUPLE_ITEMS(h->v)[i];
         PyObject *old = t->ob_item[i], *item;
+        if (QP_IS_NULL(jv)) {
+            t->ob_item[i] = NULL;
+            Py_XDECREF(old);
+            continue;
+        }
         if (old) {
             if (QP_CAPI_HAS_HEAD(old)) {
                 QPCapiHead *oh = QP_CAPI_HEAD(old);
@@ -482,7 +529,7 @@ static void qp_capi_tuple_store_js(JSContext *ctx, PyObject *op, Py_ssize_t i, P
 {
     QPCapiHead *h = QP_CAPI_HEAD(op);
     QPTuple *qt = QP_TUPLE(h->v);
-    JSValue nv = value ? qp_capi_to_js(ctx, value) : JS_UNDEFINED;
+    JSValue nv = value ? qp_capi_to_js(ctx, value) : QP_NULL;
     JSValue old;
 
     if (JS_IsException(nv))
@@ -629,6 +676,38 @@ PyObject *_PyTuple_FromPairSteal(PyObject *a, PyObject *b)
     ((PyTupleObject *)res)->ob_item[0] = a;
     ((PyTupleObject *)res)->ob_item[1] = b;
     return res;
+}
+
+/* _testinternalcapi.tuple_from_pair / tuple_from_pair_steal
+   (mod_testinternalcapi.c): the tuple made by _PyTuple_FromPair[Steal]. */
+static JSValue qp_capi_tic_tuple_from_pair(JSContext *ctx, JSValueConst a, JSValueConst b,
+                                           BOOL steal)
+{
+    PyObject *pa, *pb, *res;
+    JSValue r;
+
+    if (qp_capi_init(ctx) < 0)
+        return JS_EXCEPTION;
+    pa = qp_capi_new_ref(ctx, a);
+    if (!pa)
+        return JS_EXCEPTION;
+    pb = qp_capi_new_ref(ctx, b);
+    if (!pb) {
+        Py_DECREF(pa);
+        return JS_EXCEPTION;
+    }
+    if (steal) {
+        res = _PyTuple_FromPairSteal(pa, pb);
+    } else {
+        res = _PyTuple_FromPair(pa, pb);
+        Py_DECREF(pa);
+        Py_DECREF(pb);
+    }
+    if (!res)
+        return JS_EXCEPTION;
+    r = qp_capi_to_js(ctx, res);
+    Py_DECREF(res);
+    return r;
 }
 
 /* Resize a tuple only referenced by the caller (the mirror may move, as a

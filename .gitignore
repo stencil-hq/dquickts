@@ -39,6 +39,10 @@ tests/test_qjsc_modules.c
 
 # Python harness
 /cpython/
+# symlink to cpython/Lib/test made by tests/py/run.py l3 / make testpy-bootstrap
+/pylib/test
+# symlinks to the test-only C extension modules (build/testpy/capi-testmods), same
+/pylib/_test*.so
 /build/
 /qpy
 /fuzz_py_compile

@@ -54,8 +54,9 @@ static volatile sig_atomic_t qp_signal_wakeup_warn;                 /* mod_misc.
     [QP_EXC_ ## name] = {                                                   \
         PyVarObject_HEAD_INIT(&PyType_Type, 0)                              \
         .tp_name = #name,                                                   \
-        .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE |              \
-                    Py_TPFLAGS_BASE_EXC_SUBCLASS | Py_TPFLAGS_HAVE_GC,      \
+        .tp_flags = Py_TPFLAGS_DEFAULT | _Py_TPFLAGS_STATIC_BUILTIN |       \
+                    Py_TPFLAGS_BASETYPE | Py_TPFLAGS_BASE_EXC_SUBCLASS |    \
+                    Py_TPFLAGS_HAVE_GC,                                     \
     },
 static PyTypeObject qp_capi_exc_types[QP_EXC__COUNT] = {
     QP_EXCEPTIONS(QP_CAPI_EXC_TYPE_INIT)
@@ -278,6 +279,11 @@ void PyErr_SetObject(PyObject *exception, PyObject *value)
                      exception);
         return;
     }
+    /* _PyErr_SetObject normalizes with PyObject_IsSubclass (a metaclass
+       __subclasscheck__ may fail: that error is the one set) */
+    if (value && PyExceptionInstance_Check(value) &&
+        PyObject_IsSubclass((PyObject *)Py_TYPE(value), exception) < 0)
+        return;
     if (value) {
         v = qp_capi_value(ctx, value);
         if (JS_IsException(v))
@@ -1054,6 +1060,32 @@ PyObject *PyUnstable_Exc_PrepReraiseStar(PyObject *orig, PyObject *excs)
 {
     JSContext *ctx = qp_capi.ctx;
     JSValue o, e;
+    PyObject *tb;
+    Py_ssize_t i, numexcs;
+
+    if (orig == NULL || !PyExceptionInstance_Check(orig)) {
+        PyErr_SetString(PyExc_TypeError, "orig must be an exception instance");
+        return NULL;
+    }
+    if (excs == NULL || !PyList_Check(excs)) {
+        PyErr_SetString(PyExc_TypeError, "excs must be a list of exception instances");
+        return NULL;
+    }
+    numexcs = PyList_GET_SIZE(excs);
+    for (i = 0; i < numexcs; i++) {
+        PyObject *exc = PyList_GET_ITEM(excs, i);
+        if (exc == NULL || !(PyExceptionInstance_Check(exc) || Py_IsNone(exc))) {
+            PyErr_Format(PyExc_TypeError, "item %zd of excs is not an exception", i);
+            return NULL;
+        }
+    }
+    /* orig must have a traceback: it is a raised exception in the interpreter */
+    tb = PyException_GetTraceback(orig);
+    if (tb == NULL) {
+        PyErr_Format(PyExc_ValueError, "orig must be a raised exception");
+        return NULL;
+    }
+    Py_DECREF(tb);
 
     o = qp_capi_value(ctx, orig);
     if (JS_IsException(o))
@@ -1798,7 +1830,7 @@ static int qp_capi_tb_push(JSContext *ctx, JSValueConst func, JSValueConst frame
         JS_Throw(ctx, exc);
         return 0;
     }
-    tb = qp_tb_alloc(ctx, qp_exc_traceback(exc), func, frame, -1, lineno, QP_NULL, QP_NULL);
+    tb = qp_tb_alloc(ctx, qp_exc_traceback(exc), func, frame, -1, lineno);
     if (JS_IsException(tb)) {
         /* chain the original exception to the new error */
         JSValue err = qp_exc_fetch(ctx);
@@ -2102,69 +2134,12 @@ int PyTraceBack_Print(PyObject *v, PyObject *f)
     return qp_capi_tb_print(ctx, tb, file, limit);
 }
 
-/* Write a C string to a file descriptor (async-signal-safe). */
-static void qp_capi_fd_puts(int fd, const char *s)
-{
-    size_t n = strlen(s);
-    while (n > 0) {
-        ssize_t w = write(fd, s, n);
-        if (w <= 0) {
-            if (w < 0 && errno == EINTR)
-                continue;
-            return;
-        }
-        s += w;
-        n -= (size_t)w;
-    }
-}
-
-#define QP_CAPI_DUMP_MAX_FRAMES 100
-
-/* faulthandler-style dump of the Python frames of the running context. */
-static void qp_capi_dump_frames(int fd, JSContext *ctx)
-{
-    char buf[512], name[128], file[256];
-    int depth;
-
-    qp_capi_fd_puts(fd, "Stack (most recent call first):\n");
-    for (depth = 0; ; depth++) {
-        struct JSStackFrame *sf = qp_py_frame_at(ctx, depth);
-        JSFunctionBytecode *b;
-        QPLoc loc;
-        int lineno = -1;
-
-        if (!sf)
-            break;
-        if (depth >= QP_CAPI_DUMP_MAX_FRAMES) {
-            qp_capi_fd_puts(fd, "  ...\n");
-            break;
-        }
-        if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT ||
-            JS_VALUE_GET_OBJ(sf->cur_func)->class_id != JS_CLASS_BYTECODE_FUNCTION)
-            continue;
-        b = JS_VALUE_GET_OBJ(sf->cur_func)->u.func.function_bytecode;
-        if (sf->cur_pc && qp_code_addr2loc(b, (uint32_t)(sf->cur_pc - b->byte_code_buf - 1),
-                                           &loc) == 0)
-            lineno = loc.lineno;
-        JS_AtomGetStrRT(ctx->rt, file, sizeof(file),
-                        b->has_debug ? b->debug.filename : JS_ATOM_empty_string);
-        JS_AtomGetStrRT(ctx->rt, name, sizeof(name), b->func_name);
-        if (lineno >= 0)
-            snprintf(buf, sizeof(buf), "  File \"%s\", line %d in %s\n", file, lineno, name);
-        else
-            snprintf(buf, sizeof(buf), "  File \"%s\", line ??? in %s\n", file, name);
-        qp_capi_fd_puts(fd, buf);
-    }
-    qp_capi_fd_puts(fd, "\n");
-}
-
 const char *PyUnstable_DumpTraceback(int fd, PyThreadState *tstate)
 {
     JSContext *ctx = qp_capi.ctx;
     if (!ctx || !tstate)
         return "unable to get the current thread state";
-    qp_capi_dump_frames(fd, ctx);
-    return NULL;
+    return qp_fh_dump_traceback_ident(fd, ctx, (uint64_t)tstate->thread_id);
 }
 
 const char *PyUnstable_DumpTracebackThreads(int fd, PyInterpreterState *interp,
@@ -2172,18 +2147,10 @@ const char *PyUnstable_DumpTracebackThreads(int fd, PyInterpreterState *interp,
                                             Py_ssize_t max_threads)
 {
     JSContext *ctx = qp_capi.ctx;
-    char buf[64];
 
-    if (!ctx)
-        return "unable to get the interpreter state";
-    if (max_threads < 1)
-        return NULL;
-    /* one thread state in this runtime (capi-design.md §5) */
-    snprintf(buf, sizeof(buf), "Current thread 0x%lx (most recent call first):\n",
-             (unsigned long)PyThread_get_thread_ident());
-    qp_capi_fd_puts(fd, buf);
-    qp_capi_dump_frames(fd, ctx);
-    return NULL;
+    /* the threads of the runtime; the calling thread is the current one
+       (current_tstate is the calling thread's or NULL in practice) */
+    return qp_fh_dump_threads(fd, ctx, TRUE, max_threads);
 }
 
 /* ========================================================================= */

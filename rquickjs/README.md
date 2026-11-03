@@ -97,6 +97,12 @@ ctx.with(|ctx| -> rquickjs::Result<()> {
   readline or libedit) and `python-uuid` (libuuid; macOS uses libSystem without it). The
   libraries are found with pkg-config, else linked by name. On macOS `_scproxy` links the
   SystemConfiguration and CoreFoundation frameworks.
+- The CPython C modules (the ones above and `dlopen`ed extensions) are bound to one runtime of
+  the process at a time: the first context that imports one owns them, and other runtimes, in
+  any thread, get `ImportError` for them until that runtime is dropped; a later runtime then
+  binds them again. Dropping the `Runtime` finalizes Python (`atexit`, module finalization) and
+  frees its C extension state. The crate's own Python tests take turns on a mutex for this
+  reason, since `cargo test` runs tests on parallel threads.
 
 ## Main features of QuickJS
 

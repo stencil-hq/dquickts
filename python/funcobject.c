@@ -30,6 +30,9 @@ typedef struct QPFuncDataPriv {
        them (CPython frames own a reference to their code). */
     JSValue *retired;
     int retired_count, retired_size;
+    /* closure stored by PyFunction_SetClosure() (tuple, or JS_UNDEFINED
+       for None); QP_NULL: __closure__ reflects the var_refs */
+    JSValue closure;
 } QPFuncDataPriv;
 
 /* ======================================================================== */
@@ -61,6 +64,7 @@ static void qp_funcdata_finalizer(JSRuntime *rt, JSValue val)
     for (i = 0; i < pd->retired_count; i++)
         JS_FreeValueRT(rt, pd->retired[i]);
     js_free_rt(rt, pd->retired);
+    JS_FreeValueRT(rt, pd->closure);
     js_free_rt(rt, pd);
 }
 
@@ -88,6 +92,7 @@ static void qp_funcdata_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_
     JS_MarkValue(rt, d->code_obj, mark_func);
     for (i = 0; i < pd->retired_count; i++)
         JS_MarkValue(rt, pd->retired[i], mark_func);
+    JS_MarkValue(rt, pd->closure, mark_func);
 }
 
 static QPFuncData *qp_function_data(JSValueConst v)
@@ -183,6 +188,7 @@ static int qp_fo_attach(JSContext *ctx, JSValueConst func, JSValueConst code_obj
     d->dict = QP_NULL;
     d->code_obj = QP_NULL;
     d->version = 1;
+    pd->closure = QP_NULL;
     dobj = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_PY_FUNC_DATA);
     if (JS_IsException(dobj)) {
         js_free(ctx, pd);
@@ -249,14 +255,19 @@ static int qp_function_init(JSContext *ctx, JSValueConst func, JSValueConst pare
         qp_raise_system_error(ctx, "MAKE_FUNCTION outside of a Python function");
         return -1;
     }
-    return qp_fo_attach(ctx, func, QP_NULL, pd->globals, pd->builtins);
+    if (qp_fo_attach(ctx, func, QP_NULL, pd->globals, pd->builtins) < 0)
+        return -1;
+#ifdef CONFIG_PYTHON_CAPI
+    QP_FUNC_EVENT(ctx, CREATE, func, QP_NULL);
+#endif
+    return 0;
 }
 
 /* New Python function over `bytecode` (a JS_TAG_FUNCTION_BYTECODE value).
    closure: QP_NULL (free variables become empty cells) or a tuple of
    exactly closure_var_count PY_CELL objects (checked by the caller). */
-static JSValue qp_fo_create(JSContext *ctx, JSValueConst bytecode, JSValueConst code_obj,
-                            JSValueConst globals, JSValueConst closure)
+static JSValue qp_fo_create_quiet(JSContext *ctx, JSValueConst bytecode, JSValueConst code_obj,
+                                  JSValueConst globals, JSValueConst closure)
 {
     JSFunctionBytecode *b = JS_VALUE_GET_PTR(bytecode);
     JSValue func;
@@ -297,6 +308,18 @@ static JSValue qp_fo_create(JSContext *ctx, JSValueConst bytecode, JSValueConst 
  fail:
     JS_FreeValue(ctx, func);
     return JS_EXCEPTION;
+}
+
+/* The same, reported to the function watchers (C API). */
+static JSValue qp_fo_create(JSContext *ctx, JSValueConst bytecode, JSValueConst code_obj,
+                            JSValueConst globals, JSValueConst closure)
+{
+    JSValue func = qp_fo_create_quiet(ctx, bytecode, code_obj, globals, closure);
+#ifdef CONFIG_PYTHON_CAPI
+    if (!JS_IsException(func))
+        QP_FUNC_EVENT(ctx, CREATE, func, QP_NULL);
+#endif
+    return func;
 }
 
 static JSValue qp_function_new(JSContext *ctx, JSValueConst bytecode, JSValueConst globals)
@@ -512,6 +535,8 @@ static JSValue qp_fo_func_get(JSContext *ctx, JSValueConst self, int magic)
             JSValue tup;
             int i;
 
+            if (!QP_IS_NULL(((QPFuncDataPriv *)d)->closure))
+                return JS_DupValue(ctx, ((QPFuncDataPriv *)d)->closure);
             p = JS_VALUE_GET_OBJ(self);
             b = p->u.func.function_bytecode;
             if (b->closure_var_count == 0)
@@ -565,6 +590,9 @@ static int qp_fo_set_code(JSContext *ctx, JSValueConst self, QPFuncData *d, JSVa
                     "(e.g., from a generator to a plain function)") < 0)
             return -1;
     }
+#ifdef CONFIG_PYTHON_CAPI
+    QP_FUNC_EVENT(ctx, MODIFY_CODE, self, value);
+#endif
     if (nb != ob) {
         if (pd->retired_count >= pd->retired_size) {
             int new_size = pd->retired_size ? pd->retired_size * 2 : 2;
@@ -604,6 +632,9 @@ static int qp_fo_func_set(JSContext *ctx, JSValueConst self, JSValueConst value,
             qp_raise_type_error(ctx, "__defaults__ must be set to a tuple object");
             return -1;
         }
+#ifdef CONFIG_PYTHON_CAPI
+        QP_FUNC_EVENT(ctx, MODIFY_DEFAULTS, self, value);
+#endif
         slot = &d->defaults;
         d->version++;
         break;
@@ -614,6 +645,9 @@ static int qp_fo_func_set(JSContext *ctx, JSValueConst self, JSValueConst value,
             qp_raise_type_error(ctx, "__kwdefaults__ must be set to a dict object");
             return -1;
         }
+#ifdef CONFIG_PYTHON_CAPI
+        QP_FUNC_EVENT(ctx, MODIFY_KWDEFAULTS, self, value);
+#endif
         slot = &d->kwdefaults;
         d->version++;
         break;
@@ -677,6 +711,9 @@ static int qp_fo_func_set(JSContext *ctx, JSValueConst self, JSValueConst value,
             qp_raise_type_error(ctx, "__qualname__ must be set to a string object");
             return -1;
         }
+#ifdef CONFIG_PYTHON_CAPI
+        QP_FUNC_EVENT(ctx, MODIFY_QUALNAME, self, value);
+#endif
         slot = &d->qualname;
         break;
     case QP_FA_TYPE_PARAMS:
@@ -1332,6 +1369,31 @@ static QPCell *qp_fo_cell_data(JSValueConst v)
         JS_VALUE_GET_OBJ(v)->class_id != JS_CLASS_PY_CELL)
         return NULL;
     return JS_VALUE_GET_OBJ(v)->u.opaque;
+}
+
+/* PyFunction_SetClosure: func_closure = closure (a tuple, or JS_UNDEFINED
+   for None; the items are not checked, as in CPython).  The free variables
+   the code reads become the given cells. */
+static void qp_fo_set_closure(JSContext *ctx, JSValueConst func, JSValueConst closure)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(func);
+    JSFunctionBytecode *b = p->u.func.function_bytecode;
+    QPFuncDataPriv *pd = (QPFuncDataPriv *)qp_function_data(func);
+    int i, n;
+
+    if (!JS_IsUndefined(closure) && p->u.func.var_refs) {
+        n = (int)QP_TUPLE_SIZE(closure);
+        for (i = 0; i < b->closure_var_count && i < n; i++) {
+            QPCell *c = qp_fo_cell_data(QP_TUPLE_ITEMS(closure)[i]);
+            if (!c)
+                continue;
+            js_rc(c->var_ref)->ref_count++;
+            free_var_ref(ctx->rt, p->u.func.var_refs[i]);
+            p->u.func.var_refs[i] = c->var_ref;
+        }
+    }
+    JS_FreeValue(ctx, pd->closure);
+    pd->closure = JS_DupValue(ctx, closure);
 }
 
 static JSValue qp_cell_get(JSContext *ctx, JSValueConst cell)

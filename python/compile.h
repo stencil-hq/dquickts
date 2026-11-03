@@ -83,7 +83,7 @@
  *   CPython's: every COPY n / SWAP n / LIST_APPEND i / SET_ADD i / MAP_ADD i /
  *   DICT_MERGE i ... operand that reaches below a marker pushed after the
  *   referenced value must be incremented by the number of such markers.
- *   RERAISE n                  -> qpc_py(c, loc, QP_OP_reraise) (operand dropped)
+ *   RERAISE n                  -> qpc_py_u8(c, loc, QP_OP_reraise, n)
  *   Handlers / exits must leave the stack exactly as compute_stack_size
  *   expects: same depth AND same catch nesting at every join point.
  *   QuickJS gosub/ret are NOT used: finally bodies are duplicated like
@@ -261,6 +261,60 @@ typedef struct qpc_deferred_annotation {
     int cond_index;             /* conditional annotation index, -1 if none */
 } qpc_deferred_annotation;
 
+/* A table of constants keyed like CPython's _PyCode_ConstantKey (same type
+   and value; -0.0 != 0.0; tuples and frozensets by their items), in
+   insertion order.  Entries of code objects (is_code) are keyed by their
+   cpool index. */
+typedef struct qpc_const_ent {
+    JSValue v;          /* owned; JS_UNDEFINED for code objects */
+    int aux;            /* u_consts: cpool index of a code object (-1 others);
+                           u_cpool_keys: cpool index of the value */
+    uint32_t hash;
+    BOOL is_code;
+} qpc_const_ent;
+
+typedef struct qpc_ctab {
+    qpc_const_ent *ents;
+    int n, size;
+    int *tab;           /* open addressing: entry index + 1, 0 = empty */
+    uint32_t mask;      /* size of tab - 1 (tab NULL while empty) */
+} qpc_ctab;
+
+/* Flowgraph constant folding (compile.c "Constant folding"): one CPython
+   instruction of the current basic block that can take part in a fold.
+   The emitted bytecode of the records [i..npeep) starts at peep[i].pos. */
+enum {
+    QPC_PI_CONST,       /* LOAD_CONST v (any constant-loading instruction) */
+    QPC_PI_BUILD0,      /* BUILD_LIST 0 / BUILD_SET 0 */
+    QPC_PI_APPEND,      /* LIST_APPEND 1 / SET_ADD 1 after a CONST */
+    QPC_PI_BUILDN,      /* BUILD_LIST n / BUILD_SET n after n CONSTs (decided by the next instruction) */
+    QPC_PI_TUPLEN,      /* BUILD_TUPLE n after n CONSTs (decided by the next instruction) */
+    QPC_PI_DUPCONST,    /* COPY 1 after a phase1 CONST (JUMP_IF_FALSE/TRUE operand) */
+};
+
+typedef struct qpc_peep_insn {
+    uint8_t kind;       /* QPC_PI_* */
+    uint8_t is_set;     /* BUILD0/APPEND/BUILDN: set display */
+    uint8_t phase1;     /* CONST: visible to flowgraph's optimize_load_const
+                           (loaded by codegen or folded from a TO_BOOL) */
+    int n;              /* BUILDN/TUPLEN: item count */
+    uint32_t pos;       /* bytecode offset of the instruction (OP_line_num included) */
+    location last_loc;  /* u_last_loc before it */
+    location loc;       /* its location */
+    JSValue v;          /* CONST: value (owned) */
+} qpc_peep_insn;
+/* The jumps to a label (compiler_unit.u_lbl_jumps) */
+#define QPC_LBL_JUMPS_MAX 8
+#define QPC_LBL_PENDING_MAX 8
+typedef struct qpc_lbl_jumps {
+    int count;                  /* jumps emitted */
+    int handler;                /* an exception handler (OP_catch target) */
+    struct {
+        uint32_t pos;           /* bytecode position of the label operand */
+        location loc;           /* location of the jump (NO_LOCATION: none) */
+    } j[QPC_LBL_JUMPS_MAX];     /* the first ones */
+} qpc_lbl_jumps;
+
 typedef struct compiler_unit {
     PySTEntryObject *u_ste;
     int u_scope_type;
@@ -277,6 +331,31 @@ typedef struct compiler_unit {
 
     JSFunctionDef *u_fd;        /* code being generated; owned by the root fd tree */
     location u_last_loc;        /* location of the last OP_line_num emitted */
+    int u_last_loc_idx;         /* its locs[] index, -1 none */
+    /* the no-location entry of a join (QPC_LOC_JOIN) while its block has
+       no location: position of its OP_line_num operand (0 none), the
+       location before it and its index (qpc_join_end) */
+    uint32_t u_join_pos;
+    location u_join_prev;
+    int u_join_prev_idx;        /* -1: not in locs[] yet */
+    int u_join_fall;            /* the join has a fallthrough predecessor */
+    /* CPython propagate_line_numbers: the NO_LOCATION code after labels
+       takes the location of their predecessor when they have one (the
+       code before them or a jump), else none (qpc_label_entry_loc).
+       u_lbl_jumps[label id]: the jumps to the label emitted so far. */
+    qpc_lbl_jumps *u_lbl_jumps;
+    int u_lbl_jumps_size;
+    int u_lbl_pending;          /* labels placed since the last instruction */
+    int u_lbl_fall;             /* the code before them falls through */
+    int u_lbl_ids[QPC_LBL_PENDING_MAX]; /* (the first ones) */
+    uint32_t u_lbl_start;       /* bytecode size before them */
+    int u_lbl_start_lop;        /* u_fd->last_opcode_pos before them */
+    int u_loc_force;            /* qpc_emit_loc emits the location even if
+                                   it is the last one: a handler entry */
+    int u_loc_propagated;       /* the location given to qpc_emit_loc is the
+                                   one of the only predecessor (a jump):
+                                   not the code's own (QP_LOC_ARTIFICIAL) */
+    int u_dead;                 /* the last instruction is unreachable */
     int u_generator_like;       /* generator / coroutine / async generator: OP_return_async */
 
     int u_nfblocks;
@@ -318,6 +397,26 @@ typedef struct compiler_unit {
     struct qpc_comp_code { void *key; int idx; } *u_comp_codes;
     int u_n_comp_codes, u_comp_codes_size;
 
+    /* CPython's u_consts: the constants codegen adds (_PyCompile_AddConst
+       order), then the ones flowgraph's folding adds (u_late_consts, in
+       folding order); qpc_consts_finish turns them into
+       QPCodeInfo.consts. */
+    qpc_ctab u_consts;
+    JSValue *u_late_consts;
+    int u_n_late_consts, u_late_consts_size;
+    /* nested code objects: AST node (symtable key) and cpool index of each
+       closure; a node compiled twice (finally bodies) gives equal code
+       objects, one constant for CPython */
+    struct qpc_code_key { void *key; int idx; } *u_code_keys;
+    int u_n_code_keys, u_code_keys_size;
+    /* cpool de-duplication (CPython merges equal constants) */
+    qpc_ctab u_cpool_keys;
+    /* constant folding window (QPC_PI_* records of the current basic
+       block); u_peep_raw: emitting a fold result (no folding, no records) */
+    qpc_peep_insn *u_peep;
+    int u_npeep, u_peep_size;
+    int u_peep_raw;
+
     struct compiler_unit *u_parent;
 } compiler_unit;
 
@@ -338,6 +437,10 @@ typedef struct _PyCompiler {
     JSFunctionDef *c_root_fd;       /* module fd while compiling (freed on error) */
     int c_nunits;                   /* stack size (CPython len(c_stack) + 1) */
     GetLineColCache c_lc_cache;     /* dummy cache required by js_new_function_def */
+    /* symtable key of the code unit qpc_finish_unit finished last and its fd
+       (codegen_make_closure) */
+    void *c_finished_key;
+    JSFunctionDef *c_finished_fd;
     qpc_ids ids;
 } compiler;
 
@@ -402,7 +505,6 @@ static int qpc_use_label(compiler *c, jump_target_label lbl);
 /* QuickJS opcodes.  loc: emits OP_line_num first when loc.lineno >= 0 and
    differs from the last emitted location (NO_LOCATION: inherit). */
 static int qpc_op(compiler *c, location loc, int opcode);
-static int qpc_op_u8(compiler *c, location loc, int opcode, uint8_t v);
 static int qpc_op_u16(compiler *c, location loc, int opcode, uint16_t v);
 static int qpc_op_u32(compiler *c, location loc, int opcode, uint32_t v);
 /* OP_goto / OP_if_true / OP_if_false / OP_catch with a label */

@@ -2863,6 +2863,10 @@ QP_OS_FN(qp_os_kill)
         return JS_EXCEPTION;
     if ((magic ? killpg(pid, sig) : kill(pid, sig)) < 0)
         return qp_os_error(ctx, errno);
+    /* os_kill_impl: check immediately if the signal was sent to the
+       current process (killpg does not) */
+    if (!magic && qp_signal_check_signals(ctx) < 0)
+        return JS_EXCEPTION;
     return JS_UNDEFINED;
 }
 
@@ -2979,9 +2983,7 @@ static void qp_os_run_at_forkers(JSContext *ctx, JSValueConst module, const char
         JSValueConst f = items[reverse ? n - 1 - i : i];
         JSValue r = qp_call0(ctx, f);
         if (JS_IsException(r)) {
-            JSValue exc = qp_exc_fetch(ctx);
-            qp_exc_write_unraisable(ctx, exc, f);
-            JS_FreeValue(ctx, exc);
+            qp_format_unraisable(ctx, "Exception ignored in atfork callback %R", f);
         } else {
             JS_FreeValue(ctx, r);
         }
@@ -3396,7 +3398,10 @@ QP_OS_FN(qp_os_urandom)
 
 QP_OS_FN(qp_os_cpu_count)
 {
-    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    long n = QP_STATE(ctx)->config.cpu_count;
+    if (n > 0)      /* -X cpu_count / PYTHON_CPU_COUNT */
+        return qp_os_long(ctx, n);
+    n = sysconf(_SC_NPROCESSORS_ONLN);
     if (n < 1)
         return JS_UNDEFINED;
     return qp_os_long(ctx, n);

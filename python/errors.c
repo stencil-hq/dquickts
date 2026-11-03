@@ -27,8 +27,7 @@ static JSValue qp_unraisable_hook_args_new(JSContext *ctx, JSValueConst exc_type
                                            JSValueConst err_msg, JSValueConst obj);
 
 /* ---- traceback.c (this unit) -------------------------------------------- */
-static JSValue qp_tb_new_internal(JSContext *ctx, JSValueConst next, JSValueConst func,
-                                  uint32_t pc, JSValueConst self_hint);
+static JSValue qp_tb_from_current_frame(JSContext *ctx);
 
 /* ---- this file, used by other units ------------------------------------- */
 static void qp_exc_chain_context(JSContext *ctx, JSValueConst value);
@@ -887,18 +886,12 @@ static void qp_exc_write_unraisable_msg(JSContext *ctx, JSValueConst exc_in,
     tb = JS_DupValue(ctx, qp_exc_traceback(exc));
     if (JS_IsUndefined(tb)) {
         /* _PyTraceBack_FromFrame(NULL, current frame) */
-        struct JSStackFrame *sf = qp_py_frame_at(ctx, 0);
-        if (sf && JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT &&
-            JS_VALUE_GET_OBJ(sf->cur_func)->class_id == JS_CLASS_BYTECODE_FUNCTION) {
-            JSFunctionBytecode *b = JS_VALUE_GET_OBJ(sf->cur_func)->u.func.function_bytecode;
-            uint32_t pc = sf->cur_pc ? (uint32_t)(sf->cur_pc - b->byte_code_buf - 1) : 0;
-            tb = qp_tb_new_internal(ctx, JS_UNDEFINED, sf->cur_func, pc, QP_NULL);
-            if (JS_IsException(tb)) {
-                qp_err_clear(ctx);
-                tb = JS_UNDEFINED;
-            } else {
-                qp_exc_set_traceback_raw(ctx, exc, JS_DupValue(ctx, tb));
-            }
+        tb = qp_tb_from_current_frame(ctx);
+        if (JS_IsException(tb)) {
+            qp_err_clear(ctx);
+            tb = JS_UNDEFINED;
+        } else if (!JS_IsUndefined(tb)) {
+            qp_exc_set_traceback_raw(ctx, exc, JS_DupValue(ctx, tb));
         }
     }
     if (err_msg_str) {
@@ -977,11 +970,24 @@ static void qp_exc_write_unraisable_msg(JSContext *ctx, JSValueConst exc_in,
         JS_Throw(ctx, saved);
 }
 
-/* PyErr_WriteUnraisable(obj) for an exception that is not pending (the
-   caller fetched it). */
-static void qp_exc_write_unraisable(JSContext *ctx, JSValueConst exc, JSValueConst obj)
+/* PyErr_FormatUnraisable(fmt, obj) for the pending exception: fmt holds
+   at most one %R (of obj; obj QP_NULL = fmt is used verbatim). */
+static void qp_format_unraisable(JSContext *ctx, const char *fmt, JSValueConst obj)
 {
-    qp_exc_write_unraisable_msg(ctx, exc, NULL, obj);
+    JSValue exc = qp_exc_fetch(ctx);
+    JSValue msg = QP_IS_NULL(obj) ? qp_str_from_cstr(ctx, fmt) : qp_str_from_format(ctx, fmt, obj);
+    const char *cmsg = NULL;
+
+    if (!JS_IsException(msg))
+        cmsg = qp_str_utf8(ctx, msg, NULL);
+    if (!cmsg)
+        qp_err_clear(ctx);
+    qp_exc_write_unraisable_msg(ctx, exc, cmsg ? cmsg : "Exception ignored", QP_NULL);
+    if (cmsg)
+        JS_FreeCString(ctx, cmsg);
+    if (!JS_IsException(msg))
+        JS_FreeValue(ctx, msg);
+    JS_FreeValue(ctx, exc);
 }
 
 /* ========================================================================= */

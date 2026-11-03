@@ -318,6 +318,8 @@ static int qp_snap_read_func(SnapReader *r, JSObject *p)
             c->name = QP_NULL;
             c->qualname = QP_NULL;
             c->filename = QP_NULL;
+            c->linetable = QP_NULL;     /* replace() overrides: not saved */
+            c->exctable = QP_NULL;
             c->fields = QP_NULL;
             p->u.opaque = c;
             snap_payload_ready(r);

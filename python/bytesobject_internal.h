@@ -156,6 +156,15 @@ QP_BM_DECL(qp_bm_count);
 QP_BM_DECL(qp_bm_tailmatch);
 QP_BM_DECL(qp_bm_decode);
 QP_BM_DECL(qp_bm_hex);
+/* hex() docstring of bytes / bytearray / memoryview: "Example:" holds the
+   doctest of the given value (CPython's per-type clinic docstrings) */
+#define QP_HEX_DOC(what, value)                                                               \
+    "hex($self, /, sep=<unrepresentable>, bytes_per_sep=1)\n--\n\n" what "\n\n"                \
+    "  sep\n    An optional single character or byte to separate hex bytes.\n"                  \
+    "  bytes_per_sep\n    How many bytes between separators.  Positive values count from\n"    \
+    "    the right, negative values count from the left.\n\nExample:\n"                         \
+    ">>> value = " value "\n>>> value.hex()\n'b901ef'\n>>> value.hex(':')\n'b9:01:ef'\n"        \
+    ">>> value.hex(':', 2)\n'b9:01ef'\n>>> value.hex(':', -2)\n'b901:ef'"
 QP_BM_DECL(qp_bm_join);
 QP_BM_DECL(qp_bm_strip);
 QP_BM_DECL(qp_bm_maketrans);
@@ -185,8 +194,6 @@ QP_BM_DECL(qp_bm_fromhex);
       "expandtabs($self, /, tabsize=8)\n--\n\nReturn a copy where all tab characters are expanded using spaces.\n\nIf tabsize is not given, a tab size of 8 characters is assumed." }, \
     { "find", qp_bm_find, QP_METH_FASTCALL, 0,                                                \
       "find($self, sub[, start[, end]], /)\n--\n\nReturn the lowest index in B where subsection 'sub' is found, such that 'sub' is contained within B[start:end].\n\nReturn -1 on failure." }, \
-    { "hex", qp_bm_hex, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,                              \
-      "hex($self, /, sep=<unrepresentable>, bytes_per_sep=1)\n--\n\nCreate a string of hexadecimal numbers from a bytes object." }, \
     { "index", qp_bm_find, QP_METH_FASTCALL, 1,                                               \
       "index($self, sub[, start[, end]], /)\n--\n\nReturn the lowest index in B where subsection 'sub' is found, such that 'sub' is contained within B[start:end].\n\nRaise ValueError if the subsection is not found." }, \
     { "isalnum", qp_bm_isx, QP_METH_NOARGS, 0,                                                \

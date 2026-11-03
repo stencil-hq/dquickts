@@ -22,6 +22,8 @@
 typedef struct QPModule {
     JSValue dict;       /* md_dict (PY_DICT), owned */
     uint8_t builtin;    /* created by a builtin-module init (repr "(built-in)") */
+    uint8_t c_ext;      /* a C API module with an exec slot or a def with methods
+                           (_PyModule_IsExtension, python/capi_module.c) */
     uint32_t capi_seq;  /* D5: order in which the C API executed this C
                            module (0: not a C module); snapshots re-run the
                            C modules in that order (python/capi_snapshot.c) */

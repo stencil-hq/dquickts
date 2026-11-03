@@ -106,24 +106,29 @@ static void qp_psp_free_charp_array(JSContext *ctx, char **array)
     js_free(ctx, array);
 }
 
-/* _PySequence_BytesToCharpArray: sequence of bytes -> NULL-terminated array */
-static char **qp_psp_bytes_to_charp_array(JSContext *ctx, JSValueConst seq_obj)
+/* _PySequence_BytesToCharpArray: sequence of bytes -> NULL-terminated array
+   (len(), then the items by index) */
+static char **qp_psp_bytes_to_charp_array(JSContext *ctx, JSValueConst seq)
 {
-    JSValue seq = qp_tuple_from_iterable(ctx, seq_obj);
-    Py_ssize_t i, argc;
+    Py_ssize_t i, argc = qp_len(ctx, seq);
     char **array;
-    if (JS_IsException(seq))
+    JSValue item = JS_UNDEFINED;
+
+    if (argc < 0)
         return NULL;
-    argc = QP_TUPLE_SIZE(seq);
-    array = js_mallocz(ctx, (argc + 1) * sizeof(char *));
-    if (!array) {
-        JS_FreeValue(ctx, seq);
+    if ((size_t)argc > (PY_SSIZE_T_MAX - sizeof(char *)) / sizeof(char *)) {
+        qp_raise_memory_error(ctx);
         return NULL;
     }
+    array = js_mallocz(ctx, (argc + 1) * sizeof(char *));
+    if (!array)
+        return NULL;
     for (i = 0; i < argc; ++i) {
-        JSValueConst item = QP_TUPLE_ITEMS(seq)[i];
         const uint8_t *data;
         Py_ssize_t size;
+        item = qp_abs_sequence_getitem(ctx, seq, i);
+        if (JS_IsException(item))
+            goto fail;
         if (!qp_bytes_check(ctx, item)) {
             qp_raise_type_error(ctx, "expected bytes, %T found", item);
             goto fail;
@@ -139,12 +144,13 @@ static char **qp_psp_bytes_to_charp_array(JSContext *ctx, JSValueConst seq_obj)
             goto fail;
         memcpy(array[i], data, size);
         array[i][size] = '\0';
+        JS_FreeValue(ctx, item);
+        item = JS_UNDEFINED;
     }
     array[argc] = NULL;
-    JS_FreeValue(ctx, seq);
     return array;
 fail:
-    JS_FreeValue(ctx, seq);
+    JS_FreeValue(ctx, item);
     qp_psp_free_charp_array(ctx, array);
     return NULL;
 }

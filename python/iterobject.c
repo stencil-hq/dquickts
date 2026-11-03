@@ -44,7 +44,9 @@ static int qp_init_tuple(JSContext *ctx);
    callable_iterator: seq = callable, aux = sentinel (both QP_NULL once
        exhausted);
    range_iterator: start/step/len (int64);
-   longrange_iterator: seq = start, aux = step, aux2 = len (exact ints). */
+   longrange_iterator: seq = start, aux = step, aux2 = len (exact ints);
+   odict_iterator (odictobject.c): seq = OrderedDict, aux = next key,
+       index = kind, pos = expected size, start = expected list state. */
 typedef struct QPIterObj {
     JSValue seq, aux, aux2;
     Py_ssize_t index;

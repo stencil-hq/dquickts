@@ -1154,6 +1154,9 @@ static const QPMethodDef qp_bytearray_methods[] = {
       "reverse($self, /)\n--\n\nReverse the order of the values in B in place." },
     { "take_bytes", qp_bytearray_take_bytes, QP_METH_FASTCALL, 0,
       "take_bytes($self, n=None, /)\n--\n\nTake *n* bytes from the bytearray and return them as a bytes object.\n\n  n\n    Bytes to take, negative indexes from end. None indicates all bytes." },
+    { "hex", qp_bm_hex, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
+      QP_HEX_DOC("Create a string of hexadecimal numbers from a bytearray object.",
+                 "bytearray([0xb9, 0x01, 0xef])") },
     QP_BM_SHARED_METHODS,
     { NULL, NULL, 0, 0, NULL },
 };

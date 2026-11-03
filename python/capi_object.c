@@ -243,6 +243,14 @@ int PyObject_SetAttr(PyObject *v, PyObject *name, PyObject *w)
     JSContext *ctx = QP_CAPI_CTX();
     JSAtom atom;
     int r;
+    if (w == NULL && PyErr_Occurred()) {
+        PyObject *exc = PyErr_GetRaisedException();
+        PyErr_SetString(PyExc_SystemError,
+                        "PyObject_SetAttr() must not be called with NULL value "
+                        "and an exception set");
+        _PyErr_ChainExceptions1(exc);
+        return -1;
+    }
     if (!v || !name)
         return qp_capi_null_error_int();
     atom = qp_capi_name_atom(ctx, name);
@@ -258,6 +266,14 @@ int PyObject_SetAttrString(PyObject *v, const char *name, PyObject *w)
     JSContext *ctx = QP_CAPI_CTX();
     JSAtom atom;
     int r;
+    if (w == NULL && PyErr_Occurred()) {
+        PyObject *exc = PyErr_GetRaisedException();
+        PyErr_SetString(PyExc_SystemError,
+                        "PyObject_SetAttrString() must not be called with NULL value "
+                        "and an exception set");
+        _PyErr_ChainExceptions1(exc);
+        return -1;
+    }
     if (!v || !name)
         return qp_capi_null_error_int();
     atom = qp_capi_cstr_atom(ctx, name);
@@ -418,8 +434,6 @@ int PyObject_GenericSetDict(PyObject *obj, PyObject *value, void *context)
 {
     JSContext *ctx = QP_CAPI_CTX();
     JSValue ov, vv;
-    JSAtom atom;
-    int r;
     (void)context;
     if (!value) {
         qp_raise_type_error(ctx, "cannot delete __dict__");
@@ -436,12 +450,9 @@ int PyObject_GenericSetDict(PyObject *obj, PyObject *value, void *context)
     vv = qp_capi_value(ctx, value);
     if (JS_IsException(vv))
         return -1;
-    atom = JS_NewAtom(ctx, "__dict__");
-    if (atom == JS_ATOM_NULL)
-        return -1;
-    r = qp_generic_setattr(ctx, ov, atom, vv);
-    JS_FreeAtom(ctx, atom);
-    return r < 0 ? -1 : 0;
+    /* store into the instance dict directly: going through setattr would
+       find this very getset (tp_getset __dict__) again and recurse */
+    return qp_subtype_dict_set(ctx, ov, vv, 0);
 }
 
 /* dicts of instances live on their JS objects (design 1.5) */
@@ -459,9 +470,27 @@ int PyObject_VisitManagedDict(PyObject *obj, visitproc visit, void *arg)
     return 0;
 }
 
+/* Drop the instance __dict__ (the next access sees a new empty one), as
+   `del obj.__dict__`.  Only for an object bound to a live J outside the
+   collector: in tp_clear / tp_dealloc during a collection or while J is
+   freed, J's attributes go with J. */
 void PyObject_ClearManagedDict(PyObject *obj)
 {
-    (void)obj;
+    QPCapiHead *h;
+    JSContext *ctx;
+
+    if (!QP_CAPI_HAS_HEAD(obj))
+        return;
+    h = QP_CAPI_HEAD(obj);
+    if (h->tag != QP_CAPI_TAG_OBJECT || !(h->flags & QP_CAPI_F_LIVE) ||
+        (h->flags & QP_CAPI_F_ORPHAN) || JS_VALUE_GET_TAG(h->v) != JS_TAG_OBJECT ||
+        qp_capi.rt->gc_phase != JS_GC_PHASE_NONE)
+        return;
+    if (!qp_shape_storage(JS_VALUE_GET_OBJ(h->v)))
+        return;
+    ctx = QP_CAPI_CTX();
+    if (qp_subtype_dict_set(ctx, h->v, QP_NULL, 0) < 0)
+        PyErr_WriteUnraisable(obj);
 }
 
 /* weak references are cleared by QuickJS when the JS object dies */
@@ -472,7 +501,15 @@ void PyObject_ClearWeakRefs(PyObject *object)
 
 void PyUnstable_Object_ClearWeakRefsNoCallbacks(PyObject *object)
 {
-    (void)object;
+    JSContext *ctx = QP_CAPI_CTX();
+    JSValue ov = qp_capi_value(ctx, object);
+
+    if (JS_IsException(ov)) {
+        PyErr_Clear();
+        return;
+    }
+    if (JS_VALUE_GET_TAG(ov) == JS_TAG_OBJECT)
+        qp_weakref_clear_no_callbacks(ctx->rt, JS_VALUE_GET_OBJ(ov));
 }
 
 PyObject *_PyObject_LookupSpecial(PyObject *self, PyObject *attr)
@@ -553,7 +590,21 @@ PyObject *PyObject_Str(PyObject *v)
 
 PyObject *PyObject_ASCII(PyObject *v)
 {
-    return qp_capi_unary_str(v, qp_ascii);
+    PyObject *repr, *ascii, *res;
+
+    repr = PyObject_Repr(v);
+    if (repr == NULL)
+        return NULL;
+    /* an ASCII repr is returned as is (a str subclass stays one) */
+    if (PyUnicode_IS_ASCII(repr))
+        return repr;
+    ascii = PyUnicode_AsEncodedString(repr, "ascii", "backslashreplace");
+    Py_DECREF(repr);
+    if (ascii == NULL)
+        return NULL;
+    res = PyUnicode_DecodeASCII(PyBytes_AS_STRING(ascii), PyBytes_GET_SIZE(ascii), NULL);
+    Py_DECREF(ascii);
+    return res;
 }
 
 Py_hash_t PyObject_Hash(PyObject *v)
@@ -935,6 +986,8 @@ int PyObject_Print(PyObject *op, FILE *fp, int flags)
     clearerr(fp);
     if (!op) {
         fprintf(fp, "<nil>");
+    } else if (Py_REFCNT(op) <= 0) {
+        fprintf(fp, "<refcnt %zd at %p>", Py_REFCNT(op), (void *)op);
     } else {
         PyObject *s = (flags & Py_PRINT_RAW) ? PyObject_Str(op) : PyObject_Repr(op);
         if (!s) {
@@ -960,7 +1013,8 @@ int PyObject_Print(PyObject *op, FILE *fp, int flags)
 void PyObject_Dump(PyObject *op)
 {
     if (!op) {
-        fprintf(stderr, "<object at NULL>\n");
+        /* _PyObject_IsFreed(): NULL counts as freed memory */
+        fprintf(stderr, "<object at %p is freed>\n", (void *)op);
         fflush(stderr);
         return;
     }
@@ -969,6 +1023,19 @@ void PyObject_Dump(PyObject *op)
     fprintf(stderr, "object type     : %p\n", (void *)Py_TYPE(op));
     fprintf(stderr, "object type name: %s\n",
             Py_TYPE(op) ? Py_TYPE(op)->tp_name : "NULL");
+    fprintf(stderr, "object repr     : ");
+    fflush(stderr);
+    if (qp_capi.ctx) {
+        PyGILState_STATE gil = PyGILState_Ensure();
+        PyObject *exc = PyErr_GetRaisedException();
+        (void)PyObject_Print(op, stderr, 0);
+        fflush(stderr);
+        PyErr_Clear();
+        PyErr_SetRaisedException(exc);
+        PyGILState_Release(gil);
+    }
+    fprintf(stderr, "\n");
+    /* the C API mirror of the object (after CPython's fields) */
     if (QP_CAPI_HAS_HEAD(op)) {
         QPCapiHead *h = QP_CAPI_HEAD(op);
         fprintf(stderr, "object mirror   : kind %s, flags 0x%x%s\n",
@@ -976,16 +1043,6 @@ void PyObject_Dump(PyObject *op)
                 qp_capi.kind_ops[h->kind].name : "?",
                 h->flags, QP_IS_NULL(h->v) ? ", unbound" : "");
     }
-    fprintf(stderr, "object repr     : ");
-    fflush(stderr);
-    if (qp_capi.ctx) {
-        PyObject *exc = PyErr_GetRaisedException();
-        (void)PyObject_Print(op, stderr, 0);
-        fflush(stderr);
-        PyErr_Clear();
-        PyErr_SetRaisedException(exc);
-    }
-    fprintf(stderr, "\n");
     fflush(stderr);
 }
 
@@ -1136,11 +1193,13 @@ int PyUnstable_Object_IsUniquelyReferenced(PyObject *op)
 
 int PyUnstable_SetImmortal(PyObject *op)
 {
-    if (!QP_CAPI_HAS_HEAD(op))
+    /* static objects are immortal already: their refcount is not 1 */
+    if (Py_REFCNT(op) != 1 || PyUnicode_Check(op))
         return 0;
-    if (Py_REFCNT(op) != 1)
-        return 0;
-    qp_capi_immortalize(op);
+    if (QP_CAPI_HAS_HEAD(op) && QP_CAPI_HEAD(op)->tag == QP_CAPI_TAG_OBJECT)
+        qp_capi_immortalize(op);
+    else    /* not ours (an object on the C stack): no head to mark */
+        op->ob_refcnt = _Py_IMMORTAL_INITIAL_REFCNT;
     return 1;
 }
 
@@ -1201,6 +1260,31 @@ Py_ssize_t PyVectorcall_NARGS(size_t nargsf)
     return _PyVectorcall_NARGS(nargsf);
 }
 
+static PyObject *qp_capi_vectorcall(PyObject *callable, PyObject *const *args,
+                                    size_t nargsf, PyObject *kwnames);
+static BOOL qp_capi_use_c_call(PyObject *callable);
+
+/* The runtime objects whose CPython types implement vectorcall (functions,
+   bound methods, builtin functions, method descriptors):
+   the C code that picks a vectorcall path for them (functools.partial
+   reads fn/args before handling the keywords) sees one. */
+static BOOL qp_capi_js_has_vectorcall(PyObject *callable)
+{
+    JSContext *ctx = QP_CAPI_CTX();
+    JSValue v;
+    QPType *t;
+    if (qp_capi_use_c_call(callable))
+        return FALSE;
+    v = qp_capi_value(ctx, callable);
+    if (JS_IsException(v)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return FALSE;
+    }
+    t = qp_type_of(ctx, v);
+    return t == QP_TYPE(ctx, function) || t == QP_TYPE(ctx, method) ||
+        t == QP_TYPE(ctx, builtin_function_or_method) || t == QP_TYPE(ctx, method_descriptor);
+}
+
 vectorcallfunc PyVectorcall_Function(PyObject *callable)
 {
     PyTypeObject *tp;
@@ -1208,7 +1292,7 @@ vectorcallfunc PyVectorcall_Function(PyObject *callable)
     vectorcallfunc ptr;
     tp = Py_TYPE(callable);
     if (!PyType_HasFeature(tp, Py_TPFLAGS_HAVE_VECTORCALL))
-        return NULL;
+        return qp_capi_js_has_vectorcall(callable) ? qp_capi_vectorcall : NULL;
     offset = tp->tp_vectorcall_offset;
     if (offset <= 0)
         return NULL;
@@ -1792,4 +1876,45 @@ PyObject *PyObject_CallMethodObjArgs(PyObject *obj, PyObject *name, ...)
     if (stack != small)
         PyMem_Free(stack);
     return r;
+}
+
+/* ========================================================================= */
+/* Sentinels (Objects/sentinelobject.c)                                       */
+/* ========================================================================= */
+
+/* sentinel_new_with_module: an instance of the builtins.sentinel type
+   (python/bltinmodule.c slots name/module/repr) */
+PyObject *PySentinel_New(const char *name, const char *module_name, const char *repr)
+{
+    JSContext *ctx = QP_CAPI_CTX();
+    QPType *t = qp_capi_type_qp(&PySentinel_Type);
+    JSValue name_v, module_v = JS_UNDEFINED, repr_v = QP_NULL, obj, *s;
+
+    if (!t)
+        return NULL;
+    name_v = qp_str_from_cstr(ctx, name);
+    if (JS_IsException(name_v))
+        return NULL;
+    if (module_name) {
+        module_v = qp_str_from_cstr(ctx, module_name);
+        if (JS_IsException(module_v))
+            goto fail;
+    }
+    if (repr) {
+        repr_v = qp_str_from_cstr(ctx, repr);
+        if (JS_IsException(repr_v))
+            goto fail;
+    }
+    obj = qp_bi_new_instance(ctx, t, &s);
+    if (JS_IsException(obj))
+        goto fail;
+    qp_bi_slot_set(ctx, s, QP_SENTINEL_NAME, name_v);
+    qp_bi_slot_set(ctx, s, QP_SENTINEL_MODULE, module_v);
+    qp_bi_slot_set(ctx, s, QP_SENTINEL_REPR, repr_v);
+    return qp_capi_steal(ctx, obj);
+fail:
+    JS_FreeValue(ctx, name_v);
+    JS_FreeValue(ctx, module_v);
+    JS_FreeValue(ctx, repr_v);
+    return NULL;
 }

@@ -13,9 +13,6 @@
  *  - the interactive loop is CPython's basic REPL (PYTHON_BASIC_REPL):
  *    _pyrepl needs the M3 standard library; prompts go to stderr like
  *    PyOS_StdioReadline (no readline module);
- *  - an unhandled KeyboardInterrupt exits with status 130 instead of
- *    re-raising SIGINT (no signal module in M2: SIGINT keeps its default
- *    action, which already terminates the process the CPython way);
  *  - the runtime is not torn down at exit (no module cleanup): threading
  *    shutdown and atexit callbacks run, the standard streams are flushed
  *    and the status returned.
@@ -37,7 +34,10 @@ static int qp_err_print_uncaught(JSContext *ctx, int *pkbint);
 static int qp_linecache_register(JSContext *ctx, const char *filename, const char *src, size_t len);
 /* provided by mod_misc.c */
 static void (*qp_signal_attach(JSContext *ctx))(int);
+static void qp_signal_fini(JSContext *ctx);
 static void qp_signal_apply_inherited(JSContext *ctx, const uint8_t *ignored, int nsig);
+/* provided by mod_faulthandler.c */
+static int qp_faulthandler_init_enable(JSContext *ctx);
 /* provided by mod_time.c and mod_posix.c */
 static int qp_time_init_timezone(JSContext *ctx, JSValueConst m);
 static void qp_os_drepl_environ(JSContext *ctx, BOOL fill);
@@ -76,9 +76,15 @@ static JSValue qp_run_code(JSContext *ctx, JSValue bytecode, JSValueConst global
     return res;
 }
 
-/* Compile src (src[len] == '\0') with the given compile flags and run it. */
-static JSValue qp_run_source(JSContext *ctx, const char *src, size_t len, const char *filename,
-                             int mode, int flags, JSValueConst globals, JSValueConst locals)
+static int qp_run_register_code(JSContext *ctx, JSValueConst bc, const char *src, size_t len,
+                                const char *name);
+
+/* Compile src (src[len] == '\0') with the given compile flags and run it;
+   register_src: _PyRun_String with a name (the source is registered in
+   linecache for the traceback module). */
+static JSValue qp_run_source_ex(JSContext *ctx, const char *src, size_t len, const char *filename,
+                                int mode, int flags, JSValueConst globals, JSValueConst locals,
+                                BOOL register_src)
 {
     qp_error err;
     JSValue bc, module = QP_NULL;
@@ -97,7 +103,61 @@ static JSValue qp_run_source(JSContext *ctx, const char *src, size_t len, const 
         return bc;
     }
     qp_error_clear(&err);
+    if (register_src && qp_run_register_code(ctx, bc, src, len, filename) < 0) {
+        JS_FreeValue(ctx, bc);
+        return JS_EXCEPTION;
+    }
     return qp_run_code(ctx, bc, globals, locals);
+}
+
+static JSValue qp_run_source(JSContext *ctx, const char *src, size_t len, const char *filename,
+                             int mode, int flags, JSValueConst globals, JSValueConst locals)
+{
+    return qp_run_source_ex(ctx, src, len, filename, mode, flags, globals, locals, FALSE);
+}
+
+/* run_mod with an interactive source: linecache._register_code(code,
+   source, name), so that the traceback module shows the lines of the
+   "<...>" code (the C printer uses qp_linecache_register).  0 or -1. */
+static int qp_run_register_code(JSContext *ctx, JSValueConst bc, const char *src, size_t len,
+                                const char *name)
+{
+    JSValue mod, fn, args[3] = { JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED }, res;
+    JSAtom atom;
+    int r = -1, i;
+
+    mod = qp_import_module(ctx, "linecache");
+    if (JS_IsException(mod))
+        return -1;
+    atom = JS_NewAtom(ctx, "_register_code");
+    if (atom == JS_ATOM_NULL) {
+        JS_FreeValue(ctx, mod);
+        return -1;
+    }
+    fn = qp_getattr(ctx, mod, atom);
+    JS_FreeAtom(ctx, atom);
+    JS_FreeValue(ctx, mod);
+    if (JS_IsException(fn))
+        return -1;
+    args[0] = qp_code_new(ctx, bc);
+    if (JS_IsException(args[0]))
+        goto done;
+    args[1] = qp_str_from_utf8(ctx, src, len);
+    if (JS_IsException(args[1]))
+        goto done;
+    args[2] = qp_str_from_cstr(ctx, name);
+    if (JS_IsException(args[2]))
+        goto done;
+    res = qp_vectorcall(ctx, fn, (JSValueConst *)args, 3, QP_NULL);
+    if (!JS_IsException(res)) {
+        JS_FreeValue(ctx, res);
+        r = 0;
+    }
+ done:
+    for (i = 0; i < 3; i++)
+        JS_FreeValue(ctx, args[i]);
+    JS_FreeValue(ctx, fn);
+    return r;
 }
 
 /* PyRun_StringFlags: src is str text (no coding cookie). */
@@ -212,8 +272,9 @@ static JSValue qp_run_main_dict(JSContext *ctx, JSValueConst main_module)
     return qp_getattr(ctx, main_module, QP_ATOM(ctx, __dict__));
 }
 
-/* set_main_loader: importlib._bootstrap_external.SourceFileLoader. */
-static int qp_run_set_main_loader(JSContext *ctx, JSValueConst d, JSValueConst filename)
+/* set_main_loader: importlib._bootstrap_external.<loader_name>. */
+static int qp_run_set_main_loader(JSContext *ctx, JSValueConst d, JSValueConst filename,
+                                  const char *loader_name)
 {
     QPState *s = QP_STATE(ctx);
     JSValue ext, loader_type, loader, args[2];
@@ -227,7 +288,7 @@ static int qp_run_set_main_loader(JSContext *ctx, JSValueConst d, JSValueConst f
     JS_FreeAtom(ctx, a);
     if (JS_IsException(ext))
         return -1;
-    a = JS_NewAtom(ctx, "SourceFileLoader");
+    a = JS_NewAtom(ctx, loader_name);
     loader_type = qp_getattr(ctx, ext, a);
     JS_FreeAtom(ctx, a);
     JS_FreeValue(ctx, ext);
@@ -247,10 +308,59 @@ static int qp_run_set_main_loader(JSContext *ctx, JSValueConst d, JSValueConst f
     return rc;
 }
 
-/* _PyRun_SimpleFile: run file contents (bytes, coding cookie honoured) as
-   __main__ with __file__ set during the run.  Returns the result or
-   JS_EXCEPTION. */
-static JSValue qp_run_simple_file(JSContext *ctx, const char *src, size_t len, const char *filename)
+/* maybe_pyc_file: a ".pyc" name or, for a file we opened (closeit), the
+   first two bytes of this build's magic number. */
+static int qp_run_maybe_pyc(const char *src, size_t len, const char *filename, int closeit)
+{
+    size_t n = strlen(filename);
+    uint32_t halfmagic = qp_pyc_magic_number_token() & 0xFFFF;
+    if (n >= 4 && !strcmp(filename + n - 4, ".pyc"))
+        return 1;
+    return closeit && len >= 2 &&
+        ((uint32_t)(uint8_t)src[1] << 8 | (uint8_t)src[0]) == halfmagic;
+}
+
+/* run_pyc_file: the code object of a .pyc image (16-byte header, then
+   marshal data) run with globals = locals = d. */
+static JSValue qp_run_pyc(JSContext *ctx, const char *src, size_t len, JSValueConst d)
+{
+    uint32_t magic = qp_pyc_magic_number_token();
+    JSValue marshal, data, code, res;
+    JSAtom a;
+
+    if (len < 4 || ((uint32_t)(uint8_t)src[0] | (uint32_t)(uint8_t)src[1] << 8 |
+                    (uint32_t)(uint8_t)src[2] << 16 | (uint32_t)(uint8_t)src[3] << 24) != magic)
+        return qp_raise(ctx, QP_EXC(ctx, RuntimeError), "Bad magic number in .pyc file");
+    marshal = qp_import_module(ctx, "marshal");
+    if (JS_IsException(marshal))
+        return marshal;
+    data = qp_bytes_new(ctx, src + (len < 16 ? len : 16), len < 16 ? 0 : len - 16);
+    if (JS_IsException(data)) {
+        JS_FreeValue(ctx, marshal);
+        return data;
+    }
+    a = JS_NewAtom(ctx, "loads");
+    code = qp_call_method(ctx, marshal, a, (JSValueConst *)&data, 1, QP_NULL);
+    JS_FreeAtom(ctx, a);
+    JS_FreeValue(ctx, data);
+    JS_FreeValue(ctx, marshal);
+    if (JS_IsException(code) || !qp_typecheck(ctx, code, QP_TYPE(ctx, code))) {
+        if (JS_IsException(code))
+            JS_FreeValue(ctx, qp_exc_fetch(ctx));
+        JS_FreeValue(ctx, code);
+        return qp_raise(ctx, QP_EXC(ctx, RuntimeError), "Bad code object in .pyc file");
+    }
+    res = qp_eval_code(ctx, code, d, d);
+    JS_FreeValue(ctx, code);
+    return res;
+}
+
+/* _PyRun_SimpleFile: run file contents (bytes, coding cookie honoured, or
+   a .pyc image) as __main__ with __file__ set during the run.  closeit:
+   the contents were read from a file opened for the run (maybe_pyc_file
+   may look at its magic number).  Returns the result or JS_EXCEPTION. */
+static JSValue qp_run_simple_file(JSContext *ctx, const char *src, size_t len, const char *filename,
+                                  int closeit)
 {
     JSValue main_module, d, fname, res = JS_EXCEPTION, v;
     int rc, set_file_name = 0;
@@ -276,10 +386,17 @@ static JSValue qp_run_simple_file(JSContext *ctx, const char *src, size_t len, c
             goto done;
         set_file_name = 1;
     }
-    /* when running from stdin, leave __main__.__loader__ alone */
-    if (strcmp(filename, "<stdin>") != 0 && qp_run_set_main_loader(ctx, d, fname) < 0)
-        goto done;
-    res = qp_run_source(ctx, src, len, filename, QP_INPUT_FILE, 0, d, d);
+    if (qp_run_maybe_pyc(src, len, filename, closeit)) {
+        if (qp_run_set_main_loader(ctx, d, fname, "SourcelessFileLoader") < 0)
+            goto done;
+        res = qp_run_pyc(ctx, src, len, d);
+    } else {
+        /* when running from stdin, leave __main__.__loader__ alone */
+        if (strcmp(filename, "<stdin>") != 0 &&
+            qp_run_set_main_loader(ctx, d, fname, "SourceFileLoader") < 0)
+            goto done;
+        res = qp_run_source(ctx, src, len, filename, QP_INPUT_FILE, QP_PF_SOURCE_FILE, d, d);
+    }
     qp_run_flush_io(ctx);
  done:
     if (set_file_name && qp_dict_del_item_atom(ctx, d, QP_ATOM(ctx, __file__)) < 0) {
@@ -293,12 +410,16 @@ static JSValue qp_run_simple_file(JSContext *ctx, const char *src, size_t len, c
     return res;
 }
 
+/* PyPreConfig.configure_locale (process-wide like _PyRuntime.preconfig):
+   LC_CTYPE was set from the environment at startup (qp_main,
+   Py_InitializeEx). */
+static int qp_preconfig_configure_locale;
+
 /* ---- command line state ----------------------------------------------- */
 
 typedef struct QPMain {
     QPConfig cfg;
     const char *program;        /* argv[0] (program name in messages) */
-    int skip_first_line;        /* -x */
     int kb;                     /* an unhandled KeyboardInterrupt was reported */
     int site_import;            /* !-S */
     char **sys_argv;            /* cfg.argv storage */
@@ -307,7 +428,7 @@ typedef struct QPMain {
     char *command;              /* -c text + "\n" */
     char *envwarn;              /* PYTHONWARNINGS copy split in place */
     char *run_filename;         /* cfg.run_filename storage (made absolute) */
-    int use_frozen_modules;     /* -X frozen_modules / PYTHON_FROZEN_MODULES: start from the base snapshot embedded in qpy (qp_main_restore_base) */
+    int opt_R;                  /* -R: random hash seed even with PYTHONHASHSEED */
 } QPMain;
 
 static int qp_main_err_print(JSContext *ctx, QPMain *m)
@@ -426,6 +547,8 @@ static char *qp_main_dedent(const char *src, size_t len, size_t *out_len)
     return dest;
 }
 
+static int qp_main_command_check(JSContext *ctx, const char *src, size_t len);
+
 /* pymain_run_command */
 static int qp_main_run_command(JSContext *ctx, QPMain *m)
 {
@@ -434,9 +557,11 @@ static int qp_main_run_command(JSContext *ctx, QPMain *m)
     size_t len;
 
     src = qp_main_dedent(m->cfg.run_command, strlen(m->cfg.run_command), &len);
-    if (!src) {
+    if (!src || qp_main_command_check(ctx, src, len) < 0) {
         qp_sys_write_stderr(ctx, "Unable to decode the command from the command line:\n");
-        qp_raise_memory_error(ctx);
+        if (!src)
+            qp_raise_memory_error(ctx);
+        qp_sys_free(src);
         return qp_main_err_print(ctx, m);
     }
     main_module = qp_run_main_module(ctx);
@@ -453,13 +578,52 @@ static int qp_main_run_command(JSContext *ctx, QPMain *m)
     /* _PyRun_String with a name: the source is registered for tracebacks */
     if (qp_linecache_register(ctx, "<string>", src, len) < 0)
         JS_FreeValue(ctx, JS_GetException(ctx));
-    res = qp_run_source(ctx, src, len, "<string>", QP_INPUT_FILE, QP_PF_IGNORE_COOKIE, d, d);
+    res = qp_run_source_ex(ctx, src, len, "<string>", QP_INPUT_FILE, QP_PF_IGNORE_COOKIE, d, d,
+                           TRUE);
     qp_sys_free(src);
     JS_FreeValue(ctx, d);
     JS_FreeValue(ctx, main_module);
     if (JS_IsException(res))
         return qp_main_err_print(ctx, m);
     JS_FreeValue(ctx, res);
+    return 0;
+}
+
+/* pymain_run_command: the command, decoded from the command line with
+   surrogateescape, must encode to UTF-8 (else the UnicodeEncodeError is
+   pending, -1). */
+static int qp_main_command_check(JSContext *ctx, const char *src, size_t len)
+{
+    JSValue b, args[2], s, r;
+    JSAtom a;
+    size_t i;
+
+    for (i = 0; i < len && !((uint8_t)src[i] & 0x80); i++)
+        continue;
+    if (i == len)
+        return 0;
+    b = qp_bytes_new(ctx, src, len);
+    if (JS_IsException(b))
+        return -1;
+    args[0] = qp_str_from_cstr(ctx, "utf-8");
+    args[1] = qp_str_from_cstr(ctx, "surrogateescape");
+    a = JS_NewAtom(ctx, "decode");
+    s = qp_call_method(ctx, b, a, (JSValueConst *)args, 2, QP_NULL);
+    JS_FreeAtom(ctx, a);
+    JS_FreeValue(ctx, b);
+    JS_FreeValue(ctx, args[1]);
+    if (JS_IsException(s)) {
+        JS_FreeValue(ctx, args[0]);
+        return -1;
+    }
+    a = JS_NewAtom(ctx, "encode");
+    r = qp_call_method(ctx, s, a, (JSValueConst *)args, 1, QP_NULL);
+    JS_FreeAtom(ctx, a);
+    JS_FreeValue(ctx, s);
+    JS_FreeValue(ctx, args[0]);
+    if (JS_IsException(r))
+        return -1;
+    JS_FreeValue(ctx, r);
     return 0;
 }
 
@@ -513,7 +677,7 @@ static int qp_main_run_file(JSContext *ctx, QPMain *m)
         JS_FreeValue(ctx, fname);
         return 2;
     }
-    if (m->skip_first_line) {
+    if (m->cfg.skip_source_first_line) {
         /* push back the first newline so line numbers stay the same */
         while ((ch = getc(fp)) != EOF) {
             if (ch == '\n') {
@@ -539,7 +703,7 @@ static int qp_main_run_file(JSContext *ctx, QPMain *m)
         qp_raise_memory_error(ctx);
         return qp_main_err_print(ctx, m);
     }
-    res = qp_run_simple_file(ctx, src, len, filename);
+    res = qp_run_simple_file(ctx, src, len, filename, !m->cfg.skip_source_first_line);
     qp_sys_free(src);
     if (JS_IsException(res))
         return qp_main_err_print(ctx, m);
@@ -547,10 +711,6 @@ static int qp_main_run_file(JSContext *ctx, QPMain *m)
     return 0;
 }
 
-/* pymain_run_module.  With importlib booted (M3): runpy._run_module_as_main
-   (modname, True).  Without it only builtin modules exist, which have no
-   code object: runpy's _get_module_details errors are reproduced
-   (sys.exit("%s: %s" % (sys.executable, msg)) -> status 1). */
 /* -X tracemalloc / PYTHONTRACEMALLOC (init_interp_main):
    _tracemalloc.start(nframe); -1 with the exception pending. */
 static int qp_main_start_tracemalloc(JSContext *ctx, int nframe)
@@ -581,7 +741,11 @@ static int qp_main_start_tracemalloc(JSContext *ctx, int nframe)
     return 0;
 }
 
-static int qp_main_run_module(JSContext *ctx, QPMain *m, const char *modname)
+/* pymain_run_module.  With importlib booted (M3): runpy._run_module_as_main
+   (modname, True).  Without it only builtin modules exist, which have no
+   code object: runpy's _get_module_details errors are reproduced
+   (sys.exit("%s: %s" % (sys.executable, msg)) -> status 1). */
+static int qp_main_run_module(JSContext *ctx, QPMain *m, const char *modname, int set_argv0)
 {
     JSValue runpy, runmodule, args[2], res, name, parent, mod;
     const char *exe = m->cfg.executable ? m->cfg.executable : m->program;
@@ -609,7 +773,7 @@ static int qp_main_run_module(JSContext *ctx, QPMain *m, const char *modname)
             JS_FreeValue(ctx, runmodule);
             return qp_main_err_print(ctx, m);
         }
-        args[1] = JS_TRUE;
+        args[1] = JS_NewBool(ctx, set_argv0);
         res = qp_vectorcall(ctx, runmodule, (JSValueConst *)args, 2, QP_NULL);
         JS_FreeValue(ctx, args[0]);
         JS_FreeValue(ctx, runmodule);
@@ -652,6 +816,47 @@ static int qp_main_run_module(JSContext *ctx, QPMain *m, const char *modname)
     else
         fprintf(stderr, "%s: No module named %s\n", exe, modname);
     return 1;
+}
+
+/* pymain_get_importer: 1 when an import hook handles filename (a directory
+   or a zip file, run as its __main__ module), 0 when none does (the
+   importer cached for it is None), -1 on error. */
+static int qp_main_get_importer(JSContext *ctx, const char *filename)
+{
+    QPState *s = QP_STATE(ctx);
+    JSValue ext, finder, path, importer;
+    JSAtom a;
+    int r;
+
+    if (!JS_IsObject(s->importlib))
+        return 0;
+    a = JS_NewAtom(ctx, "_bootstrap_external");
+    ext = qp_getattr(ctx, s->importlib, a);
+    JS_FreeAtom(ctx, a);
+    if (JS_IsException(ext))
+        return -1;
+    a = JS_NewAtom(ctx, "PathFinder");
+    finder = qp_getattr(ctx, ext, a);
+    JS_FreeAtom(ctx, a);
+    JS_FreeValue(ctx, ext);
+    if (JS_IsException(finder))
+        return -1;
+    path = qp_str_from_cstr(ctx, filename);
+    if (JS_IsException(path)) {
+        JS_FreeValue(ctx, finder);
+        return -1;
+    }
+    /* PyImport_GetImporter: sys.path_importer_cache, else sys.path_hooks */
+    a = JS_NewAtom(ctx, "_path_importer_cache");
+    importer = qp_call_method(ctx, finder, a, (JSValueConst *)&path, 1, QP_NULL);
+    JS_FreeAtom(ctx, a);
+    JS_FreeValue(ctx, path);
+    JS_FreeValue(ctx, finder);
+    if (JS_IsException(importer))
+        return -1;
+    r = !JS_IsUndefined(importer);
+    JS_FreeValue(ctx, importer);
+    return r;
 }
 
 /* ---- interactive loop ------------------------------------------------- */
@@ -831,6 +1036,10 @@ static JSValue qp_repl_exec(JSContext *ctx, const char *src, size_t len, int *pc
         return JS_EXCEPTION;
     }
     qp_error_clear(&err);
+    if (qp_run_register_code(ctx, bc, src, len, "<stdin>") < 0) {
+        JS_FreeValue(ctx, bc);
+        return JS_EXCEPTION;
+    }
     main_module = qp_run_main_module(ctx);
     if (JS_IsException(main_module)) {
         JS_FreeValue(ctx, bc);
@@ -982,7 +1191,7 @@ static int qp_main_run_startup(JSContext *ctx, QPMain *m, int *exitcode)
         qp_main_err_print(ctx, m);
         return 0;
     }
-    res = qp_run_simple_file(ctx, src, len, startup);
+    res = qp_run_simple_file(ctx, src, len, startup, 0);
     qp_sys_free(src);
     if (JS_IsException(res)) {
         if (!m->cfg.inspect && qp_exc_pending_matches(ctx, QP_EXC(ctx, SystemExit))) {
@@ -1013,7 +1222,7 @@ static int qp_main_run_repl(JSContext *ctx, QPMain *m)
         qp_raise_memory_error(ctx);
         return qp_main_err_print(ctx, m);
     }
-    res = qp_run_simple_file(ctx, src, len, "<stdin>");
+    res = qp_run_simple_file(ctx, src, len, "<stdin>", 0);
     qp_sys_free(src);
     if (JS_IsException(res))
         return qp_main_err_print(ctx, m);
@@ -1325,6 +1534,27 @@ static int qp_parse_nframe(const char *s, int *out)
     return 0;
 }
 
+static const char qp_cpu_count_error[] =
+    "-X cpu_count=n option: n is missing or an invalid number, n must be greater than 0";
+
+/* config_init_cpu_count value: "default" (0) or an int >= 1. */
+static int qp_parse_cpu_count(const char *s, int *out)
+{
+    char *end;
+    long v;
+
+    if (!strcmp(s, "default")) {
+        *out = 0;
+        return 0;
+    }
+    errno = 0;
+    v = strtol(s, &end, 10);
+    if (!*s || *end || errno || v < 1 || v > INT_MAX)
+        return -1;
+    *out = (int)v;
+    return 0;
+}
+
 /* int_max_str_digits value check: 0 or >= 640. */
 static int qp_parse_max_digits(const char *s, int *out)
 {
@@ -1391,7 +1621,8 @@ static char *qp_main_abspath(const char *path, char *buf)
 }
 
 /* Absolute program path (sys.executable): argv[0] if it holds a '/',
-   else the first match in $PATH.  Symbolic links are not resolved, so a
+   else the first match in $PATH, else "" (getpath: the executable cannot
+   be calculated; issue #7774).  Symbolic links are not resolved, so a
    virtual environment's bin/python stays sys.executable (site.venv finds
    pyvenv.cfg next to it); the stdlib is located from its real path
    (importlib_boot.c). */
@@ -1407,8 +1638,9 @@ static char *qp_main_executable(const char *argv0)
     if (strchr(argv0, '/')) {
         if (qp_main_abspath(argv0, buf))
             argv0 = buf;
-    } else if ((path = getenv("PATH"))) {
-        for (p = path; *p; p = *q ? q + 1 : q) {
+    } else {
+        path = getenv("PATH");
+        for (p = path ? path : ""; *p; p = *q ? q + 1 : q) {
             q = strchr(p, ':');
             if (!q)
                 q = p + strlen(p);
@@ -1423,6 +1655,8 @@ static char *qp_main_executable(const char *argv0)
                 break;
             }
         }
+        if (!strchr(argv0, '/'))
+            argv0 = "";
     }
     n = strlen(argv0);
     res = qp_sys_malloc(n + 1);
@@ -1486,6 +1720,7 @@ static int qp_main_parse(QPMain *m, int argc, char **argv)
     cfg->int_max_str_digits = -1;
     cfg->lazy_imports = -1;
     cfg->utf8_mode = 1;     /* PEP 686: UTF-8 mode is the default in 3.15 */
+    cfg->parse_argv = 1;
     cfg->orig_argc = argc;
     cfg->orig_argv = argv;
     cfg->xoptions = qp_sys_calloc(argc + 1, sizeof(char *));
@@ -1552,7 +1787,8 @@ static int qp_main_parse(QPMain *m, int argc, char **argv)
             bytes_warning++;
             break;
         case 'd':
-            break;  /* parser debugging: debug builds only */
+            cfg->parser_debug++;    /* the output needs a debug build; the flag is kept */
+            break;
         case 'i':
             cfg->inspect++;
             cfg->interactive++;
@@ -1594,7 +1830,7 @@ static int qp_main_parse(QPMain *m, int argc, char **argv)
             cfg->verbose++;
             break;
         case 'x':
-            m->skip_first_line = 1;
+            cfg->skip_source_first_line = 1;
             break;
         case 'h':
         case '?':
@@ -1611,7 +1847,8 @@ static int qp_main_parse(QPMain *m, int argc, char **argv)
             cfg->quiet++;
             break;
         case 'R':
-            break;  /* hash randomization is always on unless PYTHONHASHSEED */
+            m->opt_R = 1;   /* config->use_hash_seed = 0: PYTHONHASHSEED is ignored */
+            break;
         default:
             qp_config_usage(1, m->program);
             qp_sys_free(warn);
@@ -1673,6 +1910,7 @@ static int qp_main_parse(QPMain *m, int argc, char **argv)
     qp_env_flag(m, &cfg->inspect, "PYTHONINSPECT");
     qp_env_flag(m, &cfg->verbose, "PYTHONVERBOSE");
     qp_env_flag(m, &cfg->dont_write_bytecode, "PYTHONDONTWRITEBYTECODE");
+    qp_env_flag(m, &cfg->parser_debug, "PYTHONDEBUG");
     qp_env_flag(m, &cfg->no_user_site, "PYTHONNOUSERSITE");
     qp_env_flag(m, &cfg->unbuffered, "PYTHONUNBUFFERED");
     qp_env_flag(m, &cfg->dev_mode, "PYTHONDEVMODE");
@@ -1681,7 +1919,7 @@ static int qp_main_parse(QPMain *m, int argc, char **argv)
         cfg->safe_path = 1;
     cfg->pythonpath = qp_env(m, "PYTHONPATH");
     cfg->stdio_encoding = qp_env(m, "PYTHONIOENCODING");
-    if ((e = qp_env(m, "PYTHONHASHSEED"))) {
+    if (!m->opt_R && (e = qp_env(m, "PYTHONHASHSEED"))) {
         if (strcmp(e, "random") != 0) {
             char *end;
             unsigned long seed;
@@ -1760,13 +1998,24 @@ static int qp_main_parse(QPMain *m, int argc, char **argv)
                                    "-X tracemalloc=NFRAME: invalid number of frames");
         }
     }
-    /* config_init_import: the frozen modules are the base snapshot */
-    m->use_frozen_modules = 1;
+    /* config_init_cpu_count */
+    if ((e = qp_env(m, "PYTHON_CPU_COUNT")) && qp_parse_cpu_count(e, &cfg->cpu_count) < 0) {
+        qp_sys_free(warn);
+        return qp_config_fatal("config_init_cpu_count", qp_cpu_count_error);
+    }
+    /* -X cpu_count without "=n" is "" here: an error, as in CPython */
+    if ((x = qp_xoption(m, "cpu_count")) && qp_parse_cpu_count(x, &cfg->cpu_count) < 0) {
+        qp_sys_free(warn);
+        return qp_config_fatal("config_init_cpu_count", qp_cpu_count_error);
+    }
+    /* config_init_import: the frozen modules (python/frozen.c) and the base
+       snapshot made with them */
+    cfg->use_frozen_modules = 1;
     if ((e = qp_env(m, "PYTHON_FROZEN_MODULES"))) {
         if (!strcmp(e, "on"))
-            m->use_frozen_modules = 1;
+            cfg->use_frozen_modules = 1;
         else if (!strcmp(e, "off"))
-            m->use_frozen_modules = 0;
+            cfg->use_frozen_modules = 0;
         else {
             qp_sys_free(warn);
             return qp_config_fatal(NULL, "bad value for PYTHON_FROZEN_MODULES "
@@ -1775,9 +2024,9 @@ static int qp_main_parse(QPMain *m, int argc, char **argv)
     }
     if ((x = qp_xoption(m, "frozen_modules"))) {
         if (!strcmp(x, "on") || !*x)
-            m->use_frozen_modules = 1;
+            cfg->use_frozen_modules = 1;
         else if (!strcmp(x, "off"))
-            m->use_frozen_modules = 0;
+            cfg->use_frozen_modules = 0;
         else {
             qp_sys_free(warn);
             return qp_config_fatal(NULL, "bad value for option -X frozen_modules "
@@ -1817,6 +2066,11 @@ static int qp_main_parse(QPMain *m, int argc, char **argv)
         cfg->dev_mode = 1;
     if (qp_xoption(m, "warn_default_encoding"))
         cfg->warn_default_encoding = 1;
+    if (qp_env(m, "PYTHONNODEBUGRANGES") || qp_xoption(m, "no_debug_ranges"))
+        cfg->no_debug_ranges = 1;
+    /* config_read_complex_options; dev mode enables it as well */
+    if (qp_env(m, "PYTHONFAULTHANDLER") || qp_xoption(m, "faulthandler") || cfg->dev_mode)
+        cfg->faulthandler = 1;
     if ((x = qp_xoption(m, "int_max_str_digits")) &&
         qp_parse_max_digits(x, &cfg->int_max_str_digits) < 0) {
         qp_sys_free(warn);
@@ -1873,6 +2127,18 @@ static int qp_main_parse(QPMain *m, int argc, char **argv)
             (char *)(bytes_warning > 1 ? "error::BytesWarning" : "default::BytesWarning");
 
     m->executable = qp_main_executable(m->program);
+#ifdef __APPLE__
+    /* getpath.py ENV_PYTHONEXECUTABLE (macOS only, read even with -E) */
+    if ((e = getenv("PYTHONEXECUTABLE")) && *e) {
+        size_t n = strlen(e);
+        char *exe = qp_sys_malloc(n + 1);
+        if (exe) {
+            memcpy(exe, e, n + 1);
+            qp_sys_free(m->executable);
+            m->executable = exe;
+        }
+    }
+#endif
     cfg->executable = m->executable ? m->executable : m->program;
     m->path0 = qp_main_compute_path0(m);
     cfg->sys_path_0 = m->path0;
@@ -1937,7 +2203,7 @@ static int qp_main_add_path0(JSContext *ctx, const char *path0)
    imported (errors reported as unraisable). */
 static void qp_main_thread_shutdown(JSContext *ctx)
 {
-    JSValue name, threading, r, exc;
+    JSValue name, threading, r;
     JSAtom a;
     int rc;
 
@@ -1949,9 +2215,7 @@ static void qp_main_thread_shutdown(JSContext *ctx)
     rc = qp_import_get_module(ctx, name, &threading);
     JS_FreeValue(ctx, name);
     if (rc < 0) {
-        exc = qp_exc_fetch(ctx);
-        qp_exc_write_unraisable(ctx, exc, QP_NULL);
-        JS_FreeValue(ctx, exc);
+        qp_format_unraisable(ctx, "Exception ignored on threading shutdown", QP_NULL);
         return;
     }
     if (rc == 0)
@@ -1959,11 +2223,8 @@ static void qp_main_thread_shutdown(JSContext *ctx)
     a = JS_NewAtom(ctx, "_shutdown");
     r = qp_call_method(ctx, threading, a, NULL, 0, QP_NULL);
     JS_FreeAtom(ctx, a);
-    if (JS_IsException(r)) {
-        exc = qp_exc_fetch(ctx);
-        qp_exc_write_unraisable(ctx, exc, QP_NULL);
-        JS_FreeValue(ctx, exc);
-    }
+    if (JS_IsException(r))
+        qp_format_unraisable(ctx, "Exception ignored on threading shutdown", QP_NULL);
     JS_FreeValue(ctx, r);
     JS_FreeValue(ctx, threading);
 }
@@ -2202,11 +2463,14 @@ static int qp_finalize(JSContext *ctx, int *pnthreads)
     *pnthreads = qp_threads_finalize(ctx);
     if (qp_sys_flush_std_files(ctx) < 0)
         ret = -1;
+    qp_signal_fini(ctx);
     /* a collection before the modules (Py_FinalizeEx's _PyGC_CollectNoFail) */
     qp_gc_collect_at_exit(ctx);
     qp_finalize_modules(ctx);
     if (qp_sys_flush_std_files(ctx) < 0)
         ret = -1;
+    /* _PyFaulthandler_Fini */
+    qp_faulthandler_fini(ctx);
     fflush(stdout);
     fflush(stderr);
     /* nothing is left pending for the teardown */
@@ -2246,10 +2510,13 @@ static void qp_runtime_finalize(JSRuntime *rt)
    does not depend on the process: qp_importlib_boot_core (importlib,
    zipimport, encodings, _signal), the _io classes (_pyio and the modules
    it imports: os, abc, codecs, stat...) and the UTF-8 codec, i.e. every
-   module of a `python -S` start but __main__.  The build writes it with
-   `qpy --write-base-snapshot FILE DIR` (qp_write_base_snapshot, DIR being
-   the directory of the qpy that embeds it) and qpy.c hands it to
-   qp_set_base_snapshot().  qp_main then restores it instead of building
+   module of a `python -S` start but __main__, made with the frozen
+   modules (python/frozen.c) like a start with frozen modules enabled
+   (os, abc, codecs, stat... come from them).  The build writes it with
+   `qpy --write-base-snapshot FILE DIR [FROZEN]` (qp_write_base_snapshot,
+   DIR being the directory of the qpy that embeds it, FROZEN the frozen
+   modules it embeds) and qpy.c hands it to qp_set_base_snapshot().
+   qp_main then restores it instead of building
    the state and compiling these modules, and applies what depends on the
    process like a normal start does (qp_main_attach_base): the
    configuration and the sys attributes it gives, the getpath paths, the
@@ -2260,11 +2527,11 @@ static void qp_runtime_finalize(JSRuntime *rt)
    The snapshot is only used when the configuration gives the same state
    (qp_main_base_eligible: no -O, -v, -X importtime, dev mode, -X options
    other than utf8 and frozen_modules...), when every source file of its
-   modules still has the size and modification time it had at build time
-   (a stale base is never used), when the stdlib of the process is the one
-   of the base, and unless -X frozen_modules=off / PYTHON_FROZEN_MODULES=off
-   (CPython's switch for its frozen stdlib modules).  Otherwise qp_main
-   starts normally.
+   modules but the frozen ones still has the size and modification time
+   it had at build time (a stale base is never used), when the stdlib of
+   the process is the one of the base, and unless -X frozen_modules=off /
+   PYTHON_FROZEN_MODULES=off (its frozen stdlib modules are then not
+   used).  Otherwise qp_main starts normally.
 
    Blob layout (host byte order, read by the build that wrote it):
      "QPYBASE1"
@@ -2409,7 +2676,7 @@ static BOOL qp_main_base_eligible(const QPMain *m)
     const QPConfig *c = &m->cfg;
     int i;
 
-    if (!qp_base_data || !m->use_frozen_modules)
+    if (!qp_base_data || !c->use_frozen_modules)
         return FALSE;
     if (c->optimize || c->verbose || c->import_time || c->dev_mode ||
         c->warn_default_encoding || c->int_max_str_digits != -1 || c->lazy_imports != -1 ||
@@ -2427,7 +2694,8 @@ static BOOL qp_main_base_eligible(const QPMain *m)
 /* The state of the base: like a start with -I -S -B (no environment, no
    site, no bytecode written at build time), a fixed hash seed, an empty
    posix.environ (QPConfig.detached), the stdlib of `home`/pylib, then the
-   _io classes and the UTF-8 codec that the standard streams need.  The
+   UTF-8 codec that the standard streams need (qp_importlib_boot_core
+   loads the _io classes).  The
    state that depends on the working directory (sys.path_importer_cache)
    is dropped and the garbage of the startup freed.  0, or -1 with an
    exception pending. */
@@ -2435,7 +2703,7 @@ static int qp_base_init(JSContext *ctx, const char *home)
 {
     static char *argv[] = { (char *)"", NULL };
     QPConfig cfg;
-    JSValue m, v;
+    JSValue v;
     JSAtom name;
 
     memset(&cfg, 0, sizeof(cfg));
@@ -2448,6 +2716,7 @@ static int qp_base_init(JSContext *ctx, const char *home)
     cfg.dont_write_bytecode = 1;
     cfg.int_max_str_digits = -1;
     cfg.lazy_imports = -1;
+    cfg.use_frozen_modules = 1;
     cfg.argc = cfg.orig_argc = 1;
     cfg.argv = cfg.orig_argv = argv;
     cfg.home = home;
@@ -2455,17 +2724,6 @@ static int qp_base_init(JSContext *ctx, const char *home)
         return -1;
     if (qp_importlib_boot_core(ctx) < 0)
         return -1;
-    /* the _io classes (_pyio) */
-    m = qp_import_module(ctx, "_io");
-    if (JS_IsException(m))
-        return -1;
-    name = JS_NewAtom(ctx, "TextIOWrapper");
-    v = name == JS_ATOM_NULL ? JS_EXCEPTION : qp_getattr(ctx, m, name);
-    JS_FreeAtom(ctx, name);
-    JS_FreeValue(ctx, m);
-    if (JS_IsException(v))
-        return -1;
-    JS_FreeValue(ctx, v);
     v = qp_codec_lookup(ctx, "utf-8");
     if (JS_IsException(v))
         return -1;
@@ -2491,12 +2749,14 @@ static void qp_base_put(DynBuf *d, const void *data, size_t n)
 }
 
 /* `'\0'.join([sys._stdlib_dir] + the sorted __file__ of sys.modules)` as
-   UTF-8 bytes */
+   UTF-8 bytes, without the frozen modules (their code does not come from
+   their source file) */
 static JSValue qp_base_file_list(JSContext *ctx)
 {
     static const char src[] =
         "(lambda sys: '\\0'.join([sys._stdlib_dir] + sorted({m.__file__ for m in "
-        "list(sys.modules.values()) if isinstance(getattr(m, '__file__', None), str)}))"
+        "list(sys.modules.values()) if isinstance(getattr(m, '__file__', None), str) and "
+        "getattr(getattr(m, '__spec__', None), 'origin', None) != 'frozen'}))"
         ".encode('utf-8', 'surrogateescape'))(__import__('sys'))";
     JSValue d = qp_dict_new(ctx), r;
 
@@ -2777,17 +3037,35 @@ static int qp_main_restore_base(QPMain *m, JSRuntime *rt, JSContext **pctx)
     return -1;
 }
 
+/* exit_sigint (Modules/main.c): after an unhandled KeyboardInterrupt the
+   process ends by SIGINT with its default action, so that the parent (a
+   shell) knows about the ^C; status 130 if that did not end it. */
+static int qp_main_exit_sigint(void)
+{
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGINT, &sa, NULL) == -1)
+        perror("signal");
+    else
+        kill(getpid(), SIGINT);
+    return 130;
+}
+
 int qp_main(int argc, char **argv)
 {
     QPMain m;
     JSRuntime *rt;
     JSContext *ctx;
     JSValue main_module;
-    int exitcode = 0, rc, nthreads;
+    int exitcode = 0, rc, nthreads, main_importer = 0;
 
     memset(&m, 0, sizeof(m));
     /* _Py_SetLocaleFromEnv(LC_CTYPE) (pymain_init) */
     setlocale(LC_CTYPE, "");
+    qp_preconfig_configure_locale = 1;
     rc = qp_main_parse(&m, argc, argv);
     if (rc >= 0) {
         qp_main_free(&m);
@@ -2840,6 +3118,11 @@ int qp_main(int argc, char **argv)
         }
 #endif
     }
+    /* _PyFaulthandler_Init */
+    if (m.cfg.faulthandler && qp_faulthandler_init_enable(ctx) < 0) {
+        exitcode = qp_main_err_print(ctx, &m);
+        goto done;
+    }
     if (m.cfg.tracemalloc > 0 && qp_main_start_tracemalloc(ctx, m.cfg.tracemalloc) < 0) {
         exitcode = qp_main_err_print(ctx, &m);
         goto done;
@@ -2850,7 +3133,17 @@ int qp_main(int argc, char **argv)
         goto done;
     }
     JS_FreeValue(ctx, main_module);
-    if (m.cfg.sys_path_0 && qp_main_add_path0(ctx, m.cfg.sys_path_0) < 0) {
+    /* a directory or zip file runs its __main__ module, with the file
+       itself as sys.path[0] (even with -P) */
+    if (m.cfg.run_filename) {
+        main_importer = qp_main_get_importer(ctx, m.cfg.run_filename);
+        if (main_importer < 0) {
+            exitcode = qp_main_err_print(ctx, &m);
+            goto done;
+        }
+    }
+    if (main_importer ? qp_main_add_path0(ctx, m.cfg.run_filename) < 0
+        : m.cfg.sys_path_0 && qp_main_add_path0(ctx, m.cfg.sys_path_0) < 0) {
         exitcode = qp_main_err_print(ctx, &m);
         goto done;
     }
@@ -2859,7 +3152,9 @@ int qp_main(int argc, char **argv)
     if (m.cfg.run_command)
         exitcode = qp_main_run_command(ctx, &m);
     else if (m.cfg.run_module)
-        exitcode = qp_main_run_module(ctx, &m, m.cfg.run_module);
+        exitcode = qp_main_run_module(ctx, &m, m.cfg.run_module, 1);
+    else if (main_importer)
+        exitcode = qp_main_run_module(ctx, &m, "__main__", 0);
     else if (m.cfg.run_filename)
         exitcode = qp_main_run_file(ctx, &m);
     else
@@ -2872,18 +3167,16 @@ int qp_main(int argc, char **argv)
        GIL */
     if (qp_finalize(ctx, &nthreads) < 0)
         exitcode = 120;
-    if (m.kb)
-        exitcode = 130;
     /* daemon threads still reference the runtime: no teardown (CPython
        does not free their thread states either) */
     if (nthreads > 0)
-        return exitcode;
+        return m.kb ? qp_main_exit_sigint() : exitcode;
     /* like qjs: release everything (the state keeps pointers into m.cfg),
        so that leaks and teardown bugs are visible */
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     qp_main_free(&m);
-    return exitcode;
+    return m.kb ? qp_main_exit_sigint() : exitcode;
 }
 
 /* ---- durable REPL (qjs --drepl FILE --python) ------------------------- */

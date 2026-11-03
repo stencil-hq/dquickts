@@ -343,7 +343,24 @@ static int qp__gen_send_ex(JSContext *ctx, QPGen *g, JSValueConst arg, JSValue *
             *presult = JS_UNDEFINED;
         return QP_SEND_RETURN;
     }
+    /* RESUME of a frame starting or resumed after a plain yield checks the
+       eval breaker; resumed after a yield from / await, it does not and
+       its frame goes back to the delegate (JUMP_BACKWARD_NO_INTERRUPT),
+       whose resumption checks: a pending signal's exception is raised
+       inside the innermost generator of a yield-from chain (bpo-30039) */
+    if (g->state == QP_GEN_SUSPENDED_YIELD_FROM) {
+        int r;
+        QPState *st = QP_STATE(ctx);
+        g->state = QP_GEN_EXECUTING;
+        st->signals_deferred = 1;
+        r = qp__gen_send_ex2(ctx, g, arg, presult, 0);
+        st->signals_deferred = 0;
+        return r;
+    }
+    QP_STATE(ctx)->signals_deferred = 0;
     g->state = QP_GEN_EXECUTING;
+    if (unlikely(ctx->interrupt_counter <= 1) && js_poll_interrupts(ctx))
+        return qp__gen_send_ex2(ctx, g, arg, presult, 1);
     return qp__gen_send_ex2(ctx, g, arg, presult, 0);
 }
 
@@ -422,9 +439,7 @@ static int qp__gen_close_iter(JSContext *ctx, JSValueConst yf)
     } else {
         int r = qp_getattr_opt(ctx, yf, QP_ATOM(ctx, close), &meth);
         if (r < 0) {
-            JSValue exc = qp_exc_fetch(ctx);
-            qp_exc_write_unraisable(ctx, exc, yf);
-            JS_FreeValue(ctx, exc);
+            qp_format_unraisable(ctx, "Exception ignored while closing generator %R", yf);
         } else if (r > 0) {
             retval = qp_call0(ctx, meth);
             JS_FreeValue(ctx, meth);
@@ -1584,23 +1599,6 @@ static JSValue qp_asyncgen_wrap_value(JSContext *ctx, JSValueConst v)
 /* finalization                                                              */
 /* ------------------------------------------------------------------------ */
 
-/* PyErr_FormatUnraisable("Exception ignored while <what> %R", obj) */
-static void qp__report_unraisable(JSContext *ctx, const char *what, JSValueConst obj)
-{
-    JSValue exc = qp_exc_fetch(ctx);
-    JSValue msg = qp_str_from_format(ctx, "Exception ignored while %s %R", what, obj);
-    const char *s = NULL;
-
-    if (!JS_IsException(msg))
-        s = qp_str_utf8(ctx, msg, NULL);
-    if (!s)
-        qp_err_clear(ctx);
-    qp_exc_write_unraisable_msg(ctx, exc, s, QP_NULL);
-    if (!JS_IsException(msg))
-        JS_FreeValue(ctx, msg);
-    JS_FreeValue(ctx, exc);
-}
-
 /* _PyErr_WarnUnawaitedCoroutine: warnings._warn_unawaited_coroutine (which
    shows cr_origin), falling back to a plain RuntimeWarning */
 static void qp__warn_unawaited_coro(JSContext *ctx, JSValueConst obj, QPGen *g)
@@ -1627,11 +1625,11 @@ static void qp__warn_unawaited_coro(JSContext *ctx, JSValueConst obj, QPGen *g)
         }
     }
     if (JS_HasException(ctx))
-        qp__report_unraisable(ctx, "finalizing coroutine", obj);
+        qp_format_unraisable(ctx, "Exception ignored while finalizing coroutine %R", obj);
     if (!warned &&
         qp_warn(ctx, QP_EXC(ctx, RuntimeWarning), 1,
                 "coroutine '%S' was never awaited", g->qualname) < 0)
-        qp__report_unraisable(ctx, "finalizing coroutine", obj);
+        qp_format_unraisable(ctx, "Exception ignored while finalizing coroutine %R", obj);
 }
 
 /* tp_finalize (gen_finalize, async_gen_asend_finalize,
@@ -1651,7 +1649,8 @@ static void qp_gen_finalize(JSContext *ctx, JSValueConst obj)
             if (qp_warn(ctx, QP_EXC(ctx, RuntimeWarning), 1,
                         "coroutine method '%s' of %R was never awaited",
                         method, qp__gen(o->gen)->qualname) < 0)
-                qp__report_unraisable(ctx, "finalizing async generator", o->gen);
+                qp_format_unraisable(ctx, "Exception ignored while finalizing async generator %R",
+                                     o->gen);
         }
     } else if (id == JS_CLASS_PY_GENERATOR || id == JS_CLASS_PY_COROUTINE ||
                id == JS_CLASS_PY_ASYNC_GEN) {
@@ -1663,7 +1662,7 @@ static void qp_gen_finalize(JSContext *ctx, JSValueConst obj)
             JSValue res = qp_call1(ctx, fin, obj);
             JS_FreeValue(ctx, fin);
             if (JS_IsException(res))
-                qp__report_unraisable(ctx, "finalizing generator", obj);
+                qp_format_unraisable(ctx, "Exception ignored while finalizing generator %R", obj);
             else
                 JS_FreeValue(ctx, res);
         } else if (g->kind == QP_GENK_CORO && g->state == QP_GEN_CREATED) {
@@ -1673,7 +1672,7 @@ static void qp_gen_finalize(JSContext *ctx, JSValueConst obj)
             JSValue res = qp__gen_close(ctx, obj);
             if (JS_IsException(res)) {
                 if (JS_HasException(ctx))
-                    qp__report_unraisable(ctx, "closing generator", obj);
+                    qp_format_unraisable(ctx, "Exception ignored while closing generator %R", obj);
             } else {
                 JS_FreeValue(ctx, res);
             }
@@ -1855,6 +1854,7 @@ static const QPTypeSpec qp__generator_spec = {
         .tp_repr = qp__gen_repr,
         .tp_iter = qp__self_iter,
         .tp_iternext = qp__gen_iternext,
+        .tp_finalize = qp_gen_finalize,
         .am = { .am_send = qp__gen_am_send },
     },
     .methods = qp__gen_methods, .getsets = qp__gen_getsets,
@@ -1865,6 +1865,7 @@ static const QPTypeSpec qp__coroutine_spec = {
     .instance_class_id = JS_CLASS_PY_COROUTINE,
     .slots = {
         .tp_repr = qp__gen_repr,
+        .tp_finalize = qp_gen_finalize,
         .am = { .am_await = qp__coro_await, .am_send = qp__gen_am_send },
     },
     .methods = qp__coro_methods, .getsets = qp__coro_getsets,
@@ -1875,6 +1876,7 @@ static const QPTypeSpec qp__async_generator_spec = {
     .instance_class_id = JS_CLASS_PY_ASYNC_GEN,
     .slots = {
         .tp_repr = qp__gen_repr,
+        .tp_finalize = qp_gen_finalize,
         .am = { .am_aiter = qp__self_iter, .am_anext = qp__agen_anext, .am_send = qp__gen_am_send },
     },
     .methods = qp__agen_methods, .getsets = qp__agen_getsets,
@@ -1897,6 +1899,7 @@ static const QPTypeSpec qp__asend_spec = {
     .slots = {
         .tp_iter = qp__self_iter,
         .tp_iternext = qp__asend_iternext,
+        .tp_finalize = qp_gen_finalize,
         .am = { .am_await = qp__self_iter, .am_send = qp__asend_am_send },
     },
     .methods = qp__asend_methods,
@@ -1908,6 +1911,7 @@ static const QPTypeSpec qp__athrow_spec = {
     .slots = {
         .tp_iter = qp__self_iter,
         .tp_iternext = qp__athrow_iternext,
+        .tp_finalize = qp_gen_finalize,
         .am = { .am_await = qp__self_iter },
     },
     .methods = qp__athrow_methods,

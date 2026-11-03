@@ -444,6 +444,8 @@ struct JSRuntime {
        re-validated with it (python/snapshot.c qp_snap_read_state): the
        hash randomization of a process started from the base snapshot */
     const uint8_t *py_snap_hash_key;
+    /* last JSShape.py_uid given */
+    uint64_t py_shape_uid;
 #endif
 };
 
@@ -493,6 +495,17 @@ typedef struct JSStackFrame {
     /* TRUE if the function was called as a constructor (for
        CallSite.prototype.isConstructor()) */
     uint8_t is_constructor;
+#ifdef CONFIG_PYTHON
+    /* Python frames only (python/instrumentation.c): QP_MON_SF_* events
+       of the previous instruction still to report, and its offset + 1
+       (0 at frame start) */
+    uint8_t py_mon_flags;
+    uint32_t py_mon_prev;
+    /* offset of the last instruction that raised in the frame, except the
+       RERAISE n != 0 (CPython restores f_lasti to it): the frame's
+       f_lasti once ended by an exception (python/frameobject.c) */
+    uint32_t py_raise_pc;
+#endif
     /* only used in generators. Current stack pointer value. NULL if
        the function is running. */
     JSValue *cur_sp;
@@ -1193,6 +1206,14 @@ struct JSShape {
     int prop_size; /* allocated properties */
     int prop_count; /* include deleted properties */
     int deleted_prop_count;
+#ifdef CONFIG_PYTHON
+    /* identity of the (proto, property layout) pair, keyed on by the
+       Python attribute inline caches instead of the shape pointer (the
+       caches hold no reference): unique in the runtime, never reused,
+       renewed by js_shape_new_uid() when the shape is created, cloned or
+       modified in place */
+    uint64_t py_uid;
+#endif
     JSShape *shape_hash_next; /* in JSRuntime.shape_hash[h] list */
     JSObject *proto;
     uint32_t hash_table[]; /* prop_hash_mask + 1 elements */
@@ -1219,6 +1240,7 @@ struct JSObject {
     uint8_t is_HTMLDDA : 1; /* specific annex B IsHtmlDDA behavior */
     uint8_t py_dict_mode : 1; /* Python instance: __dict__ materialized */
     uint8_t py_finalized : 1; /* Python instance: __del__ already run */
+    uint8_t py_gc_kept : 1; /* unreachable, kept by gc_py_finalize_cycles() for the finalizers */
 #ifdef CONFIG_PYTHON_CAPI
     uint8_t py_has_mirror : 1; /* C API: a PyObject mirror exists (qp_capi.obj_map) */
 #endif
@@ -6473,6 +6495,15 @@ static void js_shape_hash_unlink(JSRuntime *rt, JSShape *sh)
     rt->shape_hash_count--;
 }
 
+/* give 'sh' a new identity for the Python attribute inline caches (its
+   layout or prototype changes, or it is a new shape) */
+static inline void js_shape_new_uid(JSRuntime *rt, JSShape *sh)
+{
+#ifdef CONFIG_PYTHON
+    sh->py_uid = ++rt->py_shape_uid;
+#endif
+}
+
 /* create a new empty shape with prototype 'proto'. It is not hashed */
 static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
                                            int hash_size, int prop_size)
@@ -6494,6 +6525,7 @@ static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
     sh->prop_count = 0;
     sh->deleted_prop_count = 0;
     sh->is_hashed = FALSE;
+    js_shape_new_uid(rt, sh);
     return sh;
 }
 
@@ -6545,6 +6577,7 @@ static JSShape *js_clone_shape(JSContext *ctx, JSShape *sh1)
     js_rc(sh)->ref_count = 1;
     add_gc_object(ctx->rt, &sh->header, JS_GC_OBJ_TYPE_SHAPE);
     sh->is_hashed = FALSE;
+    js_shape_new_uid(ctx->rt, sh);
     if (sh->proto) {
         JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, sh->proto));
     }
@@ -6758,6 +6791,7 @@ static int add_shape_property(JSContext *ctx, JSShape **psh,
         sh->hash = new_shape_hash;
         js_shape_hash_link(rt, sh);
     }
+    js_shape_new_uid(rt, sh);
     /* Initialize the new shape property.
        The object property at p->prop[sh->prop_count] is uninitialized */
     prop = get_shape_prop(sh);
@@ -6992,6 +7026,7 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     p->is_HTMLDDA = 0;
     p->py_dict_mode = 0;
     p->py_finalized = 0;
+    p->py_gc_kept = 0;
 #ifdef CONFIG_PYTHON_CAPI
     p->py_has_mirror = 0;
 #endif
@@ -7858,8 +7893,13 @@ static void free_object(JSRuntime *rt, JSObject *p)
     JSShapeProperty *pr;
 
 #ifdef CONFIG_PYTHON
-    /* __del__ resurrects the object until the finalizer queue runs */
-    if (QP_IS_PY_CLASS(p->class_id) && !p->py_finalized &&
+    /* __del__ resurrects the object until the finalizer queue runs (and
+       so do the deallocations reported to C-API watchers: functions) */
+    if ((QP_IS_PY_CLASS(p->class_id) || p->class_id == JS_CLASS_ARRAY
+#ifdef CONFIG_PYTHON_CAPI
+         || (p->class_id == JS_CLASS_BYTECODE_FUNCTION && unlikely(qp_capi_func_watchers_set))
+#endif
+         ) && !p->py_finalized &&
         rt->gc_phase != JS_GC_PHASE_REMOVE_CYCLES && qp_del_hook(rt, p))
         return;
     /* clear the Python weak references to the object */
@@ -7954,6 +7994,10 @@ static void free_zero_refcount(JSRuntime *rt)
     rt->gc_phase = JS_GC_PHASE_NONE;
 }
 
+#ifdef CONFIG_PYTHON_CAPI
+static BOOL qp_capi_object_revived(JSRuntime *rt, JSObject *p);
+#endif
+
 /* called with the ref_count of 'v' reaches zero. */
 void __JS_FreeValueRT(JSRuntime *rt, JSValue v)
 {
@@ -7999,6 +8043,12 @@ void __JS_FreeValueRT(JSRuntime *rt, JSValue v)
     case JS_TAG_MODULE:
         {
             JSGCObjectHeader *p = JS_VALUE_GET_PTR(v);
+#ifdef CONFIG_PYTHON_CAPI
+            if (tag == JS_TAG_OBJECT && ((JSObject *)p)->py_has_mirror &&
+                rt->gc_phase != JS_GC_PHASE_REMOVE_CYCLES &&
+                qp_capi_object_revived(rt, (JSObject *)p))
+                break;
+#endif
             if (rt->gc_phase != JS_GC_PHASE_REMOVE_CYCLES) {
                 list_del(&p->link);
                 list_add(&p->link, &rt->gc_zero_ref_count_list);
@@ -8173,10 +8223,6 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
             }
             if (b->realm)
                 mark_func(rt, &b->realm->header);
-#ifdef CONFIG_PYTHON
-            if (b->py_code)
-                qp_code_info_mark(rt, b->py_code, mark_func);
-#endif
         }
         break;
     case JS_GC_OBJ_TYPE_VAR_REF:
@@ -8486,6 +8532,45 @@ static BOOL gc_py_finalize_cycles(JSRuntime *rt)
     BOOL queued = FALSE;
     int pass;
 
+    /* garbage kept by the previous collection that the finalizers did not
+       resurrect: CPython clears the weak references to it after running
+       the finalizers and before tp_clear, so a finalizer due now (of an
+       object that tp_clear would have freed) does not see it */
+    list_for_each(el, &rt->tmp_obj_list) {
+        JSObject *o;
+        p = list_entry(el, JSGCObjectHeader, link);
+        if (js_rc(p)->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
+            continue;
+        o = (JSObject *)p;
+        if (o->py_gc_kept) {
+            o->py_gc_kept = 0;
+            if (o->weakref_count != 0) {
+                /* callbacks are queued as the collector's (gc.c
+                   handle_weakrefs) */
+                JSGCPhaseEnum phase = rt->gc_phase;
+                rt->gc_phase = JS_GC_PHASE_REMOVE_CYCLES;
+                qp_weakref_object_freed(rt, o);
+                rt->gc_phase = phase;
+            }
+        }
+    }
+    /* gc.c handle_weakref_callbacks: the weakrefs with a callback to the
+       garbage are cleared before the finalizers run (and their callbacks
+       queued, drained first by gc.collect()); those without callback are
+       cleared when the garbage is freed */
+    list_for_each(el, &rt->tmp_obj_list) {
+        JSObject *o;
+        p = list_entry(el, JSGCObjectHeader, link);
+        if (js_rc(p)->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
+            continue;
+        o = (JSObject *)p;
+        if (o->weakref_count != 0) {
+            JSGCPhaseEnum phase = rt->gc_phase;
+            rt->gc_phase = JS_GC_PHASE_REMOVE_CYCLES;
+            qp_weakref_clear_callback_refs(rt, o);
+            rt->gc_phase = phase;
+        }
+    }
     /* the __del__ methods first, then the finalizers of the generators
        and coroutines (so that a __del__ sees them suspended, e.g. the
        coroutine of a pending asyncio task) */
@@ -8512,6 +8597,8 @@ static BOOL gc_py_finalize_cycles(JSRuntime *rt)
         list_del(&p->link);
         list_add_tail(&p->link, &rt->gc_obj_list);
         js_rc(p)->mark = 0;
+        if (js_rc(p)->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT)
+            ((JSObject *)p)->py_gc_kept = 1;
     }
     return TRUE;
 }
@@ -10413,6 +10500,12 @@ static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
     /* Python signal handlers and weakref callbacks */
     if (ctx->py && qp_signal_check(ctx) < 0)
         return -1;
+#ifdef CONFIG_PYTHON_CAPI
+    /* Py_AddPendingCall: the eval breaker only, not the signal checks of
+       blocking calls */
+    if (ctx->py && qp_capi_pending_check(ctx) < 0)
+        return -1;
+#endif
 #endif
     if (unlikely(rt->suspend_requested)) {
         /* Poll again at the next instruction instead of waiting for the
@@ -13340,6 +13433,7 @@ static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
         } else {
             js_shape_hash_unlink(ctx->rt, sh);
             sh->is_hashed = FALSE;
+            js_shape_new_uid(ctx->rt, sh);
         }
     }
     return 0;
@@ -21226,6 +21320,10 @@ static no_inline __exception int js_poll_safepoint(JSContext *ctx,
         qp_gil_poll(ctx);
     if (ctx->py && qp_signal_check(ctx) < 0)
         return -1;
+#ifdef CONFIG_PYTHON_CAPI
+    if (ctx->py && qp_capi_pending_check(ctx) < 0)
+        return -1;
+#endif
 #endif
     if (unlikely(rt->suspend_requested) && js_can_suspend(rt)) {
         rt->suspend_requested = FALSE;
@@ -21381,6 +21479,9 @@ static no_inline int js_suspend_frame(JSContext *ctx, JSStackFrame *sf,
         if (b->is_py) {
             /* the frame object follows its activation */
             s->frame.py_frame = sf->py_frame;
+            s->frame.py_mon_flags = sf->py_mon_flags;
+            s->frame.py_mon_prev = sf->py_mon_prev;
+            s->frame.py_raise_pc = sf->py_raise_pc;
             sf->py_frame = JS_UNDEFINED;
             qp_frame_moved(&s->frame);
         }
@@ -22311,13 +22412,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define QP_TRACE_HOOK(jumped)                                           \
     do {                                                                \
         sf->cur_pc = pc;                                                \
-        if (b->is_py && ctx->py->trace_active && !ctx->py->tracing) {   \
+        if (b->is_py && (ctx->py->trace_active | ctx->py->mon_active) && \
+            !ctx->py->tracing) {                                        \
             int qp_r_;                                                  \
-            qp_r_ = qp_trace_instr(ctx, sf, pc - 1, sp);                \
+            qp_r_ = qp_hook_instr(ctx, sf, pc - 1, sp);                 \
             if (unlikely(qp_r_ != 0)) {                                 \
                 if (qp_r_ < 0)                                          \
                     goto exception;                                     \
-                sp = qp_trace_jump(ctx, sf, sp);                        \
+                {                                                       \
+                    JSValue *qp_sp_ = qp_trace_jump(ctx, sf, sp);       \
+                    if (unlikely(!qp_sp_))                              \
+                        goto exception;                                 \
+                    sp = qp_sp_;                                        \
+                }                                                       \
                 pc = sf->cur_pc;                                        \
                 goto jumped;                                            \
             }                                                           \
@@ -22325,8 +22432,41 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     } while (0)
 #endif
 
-    if (js_poll_interrupts(caller_ctx))
-        return JS_EXCEPTION;
+#ifdef CONFIG_PYTHON
+    /* CPython runs the signal handlers at the eval breaker of Python code
+       (RESUME, backward jumps, after a call), never on entering a native
+       function (bpo-30039: raise(SIGINT) then gen.send() from C): the
+       poll is left for later then.  A Python function's entry is its
+       RESUME, which also ends the deferral of a yield-from chain
+       (qp__gen_send_ex) */
+    if (unlikely(caller_ctx->interrupt_counter <= 1) &&
+        qp_signal_handlers_pending(caller_ctx)) {
+        if (!(flags & JS_CALL_FLAG_GENERATOR) &&
+            JS_VALUE_GET_TAG(func_obj) == JS_TAG_OBJECT &&
+            js_class_has_bytecode(JS_VALUE_GET_OBJ(func_obj)->class_id)) {
+            QP_STATE(caller_ctx)->signals_deferred = 0;
+            if (js_poll_interrupts(caller_ctx))
+                return JS_EXCEPTION;
+        }
+        /* else interrupt_counter stays <= 1: the next poll runs them */
+    } else
+#endif
+    if (unlikely(--caller_ctx->interrupt_counter <= 0)) {
+#ifdef CONFIG_PYTHON
+        /* CPython checks the eval breaker at Python-level points only
+           (function start, backward jumps, after calls), not before
+           calling a C function: called from a Python frame, a C callee
+           leaves the expired counter to the caller's post-call poll
+           (PY_CALL_POLL).  Otherwise a signal handler could run, e.g.,
+           between a with block and the call of a C __exit__, outside the
+           with statement's exception range. */
+        if (!(JS_VALUE_GET_TAG(func_obj) == JS_TAG_OBJECT &&
+              JS_VALUE_GET_OBJ(func_obj)->class_id != JS_CLASS_BYTECODE_FUNCTION &&
+              qp_jsi_caller_is_py(rt)))
+#endif
+        if (__js_poll_interrupts(caller_ctx))
+            return JS_EXCEPTION;
+    }
     if (unlikely(JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)) {
 #ifdef CONFIG_PYTHON
         if (unlikely(flags & JS_CALL_FLAG_PY_TRACE_SWITCH)) {
@@ -22417,9 +22557,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 goto restart;
             }
 #ifdef CONFIG_PYTHON
-            /* sys.settrace / sys.setprofile 'call' on generator resumption */
-            if (unlikely(b->is_py) && unlikely(ctx->py->trace_active) && !ctx->py->tracing &&
-                qp_trace_call(ctx, sf) < 0)
+            /* sys.settrace / sys.setprofile 'call', sys.monitoring PY_START /
+               PY_RESUME / PY_THROW on generator resumption */
+            if (unlikely(b->is_py) && unlikely(ctx->py->trace_active | ctx->py->mon_active) &&
+                !ctx->py->tracing && qp_hook_call(ctx, sf, s->throw_flag) < 0)
                 goto exception;
 #endif
             if (s->throw_flag)
@@ -22595,6 +22736,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         for(i = 0; i < b->var_count; i++)
             var_buf[i] = JS_UNINITIALIZED;
         sf->py_frame = JS_UNDEFINED;
+        sf->py_mon_flags = 0;
+        sf->py_mon_prev = 0;
+        sf->py_raise_pc = 0;
     } else
 #endif
     for(i = 0; i < b->var_count; i++)
@@ -22612,9 +22756,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     ctx = b->realm; /* set the current realm */
 #ifdef CONFIG_PYTHON
     /* sys.settrace / sys.setprofile 'call' */
-    if (unlikely(b->is_py) && unlikely(ctx->py->trace_active) && !ctx->py->tracing) {
-        sf->cur_pc = pc;
-        if (qp_trace_call(ctx, sf) < 0) {
+            if (unlikely(b->is_py) && unlikely(ctx->py->trace_active | ctx->py->mon_active) &&
+            !ctx->py->tracing) {
+            sf->cur_pc = pc;
+            if (qp_hook_call(ctx, sf, FALSE) < 0) {
             ctx->py->reraise = 1;   /* no traceback entry before the first instruction */
             goto exception;
         }
@@ -23587,17 +23732,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_goto):
-            pc += (int32_t)get_u32(pc);
-            SAFEPOINT();
+            {
+                int32_t diff = get_u32(pc);
+                pc += diff;
+                SAFEPOINT();
+            }
             BREAK;
 #if SHORT_OPCODES
         CASE(OP_goto16):
-            pc += (int16_t)get_u16(pc);
-            SAFEPOINT();
+            {
+                int16_t diff = get_u16(pc);
+                pc += diff;
+                SAFEPOINT();
+            }
             BREAK;
         CASE(OP_goto8):
-            pc += (int8_t)pc[0];
-            SAFEPOINT();
+            {
+                int8_t diff = pc[0];
+                pc += diff;
+                SAFEPOINT();
+            }
             BREAK;
 #endif
         CASE(OP_if_true):
@@ -23614,7 +23768,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 sp--;
                 if (res) {
-                    pc += (int32_t)get_u32(pc - 4) - 4;
+                    int32_t diff = (int32_t)get_u32(pc - 4) - 4;
+                    pc += diff;
                 }
                 SAFEPOINT();
             }
@@ -23634,7 +23789,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 sp--;
                 if (!res) {
-                    pc += (int32_t)get_u32(pc - 4) - 4;
+                    int32_t diff = (int32_t)get_u32(pc - 4) - 4;
+                    pc += diff;
                 }
                 SAFEPOINT();
             }
@@ -23654,7 +23810,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 sp--;
                 if (res) {
-                    pc += (int8_t)pc[-1] - 1;
+                    int32_t diff = (int8_t)pc[-1] - 1;
+                    pc += diff;
                 }
                 SAFEPOINT();
             }
@@ -23673,7 +23830,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }
                 sp--;
                 if (!res) {
-                    pc += (int8_t)pc[-1] - 1;
+                    int32_t diff = (int8_t)pc[-1] - 1;
+                    pc += diff;
                 }
                 SAFEPOINT();
             }
@@ -25514,13 +25672,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         /* Python traceback entry (pc - 1 is inside the instruction that
            raised), except for re-raising subops */
         BOOL reraise = ctx->py->reraise;
+        if (pc > b->byte_code_buf &&
+            !(reraise && pc >= b->byte_code_buf + 3 && pc[-3] == OP_py &&
+              pc[-2] == QP_OP_reraise && pc[-1] != 0))
+            sf->py_raise_pc = (uint32_t)(pc - b->byte_code_buf - 1);
         if (reraise)
             ctx->py->reraise = 0;
         else
             qp_exc_frame_unwind(ctx, sf->cur_func, (uint32_t)(pc - b->byte_code_buf - 1));
-        /* sys.settrace 'exception' / sys.setprofile 'c_exception' */
-        if (unlikely(ctx->py->trace_active) && !ctx->py->tracing)
-            qp_trace_exception(ctx, sf, pc - 1, reraise);
+        /* sys.settrace 'exception' / sys.setprofile 'c_exception',
+           sys.monitoring RAISE / RERAISE / C_RAISE */
+        if (unlikely(ctx->py->trace_active | ctx->py->mon_active) && !ctx->py->tracing)
+            qp_hook_exception(ctx, sf, pc - 1, reraise);
     } else
 #endif
     if (is_backtrace_needed(ctx, rt->current_exception)) {
@@ -25542,6 +25705,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp--;
                     JS_IteratorClose(ctx, sp[-1], TRUE);
                 } else {
+#ifdef CONFIG_PYTHON
+                    /* sys.monitoring EXCEPTION_HANDLED */
+                    if (unlikely(b->is_py) && unlikely(ctx->py->mon_active) &&
+                        !ctx->py->tracing)
+                        qp_hook_handled(ctx, sf, b->byte_code_buf + pos);
+#endif
                     *sp++ = rt->current_exception;
                     rt->current_exception = JS_UNINITIALIZED;
                     pc = b->byte_code_buf + pos;
@@ -25552,8 +25721,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #ifdef CONFIG_PYTHON
         /* sys.settrace / sys.setprofile 'return' (None) of an unwinding
            Python frame */
-        if (unlikely(b->is_py) && unlikely(ctx->py->trace_active) && !ctx->py->tracing)
-            qp_trace_unwind(ctx, sf, pc - 1);
+        if (unlikely(b->is_py) && unlikely(ctx->py->trace_active | ctx->py->mon_active) &&
+            !ctx->py->tracing)
+            qp_hook_unwind(ctx, sf, pc - 1);
 #endif
     }
     ret_val = JS_EXCEPTION;
@@ -25989,6 +26159,9 @@ static JSAsyncFunctionState *async_func_init(JSContext *ctx,
         for(i = 0; i < b->var_count; i++)
             sf->var_buf[i] = JS_UNINITIALIZED;
         sf->py_frame = JS_UNDEFINED;
+        sf->py_mon_flags = 0;
+        sf->py_mon_prev = 0;
+        sf->py_raise_pc = 0;
     }
 #endif
     s->resolving_funcs[0] = JS_UNDEFINED;
@@ -45248,6 +45421,7 @@ typedef struct CodeContext {
     int label;
     int val;
     JSAtom atom;
+    const uint8_t *live; /* code_has_label: reachable instruction starts (Python code) or NULL */
 } CodeContext;
 
 #define M2(op1, op2)            ((op1) | ((op2) << 8))
@@ -45485,6 +45659,115 @@ static void instantiate_hoisted_definitions(JSContext *ctx, JSFunctionDef *s, Dy
     s->global_var_size = 0;
 }
 
+/* Release what the dead instruction at pos references (labels, atoms);
+   returns its size. */
+static int skip_dead_insn(JSFunctionDef *s, const uint8_t *bc_buf, int bc_len,
+                          int pos, int *linep)
+{
+    int op, label, opnd;
+    const JSOpCode *oi;
+    JSOpCode oi_tmp;
+    JSAtom atom;
+
+    op = bc_buf[pos];
+    oi = js_get_op_info(bc_buf, bc_len, pos, FALSE, &oi_tmp, &opnd);
+    if (op == OP_line_num) {
+        *linep = get_u32(bc_buf + pos + 1);
+    } else if (op == OP_label) {
+        label = get_u32(bc_buf + pos + 1);
+        assert(s->label_slots[label].first_reloc == NULL);
+    } else {
+        switch(oi->fmt) {
+        case OP_FMT_label:
+        case OP_FMT_label_u16:
+            label = get_u32(bc_buf + opnd);
+            update_label(s, label, -1);
+            break;
+        case OP_FMT_atom_label_u8:
+        case OP_FMT_atom_label_u16:
+            label = get_u32(bc_buf + opnd + 4);
+            update_label(s, label, -1);
+            /* fall thru */
+        case OP_FMT_atom:
+        case OP_FMT_atom_u8:
+        case OP_FMT_atom_u16:
+            atom = get_u32(bc_buf + opnd);
+            JS_FreeAtom(s->ctx, atom);
+            break;
+        default:
+            break;
+        }
+    }
+    return oi->size;
+}
+
+/* Python code: the instruction starts reachable from the entry (CPython's
+   flowgraph removes the unreachable basic blocks: remove_unreachable).
+   Successors: the next instruction unless the instruction ends the block
+   (goto, return, throw, raise / reraise subops), the label of a jump or
+   of a catch (its handler).  Uses the label positions (pos2).  NULL on
+   OOM (no removal). */
+static uint8_t *qp_py_reachable(JSContext *ctx, JSFunctionDef *s,
+                                const uint8_t *bc_buf, int bc_len)
+{
+    uint8_t *live = js_mallocz(ctx, bc_len + 1);
+    int *stack = js_malloc(ctx, sizeof(stack[0]) * (bc_len + 1));
+    int sp = 0, pos, next, opnd, label;
+    const JSOpCode *oi;
+    JSOpCode oi_tmp;
+    BOOL fall;
+
+    if (!live || !stack) {
+        js_free(ctx, live);
+        js_free(ctx, stack);
+        return NULL;
+    }
+#define QP_PUSH_LIVE(p) do { int p_ = (p); \
+        if (p_ >= 0 && p_ < bc_len && !live[p_]) { live[p_] = 1; stack[sp++] = p_; } } while (0)
+    QP_PUSH_LIVE(0);
+    while (sp > 0) {
+        pos = stack[--sp];
+        oi = js_get_op_info(bc_buf, bc_len, pos, FALSE, &oi_tmp, &opnd);
+        next = pos + oi->size;
+        fall = TRUE;
+        label = -1;
+        switch (bc_buf[pos]) {
+        case OP_goto:
+            fall = FALSE;
+            /* fall thru */
+        case OP_if_true:
+        case OP_if_false:
+        case OP_catch:
+        case OP_gosub:
+            label = get_u32(bc_buf + pos + 1);
+            break;
+        case OP_return:
+        case OP_return_undef:
+        case OP_return_async:
+        case OP_throw:
+        case OP_throw_error:
+        case OP_ret:
+            fall = FALSE;
+            break;
+        case OP_py:
+            if (oi->fmt == OP_FMT_label)
+                label = get_u32(bc_buf + opnd);
+            else if (bc_buf[pos + 1] == QP_OP_raise || bc_buf[pos + 1] == QP_OP_reraise)
+                fall = FALSE;
+            break;
+        default:
+            break;
+        }
+        if (label >= 0)
+            QP_PUSH_LIVE(s->label_slots[label].pos2 - opcode_info[OP_label].size);
+        if (fall)
+            QP_PUSH_LIVE(next);
+    }
+#undef QP_PUSH_LIVE
+    js_free(ctx, stack);
+    return live;
+}
+
 static int skip_dead_code(JSFunctionDef *s, const uint8_t *bc_buf, int bc_len,
                           int pos, int *linep)
 {
@@ -45709,6 +45992,7 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
 
     cc.bc_buf = bc_buf = s->byte_code.buf;
     cc.bc_len = bc_len = s->byte_code.size;
+    cc.live = NULL;
     js_dbuf_bytecode_init(ctx, &bc_out);
 
     /* first pass for runtime checks (must be done before the
@@ -46111,7 +46395,7 @@ static void add_pc2line_info(JSFunctionDef *s, uint32_t pc, uint32_t source_pos)
 /* Python code: the line number slots hold indexes in py_code->locs[]
    (OP_line_num operands).  Build the sorted pc -> loc map and the JS
    pc2line table (lines/columns of the locations). */
-static void qp_compute_pc2line_info(JSFunctionDef *s)
+static void qp_compute_pc2line_info(JSFunctionDef *s, uint32_t code_len)
 {
     QPCodeInfo *ci = s->py_code;
     int i, last_line_num, last_col_num, line_num, col_num;
@@ -46133,8 +46417,9 @@ static void qp_compute_pc2line_info(JSFunctionDef *s)
     }
     for (i = 0; i < s->line_number_count; i++) {
         uint32_t pc = s->line_number_slots[i].pc;
-        uint32_t idx = s->line_number_slots[i].source_pos;
-        if (idx >= ci->loc_count)
+        uint32_t idx = s->line_number_slots[i].source_pos;  /* (with QP_LOC_ARTIFICIAL) */
+        /* (an entry of the removed dead code at the end) */
+        if (QP_PCLOC_IDX(idx) >= ci->loc_count || pc >= code_len)
             continue;
         if (ci->pcloc_count > 0 && ci->pcloc[ci->pcloc_count - 1].pc == pc) {
             ci->pcloc[ci->pcloc_count - 1].loc = idx;
@@ -46152,7 +46437,7 @@ static void qp_compute_pc2line_info(JSFunctionDef *s)
     dbuf_put_leb128(&s->pc2line, last_col_num);
     for (i = 0; i < ci->pcloc_count; i++) {
         uint32_t pc = ci->pcloc[i].pc;
-        const QPLoc *loc = &ci->locs[ci->pcloc[i].loc];
+        const QPLoc *loc = &ci->locs[QP_PCLOC_IDX(ci->pcloc[i].loc)];
         int diff_pc, diff_line, diff_col;
         if (loc->lineno <= 0)
             continue;
@@ -46183,11 +46468,11 @@ static void qp_compute_pc2line_info(JSFunctionDef *s)
 }
 #endif
 
-static void compute_pc2line_info(JSFunctionDef *s)
+static void compute_pc2line_info(JSFunctionDef *s, uint32_t code_len)
 {
 #ifdef CONFIG_PYTHON
     if (s->is_py) {
-        qp_compute_pc2line_info(s);
+        qp_compute_pc2line_info(s, code_len);
         return;
     }
 #endif
@@ -46270,7 +46555,7 @@ static BOOL code_has_label(CodeContext *s, int pos, int label)
             pos += 5;
             continue;
         }
-        if (op == OP_goto) {
+        if (op == OP_goto && (!s->live || s->live[pos])) {
             int lab = get_u32(s->bc_buf + pos + 1);
             if (lab == label)
                 return TRUE;
@@ -46283,9 +46568,21 @@ static BOOL code_has_label(CodeContext *s, int pos, int label)
 /* return the target label, following the OP_goto jumps
    the first opcode at destination is stored in *pop
  */
+#ifdef CONFIG_PYTHON
+/* The OP_line_num operand l of Python code gives no location of its own:
+   a join's or a propagated one (QP_LOC_ARTIFICIAL), or none */
+static BOOL qp_line_is_none(JSFunctionDef *s, uint32_t l)
+{
+    return l == (uint32_t)-1 || (l & QP_LOC_ARTIFICIAL) || s->py_code->locs[l].lineno < 0;
+}
+#endif
+
 static int find_jump_target(JSFunctionDef *s, int label0, int *pop, int *pline)
 {
     int i, pos, op, label;
+#ifdef CONFIG_PYTHON
+    BOOL located = FALSE;
+#endif
 
     label = label0;
     update_label(s, label, -1);
@@ -46297,11 +46594,22 @@ static int find_jump_target(JSFunctionDef *s, int label0, int *pop, int *pline)
             case OP_line_num:
                 if (pline)
                     *pline = get_u32(s->byte_code.buf + pos + 1);
+#ifdef CONFIG_PYTHON
+                if (s->is_py && !qp_line_is_none(s, get_u32(s->byte_code.buf + pos + 1)))
+                    located = TRUE;
+#endif
                 /* fall thru */
             case OP_label:
                 pos += opcode_info[op].size;
                 continue;
             case OP_goto:
+#ifdef CONFIG_PYTHON
+                /* Python: a jump with its own location (break, continue)
+                   is kept for its 'line' event (CPython jump_thread
+                   leaves a NOP with that location) */
+                if (located)
+                    goto done;
+#endif
                 label = get_u32(s->byte_code.buf + pos + 1);
                 break;
             case OP_drop:
@@ -46418,8 +46726,233 @@ static void put_short_code(DynBuf *bc_out, int op, int idx)
 }
 
 /* peephole optimizations and resolve goto/labels */
+#ifdef CONFIG_PYTHON
+/* Python: CPython copies the small exit blocks (at most MAX_COPY_SIZE
+   instructions ending with a return or a raise) into the unconditional
+   jumps to them (inline_small_or_no_lineno_blocks), and the exit blocks
+   without location into each conditional jump to them
+   (duplicate_exits_without_lineno): such a copy gets the location of its
+   jump.  The copies for conditional jumps are emitted after the code. */
+#define QP_EXIT_COPY_MAX 4
+typedef struct QPExitCopies {
+    struct { int label, line_num, start, end; } *e;
+    int count, size;
+} QPExitCopies;
+
+/* The exit block at label: [*pstart, *pend) of the code, its operations
+   and their OP_line_num; TRUE if it is a small exit block (no label or
+   jump in it), *pnoline: it has no location of its own */
+static BOOL qp_exit_block_at(JSFunctionDef *s, int label, int *pstart, int *pend, BOOL *pnoline)
+{
+    const uint8_t *buf = s->byte_code.buf;
+    int pos = s->label_slots[label].pos2, op, n = 0;
+    BOOL noline = TRUE, seen_line = FALSE;
+
+    while (buf[pos] == OP_label)
+        pos += opcode_info[OP_label].size;
+    *pstart = pos;
+    for (;;) {
+        op = buf[pos];
+        if (op == OP_line_num) {
+            if (!qp_line_is_none(s, get_u32(buf + pos + 1)))
+                noline = FALSE;
+            seen_line = TRUE;
+            pos += opcode_info[op].size;
+            continue;
+        }
+        if (++n > QP_EXIT_COPY_MAX)
+            return FALSE;
+        if (op == OP_py) {
+            const QPSubopInfo *si = &qp_subop_info[buf[pos + 1]];
+            if (si->fmt == OP_FMT_label)
+                return FALSE;
+            pos += si->size;
+            if (qp_subop_flow_kind(buf[pos - si->size + 1], NULL) == QP_FLOW_EXIT)
+                break;
+            continue;
+        }
+        switch (opcode_info[op].fmt) {
+        case OP_FMT_label:
+        case OP_FMT_label_u16:
+        case OP_FMT_atom_label_u8:
+        case OP_FMT_atom_label_u16:
+        case OP_FMT_label8:
+        case OP_FMT_label16:
+            return FALSE;
+        default:
+            break;
+        }
+        if (op == OP_label || op == OP_ret || op == OP_tail_call || op == OP_tail_call_method)
+            return FALSE;
+        pos += opcode_info[op].size;
+        if (op == OP_return || op == OP_return_async || op == OP_return_undef ||
+            op == OP_throw || op == OP_throw_error)
+            break;
+    }
+    *pend = pos;
+    /* (no OP_line_num: the location of the code before the label, taken
+       as none) */
+    *pnoline = noline || !seen_line;
+    return TRUE;
+}
+
+/* Copy the exit block [start, end) into bc_out: its own locations are
+   kept, the others are line_num (the jump's); the atom operands get a
+   reference each */
+static void qp_exit_block_emit(JSFunctionDef *s, DynBuf *bc_out, int start, int end, int line_num)
+{
+    const uint8_t *buf = s->byte_code.buf;
+    int pos = start, line = line_num, opnd;
+    const JSOpCode *oi;
+    JSOpCode oi_tmp;
+
+    while (pos < end) {
+        if (buf[pos] == OP_line_num) {
+            uint32_t l = get_u32(buf + pos + 1);
+            line = qp_line_is_none(s, l) ? line_num : (int)l;
+            pos += opcode_info[OP_line_num].size;
+            continue;
+        }
+        oi = js_get_op_info(buf, s->byte_code.size, pos, FALSE, &oi_tmp, &opnd);
+        switch (oi->fmt) {
+        case OP_FMT_atom:
+        case OP_FMT_atom_u8:
+        case OP_FMT_atom_u16:
+            JS_DupAtom(s->ctx, get_u32(buf + opnd));
+            break;
+        default:
+            break;
+        }
+        add_pc2line_info(s, bc_out->size, line);
+        dbuf_put(bc_out, buf + pos, oi->size);
+        pos += oi->size;
+    }
+}
+
+/* A block without location ending with a goto at label (CPython
+   basicblock_has_no_lineno, without fallthrough): its operations
+   [*pstart, *pend) before the goto, *ptarget the goto's label */
+#define QP_NOLINE_COPY_MAX 16
+static BOOL qp_noline_jump_block_at(JSFunctionDef *s, int label, int *pstart, int *pend,
+                                    int *ptarget)
+{
+    const uint8_t *buf = s->byte_code.buf;
+    int pos = s->label_slots[label].pos2, op, n = 0;
+    BOOL seen_line = FALSE;
+
+    while (buf[pos] == OP_label)
+        pos += opcode_info[OP_label].size;
+    *pstart = pos;
+    for (;;) {
+        op = buf[pos];
+        if (op == OP_line_num) {
+            if (!qp_line_is_none(s, get_u32(buf + pos + 1)))
+                return FALSE;
+            seen_line = TRUE;
+            pos += opcode_info[op].size;
+            continue;
+        }
+        if (op == OP_goto)
+            break;
+        if (++n > QP_NOLINE_COPY_MAX)
+            return FALSE;
+        if (op == OP_py) {
+            const QPSubopInfo *si = &qp_subop_info[buf[pos + 1]];
+            if (si->fmt == OP_FMT_label || qp_subop_flow_kind(buf[pos + 1], NULL) == QP_FLOW_EXIT)
+                return FALSE;
+            pos += si->size;
+            continue;
+        }
+        switch (opcode_info[op].fmt) {
+        case OP_FMT_label:
+        case OP_FMT_label_u16:
+        case OP_FMT_atom_label_u8:
+        case OP_FMT_atom_label_u16:
+        case OP_FMT_label8:
+        case OP_FMT_label16:
+            return FALSE;
+        default:
+            break;
+        }
+        switch (op) {
+        case OP_label:
+        case OP_return:
+        case OP_return_async:
+        case OP_return_undef:
+        case OP_throw:
+        case OP_throw_error:
+        case OP_ret:
+        case OP_tail_call:
+        case OP_tail_call_method:
+            return FALSE;
+        default:
+            break;
+        }
+        pos += opcode_info[op].size;
+    }
+    if (!seen_line)
+        return FALSE;   /* (the location of the code before the label) */
+    *pend = pos;
+    *ptarget = get_u32(buf + pos + 1);
+    return TRUE;
+}
+
+/* Before the copy of the exit block at start for a goto whose location is
+   line_num: a NOP for the goto's line if it is neither the line of the
+   code before nor the first line of the block (CPython leaves the
+   jump's NOP, basicblock_remove_redundant_nops) */
+static void qp_exit_block_nop(JSFunctionDef *s, DynBuf *bc_out, int start, int line_num)
+{
+    const uint8_t *buf = s->byte_code.buf;
+    int line, prev, first;
+
+    if (line_num == -1 || qp_line_is_none(s, line_num))
+        return;
+    line = s->py_code->locs[line_num].lineno;
+    prev = s->line_number_last == -1 ? -1 :
+        s->py_code->locs[QP_PCLOC_IDX(s->line_number_last)].lineno;
+    if (line == prev || buf[start] != OP_line_num || qp_line_is_none(s, get_u32(buf + start + 1)))
+        return;
+    first = s->py_code->locs[get_u32(buf + start + 1)].lineno;
+    if (line == first)
+        return;
+    add_pc2line_info(s, bc_out->size, line_num);
+    dbuf_putc(bc_out, OP_nop);
+}
+
+/* The label a conditional jump (whose location is line_num) to label
+   targets: a new copy of the block if it is an exit block without
+   location, else label.  -1 on memory error. */
+static int qp_exit_copy_label(JSFunctionDef *s, int label, int line_num, QPExitCopies *ec)
+{
+    int nl, start, end;
+    BOOL noline;
+
+    if (!s->is_py || !qp_exit_block_at(s, label, &start, &end, &noline) || !noline)
+        return label;
+    if (js_resize_array(s->ctx, (void **)&ec->e, sizeof(ec->e[0]), &ec->size, ec->count + 1))
+        return -1;
+    nl = new_label_fd(s);
+    if (nl < 0)
+        return -1;
+    /* (beyond the code: never a short jump before the final pass) */
+    s->label_slots[nl].pos2 = s->byte_code.size + 256;
+    s->label_slots[nl].ref_count = 1;
+    update_label(s, label, -1);
+    ec->e[ec->count].label = nl;
+    ec->e[ec->count].line_num = line_num;
+    ec->e[ec->count].start = start;
+    ec->e[ec->count].end = end;
+    ec->count++;
+    return nl;
+}
+#endif
+
 static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
 {
+#ifdef CONFIG_PYTHON
+    QPExitCopies exit_copies = { NULL, 0, 0 };
+#endif
     int pos, pos_next, bc_len, op, op1, len, i, line_num;
     const uint8_t *bc_buf;
     DynBuf bc_out;
@@ -46427,6 +46960,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     RelocEntry *re, *re_next;
     CodeContext cc;
     int label;
+    uint8_t *py_live = NULL;    /* Python code: reachable instruction starts */
 #if SHORT_OPCODES
     JumpSlot *jp;
 #endif
@@ -46439,6 +46973,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
 
     cc.bc_buf = bc_buf = s->byte_code.buf;
     cc.bc_len = bc_len = s->byte_code.size;
+    cc.live = NULL;
     js_dbuf_bytecode_init(ctx, &bc_out);
 
     if (s->is_py) {
@@ -46473,6 +47008,14 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                 break;
             }
         }
+        py_live = qp_py_reachable(ctx, s, bc_buf, bc_len);
+        cc.live = py_live;
+#ifdef CONFIG_PYTHON
+        /* the block copies of a jump: up to 8 without location, then an
+           exit block (a location for each instruction, and the one
+           after) */
+        s->line_number_size += (8 + QP_EXIT_COPY_MAX + 1) * s->jump_size + 2;
+#endif
     }
 
 #if SHORT_OPCODES
@@ -46561,6 +47104,10 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         op = bc_buf[pos];
         len = opcode_info[op].size;
         pos_next = pos + len;
+        if (py_live && !py_live[pos]) {
+            pos_next = pos + skip_dead_insn(s, bc_buf, bc_len, pos, &line_num);
+            continue;
+        }
         if (s->is_py) {
             /* Python code: only label resolution, goto chaining and dead
                code removal (the JS peepholes assume JS semantics) */
@@ -46646,6 +47193,15 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         case OP_return_async:
         case OP_throw:
         case OP_throw_error:
+#ifdef CONFIG_PYTHON
+            if (s->is_py) {
+                /* the line of the instruction, not of the dead code after it */
+                add_pc2line_info(s, bc_out.size, line_num);
+                dbuf_put(&bc_out, bc_buf + pos, len);
+                pos_next = skip_dead_code(s, bc_buf, bc_len, pos_next, &line_num);
+                break;
+            }
+#endif
             pos_next = skip_dead_code(s, bc_buf, bc_len, pos_next, &line_num);
             goto no_change;
 
@@ -46661,6 +47217,33 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     update_label(s, label, -1);
                     break;
                 }
+#ifdef CONFIG_PYTHON
+                if (s->is_py) {
+                    /* the blocks without location ending with a jump and
+                       the small exit blocks are copied (CPython
+                       inline_small_or_no_lineno_blocks; the code without
+                       location gets the jump's) */
+                    int start, end, target, k;
+                    BOOL noline;
+                    for (k = 0; k < 8 && qp_noline_jump_block_at(s, label, &start, &end, &target); k++) {
+                        update_label(s, label, -1);
+                        qp_exit_block_emit(s, &bc_out, start, end, line_num);
+                        update_label(s, target, +1);
+                        label = find_jump_target(s, target, &op1, NULL);
+                    }
+                    if (k > 0 && code_has_label(&cc, pos_next, label)) {
+                        update_label(s, label, -1);
+                        break;
+                    }
+                    if (qp_exit_block_at(s, label, &start, &end, &noline)) {
+                        update_label(s, label, -1);
+                        qp_exit_block_nop(s, &bc_out, start, line_num);
+                        qp_exit_block_emit(s, &bc_out, start, end, line_num);
+                        pos_next = skip_dead_code(s, bc_buf, bc_len, pos_next, &line_num);
+                        break;
+                    }
+                }
+#endif
                 if (op1 == OP_return || op1 == OP_return_undef || op1 == OP_throw) {
                     /* jump to return/throw: remove jump, append return/throw */
                     /* updating the line number obfuscates assembly listing */
@@ -46719,6 +47302,14 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                         op ^= OP_if_true ^ OP_if_false;
                     }
                 }
+#ifdef CONFIG_PYTHON
+                if (s->is_py) {
+                    label = qp_exit_copy_label(s, label, line_num, &exit_copies);
+                    if (label < 0)
+                        goto fail;
+                    label_slots = s->label_slots;
+                }
+#endif
             }
         has_label:
             add_pc2line_info(s, bc_out.size, line_num);
@@ -47279,8 +47870,15 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     break;
                 }
                 label = get_u32(bc_buf + pos + 2);
-                if (OPTIMIZE)
+                if (OPTIMIZE) {
                     label = find_jump_target(s, label, &op1, NULL);
+#ifdef CONFIG_PYTHON
+                    label = qp_exit_copy_label(s, label, line_num, &exit_copies);
+                    if (label < 0)
+                        goto fail;
+                    label_slots = s->label_slots;
+#endif
+                }
                 assert(label >= 0 && label < s->label_count);
                 ls = &label_slots[label];
                 dbuf_put(&bc_out, bc_buf + pos, 2);
@@ -47306,6 +47904,35 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             break;
         }
     }
+
+#ifdef CONFIG_PYTHON
+    /* the exit block copies of qp_exit_copy_label */
+    for (i = 0; i < exit_copies.count; i++) {
+        ls = &label_slots[exit_copies.e[i].label];
+        ls->addr = bc_out.size;
+        for (re = ls->first_reloc; re != NULL; re = re_next) {
+            int diff = ls->addr - re->addr;
+            re_next = re->next;
+            switch (dbuf_error(&bc_out) ? 0 : re->size) {
+            case 4:
+                put_u32(bc_out.buf + re->addr, diff);
+                break;
+            case 2:
+                put_u16(bc_out.buf + re->addr, diff);
+                break;
+            case 1:
+                put_u8(bc_out.buf + re->addr, diff);
+                break;
+            }
+            js_free(ctx, re);
+        }
+        ls->first_reloc = NULL;
+        qp_exit_block_emit(s, &bc_out, exit_copies.e[i].start, exit_copies.e[i].end,
+                           exit_copies.e[i].line_num);
+    }
+    js_free(ctx, exit_copies.e);
+    exit_copies.e = NULL;
+#endif
 
     /* check that there were no missing labels */
     for(i = 0; i < s->label_count; i++) {
@@ -47391,10 +48018,11 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     js_free(ctx, s->jump_slots);
     s->jump_slots = NULL;
 #endif
+    js_free(ctx, py_live);
     js_free(ctx, s->label_slots);
     s->label_slots = NULL;
     /* XXX: should delay until copying to runtime bytecode function */
-    compute_pc2line_info(s);
+    compute_pc2line_info(s, bc_out.size);
     js_free(ctx, s->line_number_slots);
     s->line_number_slots = NULL;
     /* set the new byte code */
@@ -47408,6 +48036,10 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     return 0;
  fail:
     /* XXX: not safe */
+    js_free(ctx, py_live);
+#ifdef CONFIG_PYTHON
+    js_free(ctx, exit_copies.e);
+#endif
     dbuf_free(&bc_out);
     return -1;
 }

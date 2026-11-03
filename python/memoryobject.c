@@ -217,6 +217,32 @@ static JSValue qp_mbuf_new(JSContext *ctx, JSValueConst base, int flags)
     return obj;
 }
 
+/* New managed buffer over raw memory (no exporter object; PyMemoryView_
+   FromMemory, PyMemoryView_FromBuffer), which must outlive it. */
+static JSValue qp_mbuf_raw(JSContext *ctx, void *buf, Py_ssize_t len, int readonly,
+                           Py_ssize_t itemsize, const char *format)
+{
+    QPManagedBuffer *mb;
+    JSValue obj;
+    mb = js_mallocz(ctx, sizeof(*mb));
+    if (!mb)
+        return JS_EXCEPTION;
+    mb->kind = QP_BK_MBUF;
+    mb->master.obj = JS_UNDEFINED;
+    mb->master.buf = buf;
+    mb->master.len = len;
+    mb->master.readonly = readonly;
+    mb->master.itemsize = itemsize > 0 ? itemsize : 1;
+    mb->master.format = format ? format : "B";
+    obj = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_PY_BYTEARRAY);
+    if (JS_IsException(obj)) {
+        js_free(ctx, mb);
+        return obj;
+    }
+    JS_VALUE_GET_OBJ(obj)->u.opaque = mb;
+    return obj;
+}
+
 /* New memoryview registered with mbuf (consumed), with room for ndim
    dimensions; the caller fills the view. */
 static JSValue qp_mv_alloc(JSContext *ctx, JSValue mbuf, int ndim, QPMemoryView **pmv)
@@ -263,6 +289,7 @@ static JSValue qp_mv_alloc(JSContext *ctx, JSValue mbuf, int ndim, QPMemoryView 
    ...), -1 for other exporters */
 static int qp_capi_buffer_shape(JSContext *ctx, const QPBuffer *view, const Py_ssize_t **pshape,
                                 const Py_ssize_t **pstrides, Py_ssize_t *pitemsize);
+static JSValue qp_capi_buffer_base(JSContext *ctx, const QPBuffer *view);
 #endif
 
 /* mbuf_add_view(mbuf, NULL): view of the whole master buffer */
@@ -1844,6 +1871,13 @@ static JSValue qp_mv_get_attr(JSContext *ctx, JSValueConst self, int magic)
     case 0:
         if (mv == &tmp)
             return JS_DupValue(ctx, self);
+#ifdef CONFIG_PYTHON_CAPI
+        {
+            JSValue base = qp_capi_buffer_base(ctx, &QP_MBUF_OBJ(mv->mbuf)->master);
+            if (!JS_IsUndefined(base))
+                return base;
+        }
+#endif
         return JS_DupValue(ctx, QP_MBUF_OBJ(mv->mbuf)->master.obj);
     case 1: return qp_long_from_int64(ctx, mv->len);
     case 2: return JS_NewBool(ctx, mv->readonly);
@@ -1891,7 +1925,8 @@ static const QPMethodDef qp_memoryview_methods[] = {
       "Fortran order is preserved. For non-contiguous views, the data is converted\n"
       "to C first. order=None is the same as order='C'." },
     { "hex", qp_mv_hex, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
-      "hex($self, /, sep=<unrepresentable>, bytes_per_sep=1)\n--\n\nReturn the data in the buffer as a str of hexadecimal numbers." },
+      QP_HEX_DOC("Return the data in the buffer as a str of hexadecimal numbers.",
+                 "memoryview(b'\\xb9\\x01\\xef')") },
     { "tolist", qp_mv_tolist, QP_METH_NOARGS, 0,
       "tolist($self, /)\n--\n\nReturn the data in the buffer as a list of elements." },
     { "cast", qp_mv_cast, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,

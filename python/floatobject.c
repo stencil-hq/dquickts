@@ -269,8 +269,11 @@ static JSValue qp_float_from_str(JSContext *ctx, JSValueConst v)
         len = n;
     } else if (qp_type_of(ctx, v)->slots.bf.bf_getbuffer) {
         QPBuffer view;
-        if (qp_buffer_get(ctx, v, &view, QP_BUF_SIMPLE) < 0)
-            return JS_EXCEPTION;
+        if (qp_buffer_get(ctx, v, &view, QP_BUF_SIMPLE) < 0) {
+            /* e.g. a non-contiguous memoryview: not a string */
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            goto not_a_string;
+        }
         s = js_malloc(ctx, view.len + 1);
         if (s) {
             memcpy(s, view.buf, view.len);
@@ -282,6 +285,7 @@ static JSValue qp_float_from_str(JSContext *ctx, JSValueConst v)
             return JS_EXCEPTION;
     } else {
         char buf[ATOM_GET_STR_BUF_SIZE];
+    not_a_string:
         return qp_raise_type_error(ctx,
             "float() argument must be a string or a real number, not '%.200s'",
             qp_float_type_name(ctx, qp_type_of(ctx, v), buf, sizeof(buf)));

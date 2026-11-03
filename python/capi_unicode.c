@@ -454,8 +454,12 @@ static int qpd_str_plan(JSContext *ctx, JSValueConst v, QPDStrPlan *pl)
         pl->copy = 1;
         pl->len = n;
     } else {
+        /* no copy when the block has room for CPython's NUL terminator
+           after the data (qpd_str_init writes it; QuickJS wide strings
+           have none) */
         pl->kind = PyUnicode_2BYTE_KIND;
-        pl->copy = 0;
+        pl->copy = js_malloc_usable_size(ctx, p) <
+            offsetof(JSString, u) + (size_t)(n + 1) * sizeof(uint16_t);
         pl->len = n;
     }
     return 0;
@@ -498,13 +502,17 @@ static int qpd_str_init(JSContext *ctx, PyObject *op, JSValueConst v)
                 }
             }
         } else {
+            p->u.str16[pl.len] = 0;     /* slack of the block, see qpd_str_plan */
             u->data.any = p->u.str16;
         }
     } else {
         void *d = (uint8_t *)op + sizeof(PyUnicodeObject);
         Py_ssize_t k = 0, n = p->len;
         u->data.any = d;
-        if (pl.kind == PyUnicode_1BYTE_KIND) {
+        if (pl.kind == PyUnicode_2BYTE_KIND) {
+            memcpy(d, p->u.str16, (size_t)n * sizeof(uint16_t));
+            ((Py_UCS2 *)d)[n] = 0;
+        } else if (pl.kind == PyUnicode_1BYTE_KIND) {
             Py_UCS1 *o = d;
             ascii = 1;
             for (i = 0; i < n; i++) {
@@ -942,14 +950,17 @@ Py_ssize_t PyUnicode_CopyCharacters(PyObject *to, Py_ssize_t to_start, PyObject 
     from_kind = PyUnicode_KIND(from);
     to_kind = PyUnicode_KIND(to);
     from_data = PyUnicode_DATA(from);
-    if (from_kind > to_kind) {
+    /* _copy_characters(check_maxchar=1): a wider kind, or Latin-1 into an
+       ASCII string */
+    if (from_kind > to_kind || (PyUnicode_IS_ASCII(to) && !PyUnicode_IS_ASCII(from))) {
         Py_UCS4 to_max = PyUnicode_MAX_CHAR_VALUE(to);
         for (i = 0; i < how_many; i++) {
             if (PyUnicode_READ(from_kind, from_data, from_start + i) > to_max) {
-                static const char *const names[] = { "", "UCS1", "UCS2", "", "UCS4" };
+                static const char *const names[] = { "", "latin1", "UCS2", "", "UCS4" };
                 PyErr_Format(PyExc_SystemError,
                              "Cannot copy %s characters into a string of %s characters",
-                             names[from_kind], names[to_kind]);
+                             PyUnicode_IS_ASCII(from) ? "ascii" : names[from_kind],
+                             PyUnicode_IS_ASCII(to) ? "ascii" : names[to_kind]);
                 return -1;
             }
         }
@@ -2093,6 +2104,151 @@ PyObject *PyUnicode_RPartition(PyObject *s, PyObject *sep)
     return qpd_partition(s, sep, -1);
 }
 
+/* charmaptranslate_lookup: 0 with *result = NULL (no mapping: 1:1), None,
+   an int in range(0x110000) or a str; -1 on error. */
+static int qpd_translate_lookup(Py_UCS4 c, PyObject *mapping, PyObject **result)
+{
+    PyObject *w = PyLong_FromLong((long)c), *x;
+    int rc;
+
+    if (w == NULL)
+        return -1;
+    rc = PyMapping_GetOptionalItem(mapping, w, &x);
+    Py_DECREF(w);
+    if (rc == 0) {
+        *result = NULL;
+        return 0;
+    }
+    if (x == NULL) {
+        if (PyErr_ExceptionMatches(PyExc_LookupError)) {
+            PyErr_Clear();
+            *result = NULL;
+            return 0;
+        }
+        return -1;
+    }
+    if (x == Py_None || PyUnicode_Check(x)) {
+        *result = x;
+        return 0;
+    }
+    if (PyLong_Check(x)) {
+        long value = PyLong_AsLong(x);
+        if (value < 0 || value > QPD_MAX_UNICODE) {
+            PyErr_Format(PyExc_ValueError, "character mapping must be in range(0x%x)",
+                         QPD_MAX_UNICODE + 1);
+            Py_DECREF(x);
+            return -1;
+        }
+        *result = x;
+        return 0;
+    }
+    PyErr_SetString(PyExc_TypeError, "character mapping must return integer, None or str");
+    Py_DECREF(x);
+    return -1;
+}
+
+/* unicode_translate_call_errorhandler: the replacement of input[start:end]
+   ("character maps to <undefined>") and the position to resume at. */
+static PyObject *qpd_translate_error(const char *errors, PyObject **handler, PyObject *input,
+                                     Py_ssize_t start, Py_ssize_t end, Py_ssize_t *newpos)
+{
+    static const char *argparse = "Un;translating error handler must return (str, int) tuple";
+    Py_ssize_t len = PyUnicode_GET_LENGTH(input), i_newpos;
+    PyObject *exc, *restuple, *resunicode;
+
+    if (*handler == NULL) {
+        *handler = PyCodec_LookupError(errors);
+        if (*handler == NULL)
+            return NULL;
+    }
+    exc = PyObject_CallFunction(PyExc_UnicodeTranslateError, "Onns", input, start, end,
+                                "character maps to <undefined>");
+    if (exc == NULL)
+        return NULL;
+    restuple = PyObject_CallOneArg(*handler, exc);
+    Py_DECREF(exc);
+    if (restuple == NULL)
+        return NULL;
+    if (!PyTuple_Check(restuple)) {
+        PyErr_SetString(PyExc_TypeError, &argparse[3]);
+        Py_DECREF(restuple);
+        return NULL;
+    }
+    if (!PyArg_ParseTuple(restuple, argparse, &resunicode, &i_newpos)) {
+        Py_DECREF(restuple);
+        return NULL;
+    }
+    *newpos = i_newpos < 0 ? len + i_newpos : i_newpos;
+    if (*newpos < 0 || *newpos > len) {
+        PyErr_Format(PyExc_IndexError, "position %zd from error handler out of bounds", *newpos);
+        Py_DECREF(restuple);
+        return NULL;
+    }
+    Py_INCREF(resunicode);
+    Py_DECREF(restuple);
+    return resunicode;
+}
+
+/* _PyUnicode_TranslateCharmap: a character the table maps to None goes
+   through the error handler (str.translate() is the "ignore" case). */
+static PyObject *qpd_translate_charmap(PyObject *input, PyObject *mapping, const char *errors)
+{
+    _PyUnicodeWriter writer;
+    PyObject *handler = NULL, *x, *rep;
+    Py_ssize_t size = PyUnicode_GET_LENGTH(input), i = 0, collend, newpos;
+    int kind = PyUnicode_KIND(input), ignore = errors != NULL && strcmp(errors, "ignore") == 0;
+    const void *data = PyUnicode_DATA(input);
+
+    _PyUnicodeWriter_Init(&writer);
+    while (i < size) {
+        Py_UCS4 ch = PyUnicode_READ(kind, data, i);
+        int r;
+        if (qpd_translate_lookup(ch, mapping, &x) < 0)
+            goto error;
+        if (x == NULL) {
+            r = _PyUnicodeWriter_WriteChar(&writer, ch);
+        } else if (x == Py_None) {
+            Py_DECREF(x);
+            /* find all untranslatable characters */
+            for (collend = i + 1; collend < size; collend++) {
+                if (qpd_translate_lookup(PyUnicode_READ(kind, data, collend), mapping, &x) < 0)
+                    goto error;
+                Py_XDECREF(x);
+                if (x != Py_None)
+                    break;
+            }
+            if (ignore) {
+                i = collend;
+                continue;
+            }
+            rep = qpd_translate_error(errors, &handler, input, i, collend, &newpos);
+            if (rep == NULL)
+                goto error;
+            r = _PyUnicodeWriter_WriteStr(&writer, rep);
+            Py_DECREF(rep);
+            if (r < 0)
+                goto error;
+            i = newpos;
+            continue;
+        } else if (PyLong_Check(x)) {
+            r = _PyUnicodeWriter_WriteChar(&writer, (Py_UCS4)PyLong_AsLong(x));
+            Py_DECREF(x);
+        } else {
+            r = _PyUnicodeWriter_WriteStr(&writer, x);
+            Py_DECREF(x);
+        }
+        if (r < 0)
+            goto error;
+        i++;
+    }
+    Py_XDECREF(handler);
+    return _PyUnicodeWriter_Finish(&writer);
+error:
+    Py_XDECREF(handler);
+    _PyUnicodeWriter_Dealloc(&writer);
+    return NULL;
+}
+
 PyObject *PyUnicode_Translate(PyObject *str, PyObject *table, const char *errors)
 {
     JSContext *ctx = qp_capi.ctx;
@@ -2100,10 +2256,15 @@ PyObject *PyUnicode_Translate(PyObject *str, PyObject *table, const char *errors
     JSValue tv;
     JSAtom name;
     JSValue r;
-    (void)errors;
 
     if (qpd_ensure_unicode(str) < 0)
         return NULL;
+    if (table == NULL) {
+        PyErr_BadArgument();
+        return NULL;
+    }
+    if (errors == NULL || strcmp(errors, "ignore") != 0)
+        return qpd_translate_charmap(str, table, errors);
     v = qpd_js(str);
     if (JS_IsException(v))
         return NULL;

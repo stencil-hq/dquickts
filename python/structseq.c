@@ -506,7 +506,7 @@ static JSValue qp_structseq_new_type(JSContext *ctx, const QPStructSeqDesc *desc
                                       0) < 0)
             goto fail;
     }
-    {
+    if (!(desc->flags & QP_STRUCTSEQ_DISALLOW_INSTANTIATION)) {
         JSValue nw = qp_cfunction_new(ctx, &qp_ss_new_def, type, JS_UNDEFINED), sm;
         JSAtom at;
         int r;
@@ -536,11 +536,29 @@ static JSValue qp_structseq_new_type(JSContext *ctx, const QPStructSeqDesc *desc
         if (r < 0)
             goto fail;
     }
+    /* __slots__ = () only kept instances dict-less: CPython's structseq
+       types have no __slots__ attribute (pickletester assert_is_copy) */
+    if (qp_dict_del_item_atom(ctx, t->dict, QP_ATOM(ctx, __slots__)) < 0)
+        goto fail;
+    qp_type_modified(ctx, t);
+    /* tp_name is the dotted desc name, for static and PyStructSequence_NewType
+       types alike ("cannot create 'sys.flags' instances") */
+    {
+        size_t n = strlen(desc->name);
+        char *tn = js_malloc(ctx, n + 1);
+        if (!tn)
+            goto fail;
+        memcpy(tn, desc->name, n + 1);
+        t->tp_name = tn;
+        t->flags |= QP_TPFLAGS_PRIV_OWNED_NAME;
+    }
     /* CPython structseq types are immutable static-like types */
     t->flags |= QP_TPFLAGS_IMMUTABLETYPE;
     if (desc->flags & QP_STRUCTSEQ_DISALLOW_INSTANTIATION) {
-        /* type_call: "cannot create '%s' instances" (sys.version_info...) */
+        /* type_ready_set_new: no tp_new and no __new__, so type_call and
+           tuple.__new__(T) raise "cannot create '%s' instances" */
         t->flags |= QP_TPFLAGS_DISALLOW_INSTANTIATION;
+        t->slots.tp_new = NULL;
         t->flags &= ~QP_TPFLAGS_BASETYPE;
     }
     goto done;

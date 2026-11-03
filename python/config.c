@@ -10,6 +10,7 @@ static const QPModuleDef *const qp_inittab[] = {
     &qp_moddef_sys,
     &qp_moddef__string,
     &qp_moddef__suggestions,
+    &qp_moddef__missing_stdlib_info,
     &qp_moddef__typing,
     &qp_moddef_gc,
     &qp_moddef_atexit,
@@ -35,6 +36,7 @@ static const QPModuleDef *const qp_inittab[] = {
     &qp_moddef__types,
     &qp_moddef__sysconfigdata,
     &qp_moddef__testinternalcapi,
+    &qp_moddef_faulthandler,
     &qp_moddef_js,
 };
 

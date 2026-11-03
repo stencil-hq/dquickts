@@ -31,11 +31,14 @@ static JSValue qp_calculate_suggestions(JSContext *ctx, JSValueConst dir_list, J
 static int qp_file_write_str(JSContext *ctx, JSValueConst file, JSValueConst str);
 static void qp_file_flush(JSContext *ctx, JSValueConst file);
 static JSValue qp_err_private_dict(JSContext *ctx, const char *key);
+/* ---- mod_codecs.c --------------------------------------------------------- */
+static JSValue qp_codec_decode(JSContext *ctx, JSValueConst object, const char *encoding,
+                               const char *errors);
+
 
 /* ---- this file ----------------------------------------------------------- */
 static int qp_init_traceback(JSContext *ctx);
-static JSValue qp_tb_new_internal(JSContext *ctx, JSValueConst next, JSValueConst func,
-                                  uint32_t pc, JSValueConst self_hint);
+static JSValue qp_tb_from_current_frame(JSContext *ctx);
 static JSValue qp_tb_source_line_stripped(JSContext *ctx, JSValueConst filename, int lineno);
 
 #ifndef QP_SUGG_MOVE_COST
@@ -66,9 +69,8 @@ static inline BOOL qp_tb_same(JSValueConst a, JSValueConst b)
 typedef struct QPTraceback {
     JSValue next;       /* traceback object or None */
     JSValue func;       /* Python function of the frame; QP_NULL for traceback(...) objects */
-    JSValue frame;      /* frame facade; QP_NULL until tb_frame is read (func set) */
-    JSValue self_hint;  /* the frame's `self` parameter at unwind time, or QP_NULL */
-    JSValue locals;     /* locals mapping of code without CO_NEWLOCALS, or QP_NULL */
+    JSValue frame;      /* frame object of the activation (PyTraceBack_Here); QP_NULL
+                           until tb_frame is read when it was not running */
     int lasti;          /* byte offset inside the instruction (func set), else
                            the Python offset given to traceback(...) */
     int lineno;         /* -1: computed from lasti */
@@ -94,8 +96,6 @@ static void qp_tb_finalizer(JSRuntime *rt, JSValue val)
     JS_FreeValueRT(rt, tb->next);
     JS_FreeValueRT(rt, tb->func);
     JS_FreeValueRT(rt, tb->frame);
-    JS_FreeValueRT(rt, tb->self_hint);
-    JS_FreeValueRT(rt, tb->locals);
     js_free_rt(rt, tb);
 }
 
@@ -107,14 +107,11 @@ static void qp_tb_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
     JS_MarkValue(rt, tb->next, mark_func);
     JS_MarkValue(rt, tb->func, mark_func);
     JS_MarkValue(rt, tb->frame, mark_func);
-    JS_MarkValue(rt, tb->self_hint, mark_func);
-    JS_MarkValue(rt, tb->locals, mark_func);
 }
 
 /* New traceback object (all arguments borrowed). */
 static JSValue qp_tb_alloc(JSContext *ctx, JSValueConst next, JSValueConst func,
-                           JSValueConst frame, int lasti, int lineno,
-                           JSValueConst self_hint, JSValueConst locals)
+                           JSValueConst frame, int lasti, int lineno)
 {
     JSValue obj;
     QPTraceback *tb;
@@ -131,19 +128,29 @@ static JSValue qp_tb_alloc(JSContext *ctx, JSValueConst next, JSValueConst func,
     tb->next = JS_DupValue(ctx, QP_IS_NULL(next) ? JS_UNDEFINED : next);
     tb->func = JS_DupValue(ctx, func);
     tb->frame = JS_DupValue(ctx, frame);
-    tb->self_hint = JS_DupValue(ctx, self_hint);
-    tb->locals = JS_DupValue(ctx, locals);
     tb->lasti = lasti;
     tb->lineno = lineno;
     JS_VALUE_GET_OBJ(obj)->u.opaque = tb;
     return obj;
 }
 
-/* _PyTraceBack_FromFrame for a (function, pc) pair. */
-static JSValue qp_tb_new_internal(JSContext *ctx, JSValueConst next, JSValueConst func,
-                                  uint32_t pc, JSValueConst self_hint)
+/* _PyTraceBack_FromFrame(NULL, frame) for the innermost running Python
+   frame at its current instruction: a new traceback, JS_UNDEFINED when no
+   Python code runs, JS_EXCEPTION on error. */
+static JSValue qp_tb_from_current_frame(JSContext *ctx)
 {
-    return qp_tb_alloc(ctx, next, func, QP_NULL, (int)pc, -1, self_hint, QP_NULL);
+    JSStackFrame *sf = qp_py_frame_at(ctx, 0);
+    JSFunctionBytecode *b;
+    JSValue frame;
+
+    if (!sf)
+        return JS_UNDEFINED;
+    b = JS_VALUE_GET_OBJ(sf->cur_func)->u.func.function_bytecode;
+    frame = qp_frame_of(ctx, sf);
+    if (JS_IsException(frame))
+        return frame;
+    return qp_tb_alloc(ctx, JS_UNDEFINED, sf->cur_func, frame,
+                       (int)qp_fr_sf_pc(sf, b), -1);
 }
 
 /* Bytecode of the code a traceback entry refers to (NULL if unknown). */
@@ -196,7 +203,7 @@ static int qp_tb_lineno(JSContext *ctx, QPTraceback *tb)
 static void qp_exc_frame_unwind(JSContext *ctx, JSValueConst func, uint32_t pc)
 {
     JSRuntime *rt = ctx->rt;
-    JSValue cur, tb, self_hint = QP_NULL, locals = QP_NULL;
+    JSValue cur, tb, frame = QP_NULL;
     JSStackFrame *sf;
     JSFunctionBytecode *b;
 
@@ -215,21 +222,19 @@ static void qp_exc_frame_unwind(JSContext *ctx, JSValueConst func, uint32_t pc)
     }
     cur = JS_DupValue(ctx, rt->current_exception);
 
-    /* hints for the "Did you mean" suggestions and frame f_locals */
+    /* the frame object of the activation (CPython PyTraceBack_Here takes
+       _PyFrame_GetFrameObject): it keeps f_locals and f_back once the
+       frame ends (qp_frame_detach) */
     sf = rt->current_stack_frame;
     b = qp_code_bytecode(func);
-    if (sf && b && qp_tb_same(sf->cur_func, func) && sf->arg_buf && b->py_code) {
-        if (!(b->py_code->co_flags & CO_NEWLOCALS)) {
-            if (b->arg_count >= 1 && !JS_IsUninitialized(sf->arg_buf[0]))
-                locals = sf->arg_buf[0];
-        } else if (b->arg_count >= 1 && b->vardefs) {
-            char buf[16];
-            const char *n = JS_AtomGetStr(ctx, buf, sizeof(buf), b->vardefs[0].var_name);
-            if (!strcmp(n, "self") && !JS_IsUninitialized(sf->arg_buf[0]))
-                self_hint = sf->arg_buf[0];
+    if (sf && b && qp_tb_same(sf->cur_func, func) && b->py_code) {
+        frame = qp_frame_of(ctx, sf);
+        if (JS_IsException(frame)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            frame = QP_NULL;
         }
     }
-    tb = qp_tb_alloc(ctx, qp_exc_traceback(cur), func, QP_NULL, (int)pc, -1, self_hint, locals);
+    tb = qp_tb_alloc(ctx, qp_exc_traceback(cur), func, frame, (int)pc, -1);
     if (JS_IsException(tb)) {
         /* out of memory: keep the original exception pending */
         JS_Throw(ctx, cur);
@@ -273,16 +278,22 @@ static int qp_tb_set_next(JSContext *ctx, JSValueConst self, JSValueConst value,
     return 0;
 }
 
-static JSValue qp_tb_get_frame(JSContext *ctx, JSValueConst self, int magic)
+/* tb_frame, created on first use for an entry recorded without its frame
+   object.  Borrowed; JS_EXCEPTION on error. */
+static JSValue qp_tb_frame(JSContext *ctx, QPTraceback *tb)
 {
-    QPTraceback *tb = qp_tb_data(self);
     if (QP_IS_NULL(tb->frame)) {
-        JSValue f = qp_frame_new(ctx, tb->func, (uint32_t)tb->lasti, JS_UNDEFINED, tb->locals);
+        JSValue f = qp_frame_new(ctx, tb->func, (uint32_t)tb->lasti, JS_UNDEFINED, QP_NULL);
         if (JS_IsException(f))
             return f;
         tb->frame = f;
     }
-    return JS_DupValue(ctx, tb->frame);
+    return tb->frame;
+}
+
+static JSValue qp_tb_get_frame(JSContext *ctx, JSValueConst self, int magic)
+{
+    return JS_DupValue(ctx, qp_tb_frame(ctx, qp_tb_data(self)));
 }
 
 static JSValue qp_tb_get_lasti(JSContext *ctx, JSValueConst self, int magic)
@@ -347,7 +358,7 @@ static JSValue qp_tb_new(JSContext *ctx, QPType *subtype, JSValueConst *args,
                                    JS_AtomGetStr(ctx, buf, sizeof(buf), t->name));
     }
     return qp_tb_alloc(ctx, JS_IsNull(a[0]) ? JS_UNDEFINED : a[0], QP_NULL, a[1],
-                       lasti, lineno, QP_NULL, QP_NULL);
+                       lasti, lineno);
 }
 
 static const QPMethodDef qp_tb_methods[] = {
@@ -925,8 +936,10 @@ static int qp_tb_decode_utf8(const uint8_t *p, size_t n, uint32_t *out, size_t *
 }
 
 /* tokenize.detect_encoding: coding cookie of the first two lines.  Returns
-   0 utf-8, 1 latin-1, 2 ascii, -1 unsupported / invalid. */
-static int qp_tb_detect_encoding(const uint8_t *p, size_t n, BOOL bom)
+   0 utf-8, 1 latin-1, 2 ascii, 3 another codec (its normalized name in
+   other[QP_TB_ENC_NAME]), -1 invalid. */
+#define QP_TB_ENC_NAME 64
+static int qp_tb_detect_encoding(const uint8_t *p, size_t n, BOOL bom, char *other)
 {
     size_t pos = 0;
     int line;
@@ -945,7 +958,7 @@ static int qp_tb_detect_encoding(const uint8_t *p, size_t n, BOOL bom)
             for (k = i + 1; k + 7 <= e; k++) {
                 if (!memcmp(p + k, "coding", 6) && (p[k + 6] == ':' || p[k + 6] == '=')) {
                     size_t s = k + 7, t;
-                    char name[64];
+                    char name[QP_TB_ENC_NAME];
                     size_t nl = 0;
                     while (s < e && (p[s] == ' ' || p[s] == '\t'))
                         s++;
@@ -977,7 +990,8 @@ static int qp_tb_detect_encoding(const uint8_t *p, size_t n, BOOL bom)
                     if (!strcmp(name, "ascii") || !strcmp(name, "us-ascii") ||
                         !strcmp(name, "646"))
                         return 2;
-                    return -1;
+                    memcpy(other, name, nl + 1);
+                    return 3;
                 }
             }
         }
@@ -1001,6 +1015,7 @@ static int qp_tb_read_file(JSContext *ctx, const char *path, QPSrcFile *sf)
     uint32_t *text;
     int enc;
     BOOL bom = FALSE;
+    char enc_name[QP_TB_ENC_NAME];
 
     if (!f)
         return -1;
@@ -1028,7 +1043,7 @@ static int qp_tb_read_file(JSContext *ctx, const char *path, QPSrcFile *sf)
         bom = TRUE;
         i = 3;
     }
-    enc = qp_tb_detect_encoding(data + i, n - i, bom);
+    enc = qp_tb_detect_encoding(data + i, n - i, bom, enc_name);
     text = js_malloc(ctx, (n - i + 1) * sizeof(uint32_t));
     if (!text || enc < 0) {
         qp_tb_clear_exc(ctx);
@@ -1039,6 +1054,28 @@ static int qp_tb_read_file(JSContext *ctx, const char *path, QPSrcFile *sf)
     if (enc == 0) {
         if (qp_tb_decode_utf8(data + i, n - i, text, &o) < 0)
             goto fail;
+    } else if (enc == 3) {
+        /* the codec registry (tokenizer: PyUnicode_Decode) */
+        JSValue b = qp_bytes_new(ctx, data + i, n - i), s;
+        uint32_t *u;
+        int un;
+        if (JS_IsException(b))
+            goto fail_exc;
+        s = qp_codec_decode(ctx, b, enc_name, "strict");
+        JS_FreeValue(ctx, b);
+        if (JS_IsException(s))
+            goto fail_exc;
+        if (!qp_str_check(ctx, s)) {
+            JS_FreeValue(ctx, s);
+            goto fail;
+        }
+        un = JS_ToUTF32String(ctx, &u, s);
+        JS_FreeValue(ctx, s);
+        if (un < 0)
+            goto fail_exc;
+        js_free(ctx, text);
+        text = u;
+        o = un;
     } else {
         for (o = 0; i < n; i++) {
             if (enc == 2 && data[i] >= 0x80)
@@ -1064,6 +1101,8 @@ static int qp_tb_read_file(JSContext *ctx, const char *path, QPSrcFile *sf)
     sf->text = text;
     sf->len = o;
     return 0;
+ fail_exc:
+    qp_tb_clear_exc(ctx);
  fail:
     js_free(ctx, text);
     js_free(ctx, data);
@@ -1556,6 +1595,12 @@ typedef struct QPFrameSum {
 
 typedef struct QPTE QPTE;
 
+/* _colorize.Traceback theme fields */
+enum {
+    QP_TH_TYPE, QP_TH_MESSAGE, QP_TH_NOTE, QP_TH_FILENAME, QP_TH_LINE_NO, QP_TH_FRAME,
+    QP_TH_ERROR_HIGHLIGHT, QP_TH_ERROR_RANGE, QP_TH_RESET, QP_TH__COUNT
+};
+
 typedef struct QPTBState {
     JSContext *ctx;
     QPSrcFile *sources;
@@ -1567,7 +1612,106 @@ typedef struct QPTBState {
     QPTE **tes;                 /* every TracebackException node, for freeing */
     int ntes, tes_size;
     int max_group_width, max_group_depth;
+    BOOL colorize;              /* _print_exception_bltin: _colorize.can_colorize(file=file) */
+    JSValue theme[QP_TH__COUNT];    /* get_theme(force_color=True).traceback (str), when colorize */
 } QPTBState;
+
+/* theme.<field> of a colorized output; the no-colour theme is all "" */
+static void qp_tb_th(QPText *t, const QPTBState *st, int field)
+{
+    if (st->colorize && qp_text_put_str(t, st->theme[field]) < 0)
+        qp_tb_clear_exc(st->ctx);
+}
+
+/* One element of _zip_display_width(line, carets): the next character of
+   line (a code point with the zero-width ones after it, the grapheme
+   approximation) at *pi, and the number of carets it takes (its display
+   width, fewer when they run out) from *pc.  Returns its length. */
+static size_t qp_tb_zip_next(const uint32_t *line, size_t n, size_t *pi, Py_ssize_t ncarets,
+                             Py_ssize_t *pc, Py_ssize_t *ptake)
+{
+    size_t i = *pi, e = i + 1;
+    Py_ssize_t w = qp_tb_wlen(line + i, 1);
+
+    while (e < n && qp_tb_char_width(line[e]) == 0 && line[e] != '\n')
+        e++;
+    if (w > ncarets - *pc)
+        w = ncarets - *pc > 0 ? ncarets - *pc : 0;
+    *ptake = w;
+    *pc += w;
+    *pi = e;
+    return e - i;
+}
+
+/* output_line() with colorize: the line, then the carets, with the runs of
+   characters under '^' / '~' carets in error_highlight / error_range
+   (itertools.groupby over _zip_display_width(line + "\n", carets)). */
+static void qp_tb_output_colored(QPText *res, const QPTBState *st, const uint32_t *line,
+                                 size_t len, const uint32_t *carets, Py_ssize_t ncarets)
+{
+    QPText ln, cr;
+    uint32_t *full;
+    size_t n = len + 1, i = 0;
+    Py_ssize_t c = 0;
+
+    full = js_malloc(st->ctx, n * sizeof(uint32_t));
+    if (!full) {
+        qp_tb_clear_exc(st->ctx);
+        res->oom = TRUE;
+        return;
+    }
+    memcpy(full, line, len * sizeof(uint32_t));
+    full[len] = '\n';
+    qp_text_init(&ln, st->ctx);
+    qp_text_init(&cr, st->ctx);
+    while (i < n) {
+        /* one group: consecutive characters with equal caret strings */
+        size_t gs = i, k;
+        Py_ssize_t cs = c, take, gtake;
+        BOOL hl = FALSE, rng = FALSE;
+        qp_tb_zip_next(full, n, &i, ncarets, &c, &take);
+        gtake = take;
+        for (;;) {
+            size_t save_i = i;
+            Py_ssize_t save_c = c, t2;
+            if (i >= n)
+                break;
+            qp_tb_zip_next(full, n, &i, ncarets, &c, &t2);
+            if (t2 != take || memcmp(carets + save_c, carets + cs, t2 * sizeof(uint32_t))) {
+                i = save_i;
+                c = save_c;
+                break;
+            }
+            gtake += t2;
+        }
+        for (k = 0; k < (size_t)take; k++) {
+            if (carets[cs + k] == '^')
+                hl = TRUE;
+            else if (carets[cs + k] == '~')
+                rng = TRUE;
+        }
+        if (hl || rng) {
+            int field = hl ? QP_TH_ERROR_HIGHLIGHT : QP_TH_ERROR_RANGE;
+            qp_tb_th(&ln, st, field);
+            qp_text_put(&ln, full + gs, i - gs);
+            qp_tb_th(&ln, st, QP_TH_RESET);
+            qp_tb_th(&cr, st, field);
+            qp_text_put(&cr, carets + cs, gtake);
+            qp_tb_th(&cr, st, QP_TH_RESET);
+        } else {
+            qp_text_put(&ln, full + gs, i - gs);
+            qp_text_put(&cr, carets + cs, gtake);
+        }
+    }
+    qp_text_put(res, ln.buf, ln.len);
+    qp_text_put(res, cr.buf, cr.len);
+    qp_text_putc(res, '\n');
+    if (ln.oom || cr.oom)
+        res->oom = TRUE;
+    qp_text_free(&ln);
+    qp_text_free(&cr);
+    js_free(st->ctx, full);
+}
 
 static void qp_tb_put_lines_joined(QPText *t, const uint32_t *text, QPLine *lines, size_t n)
 {
@@ -1580,7 +1724,8 @@ static void qp_tb_put_lines_joined(QPText *t, const uint32_t *text, QPLine *line
 }
 
 /* One caret line of output_line(). */
-static void qp_tb_output_line(QPText *res, const uint32_t *text, QPLine *all_lines, size_t n,
+static void qp_tb_output_line(QPText *res, const QPTBState *st, const uint32_t *text,
+                              QPLine *all_lines, size_t n,
                               size_t lineno, BOOL show_carets, Py_ssize_t dp_start_offset,
                               Py_ssize_t dp_end_offset, const QPAnchors *an,
                               Py_ssize_t a_left, Py_ssize_t a_right)
@@ -1588,31 +1733,44 @@ static void qp_tb_output_line(QPText *res, const uint32_t *text, QPLine *all_lin
     const uint32_t *line = text + all_lines[lineno].start;
     size_t len = all_lines[lineno].end - all_lines[lineno].start, sp = 0;
     Py_ssize_t num_carets, col;
+    QPText carets;
 
-    qp_text_put(res, line, len);
-    qp_text_putc(res, '\n');
-    if (!show_carets)
+    if (!show_carets) {
+        qp_text_put(res, line, len);
+        qp_text_putc(res, '\n');
         return;
+    }
     while (sp < len && qp_tb_isspace(line[sp]))
         sp++;
     num_carets = lineno == n - 1 ? dp_end_offset : qp_tb_wlen(line, len);
+    qp_text_init(&carets, st->ctx);
     for (col = 0; col < num_carets; col++) {
         if (col < (Py_ssize_t)sp || (lineno == 0 && col < dp_start_offset)) {
-            qp_text_putc(res, ' ');
+            qp_text_putc(&carets, ' ');
         } else if (an &&
                    ((int)lineno > an->left_end_lineno ||
                     ((int)lineno == an->left_end_lineno && col >= a_left)) &&
                    ((int)lineno < an->right_start_lineno ||
                     ((int)lineno == an->right_start_lineno && col < a_right))) {
-            qp_text_putc(res, an->secondary_char);
+            qp_text_putc(&carets, an->secondary_char);
         } else {
-            qp_text_putc(res, an ? an->primary_char : '^');
+            qp_text_putc(&carets, an ? an->primary_char : '^');
         }
     }
-    qp_text_putc(res, '\n');
+    if (carets.oom) {
+        res->oom = TRUE;
+    } else if (st->colorize) {
+        qp_tb_output_colored(res, st, line, len, carets.buf, carets.len);
+    } else {
+        qp_text_put(res, line, len);
+        qp_text_putc(res, '\n');
+        qp_text_put(res, carets.buf, carets.len);
+        qp_text_putc(res, '\n');
+    }
+    qp_text_free(&carets);
 }
 
-/* StackSummary.format_frame_summary (colorize=False, no locals) */
+/* StackSummary.format_frame_summary (no locals) */
 static void qp_tb_format_frame(QPTBState *st, QPText *row, QPFrameSum *f)
 {
     JSContext *ctx = st->ctx;
@@ -1628,8 +1786,10 @@ static void qp_tb_format_frame(QPTBState *st, QPText *row, QPFrameSum *f)
     qp_text_init(&res, ctx);
     qp_text_init(&ded_res, ctx);
 
-    /* '  File "{}", line {}, in {}\n' */
-    qp_text_puts(row, "  File \"");
+    /* '  File {}"{}"{}, line {}{}{}, in {}{}{}\n' */
+    qp_text_puts(row, "  File ");
+    qp_tb_th(row, st, QP_TH_FILENAME);
+    qp_text_putc(row, '"');
     if (!qp_str_check(ctx, f->filename)) {
         qp_text_put_safe_str(row, f->filename, FALSE, "filename");
     } else {
@@ -1646,13 +1806,19 @@ static void qp_tb_format_frame(QPTBState *st, QPText *row, QPFrameSum *f)
             js_free(ctx, fb);
         }
     }
-    qp_text_puts(row, "\", line ");
+    qp_text_putc(row, '"');
+    qp_tb_th(row, st, QP_TH_RESET);
+    qp_text_puts(row, ", line ");
+    qp_tb_th(row, st, QP_TH_LINE_NO);
     if (f->lineno == QP_TB_NONE)
         qp_text_puts(row, "None");
     else
         qp_text_printf(row, "%d", f->lineno);
+    qp_tb_th(row, st, QP_TH_RESET);
     qp_text_puts(row, ", in ");
+    qp_tb_th(row, st, QP_TH_FRAME);
     qp_text_put_safe_str(row, f->name, FALSE, "name");
+    qp_tb_th(row, st, QP_TH_RESET);
     qp_text_putc(row, '\n');
 
     if (f->lineno == QP_TB_NONE || f->end_lineno == QP_TB_NONE)
@@ -1777,12 +1943,12 @@ static void qp_tb_format_frame(QPTBState *st, QPText *row, QPFrameSum *f)
             if (have_prev) {
                 size_t diff = i - prev;
                 if (diff == 2)
-                    qp_tb_output_line(&res, ded.buf, all_lines, n_all, i - 1, show_carets,
+                    qp_tb_output_line(&res, st, ded.buf, all_lines, n_all, i - 1, show_carets,
                                       dp_start, dp_end, has_anchors ? &an : NULL, a_left, a_right);
                 else if (diff > 2)
                     qp_text_printf(&res, "...<%d lines>...\n", (int)(diff - 1));
             }
-            qp_tb_output_line(&res, ded.buf, all_lines, n_all, i, show_carets,
+            qp_tb_output_line(&res, st, ded.buf, all_lines, n_all, i, show_carets,
                               dp_start, dp_end, has_anchors ? &an : NULL, a_left, a_right);
             prev = i;
             have_prev = TRUE;
@@ -2341,82 +2507,45 @@ static QPTraceback *qp_te_last_tb(JSValueConst tb)
 /* frame.f_locals['self'] of a traceback entry, QP_NULL if absent. */
 static JSValue qp_te_frame_self(JSContext *ctx, QPTraceback *t)
 {
-    if (!QP_IS_NULL(t->self_hint))
-        return JS_DupValue(ctx, t->self_hint);
-    if (!QP_IS_NULL(t->locals) || (QP_IS_NULL(t->func) && !QP_IS_NULL(t->frame))) {
-        JSValue loc = !QP_IS_NULL(t->locals) ? JS_DupValue(ctx, t->locals) :
-            qp_te_getattr_none(ctx, t->frame, "f_locals");
-        JSValue key = qp_str_from_cstr(ctx, "self"), v = QP_NULL;
-        if (!JS_IsException(key) && !JS_IsUndefined(loc)) {
-            v = qp_getitem(ctx, loc, key);
-            if (JS_IsException(v)) {
-                qp_tb_clear_exc(ctx);
-                v = QP_NULL;
-            }
-        }
-        JS_FreeValue(ctx, key);
-        JS_FreeValue(ctx, loc);
+    JSValue frame = qp_tb_frame(ctx, t), loc, key, v = QP_NULL;
+
+    if (JS_IsException(frame)) {
         qp_tb_clear_exc(ctx);
-        return v;
+        return QP_NULL;
     }
-    return QP_NULL;
+    loc = qp_te_getattr_none(ctx, frame, "f_locals");
+    key = qp_str_from_cstr(ctx, "self");
+    if (!JS_IsException(key) && !JS_IsUndefined(loc)) {
+        v = qp_getitem(ctx, loc, key);
+        if (JS_IsException(v))
+            v = QP_NULL;
+    }
+    JS_FreeValue(ctx, key);
+    JS_FreeValue(ctx, loc);
+    qp_tb_clear_exc(ctx);
+    return v;
 }
 
 /* list(f_locals) + list(f_globals) + list(f_builtins) of a traceback entry */
 static int qp_te_frame_names(JSContext *ctx, QPTraceback *t, JSValueConst list)
 {
-    QPFuncData *fd = QP_IS_NULL(t->func) ? NULL : qp_function_data(t->func);
-    if (fd) {
-        JSFunctionBytecode *b = qp_code_bytecode(t->func);
-        if (!QP_IS_NULL(t->locals)) {
-            if (qp_te_extend(ctx, list, t->locals) < 0)
-                return -1;
-        } else if (b) {
-            int i, nv = b->arg_count + b->var_count;
-            for (i = 0; b->vardefs && i < nv; i++) {
-                JSValue s;
-                char buf[8];
-                const char *c = JS_AtomGetStr(ctx, buf, sizeof(buf), b->vardefs[i].var_name);
-                if (b->vardefs[i].var_name == JS_ATOM_NULL || c[0] == '<' || c[0] == '.')
-                    continue;
-                s = qp_str_from_atom(ctx, b->vardefs[i].var_name);
-                if (JS_IsException(s) || qp_list_append(ctx, list, s) < 0) {
-                    JS_FreeValue(ctx, s);
-                    return -1;
-                }
-                JS_FreeValue(ctx, s);
-            }
-            for (i = 0; b->closure_var && i < b->closure_var_count; i++) {
-                JSValue s = qp_str_from_atom(ctx, b->closure_var[i].var_name);
-                if (JS_IsException(s) || qp_list_append(ctx, list, s) < 0) {
-                    JS_FreeValue(ctx, s);
-                    return -1;
-                }
-                JS_FreeValue(ctx, s);
-            }
-        }
-        if (qp_te_extend(ctx, list, fd->globals) < 0 ||
-            qp_te_extend(ctx, list, fd->builtins) < 0)
+    static const char *const names[3] = { "f_locals", "f_globals", "f_builtins" };
+    JSValue frame = qp_tb_frame(ctx, t);
+    int i;
+
+    if (JS_IsException(frame))
+        return -1;
+    for (i = 0; i < 3; i++) {
+        JSValue m = qp_te_getattr_opt(ctx, frame, names[i]);
+        int r;
+        if (JS_IsException(m))
             return -1;
-        return 0;
-    } else {
-        JSValue frame = QP_IS_NULL(t->frame) ? JS_UNDEFINED : t->frame;
-        static const char *const names[3] = { "f_locals", "f_globals", "f_builtins" };
-        int i;
-        if (JS_IsUndefined(frame))
+        r = QP_IS_NULL(m) ? 0 : qp_te_extend(ctx, list, m);
+        JS_FreeValue(ctx, m);
+        if (r < 0)
             return -1;
-        for (i = 0; i < 3; i++) {
-            JSValue m = qp_te_getattr_opt(ctx, frame, names[i]);
-            int r;
-            if (JS_IsException(m))
-                return -1;
-            r = QP_IS_NULL(m) ? 0 : qp_te_extend(ctx, list, m);
-            JS_FreeValue(ctx, m);
-            if (r < 0)
-                return -1;
-        }
-        return 0;
     }
+    return 0;
 }
 
 enum { QP_SUGG_ATTR = 1, QP_SUGG_MODNF, QP_SUGG_IMPORT, QP_SUGG_NAME };
@@ -2777,6 +2906,142 @@ static BOOL qp_te_in_stdlib_names(JSContext *ctx, JSValueConst name)
     return r > 0;
 }
 
+/* _missing_stdlib_info: generated by CPython's
+   Tools/build/check_extension_modules.py for the modules of
+   sys.stdlib_module_names a build cannot import; for this platform, the
+   Windows-only ones. */
+static int qp_missing_stdlib_info_exec(JSContext *ctx, JSValueConst mod)
+{
+    static const char *const windows_modules[] = {
+        "_overlapped", "_testconsole", "_winapi", "_wmi", "msvcrt", "nt", "winreg", "winsound",
+    };
+    JSValue d = qp_dict_new(ctx), msg, key;
+    JSAtom a;
+    size_t i;
+    int r;
+
+    if (JS_IsException(d))
+        return -1;
+    for (i = 0; i < countof(windows_modules); i++) {
+        msg = qp_str_from_format(ctx, "Unsupported platform for Windows-only standard library "
+                                 "module '%s'", windows_modules[i]);
+        if (JS_IsException(msg))
+            goto fail;
+        key = qp_str_from_cstr(ctx, windows_modules[i]);
+        r = JS_IsException(key) ? -1 : qp_dict_set_item(ctx, d, key, msg);
+        JS_FreeValue(ctx, key);
+        JS_FreeValue(ctx, msg);
+        if (r < 0)
+            goto fail;
+    }
+    a = JS_NewAtom(ctx, "_MISSING_STDLIB_MODULE_MESSAGES");
+    if (a == JS_ATOM_NULL)
+        goto fail;
+    r = qp_setattr(ctx, mod, a, d);
+    JS_FreeAtom(ctx, a);
+    JS_FreeValue(ctx, d);
+    return r;
+ fail:
+    JS_FreeValue(ctx, d);
+    return -1;
+}
+
+static const QPModuleDef qp_moddef__missing_stdlib_info = {
+    "_missing_stdlib_info",
+    NULL,
+    NULL,
+    qp_missing_stdlib_info_exec,
+};
+
+/* sys.modules[name], new reference or QP_NULL (never raises) */
+static JSValue qp_tb_loaded_module(JSContext *ctx, const char *name)
+{
+    JSValue key, mod = QP_NULL;
+    int r;
+
+    if (!qp_dict_check(ctx, QP_STATE(ctx)->modules))
+        return QP_NULL;
+    key = qp_str_from_cstr(ctx, name);
+    if (JS_IsException(key)) {
+        qp_tb_clear_exc(ctx);
+        return QP_NULL;
+    }
+    r = qp_dict_get_item(ctx, QP_STATE(ctx)->modules, key, &mod);
+    JS_FreeValue(ctx, key);
+    if (r <= 0) {
+        qp_tb_clear_exc(ctx);
+        return QP_NULL;
+    }
+    return mod;
+}
+
+/* traceback._MISSING_STDLIB_MODULE_MESSAGES.get(name, "Standard library
+   module %r was not found"): the traceback module's mapping once it is
+   imported, else the one of _missing_stdlib_info. */
+static JSValue qp_te_missing_stdlib_message(JSContext *ctx, JSValueConst name)
+{
+    JSValue mod = qp_tb_loaded_module(ctx, "traceback"), msgs = QP_NULL, m = QP_NULL;
+
+    if (QP_IS_NULL(mod)) {
+        mod = qp_import_module(ctx, "_missing_stdlib_info");
+        if (JS_IsException(mod)) {
+            qp_tb_clear_exc(ctx);
+            mod = QP_NULL;
+        }
+    }
+    if (!QP_IS_NULL(mod)) {
+        msgs = qp_te_getattr_opt(ctx, mod, "_MISSING_STDLIB_MODULE_MESSAGES");
+        JS_FreeValue(ctx, mod);
+        if (JS_IsException(msgs))
+            msgs = QP_NULL;
+    }
+    if (!QP_IS_NULL(msgs)) {
+        JSValue dflt = qp_str_from_format(ctx, "Standard library module %R was not found", name);
+        JSValueConst args[2] = { name, dflt };
+        JSAtom a = JS_NewAtom(ctx, "get");
+        if (a != JS_ATOM_NULL && !JS_IsException(dflt))
+            m = qp_call_method(ctx, msgs, a, args, 2, QP_NULL);
+        JS_FreeAtom(ctx, a);
+        JS_FreeValue(ctx, dflt);
+        JS_FreeValue(ctx, msgs);
+        if (JS_IsException(m) || !qp_str_check(ctx, m)) {
+            JS_FreeValue(ctx, m);
+            m = QP_NULL;
+        }
+        qp_tb_clear_exc(ctx);
+    }
+    if (QP_IS_NULL(m))
+        m = qp_str_from_format(ctx, "Standard library module %R was not found", name);
+    return m;
+}
+
+/* traceback._find_incompatible_extension_module(name): new str or QP_NULL
+   (never raises) */
+static JSValue qp_te_incompatible_extension(JSContext *ctx, JSValueConst name)
+{
+    JSValue mod, res = QP_NULL;
+    JSAtom a;
+
+    if (!qp_str_check(ctx, name))
+        return QP_NULL;
+    mod = qp_import_module(ctx, "traceback");
+    if (JS_IsException(mod)) {
+        qp_tb_clear_exc(ctx);
+        return QP_NULL;
+    }
+    a = JS_NewAtom(ctx, "_find_incompatible_extension_module");
+    if (a != JS_ATOM_NULL)
+        res = qp_call_method(ctx, mod, a, &name, 1, QP_NULL);
+    JS_FreeAtom(ctx, a);
+    JS_FreeValue(ctx, mod);
+    if (JS_IsException(res) || !qp_str_check(ctx, res) || !qp_bool(ctx, res)) {
+        JS_FreeValue(ctx, res);
+        res = QP_NULL;
+    }
+    qp_tb_clear_exc(ctx);
+    return res;
+}
+
 /* self._str += <formatted suffix> */
 static void qp_te_append_str(JSContext *ctx, QPTE *te, JSValue suffix)
 {
@@ -2938,7 +3203,7 @@ static QPTE *qp_te_new(QPTBState *st, JSValueConst exc)
     } else if (qp_type_is_subtype(t, QP_EXC(ctx, ModuleNotFoundError))) {
         JSValue name = qp_te_getattr_none(ctx, exc, "name");
         if (qp_te_in_stdlib_names(ctx, name)) {
-            JSValue m = qp_str_from_format(ctx, "Standard library module %R was not found", name);
+            JSValue m = qp_te_missing_stdlib_message(ctx, name);
             if (JS_IsException(m)) {
                 qp_tb_clear_exc(ctx);
             } else {
@@ -2962,10 +3227,14 @@ static QPTE *qp_te_new(QPTBState *st, JSValueConst exc)
                     "add the site-packages directory to sys.path "
                     "or to enable your virtual environment?"));
             } else {
-                /* no extension modules exist, so _find_incompatible_extension_module
-                   finds nothing */
-                JSValue s = qp_te_compute_suggestion(ctx, exc, tb, name, QP_SUGG_MODNF);
-                if (!QP_IS_NULL(s)) {
+                JSValue abi_tag = qp_te_incompatible_extension(ctx, name), s;
+                if (!QP_IS_NULL(abi_tag)) {
+                    qp_te_append_str(ctx, te, qp_str_from_format(ctx,
+                        ". Although a module with this name was found for a "
+                        "different Python version (%U).", abi_tag));
+                    JS_FreeValue(ctx, abi_tag);
+                } else if (!QP_IS_NULL(s = qp_te_compute_suggestion(ctx, exc, tb, name,
+                                                                    QP_SUGG_MODNF))) {
                     qp_te_append_str(ctx, te, qp_str_from_format(ctx, ". Did you mean: '%U'?", s));
                     JS_FreeValue(ctx, s);
                 }
@@ -3237,6 +3506,84 @@ static BOOL qp_tb_as_ssize(JSContext *ctx, JSValueConst v, Py_ssize_t *out)
     return TRUE;
 }
 
+/* TracebackException._find_keyword_typos (it tokenizes the code and
+   recompiles candidate fixes with codeop and difflib): run by the
+   traceback module on a TracebackException of the error, whose updated
+   location, text and message replace ours when it found a keyword.  Errors
+   are suppressed, as in _format_syntax_error. */
+static void qp_te_find_keyword_typos(JSContext *ctx, QPTE *te)
+{
+    static const char *const fields[6] = { "text", "offset", "end_offset", "lineno",
+                                           "end_lineno", "msg" };
+    JSValue meta, mod = JS_UNDEFINED, cls = JS_UNDEFINED, pyte = JS_UNDEFINED, r, msg;
+    JSValue args[3], vals[6];
+    const char *m;
+    BOOL wanted;
+    JSAtom a;
+    int i, eq;
+
+    if (!qp_str_check(ctx, te->se_msg))
+        return;
+    m = qp_str_utf8(ctx, te->se_msg, NULL);
+    if (!m) {
+        qp_tb_clear_exc(ctx);
+        return;
+    }
+    wanted = !strcmp(m, "invalid syntax") || strstr(m, "Perhaps you forgot a comma") != NULL;
+    JS_FreeCString(ctx, m);
+    if (!wanted)
+        return;
+    meta = qp_te_getattr_none(ctx, te->exc, "_metadata");
+    i = qp_bool(ctx, meta);
+    JS_FreeValue(ctx, meta);
+    if (i <= 0)
+        goto done;
+    mod = qp_import_module(ctx, "traceback");
+    if (JS_IsException(mod))
+        goto done;
+    cls = qp_te_getattr_opt(ctx, mod, "TracebackException");
+    if (JS_IsException(cls) || QP_IS_NULL(cls))
+        goto done;
+    args[0] = QP_TYPE_VALUE(qp_type_of(ctx, te->exc));
+    args[1] = te->exc;
+    args[2] = JS_UNDEFINED;
+    pyte = qp_vectorcall(ctx, cls, (JSValueConst *)args, 3, QP_NULL);
+    if (JS_IsException(pyte))
+        goto done;
+    a = JS_NewAtom(ctx, "_find_keyword_typos");
+    if (a == JS_ATOM_NULL)
+        goto done;
+    r = qp_call_method(ctx, pyte, a, NULL, 0, QP_NULL);
+    JS_FreeAtom(ctx, a);
+    if (JS_IsException(r))
+        goto done;
+    JS_FreeValue(ctx, r);
+    msg = qp_te_getattr_none(ctx, pyte, "msg");
+    eq = qp_str_check(ctx, msg) ? qp_str_eq(ctx, msg, te->se_msg) : 1;
+    JS_FreeValue(ctx, msg);
+    if (eq != 0)
+        goto done;
+    for (i = 0; i < 6; i++)
+        vals[i] = qp_te_getattr_none(ctx, pyte, fields[i]);
+    JS_FreeValue(ctx, te->se_text);
+    te->se_text = vals[0];
+    JS_FreeValue(ctx, te->se_offset);
+    te->se_offset = vals[1];
+    JS_FreeValue(ctx, te->se_end_offset);
+    te->se_end_offset = vals[2];
+    JS_FreeValue(ctx, te->se_lineno);
+    te->se_lineno = vals[3];
+    JS_FreeValue(ctx, te->se_end_lineno);
+    te->se_end_lineno = vals[4];
+    JS_FreeValue(ctx, te->se_msg);
+    te->se_msg = vals[5];
+ done:
+    JS_FreeValue(ctx, pyte);
+    JS_FreeValue(ctx, cls);
+    JS_FreeValue(ctx, mod);
+    qp_tb_clear_exc(ctx);
+}
+
 /* TracebackException._format_syntax_error: each yielded line is emitted */
 static void qp_tb_emit_syntax_error(QPTBState *st, QPTE *te)
 {
@@ -3249,21 +3596,29 @@ static void qp_tb_emit_syntax_error(QPTBState *st, QPTE *te)
     qp_text_init(&chunk, ctx);
     if (!JS_IsUndefined(te->se_lineno)) {
         int truth = qp_bool(ctx, te->se_filename);
-        qp_text_puts(&chunk, "  File \"");
+        qp_text_puts(&chunk, "  File ");
+        qp_tb_th(&chunk, st, QP_TH_FILENAME);
+        qp_text_putc(&chunk, '"');
         if (truth > 0) {
             qp_text_put_safe_str(&chunk, te->se_filename, FALSE, "filename");
         } else {
             qp_tb_clear_exc(ctx);
             qp_text_puts(&chunk, "<string>");
         }
-        qp_text_puts(&chunk, "\", line ");
+        qp_text_putc(&chunk, '"');
+        qp_tb_th(&chunk, st, QP_TH_RESET);
+        qp_text_puts(&chunk, ", line ");
+        qp_tb_th(&chunk, st, QP_TH_LINE_NO);
         if (qp_text_put_str(&chunk, te->se_lineno) < 0)
             qp_tb_clear_exc(ctx);
+        qp_tb_th(&chunk, st, QP_TH_RESET);
         qp_text_putc(&chunk, '\n');
         qp_tb_emit_text(st, &chunk, '|');
     } else if (!JS_IsUndefined(te->se_filename)) {
         has_suffix = TRUE;
     }
+    if (qp_str_check(ctx, te->se_text))
+        qp_te_find_keyword_typos(ctx, te);
     if (qp_str_check(ctx, te->se_text) &&
         (tn = JS_ToUTF32String(ctx, &text, te->se_text)) >= 0) {
         Py_ssize_t rlen = tn, ls = 0, spaces, offset, end_offset, colno, end_colno;
@@ -3285,8 +3640,14 @@ static void qp_tb_emit_syntax_error(QPTBState *st, QPTE *te)
             BOOL same_line;
             if (JS_IsUndefined(te->se_lineno) || JS_IsUndefined(te->se_end_lineno))
                 same_line = JS_IsUndefined(te->se_lineno) && JS_IsUndefined(te->se_end_lineno);
-            else
-                same_line = qp_tb_value_eq_str(ctx, te->se_lineno, te->se_end_lineno);
+            else {
+                /* str after TracebackException.__init__, int once
+                   _find_keyword_typos relocated the error */
+                Py_ssize_t l1, l2;
+                same_line = qp_tb_value_eq_str(ctx, te->se_lineno, te->se_end_lineno) ||
+                    (qp_tb_as_ssize(ctx, te->se_lineno, &l1) &&
+                     qp_tb_as_ssize(ctx, te->se_end_lineno, &l2) && l1 == l2);
+            }
             if (same_line) {
                 Py_ssize_t eo;
                 if (qp_tb_as_ssize(ctx, te->se_end_offset, &eo) && eo != 0)
@@ -3304,10 +3665,6 @@ static void qp_tb_emit_syntax_error(QPTBState *st, QPTE *te)
                 end_offset = offset + 1;
             colno = offset - 1 - spaces;
             end_colno = end_offset - 1 - spaces;
-            qp_text_puts(&chunk, "    ");
-            qp_text_put(&chunk, ltext, llen);
-            qp_text_putc(&chunk, '\n');
-            qp_tb_emit_text(st, &chunk, '|');
             if (colno >= 0) {
                 Py_ssize_t dp_colno = qp_tb_display_width(ltext, llen, colno);
                 Py_ssize_t hs = colno > llen ? llen : colno;
@@ -3315,8 +3672,31 @@ static void qp_tb_emit_syntax_error(QPTBState *st, QPTE *te)
                 Py_ssize_t caret_count = he > hs ? qp_tb_wlen(ltext + hs, he - hs)
                                                  : end_colno - colno;
                 qp_text_puts(&chunk, "    ");
+                if (st->colorize) {
+                    /* ltext[:colno] + error_highlight + ltext[colno:end_colno]
+                       + reset + ltext[end_colno:] */
+                    if (he < hs)
+                        he = hs;
+                    qp_text_put(&chunk, ltext, hs);
+                    qp_tb_th(&chunk, st, QP_TH_ERROR_HIGHLIGHT);
+                    qp_text_put(&chunk, ltext + hs, he - hs);
+                    qp_tb_th(&chunk, st, QP_TH_RESET);
+                    qp_text_put(&chunk, ltext + he, llen - he);
+                } else {
+                    qp_text_put(&chunk, ltext, llen);
+                }
+                qp_text_putc(&chunk, '\n');
+                qp_tb_emit_text(st, &chunk, '|');
+                qp_text_puts(&chunk, "    ");
                 qp_text_fill(&chunk, ' ', dp_colno);
+                qp_tb_th(&chunk, st, QP_TH_ERROR_HIGHLIGHT);
                 qp_text_fill(&chunk, '^', caret_count);
+                qp_tb_th(&chunk, st, QP_TH_RESET);
+                qp_text_putc(&chunk, '\n');
+                qp_tb_emit_text(st, &chunk, '|');
+            } else {
+                qp_text_puts(&chunk, "    ");
+                qp_text_put(&chunk, ltext, llen);
                 qp_text_putc(&chunk, '\n');
                 qp_tb_emit_text(st, &chunk, '|');
             }
@@ -3325,10 +3705,13 @@ static void qp_tb_emit_syntax_error(QPTBState *st, QPTE *te)
     } else {
         qp_tb_clear_exc(ctx);
     }
-    /* "{stype}: {msg}{filename_suffix}\n" */
+    /* "{type}{stype}{reset}: {message}{msg}{reset}{filename_suffix}\n" */
+    qp_tb_th(&chunk, st, QP_TH_TYPE);
     if (qp_text_put_str(&chunk, te->type_str) < 0)
         qp_tb_clear_exc(ctx);
+    qp_tb_th(&chunk, st, QP_TH_RESET);
     qp_text_puts(&chunk, ": ");
+    qp_tb_th(&chunk, st, QP_TH_MESSAGE);
     {
         int truth = qp_bool(ctx, te->se_msg);
         if (truth == 0) {
@@ -3339,6 +3722,7 @@ static void qp_tb_emit_syntax_error(QPTBState *st, QPTE *te)
             qp_text_put_safe_str(&chunk, te->se_msg, FALSE, "msg");
         }
     }
+    qp_tb_th(&chunk, st, QP_TH_RESET);
     if (has_suffix) {
         qp_text_puts(&chunk, " (");
         qp_text_put_safe_str(&chunk, te->se_filename, FALSE, "filename");
@@ -3357,7 +3741,9 @@ static void qp_tb_emit_note(QPTBState *st, QPText *note)
     qp_text_init(&chunk, st->ctx);
     for (i = 0; i <= note->len; i++) {
         if (i == note->len || note->buf[i] == '\n') {
+            qp_tb_th(&chunk, st, QP_TH_NOTE);
             qp_text_put(&chunk, note->buf + start, i - start);
+            qp_tb_th(&chunk, st, QP_TH_RESET);
             qp_text_putc(&chunk, '\n');
             qp_tb_emit_text(st, &chunk, '|');
             start = i + 1;
@@ -3382,12 +3768,17 @@ static void qp_tb_emit_exception_only(QPTBState *st, QPTE *te)
 
     qp_text_init(&chunk, ctx);
     if (!te->is_syntax_error) {
+        /* _format_final_exc_line */
+        qp_tb_th(&chunk, st, QP_TH_TYPE);
         if (qp_text_put_str(&chunk, te->type_str) < 0)
             qp_tb_clear_exc(ctx);
+        qp_tb_th(&chunk, st, QP_TH_RESET);
         if (qp_str_check(ctx, te->str) && qp_str_len(ctx, te->str) > 0) {
             qp_text_puts(&chunk, ": ");
+            qp_tb_th(&chunk, st, QP_TH_MESSAGE);
             if (qp_text_put_str(&chunk, te->str) < 0)
                 qp_tb_clear_exc(ctx);
+            qp_tb_th(&chunk, st, QP_TH_RESET);
         }
         qp_text_putc(&chunk, '\n');
         qp_tb_emit_text(st, &chunk, '|');
@@ -3533,13 +3924,136 @@ static void qp_te_format(QPTBState *st, QPTE *self)
 /* Display                                                                    */
 /* ========================================================================= */
 
+/* traceback._safe_can_colorize(file=file): _colorize.can_colorize once
+   _colorize is imported (it may be patched, or _colorize.COLORIZE
+   cleared), else the same rules here.  An error means no colour (the
+   fallback printer of PyErr_Display). */
+static BOOL qp_tb_can_colorize(JSContext *ctx, JSValueConst file)
+{
+    JSValue mod = qp_tb_loaded_module(ctx, "_colorize"), fn, kw, res, fd;
+    const char *e;
+    Py_ssize_t v;
+    int r;
+
+    if (!QP_IS_NULL(mod)) {
+        fn = qp_te_getattr_opt(ctx, mod, "can_colorize");
+        JS_FreeValue(ctx, mod);
+        if (JS_IsException(fn) || QP_IS_NULL(fn)) {
+            qp_tb_clear_exc(ctx);
+            return FALSE;
+        }
+        kw = qp_str_from_cstr(ctx, "file");
+        if (!JS_IsException(kw)) {
+            JSValue kwnames = qp_tuple_pack(ctx, 1, (JSValueConst *)&kw);
+            JS_FreeValue(ctx, kw);
+            res = JS_IsException(kwnames) ? JS_EXCEPTION :
+                qp_vectorcall(ctx, fn, &file, 0, kwnames);
+            JS_FreeValue(ctx, kwnames);
+        } else {
+            res = JS_EXCEPTION;
+        }
+        JS_FreeValue(ctx, fn);
+        r = JS_IsException(res) ? 0 : qp_bool(ctx, res);
+        JS_FreeValue(ctx, res);
+        qp_tb_clear_exc(ctx);
+        return r > 0;
+    }
+    /* _colorize.can_colorize */
+    if (!QP_STATE(ctx)->config.ignore_environment && (e = getenv("PYTHON_COLORS"))) {
+        if (!strcmp(e, "0"))
+            return FALSE;
+        if (!strcmp(e, "1"))
+            return TRUE;
+    }
+    if ((e = getenv("NO_COLOR")) && *e)
+        return FALSE;
+    if ((e = getenv("FORCE_COLOR")) && *e)
+        return TRUE;
+    if ((e = getenv("TERM")) && !strcmp(e, "dumb"))
+        return FALSE;
+    if (JS_IsUndefined(file))
+        return FALSE;
+    /* os.isatty(file.fileno()) */
+    fd = qp_call_method(ctx, file, QP_ATOM(ctx, fileno), NULL, 0, QP_NULL);
+    if (JS_IsException(fd)) {
+        qp_tb_clear_exc(ctx);
+        return FALSE;
+    }
+    r = qp_tb_as_ssize(ctx, fd, &v) && v >= 0 && v < INT32_MAX && isatty((int)v);
+    JS_FreeValue(ctx, fd);
+    return r;
+}
+
+/* _colorize.get_theme(force_color=True).traceback: the theme of _colorize
+   once it is imported (set_theme), else the default one.  0 or -1. */
+static int qp_tb_load_theme(JSContext *ctx, QPTBState *st)
+{
+    static const char *const names[QP_TH__COUNT] = {
+        "type", "message", "note", "filename", "line_no", "frame",
+        "error_highlight", "error_range", "reset",
+    };
+    static const char *const defaults[QP_TH__COUNT] = {
+        "\x1b[1;35m", "\x1b[35m", "\x1b[36m", "\x1b[35m", "\x1b[35m", "\x1b[35m",
+        "\x1b[1;31m", "\x1b[31m", "\x1b[0m",
+    };
+    JSValue mod = qp_tb_loaded_module(ctx, "_colorize"), tb = QP_NULL;
+    int i;
+
+    if (!QP_IS_NULL(mod)) {
+        JSValue fn = qp_te_getattr_opt(ctx, mod, "get_theme"), kw, kwnames, arg = JS_TRUE, theme;
+        JS_FreeValue(ctx, mod);
+        if (JS_IsException(fn) || QP_IS_NULL(fn))
+            goto fail;
+        kw = qp_str_from_cstr(ctx, "force_color");
+        kwnames = JS_IsException(kw) ? JS_EXCEPTION : qp_tuple_pack(ctx, 1, (JSValueConst *)&kw);
+        JS_FreeValue(ctx, kw);
+        theme = JS_IsException(kwnames) ? JS_EXCEPTION :
+            qp_vectorcall(ctx, fn, (JSValueConst *)&arg, 0, kwnames);
+        JS_FreeValue(ctx, kwnames);
+        JS_FreeValue(ctx, fn);
+        if (JS_IsException(theme))
+            goto fail;
+        tb = qp_te_getattr_opt(ctx, theme, "traceback");
+        JS_FreeValue(ctx, theme);
+        if (JS_IsException(tb) || QP_IS_NULL(tb))
+            goto fail;
+    }
+    for (i = 0; i < QP_TH__COUNT; i++) {
+        JSValue v;
+        if (QP_IS_NULL(tb)) {
+            v = qp_str_from_cstr(ctx, defaults[i]);
+        } else {
+            v = qp_te_getattr_opt(ctx, tb, names[i]);
+            if (!JS_IsException(v) && !qp_str_check(ctx, v)) {
+                JSValue s = QP_IS_NULL(v) ? JS_EXCEPTION : qp_str(ctx, v);
+                JS_FreeValue(ctx, v);
+                v = s;
+            }
+        }
+        if (JS_IsException(v)) {
+            JS_FreeValue(ctx, tb);
+            goto fail;
+        }
+        st->theme[i] = v;
+    }
+    JS_FreeValue(ctx, tb);
+    return 0;
+ fail:
+    qp_tb_clear_exc(ctx);
+    for (i = 0; i < QP_TH__COUNT; i++) {
+        JS_FreeValue(ctx, st->theme[i]);
+        st->theme[i] = JS_UNDEFINED;
+    }
+    return -1;
+}
+
 /* traceback._print_exception_bltin(exc, file) / PyErr_Display.  file QP_NULL
    = sys.stderr (sys.__stderr__ when None, C stderr when unusable). */
 static int qp_exc_display(JSContext *ctx, JSValueConst exc, JSValueConst file_in)
 {
     QPTBState st;
     JSValue file, saved, text;
-    int ret = -1;
+    int ret = -1, i;
 
     saved = JS_HasException(ctx) ? JS_GetException(ctx) : QP_NULL;
     if (QP_IS_NULL(file_in)) {
@@ -3569,6 +4083,9 @@ static int qp_exc_display(JSContext *ctx, JSValueConst exc, JSValueConst file_in
     st.ctx = ctx;
     st.max_group_width = 15;
     st.max_group_depth = 10;
+    for (i = 0; i < QP_TH__COUNT; i++)
+        st.theme[i] = JS_UNDEFINED;
+    st.colorize = qp_tb_can_colorize(ctx, file) && qp_tb_load_theme(ctx, &st) == 0;
     qp_text_init(&st.out, ctx);
     if (!qp_exc_check(ctx, exc)) {
         /* print_exception_invalid_type */
@@ -3593,6 +4110,8 @@ static int qp_exc_display(JSContext *ctx, JSValueConst exc, JSValueConst file_in
     qp_tb_free_sources(ctx, st.sources);
     js_free(ctx, st.seen);
     qp_text_free(&st.out);
+    for (i = 0; i < QP_TH__COUNT; i++)
+        JS_FreeValue(ctx, st.theme[i]);
     JS_FreeValue(ctx, file);
     qp_tb_clear_exc(ctx);
     if (!QP_IS_NULL(saved))

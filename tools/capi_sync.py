@@ -10,8 +10,10 @@ Two areas are kept equal to the pinned CPython tag plus recorded patches:
   capi/modules/   the sources of every module listed in capi/Setup.qp and
                   every file they include with #include "..." (clinic
                   *.c.h, local headers, _sre/, _sqlite/, _ssl/, _hacl/,
-                  expat/), plus expat/COPYING, patched by
-                  capi/modules/PATCHES.  SOURCE records the tag and commit.
+                  expat/), plus expat/COPYING and the test-only modules of
+                  TEST_MODULE_SOURCES (the `make capi-testmods` _testcapi),
+                  patched by capi/modules/PATCHES.  SOURCE records the tag
+                  and commit.
   capi/compat/    the internal headers that are layout-independent CPython
                   code (COMPAT_COPIES, from Include/internal/), patched by
                   capi/compat/PATCHES.  Every other file there is a
@@ -61,11 +63,17 @@ SOURCE = "SOURCE"
 INCLUDE_DIRS = ["", "_hacl", "_hacl/include", "expat", "_decimal/libmpdec"]
 # Vendored in addition to the include closure (licences).
 EXTRA_MODULE_FILES = ["expat/COPYING"]
+# Test-only extension sources vendored with their include closure, so that
+# their PATCHES can compile out what tests CPython internals (Makefile
+# capi-testmods; not part of qpy).  A trailing "/" names every .c file of
+# that directory.
+TEST_MODULE_SOURCES = ["_testcapimodule.c", "_testcapi/"]
 # Include/internal/ headers copied into capi/compat/ (capi-design.md §3).
 COMPAT_COPIES = [
     "pycore_bitutils.h", "pycore_blocks_output_buffer.h",
     "pycore_hashtable.h", "pycore_intrinsics.h", "pycore_llist.h",
-    "pycore_lock.h", "pycore_long.h", "pycore_mmap.h", "pycore_opcode_metadata.h",
+    "pycore_lock.h", "pycore_long.h", "pycore_mmap.h", "pycore_namespace.h",
+    "pycore_opcode_metadata.h",
     "pycore_opcode_utils.h",
     "pycore_parking_lot.h", "pycore_pyatomic_ft_wrappers.h",
     "pycore_pyhash.h", "pycore_pymath.h", "pycore_strhex.h",
@@ -175,6 +183,15 @@ def module_closure(tree):
         if src not in have:
             die("Setup.qp source %s is not in Modules/ of %s" % (src, CPYTHON_TAG))
         todo.append(src)
+    for src in TEST_MODULE_SOURCES:
+        if src.endswith("/"):
+            todo.extend(sorted(p for p in have if p.startswith(src)
+                               and p.endswith(".c") and "/" not in p[len(src):]))
+        elif src in have:
+            todo.append(src)
+        else:
+            die("test module source %s is not in Modules/ of %s"
+                % (src, CPYTHON_TAG))
     for extra in EXTRA_MODULE_FILES:
         if extra not in have:
             die("%s is not in Modules/ of %s" % (extra, CPYTHON_TAG))

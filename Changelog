@@ -1,10 +1,30 @@
 unreleased:
-
-- Python: JS_FreeRuntime() finalizes the Python contexts (atexit, module
-  finalization) and frees everything an embedder created through
-  JS_InitPython/JS_EvalPython/JS_PythonImport; the C extension modules
-  bind again to a later runtime of the process (Py_Initialize/Py_Finalize
-  cycles); runtimes in other threads get ImportError for them meanwhile
+- Python: sys.monitoring (PEP 669) delivers its events: global and local
+  event sets, per-location DISABLE, restart_events(), all events including
+  C_RETURN/C_RAISE, BRANCH_LEFT/RIGHT (and the BRANCH alias), STOP_ITERATION,
+  PY_THROW; works alongside sys.settrace/setprofile; no cost while no tool
+  has events (the trace dispatch hook); event offsets follow the
+  synthesized co_code (co_branches() covers async for, FOR_ITER exits past
+  POP_ITER, backward conditional jumps as an inverted POP_JUMP_IF over a
+  JUMP_BACKWARD); code objects are one per bytecode; coverage.py's sysmon
+  core gives CPython's line and branch reports (tests/py/monitoring/run.sh,
+  5 samples)
+- Python compiler: line numbers of artificial code follow CPython's
+  propagate_line_numbers (code after a join of several flows and exception
+  handler entries have no line; the implicit return is copied per
+  predecessor), the NOP of a multi-line super().attr is kept
+- Python tracing: sys.settrace follows CPython 3.15's legacy tracing
+  (test_sys_settrace 448/448): frame.f_lineno assignment with CPython's
+  validity rules (operand stack analysis of the bytecode, jumps out of
+  loops/handlers/with blocks, unbound locals bound to None), small exit
+  blocks and blocks without location are copied into each jump like
+  CPython's flowgraph (break/continue/return keep their line, constant
+  if/while tests are folded), f_lineno is None where code has no
+  location, f_lasti of an unstarted frame is its RESUME and of a frame
+  ended by an exception follows RERAISE's oparg; cProfile (_lsprof) runs
+  on sys.monitoring like CPython's; code called by the Python
+  implementations of C modules reports no monitoring events; the parser's
+  stack overflow raises MemoryError with CPython's message
 
 - added in-process suspension of running code (JS_RequestSuspend(),
   JS_IsSuspended(), JS_Resume())
@@ -34,61 +54,96 @@ unreleased:
   runtime saved to 'file' after each command (as a delta of a new
   session, rebuilt at startup) and restored from it at startup;
   qjs --typescript also applies to the REPL commands
-- qjs --drepl file --python: durable Python REPL (CPython REPL
-  conventions, top-level await, Ctrl-C raises KeyboardInterrupt); the
-  file holds the hash seed of the session and the delta; objects
-  holding host state make the save fail and keep the previous file
 - added Python 3.15 (CONFIG_PYTHON, python/): Python source is compiled
-  to QuickJS bytecode and runs in the same runtime, heap and GC as JS
-- added the qpy program with CPython's command line; qjs runs .py files
-  and qjs --python takes the qpy options
-- added JS_InitPython(), JS_EvalPython() (exec/eval/single modes,
-  JS_PY_EVAL_FLAG_ASYNC for top-level await) and JS_PythonImport()
-- JS <-> Python interop: values shared by identity, js.JsObject,
-  js.JsError, callKw()/toJs()/to_py(), awaitable promises, coroutines as
-  thenables, and ES imports of .py modules
-- added pylib/: a pure-Python stdlib subset pinned to CPython v3.15.2
-  (make pylib-sync)
-- added a CPython-compatible C API with CPython's accelerator modules
-  linked into qpy (CONFIG_PYTHON_CAPI, capi/, make capi-sync)
-- added the Python test harness tests/py/run.py (make testpy,
-  testpy-l3b, testpy-ast, testpy-replay, testpy-golden)
-- qpy: pylib adds tomllib, xml, zoneinfo, filecmp, pty, tty, wave,
-  optparse, timeit, dbm, profile/pstats and more; the C modules fcntl,
-  termios, pwd, grp, mmap, syslog, _elementtree, _zoneinfo and (macOS)
-  _scproxy are built from CPython's sources
-- qpy: __del__ of an object freed by reference counting runs at the
-  next call or loop iteration instead of at the next gc.collect(), so
-  unclosed files are flushed as in CPython
+  to QuickJS bytecode and runs in the same runtime, heap, GC, job queue
+  and snapshot format as JS:
+  - the qpy program with CPython's command line; qjs runs .py files and
+    qjs --python takes the qpy options
+  - pylib/: CPython v3.15.2's pure-Python Lib/ without the test suite
+    and Tk (make pylib-sync)
+  - JS <-> Python interop: values shared by identity, js.JsObject,
+    js.JsError, callKw()/toJs()/to_py(), awaitable promises, coroutines
+    as thenables, and ES imports of .py modules
+  - embedder API: JS_InitPython(), JS_EvalPython() (exec/eval/single
+    modes, JS_PY_EVAL_FLAG_ASYNC for top-level await) and
+    JS_PythonImport(); JS_FreeRuntime() finalizes Python (atexit, module
+    finalization) and frees everything; the C modules are bound to one
+    runtime of the process at a time (other runtimes get ImportError for
+    them until it is freed, a later runtime binds them again)
+  - qjs --drepl file --python: durable Python REPL (CPython REPL
+    conventions, top-level await, Ctrl-C raises KeyboardInterrupt); the
+    file holds the hash seed of the session and the delta; sessions may
+    hold C module objects (asyncio, csv, threading, logging, subprocess,
+    decimal...); the main thread's threading objects are bound to the
+    main thread of the reading process; objects holding host state and
+    running threads other than the main one make the save fail and keep
+    the previous file
+- added a CPython-compatible C API (CONFIG_PYTHON_CAPI, capi/, make
+  capi-sync): CPython's C modules built from its sources (capi/Setup.qp;
+  the ones needing a system library are linked by qpy and qjs); stable
+  ABI extensions (*.abi3.so, *.abi3t.so) and source builds against
+  capi/include (EXT_SUFFIX .quickpy-315-<plat>.so) are loaded with
+  dlopen; cp315 binaries are rejected; sys.getdlopenflags() /
+  sys.setdlopenflags(); CPython's test.test_capi suite runs against it
+  (PyConfig_Get/Set, dict/type/code/function/context watchers,
+  PyMonitoring_*, pending calls, PyMem_SetAllocator and the
+  PYTHONMALLOC=debug hooks, lazy-import filter and sys.lazy_modules)
+- qpy: venv, ensurepip and pip install abi3 wheels; numpy and Pillow
+  build from source (tools/build_numpy.sh, tools/build_pillow.sh), and
+  so do matplotlib, kiwisolver and contourpy (tools/build_matplotlib.sh,
+  meson and setuptools running under qpy; pybind11's PyType_Ready of
+  tp_alloc'd heap types); tests/py/mpl/run.sh compares a matplotlib demo
+  with CPython's
+- qpy: io.BufferedReader.seek() inside the read buffer no longer seeks the
+  raw stream, as in CPython's C implementation (tarfile over a .tar.xz or
+  .tar.gz was quadratic)
+- qpy: threads (_thread, threading) run as OS threads under a GIL;
+  signals and _thread.interrupt_main() raise in the main thread as in
+  CPython; fork() from any thread
+- qpy: sys.settrace()/sys.setprofile() (and the *_all_threads variants
+  and C API) give CPython's events: pdb, trace, profile and cProfile work
 - qpy: tracemalloc traces the runtime's allocations (Python objects,
   PyObject_Malloc, PyMem_*, PyTraceMalloc_Track domains) with Python
-  tracebacks: start/stop, snapshots, get_object_traceback(), traced and
-  peak memory; -X tracemalloc[=N] and PYTHONTRACEMALLOC start it at
+  tracebacks; -X tracemalloc[=N] and PYTHONTRACEMALLOC start it at
   startup; no cost but one test per allocation while it is not tracing
-- qpy: io.BytesIO / io.StringIO pickle state (__getstate__ /
-  __setstate__) and instance __dict__ follow the C _io module
-- qpy: os gains the missing POSIX functions and constants (openpty,
-  forkpty, system, wait3/wait4/waitid, posix_spawn, setuid family, ...)
-  and the full stat_result (st_blocks, st_blksize, st_rdev, st_flags,
-  st_gen, st_birthtime)
-- qpy: sys.getdlopenflags() / sys.setdlopenflags() set the dlopen()
-  flags of extension modules (RTLD_NOW by default, as in CPython)
-- make capi-testmods builds CPython's _testlimitedcapi as a test-only
-  abi3 extension that the L3 runs import (test_bytes runs in full)
-- Python snapshots (qjs --drepl --python, JS_WriteSnapshot()) save
-  sessions that import asyncio, csv, threading, logging or subprocess:
-  _ThreadHandle and RLock objects of the main thread are bound to the
-  main thread of the reading process (threading.main_thread() included),
-  locks no thread holds and threads that ended are values, a running
-  thread other than the main one makes the save fail; dialects
-  registered with csv stay registered; queued weakref callbacks and
-  __del__ methods run at the end of each command
-- qpy: _imp.create_builtin() no longer runs the module's exec, which
-  _imp.exec_builtin() runs once the module is in sys.modules, so a C
-  module whose exec imports itself back (_asyncio through asyncio) is
-  executed once
-- tests/py/omp_prelude_check.py checks that omp's eval prelude imports
-  and runs under qpy
+- qpy: faulthandler module: Python tracebacks of the current or all
+  threads on SIGSEGV/SIGFPE/SIGABRT/SIGBUS/SIGILL (alternate signal
+  stack), on a timeout (dump_traceback_later watchdog) or on a user
+  signal (register), plus the C stack and the extension modules, in
+  CPython's format; -X faulthandler, PYTHONFAULTHANDLER and -X dev
+  enable it at startup; Py_FatalError() dumps the thread tracebacks
+- qpy: code.co_code, co_linetable and co_exceptiontable are a CPython
+  3.15 instruction stream and tables synthesized from the bytecode, so
+  dis, inspect.getclosurevars and co_lines()-based tools work; f_lasti,
+  tb_lasti, co_positions() and co_lines() use its offsets;
+  replace(co_linetable=/co_exceptiontable=) are reported, replace(co_code=)
+  only accepts the synthesized stream
+- qpy: attribute inline caches hold no references (they check a shape
+  uid and the type version tag), so a class or an object is freed as
+  soon as it is unreachable; the gc clears the weakrefs to cyclic
+  garbage and runs their callbacks before the finalizers, as in CPython
+- qpy: CPython's frozen modules (importlib._bootstrap[_external],
+  zipimport, the startup and runpy modules, __hello__, __phello__) are
+  embedded as bytecode written at build time; -X frozen_modules and
+  PYTHON_FROZEN_MODULES work as in CPython
+- qpy: starts from an embedded base snapshot of an initialized
+  interpreter (qpy --write-base-snapshot at build time): qpy -I -c pass
+  is about as fast as in CPython
+- qpy: bytecode cache: marshal writes code objects as QuickJS bytecode,
+  imports read and write __pycache__/*.quickpy-315.pyc
+- qpy: os has the POSIX functions and constants (openpty, forkpty,
+  wait3/wait4/waitid, posix_spawn, the setuid family...) and the full
+  stat_result
+- qpy: __del__ of an object freed by reference counting runs at the
+  next call or loop iteration, so unclosed files are flushed as in
+  CPython
+- added the Python tests: tests/py/run.py (make testpy, testpy-l3b,
+  testpy-l3c, testpy-ast, testpy-replay, testpy-golden), make bench-py,
+  make capi-testmods (_testcapi, _testlimitedcapi, _testmultiphase and
+  _testsinglephase for the L3 runs, also importable by `qpy -I`
+  subprocesses through pylib/ symlinks), make test-embed,
+  make test-snapshot-capi, tests/py/abi3/run.sh and
+  tests/py/omp_prelude_check.py
 - quickjs-libc: exported js_std_print() and js_std_console_log()
 - quickjs-libc: js_module_normalize() resolves './x.js' / './x' to an
   existing './x.ts' ('./x.mjs' to './x.mts'); std.evalScript()

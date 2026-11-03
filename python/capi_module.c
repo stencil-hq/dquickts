@@ -33,7 +33,10 @@ static int qp_capi_module_kind_init(JSContext *ctx, PyObject *op, JSValueConst v
     int r;
 
     QP_CAPI_HEAD(op)->flags |= QP_CAPI_F_PERSIST;
-    m->md_state_size = -1;
+    /* new_module_notrack: 0 for module objects created by Python code;
+       the runtime's builtin modules have no C state (as single-phase
+       m_size == -1); C extension modules set it from their def */
+    m->md_state_size = qp_module_payload(v)->builtin ? -1 : 0;
     if (QP_IS_NULL(d)) {
         qp_raise_system_error(ctx, "module object without a dict");
         return -1;
@@ -92,6 +95,20 @@ static void qp_capi_module_kind_clear(JSRuntime *rt, PyObject *op)
 /* ========================================================================= */
 /* Module objects                                                            */
 /* ========================================================================= */
+
+/* _PyModule_IsExtension (an exec slot, or a def with methods): recorded on
+   the module object, where the fatal error report reads it without the C
+   API (python/mod_faulthandler.c, "Extension modules:") */
+static void qp_capi_module_note_ext(QPCapiModuleObject *m)
+{
+    QPModule *qm;
+    if (!m->md_exec &&
+        !(m->md_token_is_def && ((PyModuleDef *)m->md_token)->m_methods))
+        return;
+    qm = qp_module_payload(qp_capi_value(qp_capi.ctx, (PyObject *)m));
+    if (qm)
+        qm->c_ext = 1;
+}
 
 PyObject *PyModule_NewObject(PyObject *name)
 {
@@ -503,6 +520,7 @@ PyObject *PyModule_Create2(PyModuleDef *module, int module_api_version)
     m->md_token = module;
     m->md_token_is_def = true;
     qp_capi_module_copy_deflike(m, module);
+    qp_capi_module_note_ext(m);
     return (PyObject *)m;
 }
 
@@ -633,6 +651,7 @@ static PyObject *qp_capi_module_from_slots(const PySlot *slots, PyObject *spec, 
             mod->md_token = token;
         }
         mod->md_exec = m_exec;
+        qp_capi_module_note_ext(mod);
     } else {
         if (def_like->m_size > 0 || def_like->m_traverse || def_like->m_clear || def_like->m_free) {
             PyErr_Format(PyExc_SystemError, "module %s is not a module object, but requests module state",
@@ -783,16 +802,40 @@ static int qp_capi_module_merge(PyObject *into, PyObject *created)
     dst->md_token = src->md_token;
     dst->md_token_is_def = src->md_token_is_def;
     dst->md_exec = NULL;
+    qp_capi_module_note_ext(dst);
     Py_XSETREF(dst->qp_state_owner, Py_NewRef(created));
     return 0;
+}
+
+/* types.SimpleNamespace(**kwds) (Objects/namespaceobject.c; pycore_namespace.h,
+   exported for _testmultiphase). kwds: dict or NULL. */
+PyAPI_FUNC(PyObject *) _PyNamespace_New(PyObject *kwds)
+{
+    JSContext *ctx = qp_capi.ctx;
+    PyTypeObject *tp = qp_capi_type_from_qp(ctx, QP_TYPE(ctx, SimpleNamespace));
+    PyObject *args, *ns;
+    if (!tp)
+        return NULL;
+    args = PyTuple_New(0);
+    if (!args)
+        return NULL;
+    ns = PyObject_Call((PyObject *)tp, args, NULL);
+    Py_DECREF(args);
+    if (ns && kwds) {
+        PyObject *d = PyObject_GetAttrString(ns, "__dict__");
+        int r = d ? PyDict_Update(d, kwds) : -1;
+        Py_XDECREF(d);
+        if (r < 0)
+            Py_CLEAR(ns);
+    }
+    return ns;
 }
 
 /* Spec given to Py_mod_create of a builtin module: the module's __spec__
    when set, else a namespace with name and origin 'built-in'. */
 static PyObject *qp_capi_builtin_spec(PyObject *module, PyObject *name)
 {
-    JSContext *ctx = qp_capi.ctx;
-    PyObject *spec, *kw, *args, *ns;
+    PyObject *spec, *kw, *ns;
     if (PyObject_GetOptionalAttrString(module, "__spec__", &spec) < 0)
         return NULL;
     if (spec && spec != Py_None)
@@ -801,11 +844,7 @@ static PyObject *qp_capi_builtin_spec(PyObject *module, PyObject *name)
     kw = Py_BuildValue("{s:O,s:s}", "name", name, "origin", "built-in");
     if (!kw)
         return NULL;
-    args = PyTuple_New(0);
-    ns = qp_capi_type_from_qp(ctx, QP_TYPE(ctx, SimpleNamespace)) && args
-        ? PyObject_Call((PyObject *)qp_capi_type_from_qp(ctx, QP_TYPE(ctx, SimpleNamespace)), args, kw)
-        : NULL;
-    Py_XDECREF(args);
+    ns = _PyNamespace_New(kw);
     Py_DECREF(kw);
     return ns;
 }

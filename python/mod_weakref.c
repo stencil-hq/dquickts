@@ -21,7 +21,8 @@
  * or backward jump of the running Python code, and gc.collect() drains
  * the queue before returning.  As in CPython, a weakref that is itself
  * garbage does not get its callback called, and errors are reported with
- * "Exception ignored while calling weakref callback %R".
+ * "Exception ignored while calling weakref callback %R" ("... on calling
+ * ..." for callbacks queued by the cycle collector, as gc.c reports them).
  *
  * The record also keeps a raw pointer to the weakref object (`owner`) and
  * holds a weakref_count on it, so the owner's JSObject structure outlives
@@ -532,6 +533,64 @@ static BOOL qp_wr_owner_dying(JSObject *owner)
     return owner == NULL || owner->free_mark || js_rc(owner)->mark != 0;
 }
 
+/* rec was cleared: queue its callback unless the weakref is garbage too.
+   Returns TRUE if queued. */
+static BOOL qp_wr_queue_callback(JSRuntime *rt, QPModState *ms, QPWeakRec *rec)
+{
+    if (QP_IS_NULL(rec->callback))
+        return FALSE;
+    if (qp_wr_owner_dying(rec->owner) || rec->pending) {
+        /* the weakref is garbage too: no callback (CPython
+           handle_weakref_callbacks); its holder releases the callback */
+        return FALSE;
+    }
+    rec->pending_cb = rec->callback;
+    rec->callback = QP_NULL;
+    rec->pending = 1;
+    rec->pending_from_gc = rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES;
+    rec->pending_next = NULL;
+    if (ms->wr_pending_tail)
+        ms->wr_pending_tail->pending_next = rec;
+    else
+        ms->wr_pending_head = rec;
+    ms->wr_pending_tail = rec;
+    return TRUE;
+}
+
+/* gc.c handle_weakref_callbacks: before the finalizers of the cyclic
+   garbage run, the weakrefs with a callback to the unreachable object p
+   are cleared and the callbacks of those that are not garbage too are
+   queued.  The weakrefs without callback stay usable by the finalizers;
+   qp_weakref_object_freed() clears them. */
+static void qp_weakref_clear_callback_refs(JSRuntime *rt, JSObject *p)
+{
+    struct list_head *el;
+
+    list_for_each(el, &rt->context_list) {
+        JSContext *ctx = list_entry(el, JSContext, link);
+        QPModState *ms;
+        QPWeakBucket *b;
+        QPWeakRec *rec, *next;
+        BOOL queued = FALSE;
+
+        if (!ctx->py || !(ms = ctx->py->mod_state) || !ms->wr_size)
+            continue;
+        b = qp_wr_table_find(ms, p);
+        if (!b)
+            continue;
+        for (rec = b->head; rec; rec = next) {
+            next = rec->next;
+            if (QP_IS_NULL(rec->callback))
+                continue;
+            qp_wr_unlink(rt, rec);
+            if (qp_wr_queue_callback(rt, ms, rec))
+                queued = TRUE;
+        }
+        if (queued)
+            ctx->interrupt_counter = 1;   /* prompt qp_signal_check() */
+    }
+}
+
 static void qp_weakref_object_freed(JSRuntime *rt, JSObject *p)
 {
     struct list_head *el;
@@ -559,26 +618,45 @@ static void qp_weakref_object_freed(JSRuntime *rt, JSObject *p)
             rec->target = NULL;
             assert(p->weakref_count >= 1);
             p->weakref_count--;
-            if (QP_IS_NULL(rec->callback))
-                continue;
-            if (qp_wr_owner_dying(rec->owner) || rec->pending) {
-                /* the weakref is garbage too: no callback (CPython
-                   handle_weakrefs); its holder releases the callback */
-                continue;
-            }
-            rec->pending_cb = rec->callback;
-            rec->callback = QP_NULL;
-            rec->pending = 1;
-            rec->pending_next = NULL;
-            if (ms->wr_pending_tail)
-                ms->wr_pending_tail->pending_next = rec;
-            else
-                ms->wr_pending_head = rec;
-            ms->wr_pending_tail = rec;
-            queued = TRUE;
+            if (qp_wr_queue_callback(rt, ms, rec))
+                queued = TRUE;
         }
         if (queued)
             ctx->interrupt_counter = 1;   /* prompt qp_signal_check() */
+    }
+}
+
+/* _PyWeakref_ClearWeakRefsNoCallbacks (PyUnstable_Object_ClearWeakRefsNoCallbacks):
+   clear every weak reference to the live object p and drop the callbacks
+   without calling them. */
+static void qp_weakref_clear_no_callbacks(JSRuntime *rt, JSObject *p)
+{
+    struct list_head *el;
+
+    list_for_each(el, &rt->context_list) {
+        JSContext *ctx = list_entry(el, JSContext, link);
+        QPModState *ms;
+        QPWeakBucket *b;
+        QPWeakRec *rec, *next;
+
+        if (!ctx->py || !(ms = ctx->py->mod_state) || !ms->wr_size)
+            continue;
+        b = qp_wr_table_find(ms, p);
+        if (!b)
+            continue;
+        rec = b->head;
+        qp_wr_table_remove(ms, p);
+        for (; rec; rec = next) {
+            JSValue cb = rec->callback;
+            next = rec->next;
+            rec->prev = rec->next = NULL;
+            rec->target = NULL;
+            assert(p->weakref_count >= 1);
+            p->weakref_count--;
+            rec->callback = QP_NULL;
+            if (!QP_IS_NULL(cb))
+                JS_FreeValueRT(rt, cb);
+        }
     }
 }
 
@@ -592,6 +670,7 @@ static void qp_weakref_run_pending(JSContext *ctx)
         return;
     while ((rec = ms->wr_pending_head) != NULL) {
         JSValue cb, self, res, saved = QP_NULL;
+        BOOL from_gc;
 
         ms->wr_pending_head = rec->pending_next;
         if (!ms->wr_pending_head)
@@ -614,20 +693,13 @@ static void qp_weakref_run_pending(JSContext *ctx)
         self = JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, rec->owner));
         if (JS_HasException(ctx))
             saved = JS_GetException(ctx);
+        from_gc = rec->pending_from_gc;
         res = qp_call1(ctx, cb, self);
         if (JS_IsException(res)) {
-            JSValue exc = qp_exc_fetch(ctx);
-            JSValue msg = qp_str_from_format(ctx, "Exception ignored while calling weakref callback %R",
-                                             cb);
-            const char *cmsg = JS_IsException(msg) ? NULL : qp_str_utf8(ctx, msg, NULL);
-            if (!cmsg)
-                JS_FreeValue(ctx, qp_exc_fetch(ctx));
-            qp_exc_write_unraisable_msg(ctx, exc, cmsg ? cmsg : "Exception ignored while calling weakref callback",
-                                        QP_NULL);
-            if (cmsg)
-                JS_FreeCString(ctx, cmsg);
-            JS_FreeValue(ctx, msg);
-            JS_FreeValue(ctx, exc);
+            /* gc.c handle_weakrefs vs weakrefobject.c handle_callback */
+            qp_format_unraisable(ctx, from_gc ?
+                                 "Exception ignored on calling weakref callback %R" :
+                                 "Exception ignored while calling weakref callback %R", cb);
         } else {
             JS_FreeValue(ctx, res);
         }

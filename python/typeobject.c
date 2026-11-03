@@ -22,7 +22,7 @@
 #define QP_TEXT(t) ((QPTypeExt *)(t))
 
 /* ---- forward declarations (definitions below / in the private headers) */
-static JSValue qp_find_name_in_mro(JSContext *ctx, QPType *t, JSAtom name);
+static int qp_find_name_in_mro(JSContext *ctx, QPType *t, JSAtom name, JSValue *pres);
 static int qp_fixup_slot_dispatchers(JSContext *ctx, QPType *t);
 static int qp_update_slot(JSContext *ctx, QPType *t, JSAtom name);
 static int qp_add_operators(JSContext *ctx, QPType *t);
@@ -34,6 +34,7 @@ static int qp_lookup_method_ex(JSContext *ctx, JSValueConst self, JSAtom attr,
                                JSValue *out, int raise);
 static JSValue qp_type_getattro(JSContext *ctx, JSValueConst obj, JSAtom name);
 static int qp_type_setattro(JSContext *ctx, JSValueConst obj, JSAtom name, JSValueConst v);
+static void qp_obj_set_attribute_error_context(JSContext *ctx, JSValueConst v, JSAtom name);
 static JSValue qp_type_call(JSContext *ctx, JSValueConst callable, JSValueConst *args,
                             size_t nargsf, JSValueConst kwnames);
 static JSValue qp_type_tp_new(JSContext *ctx, QPType *meta, JSValueConst *args,
@@ -479,12 +480,16 @@ static void qp_type_finalizer(JSRuntime *rt, JSValue val)
     }
     if (t->name != JS_ATOM_NULL)
         JS_FreeAtomRT(rt, t->name);
+    if (t->flags & QP_TPFLAGS_PRIV_OWNED_NAME)
+        js_free_rt(rt, (char *)t->tp_name);
     JS_FreeValueRT(rt, t->qualname);
     JS_FreeValueRT(rt, t->bases);
     JS_FreeValueRT(rt, t->mro);
     JS_FreeValueRT(rt, t->dict);
     JS_FreeValueRT(rt, t->slot_names);
     JS_FreeValueRT(rt, e->doc);
+    if (t->ic_shape)
+        js_free_shape(rt, t->ic_shape);
     js_free_rt(rt, t->subclasses);
     js_free_rt(rt, e->bases_raw);
     js_free_rt(rt, e);
@@ -502,6 +507,8 @@ static void qp_type_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func
     JS_MarkValue(rt, t->dict, mark_func);
     JS_MarkValue(rt, t->slot_names, mark_func);
     JS_MarkValue(rt, QP_TEXT(t)->doc, mark_func);
+    if (t->ic_shape)
+        mark_func(rt, &t->ic_shape->header);
 }
 
 /* ========================================================================= */
@@ -516,7 +523,7 @@ static uint32_t qp_type_version(JSContext *ctx, QPType *t)
 
     if (t->version_tag)
         return t->version_tag;
-    if (s->next_type_version == 0 || !(t->flags & QP_TPFLAGS_READY))
+    if (s->next_type_version == 0 || !(t->flags & QP_TPFLAGS_READY) || e->no_version)
         return 0;
     /* invariant: a tagged type has tagged bases, so that invalidating a
        base reaches every tagged subclass */
@@ -549,44 +556,52 @@ static inline uint32_t qp_mcache_hash(uint32_t version, JSAtom name)
     return (h ^ (h >> 16)) & ((1u << QP_MCACHE_SIZE_EXP) - 1);
 }
 
-/* find_name_in_mro: borrowed value or QP_NULL; never raises. */
-static JSValue qp_find_name_in_mro(JSContext *ctx, QPType *t, JSAtom name)
+/* find_name_in_mro: 1 found (*pres borrowed: the dict keeps it alive),
+   0 absent, -1 error (cleared; *pres = QP_NULL); never raises. */
+static int qp_find_name_in_mro(JSContext *ctx, QPType *t, JSAtom name, JSValue *pres)
 {
-    JSValue v;
+    JSValue v, mro;
     Py_ssize_t i, n;
     JSValue *items;
+    int r = 0;
 
+    *pres = QP_NULL;
     if (JS_VALUE_GET_TAG(t->mro) != JS_TAG_OBJECT) {
         /* not ready yet: own dict only */
         if (JS_VALUE_GET_TAG(t->dict) != JS_TAG_OBJECT)
-            return QP_NULL;
-        if (qp_dict_get_item_atom(ctx, t->dict, name, &v) > 0) {
+            return 0;
+        r = qp_dict_get_item_atom(ctx, t->dict, name, &v);
+        if (r > 0) {
             JS_FreeValue(ctx, v);
-            return v;
-        }
-        if (JS_HasException(ctx))
+            *pres = v;
+        } else if (r < 0) {
             qp_tw_clear_exc(ctx);
-        return QP_NULL;
+        }
+        return r;
     }
-    n = QP_TUPLE_SIZE(t->mro);
-    items = QP_TUPLE_ITEMS(t->mro);
+    /* Keep a strong reference to the MRO: t->mro can be replaced during the
+       dict lookup, e.g. when comparing to a non-str key whose __eq__ assigns
+       __bases__ (bpo-14199). */
+    mro = JS_DupValue(ctx, t->mro);
+    n = QP_TUPLE_SIZE(mro);
+    items = QP_TUPLE_ITEMS(mro);
     for (i = 0; i < n; i++) {
         QPType *b = qp_type_from_value(items[i]);
-        int r;
         if (!b || JS_VALUE_GET_TAG(b->dict) != JS_TAG_OBJECT)
             continue;
         r = qp_dict_get_item_atom(ctx, b->dict, name, &v);
         if (r > 0) {
-            /* borrowed: the dict keeps it alive */
             JS_FreeValue(ctx, v);
-            return v;
+            *pres = v;
+            break;
         }
         if (r < 0) {
             qp_tw_clear_exc(ctx);
-            return QP_NULL;
+            break;
         }
     }
-    return QP_NULL;
+    JS_FreeValue(ctx, mro);
+    return r;
 }
 
 static JSValue qp_type_lookup(JSContext *ctx, QPType *t, JSAtom name)
@@ -601,8 +616,13 @@ static JSValue qp_type_lookup(JSContext *ctx, QPType *t, JSAtom name)
         if (ent->version == v && ent->name == name)
             return ent->value;
     }
-    res = qp_find_name_in_mro(ctx, t, name);
+    /* The tag is taken before the walk (CPython assigns it first): when user
+       code run by the walk modifies the type, the result lands under the
+       stale tag, which is never reused and so never hit. */
     v = qp_type_version(ctx, t);
+    /* only results without an error are cached */
+    if (qp_find_name_in_mro(ctx, t, name, &res) < 0)
+        return QP_NULL;
     if (v) {
         ent = &s->mcache[qp_mcache_hash(v, name)];
         ent->version = v;
@@ -818,6 +838,43 @@ static int qp_mro_check(JSContext *ctx, QPType *t, JSValueConst mro)
     return 0;
 }
 
+/* type_mro_modified: the attribute cache relies on the invalidation of a
+   type reaching its subclasses through tp_bases; a type whose metatype
+   overrides mro(), or whose MRO lacks one of its bases, is never given a
+   version tag (CPython: version 0, tp_versions_used = _Py_ATTR_CACHE_UNUSED). */
+static void qp_type_mro_modified(JSContext *ctx, QPType *t, BOOL custom_meta)
+{
+    QPTypeExt *e = QP_TEXT(t);
+    Py_ssize_t i, j, nb, nm;
+    JSValue m1, m2;
+    int r1, r2;
+
+    if (custom_meta) {
+        /* has_custom_mro: type(t).mro is not type.mro */
+        r1 = qp_find_name_in_mro(ctx, qp_type_of(ctx, QP_TYPE_VALUE(t)), QP_ATOM(ctx, mro), &m1);
+        r2 = qp_find_name_in_mro(ctx, QP_TYPE(ctx, type), QP_ATOM(ctx, mro), &m2);
+        if (r1 != r2 || (r1 > 0 && JS_VALUE_GET_PTR(m1) != JS_VALUE_GET_PTR(m2)))
+            goto clear;
+    }
+    if (!qp_tuple_check(ctx, t->bases))
+        return;
+    nb = QP_TUPLE_SIZE(t->bases);
+    nm = QP_TUPLE_SIZE(t->mro);
+    for (i = 0; i < nb; i++) {
+        JSValueConst b = QP_TUPLE_ITEMS(t->bases)[i];
+        for (j = 0; j < nm; j++) {
+            if (JS_VALUE_GET_PTR(QP_TUPLE_ITEMS(t->mro)[j]) == JS_VALUE_GET_PTR(b))
+                break;
+        }
+        if (j == nm)
+            goto clear;
+    }
+    return;
+clear:
+    e->no_version = 1;
+    qp_type_modified(ctx, t);
+}
+
 /* mro_invoke + mro_internal: compute and store t->mro. */
 static int qp_mro_internal(JSContext *ctx, QPType *t)
 {
@@ -852,6 +909,7 @@ static int qp_mro_internal(JSContext *ctx, QPType *t)
     JS_FreeValue(ctx, t->mro);
     t->mro = mro;
     qp_type_modified(ctx, t);
+    qp_type_mro_modified(ctx, t, custom);
     return 0;
 }
 
@@ -1102,6 +1160,7 @@ static int qp_inherit_slots(JSContext *ctx, QPType *t, QPType *b)
         t->flags |= QP_TPFLAGS_METHOD_DESCRIPTOR;
     QP_COPY(tp_descr_set);
     QP_COPY(tp_init);
+    QP_COPY(tp_finalize);
 #undef QP_COPY
     return 0;
 }
@@ -2347,17 +2406,42 @@ static JSValue qp_type_get_doc(JSContext *ctx, JSValueConst self, int magic)
 static JSValue qp_type_get_text_signature(JSContext *ctx, JSValueConst self, int magic)
 {
     QPType *t = qp_type_from_value(self);
-    JSValue sn, res;
-    const char *s, *doc = (t->flags & QP_TPFLAGS_HEAPTYPE) ? NULL : qp_capi_type_doc(t);
+    JSValue sn, res, hdoc = JS_UNDEFINED;
+    const char *s, *doc = NULL, *heap_doc = NULL;
+    int r;
+
+    /* tp_doc: the C doc of builtin and C API types (PyType_FromSpec heap
+       types keep the signature there, their __doc__ is stripped) */
+    doc = qp_capi_type_doc(t);
+    if (!doc && (t->flags & QP_TPFLAGS_HEAPTYPE)) {
+        /* type_new_set_doc: a class's tp_doc is its str __doc__, which may
+           carry a "Name(...)\n--\n\n" signature too */
+        r = qp_dict_get_item_atom(ctx, t->dict, QP_ATOM(ctx, __doc__), &hdoc);
+        if (r < 0)
+            return JS_EXCEPTION;
+        if (r > 0 && qp_str_check(ctx, hdoc)) {
+            heap_doc = qp_str_utf8(ctx, hdoc, NULL);
+            if (!heap_doc) {
+                JS_FreeValue(ctx, hdoc);
+                return JS_EXCEPTION;
+            }
+        }
+        JS_FreeValue(ctx, hdoc);
+        doc = heap_doc;
+    }
     if (!doc)
         return JS_UNDEFINED;
     sn = qp_type_short_name(ctx, t);
     s = JS_IsException(sn) ? NULL : JS_ToCString(ctx, sn);
     JS_FreeValue(ctx, sn);
     if (!s)
-        return JS_EXCEPTION;
-    res = qp_text_signature_from_internal(ctx, s, doc);
-    JS_FreeCString(ctx, s);
+        res = JS_EXCEPTION;
+    else
+        res = qp_text_signature_from_internal(ctx, s, doc);
+    if (s)
+        JS_FreeCString(ctx, s);
+    if (heap_doc)
+        JS_FreeCString(ctx, heap_doc);
     return res;
 }
 
@@ -2955,6 +3039,7 @@ static int qp_type_setattro(JSContext *ctx, JSValueConst obj, JSAtom name, JSVal
                      tn, n);
             JS_FreeValue(ctx, tn);
             JS_FreeValue(ctx, n);
+            qp_obj_set_attribute_error_context(ctx, obj, name);
             return -1;
         }
     } else {
@@ -2963,7 +3048,7 @@ static int qp_type_setattro(JSContext *ctx, JSValueConst obj, JSAtom name, JSVal
     if (r < 0)
         return -1;
     qp_type_modified(ctx, type);
-    if (qp_is_slot_name(ctx, name) || name == QP_ATOM(ctx, __del__))
+    if (qp_is_slot_name(ctx, name))
         qp_update_slot(ctx, type, name);
     return 0;
 }

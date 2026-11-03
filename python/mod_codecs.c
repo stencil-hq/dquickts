@@ -24,6 +24,33 @@
 static int qp_unicode_lookup_name(const char *name, size_t len, uint32_t *cp);
 static int qp_unicode_get_name(uint32_t code, char *buffer, int buflen);
 
+/* _PyUnicode_GetNameCAPI: the first use of the character name database
+   (\N{...} escapes, the namereplace handler) imports the unicodedata
+   module, as CPython's PyCapsule_Import("unicodedata._ucnhash_CAPI"); the
+   names themselves come from the built-in table.  Before the import system
+   is set up (boot code), or in a parser-only context without Python state
+   (--dump-ast-json-batch), the table is used without importing.  0, or -1
+   with the import error pending. */
+static int qp_unicode_name_capi(JSContext *ctx)
+{
+    QPModState *ms;
+    JSValue m;
+
+    if (!QP_STATE(ctx) || !JS_IsObject(QP_STATE(ctx)->importlib))
+        return 0;
+    ms = qp_modstate(ctx);
+    if (!ms)
+        return -1;
+    if (ms->ucnhash_loaded)
+        return 0;
+    m = qp_import_module(ctx, "unicodedata");
+    if (JS_IsException(m))
+        return -1;
+    JS_FreeValue(ctx, m);
+    ms->ucnhash_loaded = TRUE;
+    return 0;
+}
+
 #define QP_CD_MAX_UNICODE 0x10FFFF
 #define QP_CD_IS_SURR(ch)      ((ch) >= 0xD800 && (ch) <= 0xDFFF)
 #define QP_CD_IS_HIGH_SURR(ch) ((ch) >= 0xD800 && (ch) <= 0xDBFF)
@@ -1079,6 +1106,8 @@ static JSValue qp_cd_eh_namereplace(JSContext *ctx, JSValueConst self, JSValueCo
 
     if (!QP_CD_EXC_IS(ctx, exc, UnicodeEncodeError))
         return qp_cd_wrong_exception_type(ctx, exc);
+    if (qp_unicode_name_capi(ctx) < 0)
+        return JS_EXCEPTION;
     if (qp_cd_ue_params(ctx, exc, FALSE, &p) < 0)
         return JS_EXCEPTION;
     js_dbuf_init(ctx, &d);
@@ -2566,6 +2595,12 @@ static JSValue qp_cd_decode_unicode_escape_internal(JSContext *ctx, const void *
 
         /* \N{name} */
         case 'N':
+            if (qp_unicode_name_capi(ctx) < 0) {
+                JS_FreeValue(ctx, qp_exc_fetch(ctx));
+                qp_raise(ctx, QP_EXC(ctx, UnicodeError),
+                         "\\N escapes not supported (can't load unicodedata module)");
+                goto fail;
+            }
             message = "malformed \\N character escape";
             if (s >= in.len)
                 goto incomplete;
@@ -2641,17 +2676,19 @@ static JSValue qp_cd_decode_unicode_escape(JSContext *ctx, const void *data, Py_
     int first_invalid_escape_char;
     JSValue result = qp_cd_decode_unicode_escape_internal(ctx, data, size, errors, consumed,
                                                           &first_invalid_escape_char);
-    char msg[128];
     if (JS_IsException(result))
         return result;
     if (first_invalid_escape_char != -1) {
+        int r;
         if (first_invalid_escape_char > 0xff)
-            snprintf(msg, sizeof(msg), "\"\\%o\" is an invalid octal escape sequence. "
-                     "Such sequences will not work in the future. ", first_invalid_escape_char);
+            r = qp_warn(ctx, QP_EXC(ctx, DeprecationWarning), 1,
+                        "\"\\%o\" is an invalid octal escape sequence. "
+                        "Such sequences will not work in the future. ", first_invalid_escape_char);
         else
-            snprintf(msg, sizeof(msg), "\"\\%c\" is an invalid escape sequence. "
-                     "Such sequences will not work in the future. ", first_invalid_escape_char);
-        if (qp_warn(ctx, QP_EXC(ctx, DeprecationWarning), 1, "%s", msg) < 0) {
+            r = qp_warn(ctx, QP_EXC(ctx, DeprecationWarning), 1,
+                        "\"\\%c\" is an invalid escape sequence. "
+                        "Such sequences will not work in the future. ", first_invalid_escape_char);
+        if (r < 0) {
             JS_FreeValue(ctx, result);
             return JS_EXCEPTION;
         }
@@ -2864,7 +2901,6 @@ static JSValue qp_cd_decode_escape_bytes(JSContext *ctx, const uint8_t *s, Py_ss
     DynBuf d;
     Py_ssize_t i = 0;
     int first_invalid_escape_char = -1;
-    char msg[128];
     JSValue result;
 
     js_dbuf_init(ctx, &d);
@@ -2944,13 +2980,16 @@ static JSValue qp_cd_decode_escape_bytes(JSContext *ctx, const uint8_t *s, Py_ss
     if (JS_IsException(result))
         return result;
     if (first_invalid_escape_char != -1) {
+        int r;
         if (first_invalid_escape_char > 0xff)
-            snprintf(msg, sizeof(msg), "b\"\\%o\" is an invalid octal escape sequence. "
-                     "Such sequences will not work in the future. ", first_invalid_escape_char);
+            r = qp_warn(ctx, QP_EXC(ctx, DeprecationWarning), 1,
+                        "b\"\\%o\" is an invalid octal escape sequence. "
+                        "Such sequences will not work in the future. ", first_invalid_escape_char);
         else
-            snprintf(msg, sizeof(msg), "b\"\\%c\" is an invalid escape sequence. "
-                     "Such sequences will not work in the future. ", first_invalid_escape_char);
-        if (qp_warn(ctx, QP_EXC(ctx, DeprecationWarning), 1, "%s", msg) < 0) {
+            r = qp_warn(ctx, QP_EXC(ctx, DeprecationWarning), 1,
+                        "b\"\\%c\" is an invalid escape sequence. "
+                        "Such sequences will not work in the future. ", first_invalid_escape_char);
+        if (r < 0) {
             JS_FreeValue(ctx, result);
             return JS_EXCEPTION;
         }

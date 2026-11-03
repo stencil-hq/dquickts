@@ -16,6 +16,14 @@ typedef struct QPSlice {
     JSValue start, stop, step;   /* any objects, None when absent; owned */
 } QPSlice;
 
+static void qp_slice_fields(JSValueConst v, JSValueConst fields[3])
+{
+    QPSlice *s = JS_VALUE_GET_OBJ(v)->u.opaque;
+    fields[0] = s->start;
+    fields[1] = s->stop;
+    fields[2] = s->step;
+}
+
 static QPSlice *qp_slice_get(JSValueConst v)
 {
     JSObject *p;

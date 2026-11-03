@@ -4,13 +4,36 @@
 
 | Milestone | Status |
 |---|---|
-| M0 | Done |
+| M0 harness | Done: `make testpy`, `testpy-l3b`, `testpy-l3c`, `testpy-ast`, `testpy-replay`, `testpy-golden`; expected-failure files committed |
 | M1 parser | Done: L2 identical on 100% of `Lib/**/*.py` |
-| M2 core | Done: L0 163/167 core scripts pass |
-| M3 stdlib + C API | In progress: `pylib/` subset in place; C API and `capi/modules` being integrated |
-| M4 snapshots, JS interop, rquickjs | Done, pending verification; durable Python REPL in progress |
-| M5 threads | In progress (`_thread.start_new_thread` still raises) |
-| M6 tracing / omp integration | In progress |
+| M2 core | Done: L0 207/211 golden scripts (the 4 failures are the UTF-16 surrogate deviation, §8) |
+| M3 stdlib + C API | Done: L3a 4563/4617 test ids; L1 replay parity 99.9% on self-contained cells and 99.9% on sessions; omp `prelude.py` imports and runs (`tests/py/omp_prelude_check.py`) |
+| M4 snapshots, JS interop, rquickjs | Done: interop suite, `--drepl --python` (C module state included, `make test-snapshot-capi`), rquickjs `eval_python` |
+| M5 abi3, threads | Done: 13 abi3 wheels pass their smoke tests (`tests/py/abi3/run.sh`); OS threads under a GIL (`tests/py/threads`, `test_threading` in L3) |
+| M6 tracing, performance | Done: `sys.settrace`/`setprofile` (pdb, trace, cProfile), tracemalloc, frozen modules, base snapshot startup about 1.0x CPython, `make bench-py` geomean about 1.48x CPython |
+| M7 source builds, L3b/L3c | Done: numpy `test_multiarray` 99.99% plus `test_umath`, `test_numeric`, `test_linalg`, `test_random` (`tools/build_numpy.sh`); Pillow 719 passed (`tools/build_pillow.sh -t`); L3b about 9047/9082, L3c 14087/14155 |
+
+Remaining deviations (listed per test id in `tests/py/l0_errors.txt` and
+`tests/py/cpython_errors.txt`, 152 L3 ids):
+
+- `str` is UTF-16: a surrogate pair written as two lone surrogates reads as one astral character
+  (§8).
+- C modules are bound to one runtime of the process at a time; no subinterpreters,
+  per-interpreter GIL or multi-phase-init isolation checks; no free-threaded ABI.
+- VM internals with no QuickJS equivalent: inline values and `__dict__` layout
+  (`test_class.TestInlineValues`), writes through frame `f_locals`, generator/frame internals
+  (`gi_code` reuse, frame clearing), `sys.monitoring` events (not delivered), and
+  `co_code` beyond the stream synthesized from the QuickJS bytecode (`replace(co_code=...)`
+  only accepts that stream; the runtime cannot execute CPython bytecode).
+- `__del__`/`tp_finalize` of objects in garbage cycles and weakref callbacks during cycle
+  resurrection; refleak checks.
+- Lone surrogates in the UTF-8/16/32 codecs (same UTF-16 cause); `locale`-aware `int`/`float`
+  formatting; `gc` generations and `DEBUG_SAVEALL`; a few `os` (fork at finalization, invalid
+  fds, `utime` with `Decimal`/`Fraction`) and `ast` (`__replace__` of custom fields) cases; the
+  `test_concurrent_futures` modules.
+- Statically linked C modules: in `sys.builtin_module_names`, no `__file__`.
+- Code objects are QuickJS bytecode: `.pyc` files are not interchangeable with CPython's
+  (`cache_tag` `quickpy-315`); `cp315` binaries are rejected.
 
 Goal: run CPython 3.15 code on the QuickJS VM by compiling Python to QuickJS bytecode. Python
 and JS/TS share one runtime: heap, GC, job queue, module graph and snapshot format. C extensions
@@ -72,7 +95,11 @@ Front ends: `qjs` picks Python from the `.py` extension or `--python`, the same 
 `qpy` is a launcher with CPython's command line (`-c`, `-m`, `-u`, `-X`, `-I`). CPython's tests
 spawn `sys.executable` with those flags. `qjs --drepl FILE --python` is the durable Python REPL.
 The stdlib is frozen into a base snapshot built at build time and embedded in the binary. Bases
-are reproducible, so startup reads a snapshot instead of compiling modules.
+are reproducible, so startup reads a snapshot instead of compiling modules. CPython's frozen
+modules (importlib's bootstrap, zipimport, the startup and `runpy` modules, `__hello__` and
+`__phello__`; `_imp.find_frozen`, `FrozenImporter`, `-X frozen_modules`) are their marshalled
+QuickJS bytecode, also written at build time and embedded next to the base (python/frozen.c);
+the base is made with them.
 
 ## 2. Decision D1: test suite
 
@@ -111,6 +138,8 @@ runs, and `unittest` pulls in `traceback`, `inspect` → `dis`, `re`, `difflib`,
   test_collections, test_os, test_shutil, test_glob, test_time, test_struct, test_difflib,
   test_ast, test_textwrap, test_tempfile, test_hashlib, test_sqlite3, test_datetime,
   test_urllib*, test_concurrent_futures, test_statistics, test_asyncio`.
+- L3c extends L3 to more stdlib modules, grouped by area in the `[l3c]` section of
+  `tests/py/cpython.conf` (`make testpy-l3c`).
 - Fuzzing: `fuzz_py_compile` next to the existing `fuzz_compile`.
 - Benchmarks: pyperformance pure-Python subset (nbody, richards, chaos, float, deltablue,
   raytrace, go, spectral_norm, unpack_sequence, generators, coroutines, json_dumps/loads,
@@ -174,8 +203,10 @@ Compiler pipeline:
   `lnot` + `if_false` is only valid after `py_to_bool`.
 - New `is_py` bit in `JSFunctionBytecode`. Error paths shared with JS check it, e.g. so
   `get_loc_check` raises `UnboundLocalError` instead of `ReferenceError`.
-- Inline caches: `<ic>` operands index a per-function cache array, keyed by type version tag
-  (attributes) or dict version (globals). Snapshots save the caches as empty.
+- Inline caches: `<ic>` operands index a per-function cache array, keyed by shape uid + type
+  version tag (attributes) or dict version (globals). Like CPython's, they hold no references,
+  so they never extend the life of an object or class; the type keeps the instance shape last
+  cached (CPython: the type owns its instances' shared keys). Snapshots save the caches as empty.
 
 Calling convention, vectorcall style: `argv` holds the positional values, then the keyword
 values. The kwnames tuple travels in the `new_target` slot under a new `JS_CALL_FLAG_PY_KW`.
@@ -199,8 +230,12 @@ Language mapping:
 - Exceptions capture `(function, pc)` pairs when thrown. Traceback objects are built from them
   on demand, not from a formatted string.
 - `__code__` is a facade over `JSFunctionBytecode` (`co_argcount`, `co_varnames`, `co_flags`,
-  `co_firstlineno`, `co_qualname`, …) so `inspect.signature` and `dataclasses` work. `dis` is
-  our own disassembler.
+  `co_firstlineno`, `co_qualname`, …) so `inspect.signature` and `dataclasses` work.
+  `co_code`, `co_linetable` and `co_exceptiontable` are a CPython 3.15 instruction stream
+  synthesized from the bytecode (one group of CPython instructions per QuickJS instruction,
+  python/codeobject.c), so the stock `dis`, `inspect.getclosurevars` and `co_lines()`-based
+  tools work; `f_lasti`/`tb_lasti`/`co_positions()` offsets are offsets in it. The runtime
+  cannot execute CPython bytecode: `replace(co_code=...)` only accepts the synthesized stream.
 
 ## 4. Decision D3: sharing between JS and Python
 
@@ -377,6 +412,23 @@ Decision: a cpyext-style mirror model, with two compatibility tiers.
     huge-memory dot tests.
   - Pillow 13.0.0 subset (`tools/build_pillow.sh -t`): 719 passed, 4 skipped, 1 xfailed. All
     skips are upstream conditions.
+  - matplotlib recipe: `tools/build_matplotlib.sh`. It builds numpy and Pillow with the two
+    recipes above, then kiwisolver 1.5.1 (setuptools, cppy), contourpy 1.4.0 and matplotlib
+    3.11.2 (meson-python, pybind11) from their sdists. Every build tool runs under qpy: pip,
+    meson with its subproject downloads (FreeType, HarfBuzz, libraqm, SheenBidi, Qhull, bundled
+    as in the PyPI wheels), setuptools. pybind11 makes its types with `tp_alloc` of a metatype
+    and `PyType_Ready`, so `PyType_Ready` of such a heap type binds it like a `PyType_FromSpec`
+    type.
+  - `tests/py/mpl/run.sh [-t]` runs `tests/py/mpl/demo.py` (Agg 2x2 figure, mathtext, contour,
+    tight and constrained layout, PNG/SVG/PDF) under qpy and under CPython 3.15 with the PyPI
+    wheels of the same versions. The stdout matches and the PNGs are pixel-identical. The SVG
+    and PDF bytes differ only in their zlib streams: qpy links Homebrew zlib 1.3.2, while the
+    Pillow wheel uses zlib-ng and CPython uses the system zlib 1.2.12. The demo therefore hashes
+    the decoded images and the decompressed streams. With `-t`, matplotlib's own tests give the
+    same counts under qpy and CPython: test_figure 155 passed/5 skipped, test_axes 890/35,
+    test_colors 324/1, test_contour 89/2, test_text 117/16, test_mathtext 1127/539, test_agg
+    20, test_backend_svg 28/20. The skips are missing Inkscape/Ghostscript and similar upstream
+    conditions.
 - **Our own modules** (not taken from CPython): `builtins, sys, posix` (over quickjs-libc and
   libc), `time, _thread, _weakref` (QJS WeakRef), `gc, _imp, marshal` (data only), `_ast,
   _tokenize, _opcode`/`dis`, `_contextvars, atexit, _signal, errno, _stat`. `_io` starts as

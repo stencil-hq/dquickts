@@ -1078,7 +1078,7 @@ static const QPMethodDef qp_typevar_methods[] = {
 static const QPTypeSpec qp_typevar_spec = {
     .name = "typing.TypeVar",
     .doc = qp_typevar_doc,
-    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_MANAGED_DICT,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_MANAGED_DICT | QP_TPFLAGS_WEAKREF,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_OBJECT,
@@ -1189,7 +1189,7 @@ static const QPMethodDef qp_paramspeckwargs_methods[] = {
 static const QPTypeSpec qp_paramspecargs_spec = {
     .name = "typing.ParamSpecArgs",
     .doc = qp_paramspecargs_doc,
-    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_IMMUTABLETYPE,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_WEAKREF,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_OBJECT,
@@ -1206,7 +1206,7 @@ static const QPTypeSpec qp_paramspecargs_spec = {
 static const QPTypeSpec qp_paramspeckwargs_spec = {
     .name = "typing.ParamSpecKwargs",
     .doc = qp_paramspeckwargs_doc,
-    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_IMMUTABLETYPE,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_WEAKREF,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_OBJECT,
@@ -1401,7 +1401,7 @@ static const QPMethodDef qp_paramspec_methods[] = {
 static const QPTypeSpec qp_paramspec_spec = {
     .name = "typing.ParamSpec",
     .doc = qp_paramspec_doc,
-    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_MANAGED_DICT,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_MANAGED_DICT | QP_TPFLAGS_WEAKREF,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_OBJECT,
@@ -1445,7 +1445,7 @@ static const QPMethodDef qp_typevartuple_methods[] = {
 static const QPTypeSpec qp_typevartuple_spec = {
     .name = "typing.TypeVarTuple",
     .doc = qp_typevartuple_doc,
-    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_MANAGED_DICT,
+    .flags = QP_TPFLAGS_DEFAULT | QP_TPFLAGS_IMMUTABLETYPE | QP_TPFLAGS_MANAGED_DICT | QP_TPFLAGS_WEAKREF,
     .base = -1,
     .exc_base = -1,
     .instance_class_id = JS_CLASS_PY_OBJECT,
@@ -1885,6 +1885,30 @@ static int qp_init_typevar(JSContext *ctx)
        instantiation as for a static type without tp_new. */
     QP_TYPE(ctx, Generic)->flags &= ~QP_TPFLAGS_DISALLOW_INSTANTIATION;
     QP_TYPE(ctx, Generic)->slots.tp_new = QP_TYPE(ctx, object)->slots.tp_new;
+    {
+        /* PyType_FromModuleAndSpec heap types (_PyTypeAlias_Type and
+           NoDefault are static): Py_TPFLAGS_HEAPTYPE, __module__ in the
+           dict.  copyreg._reduce_ex walks past them (pickling a Generic
+           subclass with protocol < 2). */
+        static const int heap_ids[] = {
+            QP_T_Generic, QP_T_TypeVar, QP_T_TypeVarTuple, QP_T_ParamSpec,
+            QP_T_ParamSpecArgs, QP_T_ParamSpecKwargs,
+        };
+        JSValue mod = qp_str_from_cstr(ctx, "typing");
+        size_t i;
+        int r = 0;
+
+        if (JS_IsException(mod))
+            return -1;
+        for (i = 0; i < countof(heap_ids) && r >= 0; i++) {
+            QPType *t = QP_STATE(ctx)->types[heap_ids[i]];
+            t->flags |= QP_TPFLAGS_HEAPTYPE;
+            r = qp_dict_set_item_atom(ctx, t->dict, QP_ATOM(ctx, __module__), mod);
+        }
+        JS_FreeValue(ctx, mod);
+        if (r < 0)
+            return -1;
+    }
     nodefault = qp_object_new_instance(ctx, QP_TYPE(ctx, NoDefaultType), JS_CLASS_PY_OBJECT);
     if (JS_IsException(nodefault))
         return -1;

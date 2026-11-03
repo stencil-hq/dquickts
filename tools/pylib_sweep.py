@@ -59,7 +59,9 @@ def pylib_modules():
             dirnames[:] = []
             continue
         if not parts:
-            dirnames[:] = [d for d in dirnames if d != "site-packages"]
+            # pylib/test: symlink to CPython's test suite (tests/py/run.py l3)
+            dirnames[:] = [d for d in dirnames
+                           if d not in ("site-packages", "test")]
         dirnames.sort()
         for fn in sorted(filenames):
             if not fn.endswith(".py"):

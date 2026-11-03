@@ -10,7 +10,6 @@
 # and regenerate rather than editing this list by hand.
 #
 # not copied:
-#   __phello__       frozen-module test package
 #   idlelib          IDLE (Tk GUI)
 #   site-packages    pip's install target (README.txt only)
 #   test             CPython's test suite; L3 runs it from cpython/Lib/test
@@ -20,6 +19,7 @@
 
 __future__.py
 __hello__.py
+__phello__/
 _aix_support.py
 _android_support.py
 _apple_support.py

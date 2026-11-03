@@ -2870,8 +2870,9 @@ collections_exec(PyObject *module) {
     ADD_TYPE(module, &dequereviter_spec, state->dequereviter_type, NULL);
     ADD_TYPE(module, &tuplegetter_spec, state->tuplegetter_type, NULL);
 
-    /* dquickts: no C OrderedDict (Objects/odictobject.c); collections
-       falls back to its pure-Python class when the name is missing */
+    if (PyModule_AddType(module, &PyODict_Type) < 0) {
+        return -1;
+    }
 
     return 0;
 }

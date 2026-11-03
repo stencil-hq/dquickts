@@ -5,6 +5,7 @@
 #
 #   tools/build_numpy.sh [QPY [WORKDIR]]          (network access required)
 #   NUMPY_TESTS=1 tools/build_numpy.sh ...        also run the test subset
+#   JOBS=4 tools/build_numpy.sh ...               limit the ninja jobs
 #
 # Who runs what:
 #  - pip and meson-python run under qpy (WORKDIR/qvenv): meson-python asks
@@ -66,7 +67,7 @@ chmod +x "$WORK/bin/meson"
 # configure, build and install the wheel (quickpy315-quickpy_315_*.whl)
 PATH=$WORK/bin:$PATH MESON=$WORK/bin/meson \
     "$WORK/qvenv/bin/python" -m pip install --no-build-isolation --force-reinstall --no-deps \
-    "$SRC" -Cbuild-dir="$WORK/build"
+    "$SRC" -Cbuild-dir="$WORK/build" ${JOBS:+-Ccompile-args=-j$JOBS}
 
 [ "${NUMPY_TESTS:-0}" = 1 ] || exit 0
 
@@ -79,8 +80,7 @@ status=0
 for t in _core/tests/test_multiarray.py _core/tests/test_umath.py _core/tests/test_numeric.py \
          linalg/tests/test_linalg.py random/tests/test_random.py; do
     name=$(basename "$t" .py)
-    # -p no:faulthandler: qpy has no faulthandler module
-    "$WORK/qvenv/bin/python" -m pytest -q -p no:cacheprovider -p no:faulthandler "$SP/$t" \
+    "$WORK/qvenv/bin/python" -m pytest -q -p no:cacheprovider "$SP/$t" \
         --junitxml="$WORK/$name.xml" > "$WORK/$name.log" 2>&1 || status=1
     printf '%s: %s\n' "$name" "$(tail -1 "$WORK/$name.log")"
 done

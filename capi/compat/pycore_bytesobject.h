@@ -39,4 +39,18 @@ _PyBytes_ReverseFind(const char *haystack, Py_ssize_t len_haystack,
                      const char *needle, Py_ssize_t len_needle,
                      Py_ssize_t offset);
 
+/* --- PyBytesWriter ------------------------------------------------------ */
+
+/* CPython's layout, kept by python/capi_bytes.c */
+struct PyBytesWriter {
+    char small_buffer[256];
+    PyObject *obj;
+    Py_ssize_t size;
+    int use_bytearray;
+    int overallocate;
+};
+
+// Export for '_testcapi' shared extension
+PyAPI_FUNC(PyBytesWriter*) _PyBytesWriter_CreateByteArray(Py_ssize_t size);
+
 #endif /* !Py_INTERNAL_BYTESOBJECT_H */

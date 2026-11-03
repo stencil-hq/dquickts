@@ -17,6 +17,19 @@
 #define QP_DC_IS_NULL(v) (JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED)
 #define QP_DC_IS_STR(v) (JS_VALUE_GET_TAG(v) == JS_TAG_STRING)
 
+/* _PyDict_NotifyEvent: dict watchers (C API), one test of the tag bits
+ * when the dict is not watched. */
+#ifdef CONFIG_PYTHON_CAPI
+#define QP_DC_WATCHED(d) unlikely((d)->version & QP_DC_WATCHER_MASK)
+#define QP_DC_NOTIFY(ctx, d, ev, k, v) do {                                 \
+        if (QP_DC_WATCHED(d))                                               \
+            qp_capi_dict_notify(ctx, d, ev, k, v);                          \
+    } while (0)
+#else
+#define QP_DC_WATCHED(d) 0
+#define QP_DC_NOTIFY(ctx, d, ev, k, v) ((void)0)
+#endif
+
 /* Python identity (`a is b`) on JSValues, used where CPython compares
  * PyObject pointers: same normalized tag and same payload. */
 static inline BOOL qp_dc_same(JSValueConst a, JSValueConst b)
@@ -218,7 +231,7 @@ static inline void qp_dc_set_keys(qp_dictcore *d, qp_dictkeys *keys)
 {
     d->keys = keys;
     d->keys_gen++;
-    d->version++;
+    d->version += QP_DC_VERSION_INC;
 }
 
 static void qp_dictcore_init(qp_dictcore *d)
@@ -262,7 +275,7 @@ static void qp_dictcore_free(JSRuntime *rt, qp_dictcore *d)
     d->keys = QP_DC_EMPTY_KEYS;
     d->used = 0;
     d->keys_gen++;
-    d->version++;
+    d->version += QP_DC_VERSION_INC;
     qp_dc_keys_release(rt, keys);
 }
 
@@ -525,6 +538,9 @@ static int qp_dc_insert_combined(JSContext *ctx, qp_dictcore *d,
         if (qp_dc_insertion_resize(ctx, d, 1) < 0)
             return -1;
     }
+    if (!QP_DC_IS_STR(key))
+        d->version &= ~(uint64_t)QP_DC_TAG_SPLIT;   /* now a combined table */
+    QP_DC_NOTIFY(ctx, d, QP_DC_EVENT_ADDED, key, value);
     keys = d->keys;
     hashpos = qp_dc_find_empty_slot(keys, hash);
     qp_dc_set_index(keys, hashpos, keys->nentries);
@@ -543,7 +559,7 @@ static void qp_dc_replace_value(JSContext *ctx, qp_dictcore *d, Py_ssize_t ix,
 {
     qp_dictentry *ep = &d->keys->entries[ix];
     if (!qp_dc_same(old_value, value))
-        d->version++;
+        d->version += QP_DC_VERSION_INC;
     ep->value = value;
     JS_FreeValue(ctx, old_value);   /* which **CAN** re-enter (see gh-66843) */
 }
@@ -565,9 +581,13 @@ static int qp_dc_insertdict(JSContext *ctx, qp_dictcore *d, JSValue key,
         if (qp_dc_insert_combined(ctx, d, hash, key, value) < 0)
             goto fail;
         d->used++;
-        d->version++;
+        d->version += QP_DC_VERSION_INC;
         return 0;
     }
+    /* a split table (instance __dict__) reports every store */
+    if (QP_DC_WATCHED(d) &&
+        (!qp_dc_same(old_value, value) || (d->version & QP_DC_TAG_SPLIT)))
+        QP_DC_NOTIFY(ctx, d, QP_DC_EVENT_MODIFIED, key, value);
     qp_dc_replace_value(ctx, d, ix, old_value, value);
     JS_FreeValue(ctx, key);
     return 0;
@@ -593,6 +613,9 @@ static int qp_dc_insert_to_emptydict(JSContext *ctx, qp_dictcore *d,
         JS_FreeValue(ctx, value);
         return -1;
     }
+    if (!unicode)
+        d->version &= ~(uint64_t)QP_DC_TAG_SPLIT;   /* now a combined table */
+    QP_DC_NOTIFY(ctx, d, QP_DC_EVENT_ADDED, key, value);
     hashpos = (size_t)hash & (QP_DC_MINSIZE - 1);
     qp_dc_set_index(newkeys, hashpos, 0);
     ep = &newkeys->entries[0];
@@ -665,7 +688,7 @@ static int qp_dictcore_setdefault(JSContext *ctx, qp_dictcore *d,
             return -1;
         }
         d->used++;
-        d->version++;
+        d->version += QP_DC_VERSION_INC;
         if (presult)
             *presult = d->keys->entries[d->keys->nentries - 1].value;
         return 0;
@@ -686,7 +709,7 @@ static void qp_dictcore_delitem_ix(JSContext *ctx, qp_dictcore *d,
     Py_ssize_t hashpos = qp_dc_lookdict_index(keys, ep->hash, ix);
 
     d->used--;
-    d->version++;
+    d->version += QP_DC_VERSION_INC;
     qp_dc_set_index(keys, (size_t)hashpos, QP_DKIX_DUMMY);
     old_key = ep->key;
     old_value = ep->value;
@@ -707,6 +730,7 @@ static int qp_dictcore_delitem(JSContext *ctx, qp_dictcore *d,
         return -1;
     if (ix == QP_DKIX_EMPTY)
         return 0;
+    QP_DC_NOTIFY(ctx, d, QP_DC_EVENT_DELETED, key, JS_UNINITIALIZED);
     qp_dictcore_delitem_ix(ctx, d, ix);
     return 1;
 }
@@ -728,6 +752,7 @@ static int qp_dictcore_pop(JSContext *ctx, qp_dictcore *d, JSValueConst key,
         return -1;
     if (ix == QP_DKIX_EMPTY)
         return 0;
+    QP_DC_NOTIFY(ctx, d, QP_DC_EVENT_DELETED, key, JS_UNINITIALIZED);
     /* Keep a reference for the result: delitem releases the table's one. */
     JS_DupValue(ctx, old_value);
     qp_dictcore_delitem_ix(ctx, d, ix);
@@ -755,6 +780,8 @@ static int qp_dictcore_popitem(JSContext *ctx, qp_dictcore *d,
     i = keys->nentries - 1;
     while (i >= 0 && QP_DC_IS_NULL(ep0[i].value))
         i--;
+    d->version &= ~(uint64_t)QP_DC_TAG_SPLIT;   /* CPython makes it combined first */
+    QP_DC_NOTIFY(ctx, d, QP_DC_EVENT_DELETED, ep0[i].key, JS_UNINITIALIZED);
     *pkey = ep0[i].key;
     *pvalue = ep0[i].value;
     hash = ep0[i].hash;
@@ -767,7 +794,7 @@ static int qp_dictcore_popitem(JSContext *ctx, qp_dictcore *d,
     /* We can't dk_usable++ since there is DKIX_DUMMY in indices */
     keys->nentries = i;
     d->used--;
-    d->version++;
+    d->version += QP_DC_VERSION_INC;
     return 1;
 }
 
@@ -778,6 +805,9 @@ static void qp_dictcore_clear(JSContext *ctx, qp_dictcore *d)
     qp_dictkeys *oldkeys = d->keys;
     if (oldkeys == QP_DC_EMPTY_KEYS)
         return;
+    QP_DC_NOTIFY(ctx, d, QP_DC_EVENT_CLEARED, JS_UNINITIALIZED, JS_UNINITIALIZED);
+    d->version &= ~(uint64_t)QP_DC_TAG_SPLIT;   /* the empty keys are combined */
+    oldkeys = d->keys;
     d->used = 0;
     qp_dc_set_keys(d, QP_DC_EMPTY_KEYS);
     qp_dc_keys_release(ctx->rt, oldkeys);
@@ -888,8 +918,8 @@ static qp_dictkeys *qp_dc_clone_keys(JSContext *ctx, const qp_dictcore *orig)
 
 /* dict_dict_merge. */
 static int qp_dictcore_merge(JSContext *ctx, qp_dictcore *d,
-                             qp_dictcore *other, int override,
-                             JSValue *dupkey,
+                             qp_dictcore *other, JSValueConst other_obj,
+                             int override, JSValue *dupkey,
                              qp_dictcore_eq_fn *eq, void *opaque)
 {
     Py_ssize_t orig_size, pos, ix;
@@ -903,11 +933,14 @@ static int qp_dictcore_merge(JSContext *ctx, qp_dictcore *d,
         const qp_dictkeys *okeys = other->keys;
         override = 1;
         /* If other is clean, combined, and just allocated, just clone it. */
-        if (other->used == okeys->nentries &&
+        if (!(d->version & QP_DC_TAG_SPLIT) && !(other->version & QP_DC_TAG_SPLIT) &&
+            other->used == okeys->nentries &&
             (okeys->log2_size == QP_DC_LOG_MINSIZE ||
              (Py_ssize_t)QP_DC_USABLE_FRACTION(QP_DC_SIZE(okeys)/2) < other->used)) {
-            qp_dictkeys *keys = qp_dc_clone_keys(ctx, other);
+            qp_dictkeys *keys;
             qp_dictkeys *oldkeys;
+            QP_DC_NOTIFY(ctx, d, QP_DC_EVENT_CLONED, other_obj, JS_UNINITIALIZED);
+            keys = qp_dc_clone_keys(ctx, other);
             if (!keys)
                 return -1;
             oldkeys = d->keys;
@@ -984,7 +1017,7 @@ static int qp_dictcore_copy(JSContext *ctx, qp_dictcore *dst, qp_dictcore *src,
         qp_dc_keys_release(ctx->rt, oldkeys);
         return 0;
     }
-    return qp_dictcore_merge(ctx, dst, src, 1, NULL, eq, opaque);
+    return qp_dictcore_merge(ctx, dst, src, JS_UNDEFINED, 1, NULL, eq, opaque);
 }
 
 /* The dictresize() call of dict_dict_fromkeys / dict_set_fromkeys. */
@@ -2041,6 +2074,8 @@ static Py_hash_t qp_setcore_frozenset_hash(qp_setcore *so)
 
 #undef QP_DC_IS_NULL
 #undef QP_DC_IS_STR
+#undef QP_DC_WATCHED
+#undef QP_DC_NOTIFY
 #undef QP_DC_LOG_MINSIZE
 #undef QP_DC_MINSIZE
 #undef QP_DC_PERTURB_SHIFT

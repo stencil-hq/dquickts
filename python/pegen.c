@@ -27,8 +27,12 @@ static void *qp_pegen_no_memory(Parser *p)
     return NULL;
 }
 
+/* python/mod_codecs.c: imports unicodedata on the first \N{...} escape */
+static int qp_unicode_name_capi(JSContext *ctx);
+
 /* A QuickJS allocation failed and left its exception pending in p->ctx:
    report it as MemoryError. */
+
 static void *qp_pegen_js_error(Parser *p)
 {
     JS_FreeValue(p->ctx, JS_GetException(p->ctx));
@@ -1317,7 +1321,8 @@ _PyPegen_run_parser(Parser *p)
 
 mod_ty
 _PyPegen_run_parser_from_string(const char *str, int start_rule, const char *filename,
-                                JSValueConst module, int cf_flags, PyArena *arena)
+                                JSValueConst module, int cf_flags, PyArena *arena,
+                                int nul_lineno)
 {
     qp_error *err = qp_arena_error(arena);
     int exec_input = start_rule == Py_file_input;
@@ -1339,6 +1344,7 @@ _PyPegen_run_parser_from_string(const char *str, int start_rule, const char *fil
         return NULL;
     }
     tok->barry_as_bdfl = parser_flags & PyPARSE_BARRY_AS_BDFL;
+    tok->qp_nul_lineno = nul_lineno;
     tok->filename = filename;
     tok->module = module;
     tok->ctx = qp_arena_ctx(arena);
@@ -1375,6 +1381,8 @@ mod_ty qp_parse_string(JSContext *ctx, qp_arena *arena, const char *src, size_t 
 {
     mod_ty result;
     char *str;
+    const char *nul, *p;
+    int nul_lineno = 0;
 
     assert(qp_arena_error(arena) == err);
     assert(qp_arena_ctx(arena) == ctx);
@@ -1387,7 +1395,17 @@ mod_ty qp_parse_string(JSContext *ctx, qp_arena *arena, const char *src, size_t 
     }
     memcpy(str, src, len);
     str[len] = '\0';
-    result = _PyPegen_run_parser_from_string(str, mode, filename, module, flags, arena);
+    /* a source file is read line by line (universal newlines): the line
+       holding a null byte is an error once the tokenizer reaches it */
+    if ((flags & QP_PF_SOURCE_FILE) && (nul = memchr(src, '\0', len)) != NULL) {
+        nul_lineno = 1;
+        for (p = src; p < nul; p++) {
+            if (*p == '\n' || (*p == '\r' && (p + 1 >= nul || p[1] != '\n')))
+                nul_lineno++;
+        }
+    }
+    result = _PyPegen_run_parser_from_string(str, mode, filename, module, flags, arena,
+                                             nul_lineno);
     js_free(ctx, str);
     if (result == NULL && err->kind == QP_ERR_NONE) {
         qp_error_set(err, QP_ERR_MEMORY, 0, 0, 0, 0, "%s", "");
@@ -4366,6 +4384,14 @@ qp_decode_unicode_escape(Parser *p, const char *s, Py_ssize_t size, JSValue *res
 
             /* \N{name} */
         case 'N':
+            if (qp_unicode_name_capi(p->ctx) < 0) {
+                JS_FreeValue(p->ctx, qp_exc_fetch(p->ctx));
+                string_buffer_free(&writer);
+                qp_error_clear(p->err);
+                qp_error_set(p->err, QP_ERR_UNICODE_DECODE, 0, 0, 0, 0, "%s",
+                             "\\N escapes not supported (can't load unicodedata module)");
+                return -1;
+            }
             message = "malformed \\N character escape";
             if (s >= end) {
                 goto incomplete;

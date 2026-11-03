@@ -275,6 +275,20 @@ static const char qp_iom_prelude_src[] =
     "     '                                % type(b).__name__) from None\\n', 1),\n"
     "    ('BufferedReader', 'raise ValueError(\"invalid whence value\")',\n"
     "     'raise ValueError(\"whence value %d unsupported\" % (whence,))', 1),\n"
+    "    # seek: Modules/_io moves inside the read buffer without seeking the\n"
+    "    # raw stream (_io__Buffered_seek_impl); a DecompressReader (lzma, gzip,\n"
+    "    # bz2 files) seeks backwards by decompressing again from the start, so\n"
+    "    # tarfile's member walk over a .tar.xz would be quadratic\n"
+    "    ('BufferedReader',\n"
+    "     '            pos = _BufferedIOMixin.seek(self, pos, whence)\\n',\n"
+    "     '            if whence != 2 and self._read_buf:\\n'\n"
+    "     '                raw_pos = _BufferedIOMixin.tell(self)\\n'\n"
+    "     '                start = raw_pos - len(self._read_buf)\\n'\n"
+    "     '                target = pos if whence == 0 else raw_pos + pos\\n'\n"
+    "     '                if start <= target <= raw_pos:\\n'\n"
+    "     '                    self._read_pos = target - start\\n'\n"
+    "     '                    return max(target, 0)\\n'\n"
+    "     '            pos = _BufferedIOMixin.seek(self, pos, whence)\\n', 1),\n"
     "    ('BufferedWriter',\n"
     "     '    def truncate(self, pos=None):\\n'\n"
     "     '        with self._write_lock:\\n',\n"
@@ -425,16 +439,6 @@ static const char qp_iom_prelude_src[] =
     "     '        if self.closed:\\n'\n"
     "     '            raise ValueError(\"tell on closed file\")\\n',\n"
     "     '        self._checkClosed()\\n', 1),\n"
-    "    ('TextIOWrapper',\n"
-    "     '        b = encoder.encode(s)\\n'\n"
-    "     '        self.buffer.write(b)\\n',\n"
-    "     '        b = encoder.encode(s)\\n'\n"
-    "     '        try:\\n'\n"
-    "     '            self.buffer.write(b)\\n'\n"
-    "     '        except UnsupportedOperation:\\n'\n"
-    "     '            if not self.writable():\\n'\n"
-    "     '                raise UnsupportedOperation(\"not writable\") from None\\n'\n"
-    "     '            raise\\n', 1),\n"
     "    ('TextIOWrapper',\n"
     "     '        if self._decoder is None:\\n'\n"
     "     '            raise ValueError(\"no decoder\")\\n',\n"
@@ -974,8 +978,9 @@ static const char qp_iom_prelude_src[] =
     "    ('StringIO', None, _IO_STRINGIO, 1),\n"
     "    ('IOBase', '    __closed = False\\n',\n"
     "     _slots_block(('__dict__', '__weakref__', '_IOBase__closed', '_qp_dict_made'),\n"
-    "                  '        self.__closed = False\\n'\n"
-    "                  '        self._qp_dict_made = False\\n', False), 1),\n"
+    "                  # C state, not attributes: a __setattr__ override does not see it\n"
+    "                  '        object.__setattr__(self, \"_IOBase__closed\", False)\\n'\n"
+    "                  '        object.__setattr__(self, \"_qp_dict_made\", False)\\n', False), 1),\n"
     "    # C BytesIO.__init__ refuses to drop an exported buffer and reopens a\n"
     "    # closed object\n"
     "    ('BytesIO', '        # Use to keep self._buffer and self._pos consistent.\\n',\n"
@@ -991,8 +996,220 @@ static const char qp_iom_prelude_src[] =
     "                   '_decoder', '_encoder', '_encoding', '_errors', '_has_read1',\n"
     "                   '_line_buffering', '_readnl', '_readtranslate', '_readuniversal',\n"
     "                   '_seekable', '_snapshot', '_telling', '_write_through', '_writenl',\n"
-    "                   '_writetranslate'),\n"
-    "                  '        self._buffer = None\\n'), 1),\n"
+    "                   '_writetranslate', '_qp_pending', '_qp_pending_count',\n"
+    "                   '_qp_chunk_size', '_qp_writable'),\n"
+    "                  '        self._buffer = None\\n'\n"
+    "                  '        self._qp_pending = None\\n'\n"
+    "                  '        self._qp_pending_count = 0\\n'\n"
+    "                  '        self._qp_chunk_size = 8192\\n'\n"
+    "                  '        self._qp_writable = False\\n'), 1),\n"
+    ")\n"
+    "\n"
+    "# Modules/_io/bufferedio.c and textio.c object states and buffering (see\n"
+    "# the helpers appended by _IO_STATE).\n"
+    "_IO_REWRITES += (\n"
+    "    # CHECK_INITIALIZED / CHECK_ATTACHED: a failed __init__ or detach()\n"
+    "    # leaves a raw stream / buffer whose every use raises ValueError\n"
+    "    ('_BufferedIOMixin', r'''    def raw(self):\n"
+    "        return self._raw\n"
+    "''', r'''    def raw(self):\n"
+    "        raw = self._raw\n"
+    "        if type(raw) is _QPUnusable:\n"
+    "            raw._qp_raise\n"
+    "        return raw\n"
+    "''', 1),\n"
+    "    ('_BufferedIOMixin', r'''        raw = self._raw\n"
+    "        self._raw = None\n"
+    "''', r'''        raw = self._raw\n"
+    "        self._raw = _qp_raw_detached\n"
+    "''', 1),\n"
+    "    ('_BufferedIOMixin', r'''        except AttributeError:\n"
+    "            return \"<{}.{}>\".format(modname, clsname)\n"
+    "''', r'''        except (AttributeError, ValueError):\n"
+    "            return \"<{}.{}>\".format(modname, clsname)\n"
+    "''', 1),\n"
+    "    ('BufferedReader', r'''        if not raw.readable():\n"
+    "''', r'''        self._raw = _qp_uninitialized\n"
+    "        if not raw.readable():\n"
+    "''', 1),\n"
+    "    ('BufferedWriter', r'''        if not raw.writable():\n"
+    "''', r'''        self._raw = _qp_uninitialized\n"
+    "        if not raw.writable():\n"
+    "''', 1),\n"
+    "    ('BufferedReader', r'''        if buffer_size <= 0:\n"
+    "''', r'''        if buffer_size <= 0:\n"
+    "            self._raw = _qp_uninitialized\n"
+    "''', 1),\n"
+    "    ('BufferedWriter', r'''        if buffer_size <= 0:\n"
+    "''', r'''        if buffer_size <= 0:\n"
+    "            self._raw = _qp_uninitialized\n"
+    "''', 1),\n"
+    "    ('BufferedReader', r'''        self._read_lock = Lock()\n"
+    "''', r'''        self._read_lock = _QPBufferedLock(self)\n"
+    "''', 1),\n"
+    "    ('BufferedWriter', r'''        self._write_lock = Lock()\n"
+    "''', r'''        self._write_lock = _QPBufferedLock(self)\n"
+    "''', 1),\n"
+    "    # the C reader fills its buffer with raw.readinto() and checks the result\n"
+    "    ('BufferedReader', r'''            chunk = self.raw.read(wanted)\n"
+    "''', r'''            chunk = _qp_raw_read(self.raw, wanted)\n"
+    "''', 1),\n"
+    "    ('BufferedReader', r'''            current = self.raw.read(to_read)\n"
+    "''', r'''            current = _qp_raw_read(self.raw, to_read)\n"
+    "''', 1),\n"
+    "    ('BufferedReader', r'''                    n = self.raw.readinto(buf[written:])\n"
+    "''', r'''                    n = _qp_raw_readinto(self.raw, buf[written:])\n"
+    "''', 1),\n"
+    "    # read1: the buffered bytes, else one raw read of up to size bytes\n"
+    "    ('BufferedReader', r'''        with self._read_lock:\n"
+    "            self._peek_unlocked(1)\n"
+    "            return self._read_unlocked(\n"
+    "                min(size, len(self._read_buf) - self._read_pos))\n"
+    "''', r'''        have = len(self._read_buf) - self._read_pos\n"
+    "        if have > 0:\n"
+    "            with self._read_lock:\n"
+    "                return self._read_unlocked(min(size, have))\n"
+    "        buf = bytearray(size)\n"
+    "        with self._read_lock:\n"
+    "            self._reset_read_buf()\n"
+    "            with memoryview(buf) as view:\n"
+    "                n = _qp_raw_readinto(self.raw, view)\n"
+    "        if not n:\n"
+    "            return b\"\"\n"
+    "        del buf[n:]\n"
+    "        return bytes(buf)\n"
+    "''', 1),\n"
+    "    # C BytesIO.read1 does not dispatch to an overridden read()\n"
+    "    ('BytesIO', r'''        return self.read(size)\n"
+    "''', r'''        return BytesIO.read(self, size)\n"
+    "''', 1),\n"
+    "    ('FileIO', r'''    _fd = -1\n"
+    "''', r'''    __slots__ = ('_qp_finalizing',)\n"
+    "    _fd = -1\n"
+    "''', 1),\n"
+    "    # fileio_dealloc_warn uses the C warnings module (also at shutdown)\n"
+    "    ('FileIO', r'''            import warnings\n"
+    "            warnings.warn(''', r'''            self._qp_warn(''', 1),\n"
+    "    ('TextIOWrapper', r'''    _CHUNK_SIZE = 2048\n"
+    "''', '', 1),\n"
+    "    # Argument Clinic str converters, then self->ok = 0 until __init__ ends\n"
+    "    ('TextIOWrapper', r'''        self._check_newline(newline)\n"
+    "        encoding = text_encoding(encoding)\n"
+    "''', r'''        if encoding is not None:\n"
+    "            if not isinstance(encoding, str):\n"
+    "                raise TypeError(\"TextIOWrapper() argument 'encoding' must be \"\n"
+    "                                \"str or None, not %s\" % type(encoding).__name__)\n"
+    "            _qp_cstring(encoding)\n"
+    "        if newline is not None:\n"
+    "            if not isinstance(newline, str):\n"
+    "                raise TypeError(\"TextIOWrapper() argument 'newline' must be \"\n"
+    "                                \"str or None, not %s\" % type(newline).__name__)\n"
+    "            _qp_cstring(newline)\n"
+    "        self._buffer = _qp_uninitialized\n"
+    "        self._qp_pending = None\n"
+    "        self._qp_pending_count = 0\n"
+    "        if errors is not None:\n"
+    "            if not isinstance(errors, str):\n"
+    "                raise TypeError(\"TextIOWrapper() argument 'errors' must be \"\n"
+    "                                \"str or None, not %s\" % type(errors).__name__)\n"
+    "            _qp_cstring(errors)\n"
+    "        self._check_newline(newline)\n"
+    "        encoding = text_encoding(encoding)\n"
+    "''', 1),\n"
+    "    ('TextIOWrapper', r'''    def buffer(self):\n"
+    "        return self._buffer\n"
+    "''', r'''    def buffer(self):\n"
+    "        buffer = self._buffer\n"
+    "        if type(buffer) is _QPUnusable:\n"
+    "            buffer._qp_raise\n"
+    "        return buffer\n"
+    "''', 1),\n"
+    "    ('TextIOWrapper', r'''        buffer = self._buffer\n"
+    "        self._buffer = None\n"
+    "''', r'''        buffer = self._buffer\n"
+    "        self._buffer = _qp_buffer_detached\n"
+    "''', 1),\n"
+    "    # gh-142594: `closed` may detach the wrapper\n"
+    "    ('TextIOWrapper', r'''        if self.buffer is not None and not self.closed:\n"
+    "''', r'''        if (self.buffer is not None and not self.closed and\n"
+    "                type(self._buffer) is not _QPUnusable):\n"
+    "''', 1),\n"
+    "    ('TextIOWrapper', r'''            name = self.name\n"
+    "        except AttributeError:\n"
+    "''', r'''            name = self.name\n"
+    "        except (AttributeError, ValueError):\n"
+    "''', 1),\n"
+    "    ('TextIOWrapper', r'''        self._write_through = write_through\n"
+    "''', r'''        self._write_through = write_through\n"
+    "        self._qp_writable = self.buffer.writable()\n"
+    "''', 1),\n"
+    "    ('TextIOWrapper', r'''            if encoding == \"locale\":\n"
+    "                encoding = self._get_locale_encoding()\n"
+    "\n"
+    "        if newline is Ellipsis:\n"
+    "''', r'''            if encoding == \"locale\":\n"
+    "                encoding = self._get_locale_encoding()\n"
+    "            else:\n"
+    "                _qp_lookup_text_encoding(encoding)\n"
+    "        errors.encode('utf-8')\n"
+    "\n"
+    "        if newline is Ellipsis:\n"
+    "''', 1),\n"
+    "    # pending_bytes: written text is kept until _CHUNK_SIZE bytes, a flush,\n"
+    "    # a read or a tell\n"
+    "    ('TextIOWrapper', r'''        self.buffer.flush()\n"
+    "        self._telling = self._seekable\n"
+    "''', r'''        self._telling = self._seekable\n"
+    "        self._qp_writeflush()\n"
+    "        self.buffer.flush()\n"
+    "''', 1),\n"
+    "    ('TextIOWrapper', r'''        encoder = self._encoder or self._get_encoder()\n"
+    "        # XXX What if we were just reading?\n"
+    "''', r'''        if not self._qp_writable:\n"
+    "            raise UnsupportedOperation(\"not writable\")\n"
+    "        encoder = self._encoder or self._get_encoder()\n"
+    "''', 1),\n"
+    "    ('TextIOWrapper', r'''        b = encoder.encode(s)\n"
+    "        self.buffer.write(b)\n"
+    "''', r'''        b = encoder.encode(s)\n"
+    "        if not isinstance(b, bytes):\n"
+    "            raise TypeError(\"encoder should return a bytes object, not '%s'\"\n"
+    "                            % type(b).__name__)\n"
+    "        if len(b) >= self._qp_chunk_size:\n"
+    "            while self._qp_pending is not None:\n"
+    "                self._qp_writeflush()\n"
+    "        if b:\n"
+    "            if self._qp_pending is None:\n"
+    "                self._qp_pending = [b]\n"
+    "            else:\n"
+    "                self._qp_pending.append(b)\n"
+    "            self._qp_pending_count += len(b)\n"
+    "        if (self._qp_pending_count >= self._qp_chunk_size or self._write_through or\n"
+    "                (self._line_buffering and (haslf or \"\\r\" in s))):\n"
+    "            self._qp_writeflush()\n"
+    "''', 1),\n"
+    "    # convert_optional_bool: PyLong_AsLong(value) != 0\n"
+    "    ('TextIOWrapper', r'''            line_buffering = self.line_buffering\n"
+    "        if write_through is None:\n"
+    "            write_through = self.write_through\n"
+    "''', r'''            line_buffering = self.line_buffering\n"
+    "        else:\n"
+    "            line_buffering = _qp_long_bool(line_buffering)\n"
+    "        if write_through is None:\n"
+    "            write_through = self.write_through\n"
+    "        else:\n"
+    "            write_through = _qp_long_bool(write_through)\n"
+    "''', 1),\n"
+    "    ('TextIOWrapper', r'''        decoder = self._decoder or self._get_decoder()\n"
+    "        if size < 0:\n"
+    "''', r'''        self._qp_writeflush()\n"
+    "        decoder = self._decoder or self._get_decoder()\n"
+    "        if size < 0:\n"
+    "''', 1),\n"
+    "    ('TextIOWrapper', r'''        # Grab all the decoded text (we will rewind any extra bits later).\n"
+    "''', r'''        self._qp_writeflush()\n"
+    "        # Grab all the decoded text (we will rewind any extra bits later).\n"
+    "''', 1),\n"
     ")\n"
     "\n"
     "# Appended to the _pyio source: the C BytesIO / StringIO pickle state\n"
@@ -1097,10 +1314,252 @@ static const char qp_iom_prelude_src[] =
     "    return size\n"
     "\n"
     "\n"
+    "# C BytesIO.readline scans its buffer: IOBase.readline would call a\n"
+    "# subclass's peek() (pickletester UnseekableIO raises from it)\n"
+    "def readline(self, size=-1, /):\n"
+    "    if self.closed:\n"
+    "        raise ValueError('I/O operation on closed file.')\n"
+    "    if size is None:\n"
+    "        size = -1\n"
+    "    else:\n"
+    "        try:\n"
+    "            size_index = size.__index__\n"
+    "        except AttributeError:\n"
+    "            raise TypeError('argument should be integer or None, not '\n"
+    "                            f'{type(size).__name__!r}') from None\n"
+    "        size = size_index()\n"
+    "    with self._lock:\n"
+    "        buf = self._buffer\n"
+    "        pos = self._pos\n"
+    "        n = len(buf)\n"
+    "        if pos >= n:\n"
+    "            return b''\n"
+    "        end = buf.find(b'\\\\n', pos)\n"
+    "        end = n if end < 0 else end + 1\n"
+    "        if 0 <= size < end - pos:\n"
+    "            end = pos + size\n"
+    "        self._pos = end\n"
+    "        return bytes(buf[pos:end])\n"
+    "\n"
+    "\n"
+    "import _thread as _qp_thread\n"
+    "import _weakref as _qp_weakref\n"
+    "import _warnings as _qp_warnings\n"
+    "\n"
+    "\n"
+    "def _qp_index(value):\n"
+    "    # PyNumber_Index, through range(): _operator is a C API module, which\n"
+    "    # the _io of every interpreter (a second one included) must not import\n"
+    "    return range(value).stop\n"
+    "\n"
+    "\n"
+    "class _QPUnusable:\n"
+    "    # What a buffered object holds as its raw stream and a TextIOWrapper as\n"
+    "    # its buffer while the C object refuses any use: CHECK_INITIALIZED (an\n"
+    "    # __init__ that failed) and CHECK_ATTACHED (after detach()).  Any\n"
+    "    # attribute access but __class__ (isinstance() of the objects that\n"
+    "    # gc.get_objects() lists) raises the ValueError.\n"
+    "    __slots__ = ('_qp_msg',)\n"
+    "\n"
+    "    def __init__(self, msg):\n"
+    "        object.__setattr__(self, '_qp_msg', msg)\n"
+    "\n"
+    "    def __getattribute__(self, name):\n"
+    "        if name == '__class__':\n"
+    "            return _QPUnusable\n"
+    "        raise ValueError(object.__getattribute__(self, '_qp_msg'))\n"
+    "\n"
+    "\n"
+    "_qp_uninitialized = _QPUnusable('I/O operation on uninitialized object')\n"
+    "_qp_raw_detached = _QPUnusable('raw stream has been detached')\n"
+    "_qp_buffer_detached = _QPUnusable('underlying buffer has been detached')\n"
+    "\n"
+    "\n"
+    "class _QPBufferedLock(_qp_thread.RLock):\n"
+    "    # ENTER_BUFFERED (Modules/_io/bufferedio.c): the lock of a buffered\n"
+    "    # object; the thread holding it entering again (a signal handler or a\n"
+    "    # raw stream method calling back) is a RuntimeError, not a deadlock.\n"
+    "    # The owner is the C RLock's and __exit__ is RLock's C release: a\n"
+    "    # signal handler runs at Python call boundaries (the post-call poll,\n"
+    "    # the entry of a Python __exit__), where an owner field or a Python\n"
+    "    # release would still show this thread holding the lock, so the\n"
+    "    # handler would block on it or leave it held.  No module globals:\n"
+    "    # buffered objects are still flushed at shutdown, after the module\n"
+    "    # dicts were cleared.\n"
+    "    __slots__ = ('_obj',)\n"
+    "\n"
+    "    def __init__(self, obj):\n"
+    "        self._obj = _qp_weakref.ref(obj)\n"
+    "\n"
+    "    def __enter__(self):\n"
+    "        if self._is_owned():\n"
+    "            raise RuntimeError('reentrant call inside %r' % (self._obj(),))\n"
+    "        try:\n"
+    "            self.acquire()\n"
+    "        except BaseException:\n"
+    "            # a signal handler raised as acquire() returned\n"
+    "            if self._is_owned():\n"
+    "                self.release()\n"
+    "            raise\n"
+    "        return self\n"
+    "\n"
+    "\n"
+    "def _qp_ssize(value, exc):\n"
+    "    # PyNumber_AsSsize_t(value, exc)\n"
+    "    value = _qp_index(value)\n"
+    "    if not -0x8000000000000000 <= value <= 0x7fffffffffffffff:\n"
+    "        raise exc(f\"cannot fit '{type(value).__name__}' into an index-sized integer\")\n"
+    "    return value\n"
+    "\n"
+    "\n"
+    "def _qp_raw_readinto(raw, buf):\n"
+    "    # _bufferedreader_raw_read: raw.readinto() (retried on EINTR) returns\n"
+    "    # None (would block) or a length between 0 and len(buf)\n"
+    "    while True:\n"
+    "        try:\n"
+    "            res = raw.readinto(buf)\n"
+    "        except InterruptedError:\n"
+    "            continue\n"
+    "        break\n"
+    "    if res is None:\n"
+    "        return None\n"
+    "    try:\n"
+    "        n = _qp_ssize(res, ValueError)\n"
+    "    except Exception as exc:\n"
+    "        raise OSError('raw readinto() failed') from exc\n"
+    "    if not 0 <= n <= len(buf):\n"
+    "        raise OSError(f'raw readinto() returned invalid length {n} '\n"
+    "                      f'(should have been between 0 and {len(buf)})')\n"
+    "    return n\n"
+    "\n"
+    "\n"
+    "def _qp_raw_read(raw, size):\n"
+    "    buf = bytearray(size)\n"
+    "    with memoryview(buf) as view:\n"
+    "        n = _qp_raw_readinto(raw, view)\n"
+    "    if n is None:\n"
+    "        return None\n"
+    "    del buf[n:]\n"
+    "    return bytes(buf)\n"
+    "\n"
+    "\n"
+    "def _qp_long_bool(value):\n"
+    "    value = _qp_index(value)\n"
+    "    if not -0x8000000000000000 <= value <= 0x7fffffffffffffff:\n"
+    "        raise OverflowError('Python int too large to convert to C long')\n"
+    "    return value != 0\n"
+    "\n"
+    "\n"
+    "def _qp_cstring(s):\n"
+    "    # a str argument converted to a C string (PyUnicode_AsUTF8AndSize and\n"
+    "    # the embedded NUL check of Argument Clinic's str converter)\n"
+    "    s.encode('utf-8')\n"
+    "    if chr(0) in s:\n"
+    "        raise ValueError('embedded null character')\n"
+    "\n"
+    "\n"
+    "def _qp_lookup_text_encoding(encoding):\n"
+    "    # _PyCodec_LookupTextEncoding(PyUnicode_AsUTF8(encoding), ...)\n"
+    "    encoding.encode('utf-8')\n"
+    "    name = encoding.partition(chr(0))[0]\n"
+    "    if not codecs.lookup(name)._is_text_encoding:\n"
+    "        raise LookupError(f\"{name!r} is not a text encoding; \"\n"
+    "                          \"use codecs.open() to handle arbitrary codecs\")\n"
+    "\n"
+    "\n"
+    "def _qp_writeflush(self):\n"
+    "    # _textiowrapper_writeflush: hand the pending encoded text (C keeps up\n"
+    "    # to _CHUNK_SIZE bytes of it) to buffer.write()\n"
+    "    pending = self._qp_pending\n"
+    "    if pending is None:\n"
+    "        return\n"
+    "    b = pending[0] if len(pending) == 1 else b''.join(pending)\n"
+    "    self._qp_pending = None\n"
+    "    self._qp_pending_count = 0\n"
+    "    while True:\n"
+    "        try:\n"
+    "            self.buffer.write(b)\n"
+    "        except InterruptedError:\n"
+    "            continue\n"
+    "        break\n"
+    "\n"
+    "\n"
+    "def _CHUNK_SIZE_get(self):\n"
+    "    self.buffer\n"
+    "    return self._qp_chunk_size\n"
+    "\n"
+    "\n"
+    "def _CHUNK_SIZE_set(self, value):\n"
+    "    self.buffer\n"
+    "    n = _qp_ssize(value, ValueError)\n"
+    "    if n <= 0:\n"
+    "        raise ValueError('a strictly positive integer is required')\n"
+    "    self._qp_chunk_size = n\n"
+    "\n"
+    "\n"
+    "def _CHUNK_SIZE_del(self):\n"
+    "    raise AttributeError(f\"attribute '_CHUNK_SIZE' of '{_qp_tp_name(self)}' \"\n"
+    "                         \"objects cannot be deleted\")\n"
+    "\n"
+    "\n"
+    "# methods, not module globals: flushing sys.stdout at shutdown runs after\n"
+    "# the module dicts were cleared\n"
+    "TextIOWrapper._qp_writeflush = _qp_writeflush\n"
+    "FileIO._qp_warn = staticmethod(_qp_warnings.warn)\n"
+    "del _qp_writeflush\n"
+    "TextIOWrapper._CHUNK_SIZE = property(_CHUNK_SIZE_get, _CHUNK_SIZE_set, _CHUNK_SIZE_del)\n"
+    "del _CHUNK_SIZE_get, _CHUNK_SIZE_set, _CHUNK_SIZE_del\n"
+    "\n"
+    "\n"
+    "def _finalizing_get(self):\n"
+    "    try:\n"
+    "        return self._qp_finalizing\n"
+    "    except AttributeError:\n"
+    "        return False\n"
+    "\n"
+    "\n"
+    "def _finalizing_set(self, value):\n"
+    "    if type(value) is not bool:\n"
+    "        raise TypeError('attribute value type must be bool')\n"
+    "    self._qp_finalizing = value\n"
+    "\n"
+    "\n"
+    "def _finalizing_del(self):\n"
+    "    raise TypeError(\"can't delete numeric/char attribute\")\n"
+    "\n"
+    "\n"
+    "FileIO._finalizing = property(_finalizing_get, _finalizing_set, _finalizing_del)\n"
+    "del _finalizing_get, _finalizing_set, _finalizing_del\n"
+    "\n"
+    "\n"
+    "def _qp_cannot_pickle():\n"
+    "    # _PyIOBase_cannot_pickle\n"
+    "    def __getstate__(self):\n"
+    "        raise TypeError(f'cannot pickle {type(self).__name__!r} instances')\n"
+    "    return __getstate__\n"
+    "\n"
+    "\n"
+    "def _qp_bytesio_readinto():\n"
+    "    # C BytesIO.readinto does not dispatch to an overridden read()\n"
+    "    def readinto(self, buffer, /):\n"
+    "        with memoryview(buffer) as view, view.cast('B') as b:\n"
+    "            data = BytesIO.read(self, len(b))\n"
+    "            n = len(data)\n"
+    "            b[:n] = data\n"
+    "        return n\n"
+    "    return readinto\n"
+    "\n"
+    "\n"
+    "_qp_method(BytesIO, _qp_bytesio_readinto())\n"
+    "del _qp_bytesio_readinto\n"
+    "_qp_method(TextIOWrapper, _qp_cannot_pickle())\n"
+    "del _qp_cannot_pickle\n"
+    "\n"
     "_qp_method(BytesIO, __getstate__)\n"
     "_qp_method(BytesIO, __setstate__)\n"
     "_qp_method(BytesIO, truncate)\n"
-    "del __getstate__, __setstate__, truncate, _qp_method\n"
+    "_qp_method(BytesIO, readline)\n"
+    "del __getstate__, __setstate__, truncate, readline, _qp_method\n"
     "'''\n"
     "\n"
     "\n"
@@ -2209,6 +2668,95 @@ static int qp_iom_set_std(JSContext *ctx, const char *name, JSValueConst std)
     return qp_iom_setattr(ctx, sys, name, JS_DupValue(ctx, std));
 }
 
+#define QP_IO_ENCODING_BUF 128
+#define QP_IO_ERRORS_BUF 64
+
+/* config_init_stdio_encoding + config_get_stdio_errors +
+   config_get_codec_name: PyConfig.stdio_encoding and stdio_errors, the
+   encoding and error handler of the standard streams.  *pencoding points
+   to encoding_buf (QP_IO_ENCODING_BUF bytes) or a constant, *perrors to
+   errors_buf (QP_IO_ERRORS_BUF bytes) or a constant.  0, or -1 with an
+   exception pending. */
+static int qp_io_stdio_config(JSContext *ctx, const QPConfig *cfg, char *encoding_buf,
+                              char *errors_buf, const char **pencoding, const char **perrors)
+{
+    const char *encoding = NULL, *errors = NULL;
+
+    /* config_init_stdio_encoding: PYTHONIOENCODING=encoding[:errors] */
+    if (cfg->stdio_encoding) {
+        const char *opt = cfg->stdio_encoding, *colon = strchr(opt, ':');
+        size_t n = colon ? (size_t)(colon - opt) : strlen(opt);
+        if (n > 0 && n < QP_IO_ENCODING_BUF) {
+            memcpy(encoding_buf, opt, n);
+            encoding_buf[n] = '\0';
+            encoding = encoding_buf;
+        }
+        if (colon && colon[1] && strlen(colon + 1) < QP_IO_ERRORS_BUF) {
+            strcpy(errors_buf, colon + 1);
+            errors = errors_buf;
+        }
+        /* If the encoding is set but not the error handler, use "strict"
+           (PYTHONIOENCODING=latin1 behaves as latin1:strict). */
+        if (encoding && !errors)
+            errors = "strict";
+    }
+    if (!encoding) {
+        /* config_get_locale_encoding */
+        if (cfg->utf8_mode) {
+            encoding = "utf-8";
+        } else {
+            const char *cs = nl_langinfo(CODESET);
+            if (!cs || !cs[0] || strlen(cs) >= QP_IO_ENCODING_BUF) {
+                encoding = "utf-8";
+            } else {
+                strcpy(encoding_buf, cs);
+                encoding = encoding_buf;
+            }
+        }
+    }
+    if (!errors) {
+        /* config_get_stdio_errors */
+        if (cfg->utf8_mode) {
+            errors = "surrogateescape";
+        } else {
+            const char *loc = setlocale(LC_CTYPE, NULL);
+            errors = (loc && (!strcmp(loc, "C") || !strcmp(loc, "POSIX"))) ? "surrogateescape"
+                                                                          : "strict";
+        }
+    }
+    /* config_get_codec_name: normalize to the codec's name ("UTF-8" -> "utf-8") */
+    {
+        JSValue codec = qp_codec_lookup(ctx, encoding), name;
+        const char *s;
+        size_t len;
+        if (JS_IsException(codec))
+            return -1;
+        name = qp_getattr(ctx, codec, QP_ATOM(ctx, name));
+        JS_FreeValue(ctx, codec);
+        if (JS_IsException(name))
+            return -1;
+        if (!qp_str_check(ctx, name)) {
+            JS_FreeValue(ctx, name);
+            qp_raise_type_error(ctx, "codec name must be a string");
+            return -1;
+        }
+        s = qp_str_utf8(ctx, name, &len);
+        if (!s) {
+            JS_FreeValue(ctx, name);
+            return -1;
+        }
+        if (len < QP_IO_ENCODING_BUF) {
+            memmove(encoding_buf, s, len + 1);
+            encoding = encoding_buf;
+        }
+        JS_FreeCString(ctx, s);
+        JS_FreeValue(ctx, name);
+    }
+    *pencoding = encoding;
+    *perrors = errors;
+    return 0;
+}
+
 /* init_set_builtins_open() + init_sys_streams(), called by the importlib
    boot code once the import system and the codec registry are ready.
    0, or -1 with an exception pending (CPython: fatal "can't initialize
@@ -2217,8 +2765,8 @@ static int qp_io_install_stdio(JSContext *ctx)
 {
     const QPConfig *cfg = &QP_STATE(ctx)->config;
     JSValue io, wrapper, std, encattr;
-    char encoding_buf[128], errors_buf[64];
-    const char *encoding = NULL, *errors = NULL;
+    char encoding_buf[QP_IO_ENCODING_BUF], errors_buf[QP_IO_ERRORS_BUF];
+    const char *encoding, *errors;
     struct stat sb;
     int rc;
 
@@ -2243,76 +2791,8 @@ static int qp_io_install_stdio(JSContext *ctx)
         goto fail;
     }
 
-    /* config_init_stdio_encoding: PYTHONIOENCODING=encoding[:errors] */
-    if (cfg->stdio_encoding) {
-        const char *opt = cfg->stdio_encoding, *colon = strchr(opt, ':');
-        size_t n = colon ? (size_t)(colon - opt) : strlen(opt);
-        if (n > 0 && n < sizeof(encoding_buf)) {
-            memcpy(encoding_buf, opt, n);
-            encoding_buf[n] = '\0';
-            encoding = encoding_buf;
-        }
-        if (colon && colon[1] && strlen(colon + 1) < sizeof(errors_buf)) {
-            strcpy(errors_buf, colon + 1);
-            errors = errors_buf;
-        }
-        /* If the encoding is set but not the error handler, use "strict"
-           (PYTHONIOENCODING=latin1 behaves as latin1:strict). */
-        if (encoding && !errors)
-            errors = "strict";
-    }
-    if (!encoding) {
-        /* config_get_locale_encoding */
-        if (cfg->utf8_mode) {
-            encoding = "utf-8";
-        } else {
-            const char *cs = nl_langinfo(CODESET);
-            if (!cs || !cs[0] || strlen(cs) >= sizeof(encoding_buf)) {
-                encoding = "utf-8";
-            } else {
-                strcpy(encoding_buf, cs);
-                encoding = encoding_buf;
-            }
-        }
-    }
-    if (!errors) {
-        /* config_get_stdio_errors */
-        if (cfg->utf8_mode) {
-            errors = "surrogateescape";
-        } else {
-            const char *loc = setlocale(LC_CTYPE, NULL);
-            errors = (loc && (!strcmp(loc, "C") || !strcmp(loc, "POSIX"))) ? "surrogateescape"
-                                                                          : "strict";
-        }
-    }
-    /* config_get_codec_name: normalize to the codec's name ("UTF-8" -> "utf-8") */
-    {
-        JSValue codec = qp_codec_lookup(ctx, encoding), name;
-        const char *s;
-        size_t len;
-        if (JS_IsException(codec))
-            goto fail;
-        name = qp_getattr(ctx, codec, QP_ATOM(ctx, name));
-        JS_FreeValue(ctx, codec);
-        if (JS_IsException(name))
-            goto fail;
-        if (!qp_str_check(ctx, name)) {
-            JS_FreeValue(ctx, name);
-            qp_raise_type_error(ctx, "codec name must be a string");
-            goto fail;
-        }
-        s = qp_str_utf8(ctx, name, &len);
-        if (!s) {
-            JS_FreeValue(ctx, name);
-            goto fail;
-        }
-        if (len < sizeof(encoding_buf)) {
-            memmove(encoding_buf, s, len + 1);
-            encoding = encoding_buf;
-        }
-        JS_FreeCString(ctx, s);
-        JS_FreeValue(ctx, name);
-    }
+    if (qp_io_stdio_config(ctx, cfg, encoding_buf, errors_buf, &encoding, &errors) < 0)
+        goto fail;
 
     /* Set sys.stdin */
     std = qp_iom_create_stdio(ctx, io, STDIN_FILENO, 0, "<stdin>", encoding, errors);

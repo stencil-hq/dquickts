@@ -237,6 +237,19 @@ static DynBuf *qpc_bc(compiler *c)
     return &c->u->u_fd->byte_code;
 }
 
+/* lineno of a location that qpc_emit_loc records as "no location" (the
+   instructions after it have none, CPython lineno -1), unlike NO_LOCATION
+   that inherits the location of the code before */
+#define QPC_LOC_NONE (-4)
+/* QPC_LOC_NONE at a join of several flows (qpc_label_entry_loc), undone
+   by qpc_join_end when the block has no location and ends without
+   falling through */
+#define QPC_LOC_JOIN (-5)
+
+#define SAME_LOCATION(a, b) \
+    ((a).lineno == (b).lineno && (a).end_lineno == (b).end_lineno && \
+     (a).col_offset == (b).col_offset && (a).end_col_offset == (b).end_col_offset)
+
 static int qpc_emit_loc(compiler *c, location loc)
 {
     compiler_unit *u = c->u;
@@ -244,13 +257,39 @@ static int qpc_emit_loc(compiler *c, location loc)
     int idx;
     DynBuf *bc;
 
-    if (loc.lineno < 0)
-        return SUCCESS;     /* NO_LOCATION / NEXT_LOCATION: inherit */
-    if (u->u_last_loc.lineno == loc.lineno &&
+    BOOL join = FALSE, artificial = u->u_loc_propagated, force = u->u_loc_force;
+
+    u->u_loc_propagated = FALSE;
+    u->u_loc_force = FALSE;
+
+    if (loc.lineno == QPC_LOC_NONE || loc.lineno == QPC_LOC_JOIN) {
+        join = loc.lineno == QPC_LOC_JOIN;
+        if (u->u_last_loc.lineno == -1 &&
+            !(join && !u->u_join_fall && u->u_join_prev.lineno >= 0))
+            return SUCCESS;
+        loc = NO_LOCATION;
+        goto emit;
+    } else if (loc.lineno < 0) {
+        if (loc.lineno != -1 || u->u_last_loc_idx >= 0)
+            return SUCCESS;     /* NO_LOCATION / NEXT_LOCATION: inherit */
+        /* nothing before: the location of the RESUME (CPython
+           propagate_line_numbers; codeobject.c qp_co_linetable) */
+        if (u->u_scope_type == COMPILE_SCOPE_MODULE) {
+            loc.lineno = 0;
+            loc.end_lineno = 1;
+        } else {
+            loc.lineno = loc.end_lineno = u->u_firstlineno;
+        }
+        loc.col_offset = loc.end_col_offset = 0;
+    }
+    if (!force &&
+        u->u_last_loc.lineno == loc.lineno &&
         u->u_last_loc.end_lineno == loc.end_lineno &&
         u->u_last_loc.col_offset == loc.col_offset &&
         u->u_last_loc.end_col_offset == loc.end_col_offset)
         return SUCCESS;
+ emit:
+    u->u_join_pos = 0;      /* (a location in the block after a join) */
     ql.lineno = loc.lineno;
     ql.end_lineno = loc.end_lineno;
     ql.col = loc.col_offset;
@@ -260,36 +299,205 @@ static int qpc_emit_loc(compiler *c, location loc)
         return ERROR;
     bc = qpc_bc(c);
     dbuf_putc(bc, OP_line_num);
-    dbuf_put_u32(bc, idx);
+    dbuf_put_u32(bc, artificial ? idx | QP_LOC_ARTIFICIAL : idx);
+    if (join && !u->u_join_fall && u->u_join_prev.lineno >= 0) {
+        /* (u_join_prev: the location of the first jump) */
+        u->u_join_pos = bc->size - 4;
+        u->u_join_prev_idx = -1;
+    } else if (join && u->u_join_fall && u->u_last_loc_idx >= 0) {
+        u->u_join_pos = bc->size - 4;
+        u->u_join_prev = u->u_last_loc;
+        u->u_join_prev_idx = u->u_last_loc_idx;
+    }
     u->u_last_loc = loc;
+    u->u_last_loc_idx = idx;
     return SUCCESS;
+}
+
+/* The instruction opcode (subop for OP_py) ends the block after a join
+   that has no location so far: without fallthrough (CPython
+   inline_small_or_no_lineno_blocks copies the block into each
+   predecessor, the code keeps the location before the join), or else
+   (the block keeps no location). */
+static void qpc_join_end(compiler *c, int opcode, int subop)
+{
+    compiler_unit *u = c->u;
+
+    switch (opcode) {
+    case OP_goto:
+    case OP_return:
+    case OP_return_undef:
+    case OP_return_async:
+    case OP_throw:
+    case OP_throw_error:
+        break;
+    case OP_py:
+        if (subop < 0)
+            return;     /* (qpc_py calls back with the subop) */
+        if (qp_subop_flow_kind(subop, NULL) == QP_FLOW_EXIT)
+            break;
+        if (qp_subop_flow_kind(subop, NULL) == QP_FLOW_BRANCH)
+            u->u_join_pos = 0;
+        return;
+    case OP_if_false:
+    case OP_if_true:
+        u->u_join_pos = 0;
+        return;
+    default:
+        return;
+    }
+    if (u->u_join_prev_idx < 0) {
+        QPLoc ql;
+        ql.lineno = u->u_join_prev.lineno;
+        ql.end_lineno = u->u_join_prev.end_lineno;
+        ql.col = u->u_join_prev.col_offset;
+        ql.end_col = u->u_join_prev.end_col_offset;
+        u->u_join_prev_idx = qp_fd_add_loc(c->ctx, u->u_fd, &ql);
+        if (u->u_join_prev_idx < 0) {
+            u->u_join_pos = 0;      /* (out of memory: no location) */
+            return;
+        }
+    }
+    put_u32(qpc_bc(c)->buf + u->u_join_pos, u->u_join_prev_idx | QP_LOC_ARTIFICIAL);
+    u->u_last_loc = u->u_join_prev;
+    u->u_last_loc_idx = u->u_join_prev_idx;
+    u->u_join_pos = 0;
+}
+
+/* The jumps recorded for label id, NULL if none. */
+static qpc_lbl_jumps *qpc_label_jumps(compiler_unit *u, int id)
+{
+    if (id < 0 || id >= u->u_lbl_jumps_size ||
+        (u->u_lbl_jumps[id].count == 0 && !u->u_lbl_jumps[id].handler))
+        return NULL;
+    return &u->u_lbl_jumps[id];
+}
+
+/* The location of the predecessors of the labels placed since the last
+   instruction for the instruction opcode after them, whose location is
+   loc (CPython propagate_line_numbers: one predecessor gives its location,
+   several none; an exception handler entry none; an unconditional jump
+   without a location is copied into each predecessor by
+   inline_small_or_no_lineno_blocks: it keeps the location before it). */
+static location qpc_label_entry_loc(compiler *c, location loc, int opcode)
+{
+    compiler_unit *u = c->u;
+    int n = u->u_lbl_pending, preds, i;
+    location jloc = NO_LOCATION, jloc0 = NO_LOCATION;
+    qpc_lbl_jumps *lj;
+    BOOL handler = FALSE;
+
+    u->u_lbl_pending = 0;
+    if (loc.lineno >= 0) {
+        /* an exception handler starting with its own location: an entry
+           of the location table even when it is the location before
+           (the trace hook tells it from code inheriting a location) */
+        for (i = 0; i < n && i < QPC_LBL_PENDING_MAX; i++) {
+            lj = qpc_label_jumps(u, u->u_lbl_ids[i]);
+            if (lj && lj->handler)
+                u->u_loc_force = TRUE;
+        }
+        return loc;
+    }
+    if (loc.lineno != -1 || n > QPC_LBL_PENDING_MAX)
+        return loc;
+    preds = u->u_lbl_fall;
+    for (i = 0; i < n; i++) {
+        lj = qpc_label_jumps(u, u->u_lbl_ids[i]);
+        if (lj) {
+            if (lj->count) {
+                if (jloc0.lineno == -1)
+                    jloc0 = lj->j[0].loc;
+                jloc = lj->j[0].loc;
+            }
+            preds += lj->count;
+            handler |= lj->handler;
+        }
+    }
+    if (preds == 0 && handler) {
+        /* an exception handler only (not a successor in CPython's
+           propagate_line_numbers) */
+        loc.lineno = QPC_LOC_NONE;
+        return loc;
+    }
+    if (preds == 1 && !u->u_lbl_fall) {
+        if (jloc.lineno < 0) {
+            /* the jump has no location: neither has its target (not
+               the code before it) */
+            loc.lineno = QPC_LOC_NONE;
+            return loc;
+        }
+        u->u_loc_propagated = TRUE;
+        return jloc;
+    }
+    if (preds >= 2) {
+        u->u_join_fall = u->u_lbl_fall;
+        u->u_join_prev = jloc0;
+        loc.lineno = QPC_LOC_JOIN;
+    }
+    return loc;
+}
+
+static BOOL qpc_falls_through(compiler *c);
+
+static int qpc_peep_next(compiler *c, int opcode, int subop, int arg);
+static int qpc_peep_fold(compiler *c, location loc, int opcode, int subop, int arg);
+static int qpc_peep_record(compiler *c, int opcode, int subop, int arg,
+                           uint32_t pos, location last_loc, location loc);
+static void qpc_peep_clear(compiler *c);
+
+/* Start an instruction (opcode, OP_py subop or -1, operand arg when it
+   matters for constant folding): the location, the opcode and the subop
+   bytes; the caller appends the operands.  Returns 1 when constant folding
+   replaced the instruction (nothing to append), 0 or ERROR. */
+static int qpc_insn(compiler *c, location loc, int opcode, int subop, int arg)
+{
+    compiler_unit *u = c->u;
+    uint32_t pos;
+    location last;
+    int r;
+
+    if (!u->u_peep_raw) {
+        RETURN_IF_ERROR(qpc_peep_next(c, opcode, subop, arg));
+        r = qpc_peep_fold(c, loc, opcode, subop, arg);
+        if (r != 0)
+            return r;
+    }
+    pos = qpc_bc(c)->size;
+    last = u->u_last_loc;
+    if (u->u_lbl_pending) {
+        u->u_dead = FALSE;
+        loc = qpc_label_entry_loc(c, loc, opcode);
+    } else if (!u->u_dead && !qpc_falls_through(c)) {
+        u->u_dead = TRUE;
+    }
+    RETURN_IF_ERROR(qpc_emit_loc(c, loc));
+    u->u_fd->last_opcode_pos = qpc_bc(c)->size;
+    dbuf_putc(qpc_bc(c), opcode);
+    if (subop >= 0)
+        dbuf_putc(qpc_bc(c), subop);
+    if (!u->u_peep_raw)
+        RETURN_IF_ERROR(qpc_peep_record(c, opcode, subop, arg, pos, last, loc));
+    if (u->u_join_pos)
+        qpc_join_end(c, opcode, subop);
+    return 0;
 }
 
 static int qpc_op(compiler *c, location loc, int opcode)
 {
-    RETURN_IF_ERROR(qpc_emit_loc(c, loc));
-    c->u->u_fd->last_opcode_pos = qpc_bc(c)->size;
-    dbuf_putc(qpc_bc(c), opcode);
-    return SUCCESS;
-}
-
-static int qpc_op_u8(compiler *c, location loc, int opcode, uint8_t v)
-{
-    RETURN_IF_ERROR(qpc_op(c, loc, opcode));
-    dbuf_putc(qpc_bc(c), v);
-    return SUCCESS;
+    return qpc_insn(c, loc, opcode, -1, 0) < 0 ? ERROR : SUCCESS;
 }
 
 static int qpc_op_u16(compiler *c, location loc, int opcode, uint16_t v)
 {
-    RETURN_IF_ERROR(qpc_op(c, loc, opcode));
+    RETURN_IF_ERROR(qpc_insn(c, loc, opcode, -1, v));
     dbuf_put_u16(qpc_bc(c), v);
     return SUCCESS;
 }
 
 static int qpc_op_u32(compiler *c, location loc, int opcode, uint32_t v)
 {
-    RETURN_IF_ERROR(qpc_op(c, loc, opcode));
+    RETURN_IF_ERROR(qpc_insn(c, loc, opcode, -1, v));
     dbuf_put_u32(qpc_bc(c), v);
     return SUCCESS;
 }
@@ -303,11 +511,84 @@ static jump_target_label qpc_new_label(compiler *c)
     return l;
 }
 
-static int qpc_use_label(compiler *c, jump_target_label lbl)
+/* The last instruction emitted falls through (not a jump, return or
+   raise). */
+static BOOL qpc_falls_through(compiler *c)
 {
     JSFunctionDef *fd = c->u->u_fd;
+    const uint8_t *p;
+
+    if (fd->last_opcode_pos < 0 || fd->last_opcode_pos >= fd->byte_code.size)
+        return TRUE;
+    p = fd->byte_code.buf + fd->last_opcode_pos;
+    switch (p[0]) {
+    case OP_goto:
+    case OP_return:
+    case OP_return_undef:
+    case OP_return_async:
+    case OP_throw:
+    case OP_throw_error:
+        return FALSE;
+    case OP_py:
+        return fd->last_opcode_pos + 1 >= fd->byte_code.size ||
+            qp_subop_flow_kind(p[1], NULL) != QP_FLOW_EXIT;
+    }
+    return TRUE;
+}
+
+/* Record a jump to lbl whose label operand ends the bytecode (handler:
+   an OP_catch, not a predecessor). */
+static int qpc_record_jump(compiler *c, int id, BOOL handler)
+{
+    compiler_unit *u = c->u;
+    qpc_lbl_jumps *lj;
+
+    if (u->u_dead && !handler)
+        return SUCCESS;     /* unreachable (removed by resolve_labels) */
+    if (id >= u->u_lbl_jumps_size) {
+        int n = max_int(64, u->u_lbl_jumps_size * 2);
+        qpc_lbl_jumps *p;
+        while (n <= id)
+            n *= 2;
+        p = js_realloc(c->ctx, u->u_lbl_jumps, sizeof(*p) * n);
+        if (!p)
+            return ERROR;
+        memset(p + u->u_lbl_jumps_size, 0, sizeof(*p) * (n - u->u_lbl_jumps_size));
+        u->u_lbl_jumps = p;
+        u->u_lbl_jumps_size = n;
+    }
+    lj = &u->u_lbl_jumps[id];
+    if (handler) {
+        lj->handler = TRUE;
+        return SUCCESS;
+    }
+    if (lj->count < QPC_LBL_JUMPS_MAX) {
+        lj->j[lj->count].pos = qpc_bc(c)->size - 4;
+        lj->j[lj->count].loc = u->u_last_loc;
+    }
+    lj->count++;
+    return SUCCESS;
+}
+
+static int qpc_use_label(compiler *c, jump_target_label lbl)
+{
+    compiler_unit *u = c->u;
+    JSFunctionDef *fd = u->u_fd;
     if (!IS_JUMP_TARGET_LABEL(lbl))
         return SUCCESS;
+    /* a new basic block */
+    RETURN_IF_ERROR(qpc_peep_next(c, -1, -1, 0));
+    qpc_peep_clear(c);
+    if (qpc_label_jumps(u, lbl.id))
+        u->u_join_pos = 0;  /* (the block after a join falls through) */
+    if (!u->u_lbl_pending) {
+        u->u_lbl_fall = !u->u_dead && qpc_falls_through(c);
+        u->u_lbl_start = fd->byte_code.size;
+        u->u_lbl_start_lop = fd->last_opcode_pos;
+    }
+    if (u->u_lbl_pending < QPC_LBL_PENDING_MAX)
+        u->u_lbl_ids[u->u_lbl_pending] = lbl.id;
+    u->u_lbl_pending++;
     fd->last_opcode_pos = fd->byte_code.size;
     dbuf_putc(&fd->byte_code, OP_label);
     dbuf_put_u32(&fd->byte_code, lbl.id);
@@ -320,18 +601,20 @@ static int qpc_jump(compiler *c, location loc, int opcode, jump_target_label lbl
     assert(IS_JUMP_TARGET_LABEL(lbl));
     RETURN_IF_ERROR(qpc_op_u32(c, loc, opcode, lbl.id));
     c->u->u_fd->label_slots[lbl.id].ref_count++;
-    return SUCCESS;
+    return qpc_record_jump(c, lbl.id, opcode == OP_catch);
 }
 
 static int qpc_py(compiler *c, location loc, int subop)
 {
     assert(subop >= 0 && subop < QP_OP_COUNT);
-    return qpc_op_u8(c, loc, OP_py, subop);
+    return qpc_insn(c, loc, OP_py, subop, 0) < 0 ? ERROR : SUCCESS;
 }
 
 static int qpc_py_u8(compiler *c, location loc, int subop, int v)
 {
-    RETURN_IF_ERROR(qpc_py(c, loc, subop));
+    int r = qpc_insn(c, loc, OP_py, subop, v);
+    if (r != 0)
+        return r < 0 ? ERROR : SUCCESS;
     dbuf_putc(qpc_bc(c), (uint8_t)v);
     return SUCCESS;
 }
@@ -340,7 +623,7 @@ static int qpc_py_u16(compiler *c, location loc, int subop, int v)
 {
     if (v < 0 || v > 0xffff)
         return qpc_error(c, loc, "too many operands in an expression");
-    RETURN_IF_ERROR(qpc_py(c, loc, subop));
+    RETURN_IF_ERROR(qpc_insn(c, loc, OP_py, subop, v));
     dbuf_put_u16(qpc_bc(c), (uint16_t)v);
     return SUCCESS;
 }
@@ -385,13 +668,19 @@ static int qpc_py_atom_ic(compiler *c, location loc, int subop, JSAtom atom)
     return qpc_py_atom_u16(c, loc, subop, atom, ic);
 }
 
+static int qpc_peep_jump(compiler *c, location loc, int subop, jump_target_label lbl);
+
 static int qpc_py_jump(compiler *c, location loc, int subop, jump_target_label lbl)
 {
+    int r;
     assert(IS_JUMP_TARGET_LABEL(lbl));
+    r = qpc_peep_jump(c, loc, subop, lbl);
+    if (r != 0)
+        return r < 0 ? ERROR : SUCCESS;
     RETURN_IF_ERROR(qpc_py(c, loc, subop));
     dbuf_put_u32(qpc_bc(c), lbl.id);
     c->u->u_fd->label_slots[lbl.id].ref_count++;
-    return SUCCESS;
+    return qpc_record_jump(c, lbl.id, FALSE);
 }
 
 static int qpc_copy(compiler *c, location loc, int n)
@@ -438,11 +727,162 @@ static int qpc_pop_block_under(compiler *c, location loc)
 /* Constants                                                                 */
 /* ======================================================================== */
 
+/* ---- constant keys (_PyCode_ConstantKey) -------------------------------- */
+
+static uint32_t qpc_const_hash(JSContext *ctx, JSValueConst v)
+{
+    Py_hash_t h = qp_hash(ctx, v);
+    if (h == -1 && JS_HasException(ctx))
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    return (uint32_t)h ^ (uint32_t)((uint64_t)h >> 32);
+}
+
+/* Same _PyCode_ConstantKey: same type and value, floats and complex
+   numbers bit for bit (0.0 != -0.0), tuples and frozensets item by item. */
+static BOOL qpc_const_key_eq(JSContext *ctx, JSValueConst a, JSValueConst b)
+{
+    QPType *t = qp_type_of(ctx, a);
+    int r;
+
+    if (t != qp_type_of(ctx, b))
+        return FALSE;
+    if (t == QP_TYPE(ctx, float)) {
+        double x = JS_VALUE_GET_FLOAT64(a), y = JS_VALUE_GET_FLOAT64(b);
+        return memcmp(&x, &y, sizeof(x)) == 0;
+    }
+    if (t == QP_TYPE(ctx, complex)) {
+        QPComplex x, y;
+        if (qp_complex_as_c(ctx, a, &x) < 0 || qp_complex_as_c(ctx, b, &y) < 0) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            return FALSE;
+        }
+        return memcmp(&x.real, &y.real, sizeof(double)) == 0 &&
+            memcmp(&x.imag, &y.imag, sizeof(double)) == 0;
+    }
+    if (t == QP_TYPE(ctx, tuple)) {
+        Py_ssize_t i, n = QP_TUPLE_SIZE(a);
+        if (n != QP_TUPLE_SIZE(b))
+            return FALSE;
+        for (i = 0; i < n; i++) {
+            if (!qpc_const_key_eq(ctx, QP_TUPLE_ITEMS(a)[i], QP_TUPLE_ITEMS(b)[i]))
+                return FALSE;
+        }
+        return TRUE;
+    }
+    if (t == QP_TYPE(ctx, frozenset)) {
+        Py_ssize_t pa = 0, pb;
+        JSValue ka, kb;
+        if (qp_set_size(a) != qp_set_size(b))
+            return FALSE;
+        while (qp_set_next(a, &pa, &ka, NULL)) {
+            BOOL found = FALSE;
+            pb = 0;
+            while (!found && qp_set_next(b, &pb, &kb, NULL))
+                found = qpc_const_key_eq(ctx, ka, kb);
+            if (!found)
+                return FALSE;
+        }
+        return TRUE;
+    }
+    if (t == QP_TYPE(ctx, slice)) {
+        JSValueConst fa[3], fb[3];
+        qp_slice_fields(a, fa);
+        qp_slice_fields(b, fb);
+        return qpc_const_key_eq(ctx, fa[0], fb[0]) && qpc_const_key_eq(ctx, fa[1], fb[1]) &&
+            qpc_const_key_eq(ctx, fa[2], fb[2]);
+    }
+    if (t == QP_TYPE(ctx, NoneType) || t == QP_TYPE(ctx, bool) || t == QP_TYPE(ctx, ellipsis))
+        return qp_is(a, b);
+    r = qp_richcompare_bool(ctx, a, b, QP_CMP_EQ);
+    if (r < 0) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return FALSE;
+    }
+    return r;
+}
+
+static void qpc_ctab_free(JSContext *ctx, qpc_ctab *t)
+{
+    for (int i = 0; i < t->n; i++)
+        JS_FreeValue(ctx, t->ents[i].v);
+    js_free(ctx, t->ents);
+    js_free(ctx, t->tab);
+}
+
+static int qpc_ctab_rehash(JSContext *ctx, qpc_ctab *t, uint32_t size)
+{
+    int *tab = js_mallocz(ctx, sizeof(tab[0]) * size);
+    if (!tab)
+        return -1;
+    js_free(ctx, t->tab);
+    t->tab = tab;
+    t->mask = size - 1;
+    for (int i = 0; i < t->n; i++) {
+        uint32_t h = t->ents[i].hash & t->mask;
+        while (tab[h])
+            h = (h + 1) & t->mask;
+        tab[h] = i + 1;
+    }
+    return 0;
+}
+
+/* Index of the entry of v (code objects: of cpool index aux) in t, added
+   (v duplicated, aux stored) if absent; -1 on OOM.  *padded: 1 if added. */
+static int qpc_ctab_add(compiler *c, qpc_ctab *t, JSValueConst v, BOOL is_code, int aux,
+                        int *padded)
+{
+    JSContext *ctx = c->ctx;
+    uint32_t hash = is_code ? (uint32_t)aux * 2654435761u : qpc_const_hash(ctx, v);
+    uint32_t h;
+    int k;
+
+    *padded = 0;
+    if (t->tab) {
+        for (h = hash & t->mask; (k = t->tab[h]) != 0; h = (h + 1) & t->mask) {
+            qpc_const_ent *e = &t->ents[k - 1];
+            if (e->hash != hash || e->is_code != is_code)
+                continue;
+            if (is_code ? e->aux == aux : qpc_const_key_eq(ctx, e->v, v))
+                return k - 1;
+        }
+    }
+    if (js_resize_array(ctx, (void **)&t->ents, sizeof(t->ents[0]), &t->size, t->n + 1))
+        return -1;
+    k = t->n++;
+    t->ents[k].v = is_code ? JS_UNDEFINED : JS_DupValue(ctx, v);
+    t->ents[k].aux = aux;
+    t->ents[k].hash = hash;
+    t->ents[k].is_code = is_code;
+    *padded = 1;
+    if (!t->tab || (uint32_t)t->n * 2 > t->mask + 1) {
+        if (qpc_ctab_rehash(ctx, t, t->tab ? 2 * (t->mask + 1) : 16) < 0)
+            return -1;
+    } else {
+        for (h = hash & t->mask; t->tab[h]; h = (h + 1) & t->mask)
+            ;
+        t->tab[h] = k + 1;
+    }
+    return k;
+}
+
+/* Add a constant to the current cpool (consumes v), returns its index or
+   -1.  Equal constants share an entry, like CPython's constant merging. */
 static int qpc_add_const(compiler *c, JSValue v)
 {
-    JSFunctionDef *fd = c->u->u_fd;
+    compiler_unit *u = c->u;
+    JSFunctionDef *fd = u->u_fd;
+    int k, added;
     if (JS_IsException(v))
         return -1;
+    k = qpc_ctab_add(c, &u->u_cpool_keys, v, FALSE, fd->cpool_count, &added);
+    if (k < 0) {
+        JS_FreeValue(c->ctx, v);
+        return -1;
+    }
+    if (!added) {
+        JS_FreeValue(c->ctx, v);
+        return u->u_cpool_keys.ents[k].aux;
+    }
     if (js_resize_array(c->ctx, (void *)&fd->cpool, sizeof(fd->cpool[0]),
                         &fd->cpool_size, fd->cpool_count + 1)) {
         JS_FreeValue(c->ctx, v);
@@ -452,40 +892,727 @@ static int qpc_add_const(compiler *c, JSValue v)
     return fd->cpool_count - 1;
 }
 
+/* cpool slot of a nested function (filled by js_create_function) */
+static int qpc_add_closure_slot(compiler *c)
+{
+    JSFunctionDef *fd = c->u->u_fd;
+    if (js_resize_array(c->ctx, (void *)&fd->cpool, sizeof(fd->cpool[0]),
+                        &fd->cpool_size, fd->cpool_count + 1))
+        return -1;
+    fd->cpool[fd->cpool_count++] = JS_UNDEFINED;
+    return fd->cpool_count - 1;
+}
+
+/* ---- co_consts ------------------------------------------------------------
+ * CPython's co_consts is u_consts after flowgraph: the constants codegen
+ * adds (_PyCompile_AddConst: every ADDOP_LOAD_CONST, the docstring, nested
+ * code objects), then the ones its constant folding adds, minus those no
+ * LOAD_CONST uses (remove_unused_consts), except index 0 which is always
+ * kept.  Here codegen's adds go to u_consts as they happen (qpc_consts_add,
+ * called by the qpc_load_* emitters at the ADDOP_LOAD_CONST sites), the
+ * folding results to u_late_consts (qpc_consts_add_late, "Constant
+ * folding" below); qpc_consts_finish stores in QPCodeInfo.consts the cpool
+ * indexes of index 0 and of every constant a LOAD_CONST can use, and
+ * codeobject.c keeps index 0 and those the bytecode loads. */
+
+/* Constants never loaded with LOAD_CONST: LOAD_SMALL_INT 0..255,
+   LOAD_COMMON_CONSTANT None, True, False, '' and -1. */
+static BOOL qpc_const_is_common(JSValueConst v)
+{
+    switch (JS_VALUE_GET_TAG(v)) {
+    case JS_TAG_UNDEFINED:
+    case JS_TAG_BOOL:
+        return TRUE;
+    case JS_TAG_INT:
+        return JS_VALUE_GET_INT(v) >= -1 && JS_VALUE_GET_INT(v) <= 255;
+    case JS_TAG_STRING:
+        return JS_VALUE_GET_STRING(v)->len == 0;
+    default:
+        return FALSE;
+    }
+}
+
+/* _PyCompile_AddConst */
+static int qpc_consts_add(compiler *c, JSValueConst v)
+{
+    int added;
+    return qpc_ctab_add(c, &c->u->u_consts, v, FALSE, -1, &added) < 0 ? ERROR : SUCCESS;
+}
+
+/* ADDOP_LOAD_CONST of the code object of AST node key at cpool_idx */
+static int qpc_consts_add_code(compiler *c, void *key, int cpool_idx)
+{
+    compiler_unit *u = c->u;
+    int added, first = cpool_idx;
+    for (int i = 0; i < u->u_n_code_keys; i++) {
+        if (u->u_code_keys[i].key == key) {
+            first = u->u_code_keys[i].idx;
+            break;
+        }
+    }
+    if (js_resize_array(c->ctx, (void **)&u->u_code_keys, sizeof(u->u_code_keys[0]),
+                        &u->u_code_keys_size, u->u_n_code_keys + 1))
+        return ERROR;
+    u->u_code_keys[u->u_n_code_keys].key = key;
+    u->u_code_keys[u->u_n_code_keys++].idx = cpool_idx;
+    return qpc_ctab_add(c, &u->u_consts, JS_UNDEFINED, TRUE, first, &added) < 0 ?
+        ERROR : SUCCESS;
+}
+
+/* flowgraph instr_make_load_const / add_const of a folding result */
+static int qpc_consts_add_late(compiler *c, JSValueConst v)
+{
+    compiler_unit *u = c->u;
+    if (qpc_const_is_common(v))
+        return SUCCESS;
+    if (js_resize_array(c->ctx, (void **)&u->u_late_consts, sizeof(u->u_late_consts[0]),
+                        &u->u_late_consts_size, u->u_n_late_consts + 1))
+        return ERROR;
+    u->u_late_consts[u->u_n_late_consts++] = JS_DupValue(c->ctx, v);
+    return SUCCESS;
+}
+
+static int qpc_consts_finish(compiler *c)
+{
+    compiler_unit *u = c->u;
+    QPCodeInfo *ci = u->u_fd->py_code;
+    int i, n, added;
+    uint32_t *map;
+
+    for (i = 0; i < u->u_n_late_consts; i++) {
+        if (qpc_ctab_add(c, &u->u_consts, u->u_late_consts[i], FALSE, -1, &added) < 0)
+            return ERROR;
+    }
+    if (u->u_consts.n == 0)
+        return SUCCESS;
+    map = js_malloc(c->ctx, sizeof(map[0]) * (u->u_consts.n + u->u_fd->cpool_count));
+    if (!map)
+        return ERROR;
+    for (i = n = 0; i < u->u_consts.n; i++) {
+        qpc_const_ent *e = &u->u_consts.ents[i];
+        int idx;
+        if (e->is_code) {
+            /* the other closures of the same AST node: aliases */
+            void *key = NULL;
+            map[n++] = e->aux;
+            for (int k = 0; k < u->u_n_code_keys; k++) {
+                if (u->u_code_keys[k].idx == e->aux) {
+                    key = u->u_code_keys[k].key;
+                    break;
+                }
+            }
+            for (int k = 0; k < u->u_n_code_keys; k++) {
+                if (u->u_code_keys[k].key == key && u->u_code_keys[k].idx != e->aux) {
+                    map[n++] = u->u_code_keys[k].idx | QP_CODE_CONST_ALIAS;
+                }
+            }
+            continue;
+        } else {
+            if (i > 0 && qpc_const_is_common(e->v))
+                continue;
+            idx = qpc_add_const(c, JS_DupValue(c->ctx, e->v));
+            if (idx < 0) {
+                js_free(c->ctx, map);
+                return ERROR;
+            }
+        }
+        map[n++] = idx;
+    }
+    js_free(c->ctx, ci->consts);
+    ci->consts = map;
+    ci->nconsts = n;
+    return SUCCESS;
+}
+
+/* ---- Constant folding ------------------------------------------------------
+ * CPython folds constants on the CFG (flowgraph.c optimize_basic_block,
+ * after optimize_load_const): an instruction whose operands are loaded by
+ * the immediately preceding constant-loading instructions of its basic
+ * block is replaced by the LOAD_CONST of the result (BUILD_TUPLE, BINARY_OP
+ * incl. NB_SUBSCR, UNARY_*, TO_BOOL (optimize_load_const, on codegen
+ * constants only), BUILD_LIST/BUILD_SET before GET_ITER or CONTAINS_OP or
+ * of 3+ items (optimize_lists_and_sets), BUILD_LIST 0 + LIST_APPEND 1 ...
+ * before GET_ITER/CONTAINS_OP or CALL_INTRINSIC_1 LIST_TO_TUPLE
+ * (fold_constant_seq_into_load_const)).  The same folds are done here while
+ * emitting: the emitters record the instructions that can take part in a
+ * fold since the start of the basic block (u_peep, any other instruction or
+ * a label clears it), a fold truncates the bytecode back to its first
+ * operand and emits the push of the result.  Folds that depend on the next
+ * instruction (BUILD_TUPLE n before UNPACK_SEQUENCE n is a swap, BUILD_LIST
+ * / BUILD_SET / LIST_APPEND before GET_ITER / CONTAINS_OP) are decided when
+ * it is emitted (qpc_peep_next).  Limits: _PY_STACK_USE_GUIDELINE operands,
+ * flowgraph's const_folding_safe_* size checks.  Not done: the jump
+ * threading and dead code removal of constant conditions. */
+
+#define QPC_MAX_INT_SIZE           128  /* bits */
+#define QPC_MAX_COLLECTION_SIZE    256  /* items */
+#define QPC_MAX_STR_SIZE          4096  /* characters */
+#define QPC_MAX_TOTAL_ITEMS       1024  /* including nested collections */
+
+static void qpc_clear_exception(JSContext *ctx)
+{
+    JS_FreeValue(ctx, JS_GetException(ctx));
+}
+
+static void qpc_peep_clear(compiler *c)
+{
+    compiler_unit *u = c->u;
+    for (int i = 0; i < u->u_npeep; i++)
+        JS_FreeValue(c->ctx, u->u_peep[i].v);
+    u->u_npeep = 0;
+}
+
+/* Record an instruction (v consumed) */
+static int qpc_peep_push(compiler *c, int kind, uint32_t pos, location last_loc,
+                         location loc, JSValue v)
+{
+    compiler_unit *u = c->u;
+    qpc_peep_insn *p;
+    if (js_resize_array(c->ctx, (void **)&u->u_peep, sizeof(u->u_peep[0]),
+                        &u->u_peep_size, u->u_npeep + 1)) {
+        JS_FreeValue(c->ctx, v);
+        return ERROR;
+    }
+    p = &u->u_peep[u->u_npeep++];
+    memset(p, 0, sizeof(*p));
+    p->kind = kind;
+    p->pos = pos;
+    p->last_loc = last_loc;
+    p->loc = loc;
+    p->v = v;
+    return SUCCESS;
+}
+
+/* Number of CONST records at the top of the window */
+static int qpc_peep_nconst(compiler_unit *u)
+{
+    int n = 0;
+    while (n < u->u_npeep && u->u_peep[u->u_npeep - 1 - n].kind == QPC_PI_CONST)
+        n++;
+    return n;
+}
+
+/* Drop the records [i..npeep) and their code */
+static void qpc_peep_truncate(compiler *c, int i)
+{
+    compiler_unit *u = c->u;
+    u->u_fd->byte_code.size = u->u_peep[i].pos;
+    u->u_fd->last_opcode_pos = -1;
+    if (u->u_join_pos >= u->u_fd->byte_code.size)
+        u->u_join_pos = 0;  /* (the join's OP_line_num was removed) */
+    u->u_last_loc = u->u_peep[i].last_loc;
+    for (int k = i; k < u->u_npeep; k++)
+        JS_FreeValue(c->ctx, u->u_peep[k].v);
+    u->u_npeep = i;
+}
+
+/* Emit the push of constant v (borrowed), outside of the folding window */
+static int qpc_emit_const_raw(compiler *c, location loc, JSValueConst v)
+{
+    compiler_unit *u = c->u;
+    int r, idx;
+    u->u_peep_raw++;
+    switch (JS_VALUE_GET_TAG(v)) {
+    case JS_TAG_UNDEFINED:
+        r = qpc_op(c, loc, OP_undefined);
+        break;
+    case JS_TAG_BOOL:
+        r = qpc_op(c, loc, JS_VALUE_GET_BOOL(v) ? OP_push_true : OP_push_false);
+        break;
+    case JS_TAG_INT:
+        r = qpc_op_u32(c, loc, OP_push_i32, (uint32_t)JS_VALUE_GET_INT(v));
+        break;
+    default:
+        idx = qpc_add_const(c, JS_DupValue(c->ctx, v));
+        r = idx < 0 ? ERROR : qpc_op_u32(c, loc, OP_push_const, idx);
+        break;
+    }
+    u->u_peep_raw--;
+    return r;
+}
+
+/* The push of a constant (v consumed) that becomes a CONST record */
+static int qpc_emit_const_rec(compiler *c, location loc, JSValue v, int phase1)
+{
+    compiler_unit *u = c->u;
+    uint32_t pos = u->u_fd->byte_code.size;
+    location last = u->u_last_loc;
+    if (qpc_emit_const_raw(c, loc, v) < 0) {
+        JS_FreeValue(c->ctx, v);
+        return ERROR;
+    }
+    RETURN_IF_ERROR(qpc_peep_push(c, QPC_PI_CONST, pos, last, loc, v));
+    u->u_peep[u->u_npeep - 1].phase1 = phase1;
+    return SUCCESS;
+}
+
+/* Replace the records [i..npeep) by the push of the folding result v
+   (consumed) at loc. */
+static int qpc_peep_replace(compiler *c, int i, location loc, JSValue v, int phase1)
+{
+    qpc_peep_truncate(c, i);
+    return qpc_emit_const_rec(c, loc, v, phase1);
+}
+
+/* The CONST values [i..i+n) of the window as a tuple (frozenset) */
+static JSValue qpc_peep_tuple(compiler *c, int i, int n, int step, BOOL is_set)
+{
+    JSContext *ctx = c->ctx;
+    JSValue t = qp_tuple_new(ctx, n), s;
+    if (JS_IsException(t))
+        return t;
+    for (int k = 0; k < n; k++) {
+        JS_FreeValue(ctx, QP_TUPLE_ITEMS(t)[k]);
+        QP_TUPLE_ITEMS(t)[k] = JS_DupValue(ctx, c->u->u_peep[i + k * step].v);
+    }
+    if (!is_set)
+        return t;
+    s = qp_frozenset_new(ctx, t);
+    JS_FreeValue(ctx, t);
+    return s;
+}
+
+/* const_folding_check_complexity */
+static Py_ssize_t qpc_fold_complexity(JSContext *ctx, JSValueConst obj, Py_ssize_t limit)
+{
+    if (qp_tuple_check(ctx, obj)) {
+        Py_ssize_t i, n = QP_TUPLE_SIZE(obj);
+        limit -= n;
+        for (i = 0; limit >= 0 && i < n; i++) {
+            limit = qpc_fold_complexity(ctx, QP_TUPLE_ITEMS(obj)[i], limit);
+            if (limit < 0)
+                return limit;
+        }
+    }
+    return limit;
+}
+
+/* const_folding_safe_multiply size checks: FALSE if CPython does not fold */
+static BOOL qpc_fold_mul_ok(JSContext *ctx, JSValueConst v, JSValueConst w)
+{
+    int64_t n;
+    int overflow;
+    if (qp_long_check(ctx, v) && qp_long_check(ctx, w)) {
+        if (qp_long_sign(v) && qp_long_sign(w) &&
+            qp_long_numbits(v) + qp_long_numbits(w) > QPC_MAX_INT_SIZE)
+            return FALSE;
+    }
+    else if (qp_long_check(ctx, v) && qp_tuple_check(ctx, w)) {
+        Py_ssize_t size = QP_TUPLE_SIZE(w);
+        if (size) {
+            if (qp_long_as_int64_overflow(v, &n, &overflow) < 0 || overflow ||
+                n < 0 || n > QPC_MAX_COLLECTION_SIZE / size)
+                return FALSE;
+            if (n && qpc_fold_complexity(ctx, w, QPC_MAX_TOTAL_ITEMS / n) < 0)
+                return FALSE;
+        }
+    }
+    else if (qp_long_check(ctx, v) && (qp_str_check(ctx, w) || qp_bytes_check(ctx, w))) {
+        Py_ssize_t size = qp_len(ctx, w);
+        if (size < 0) {
+            qpc_clear_exception(ctx);
+            return FALSE;
+        }
+        if (size) {
+            if (qp_long_as_int64_overflow(v, &n, &overflow) < 0 || overflow ||
+                n < 0 || n > QPC_MAX_STR_SIZE / size)
+                return FALSE;
+        }
+    }
+    else if (qp_long_check(ctx, w) &&
+             (qp_tuple_check(ctx, v) || qp_str_check(ctx, v) || qp_bytes_check(ctx, v))) {
+        return qpc_fold_mul_ok(ctx, w, v);
+    }
+    return TRUE;
+}
+
+/* PyLong_AsSize_t of a positive or zero int, (uint64_t)-1 if it does not
+   fit (or is negative) */
+static uint64_t qpc_fold_size_t(JSValueConst w)
+{
+    int64_t n;
+    int overflow;
+    if (qp_long_as_int64_overflow(w, &n, &overflow) < 0 || overflow || n < 0)
+        return (uint64_t)-1;
+    return (uint64_t)n;
+}
+
+/* eval_const_binop with the const_folding_safe_* checks: the result, or
+   JS_EXCEPTION (no exception pending) when CPython does not fold. */
+static JSValue qpc_fold_binop_value(compiler *c, JSValueConst v, int nb, JSValueConst w)
+{
+    JSContext *ctx = c->ctx;
+    JSValue r;
+    switch (nb) {
+    case QP_NB_MULTIPLY:
+        if (!qpc_fold_mul_ok(ctx, v, w))
+            return JS_EXCEPTION;
+        break;
+    case QP_NB_POWER:
+        if (qp_long_check(ctx, v) && qp_long_check(ctx, w) &&
+            qp_long_sign(v) && qp_long_sign(w) > 0) {
+            uint64_t vbits = qp_long_numbits(v), wbits = qpc_fold_size_t(w);
+            if (wbits == (uint64_t)-1 || vbits > QPC_MAX_INT_SIZE / wbits)
+                return JS_EXCEPTION;
+        }
+        break;
+    case QP_NB_LSHIFT:
+        if (qp_long_check(ctx, v) && qp_long_check(ctx, w) &&
+            qp_long_sign(v) && qp_long_sign(w)) {
+            uint64_t vbits = qp_long_numbits(v), wbits = qpc_fold_size_t(w);
+            if (wbits == (uint64_t)-1 || wbits > QPC_MAX_INT_SIZE ||
+                vbits > QPC_MAX_INT_SIZE - wbits)
+                return JS_EXCEPTION;
+        }
+        break;
+    case QP_NB_REMAINDER:
+        if (qp_str_check(ctx, v) || qp_bytes_check(ctx, v))
+            return JS_EXCEPTION;
+        break;
+    case QP_NB_MATRIX_MULTIPLY:
+        /* No builtin constants implement matrix multiplication */
+        return JS_EXCEPTION;
+    default:
+        if (nb >= QP_NB_INPLACE_ADD && nb != QP_NB_SUBSCR)
+            return JS_EXCEPTION;
+        break;
+    }
+    r = qp_binop(ctx, v, w, nb);
+    if (JS_IsException(r))
+        qpc_clear_exception(ctx);
+    return r;
+}
+
+/* eval_const_unaryop (unop = QP_UNOP_*, -1 = UNARY_NOT) */
+static JSValue qpc_fold_unop_value(compiler *c, JSValueConst v, int unop)
+{
+    JSContext *ctx = c->ctx;
+    JSValue r;
+    if (unop < 0) {
+        int t = qp_bool(ctx, v);
+        if (t < 0) {
+            qpc_clear_exception(ctx);
+            return JS_EXCEPTION;
+        }
+        return JS_NewBool(ctx, !t);
+    }
+    /* XXX: This should be removed once the ~bool depreciation expires. */
+    if (unop == QP_UNOP_INVERT && JS_VALUE_GET_TAG(v) == JS_TAG_BOOL)
+        return JS_EXCEPTION;
+    r = qp_unop(ctx, v, unop);
+    if (JS_IsException(r))
+        qpc_clear_exception(ctx);
+    return r;
+}
+
+/* fold_tuple_of_constants: the top record is BUILD_TUPLE n after n CONSTs */
+static int qpc_fold_tuple(compiler *c)
+{
+    compiler_unit *u = c->u;
+    qpc_peep_insn *b = &u->u_peep[u->u_npeep - 1];
+    int n = b->n, i = u->u_npeep - 1 - n;
+    location loc = b->loc;
+    JSValue t = qpc_peep_tuple(c, i, n, 1, FALSE);
+    if (JS_IsException(t))
+        return ERROR;
+    if (qpc_consts_add_late(c, t) < 0) {
+        JS_FreeValue(c->ctx, t);
+        return ERROR;
+    }
+    return qpc_peep_replace(c, i, loc, t, 0);
+}
+
+/* optimize_lists_and_sets: the top record is BUILD_LIST/BUILD_SET n after
+   n CONSTs; iter: the next instruction is GET_ITER or CONTAINS_OP */
+static int qpc_fold_list_set(compiler *c, BOOL iter)
+{
+    compiler_unit *u = c->u;
+    qpc_peep_insn *b = &u->u_peep[u->u_npeep - 1];
+    int n = b->n, i = u->u_npeep - 1 - n, r;
+    BOOL is_set = b->is_set;
+    location loc = b->loc;
+    JSValue t;
+
+    if (!iter && n < 3) {
+        qpc_peep_clear(c);
+        return SUCCESS;
+    }
+    t = qpc_peep_tuple(c, i, n, 1, is_set);
+    if (JS_IsException(t))
+        return ERROR;
+    if (qpc_consts_add_late(c, t) < 0) {
+        JS_FreeValue(c->ctx, t);
+        return ERROR;
+    }
+    if (iter)
+        return qpc_peep_replace(c, i, loc, t, 0);
+    /* BUILD_LIST 0, LOAD_CONST (c1, ... cN), LIST_EXTEND 1 */
+    qpc_peep_truncate(c, i);
+    u->u_peep_raw++;
+    r = is_set ? qpc_py_u16(c, loc, QP_OP_build_set, 0) : qpc_op_u16(c, loc, OP_array_from, 0);
+    if (r >= 0)
+        r = qpc_emit_const_raw(c, loc, t);
+    if (r >= 0)
+        r = qpc_py_u16(c, loc, is_set ? QP_OP_set_update : QP_OP_list_extend, 1);
+    u->u_peep_raw--;
+    JS_FreeValue(c->ctx, t);
+    qpc_peep_clear(c);
+    return r;
+}
+
+/* fold_constant_seq_into_load_const: BUILD_LIST 0 (BUILD_SET 0), then
+   (CONST, LIST_APPEND 1 (SET_ADD 1)) pairs ending with the record top
+   (expect_append: top is an APPEND, the target is the LIST_TO_TUPLE
+   intrinsic about to be emitted; else top is the CONST before the target
+   APPEND, which is the record above it).  Returns 1 if folded. */
+static int qpc_fold_seq(compiler *c, int top, BOOL expect_append, BOOL is_set, location loc)
+{
+    compiler_unit *u = c->u;
+    int i, n = 0;
+    JSValue t;
+
+    for (i = top; i >= 0; i--) {
+        qpc_peep_insn *p = &u->u_peep[i];
+        if (p->kind == QPC_PI_BUILD0 && p->is_set == is_set) {
+            if (!expect_append)
+                return 0;
+            break;
+        }
+        if (expect_append) {
+            if (p->kind != QPC_PI_APPEND || p->is_set != is_set)
+                return 0;
+        } else {
+            if (p->kind != QPC_PI_CONST)
+                return 0;
+            n++;
+        }
+        expect_append = !expect_append;
+    }
+    if (i < 0)
+        return 0;
+    t = qpc_peep_tuple(c, i + 1, n, 2, is_set);
+    if (JS_IsException(t))
+        return ERROR;
+    if (qpc_consts_add_late(c, t) < 0) {
+        JS_FreeValue(c->ctx, t);
+        return ERROR;
+    }
+    RETURN_IF_ERROR(qpc_peep_replace(c, i, loc, t, 0));
+    return 1;
+}
+
+/* Decide the fold deferred by the top record now that the next
+   instruction (opcode/subop/arg; opcode -1: end of the basic block) is
+   known. */
+static int qpc_peep_next(compiler *c, int opcode, int subop, int arg)
+{
+    compiler_unit *u = c->u;
+    qpc_peep_insn *top;
+    BOOL iter;
+
+    if (u->u_npeep == 0)
+        return SUCCESS;
+    top = &u->u_peep[u->u_npeep - 1];
+    iter = opcode == OP_py && (subop == QP_OP_get_iter || subop == QP_OP_contains);
+    switch (top->kind) {
+    case QPC_PI_TUPLEN:
+        if (opcode == OP_py && subop == QP_OP_unpack_seq && arg == top->n &&
+            top->n >= 1 && top->n <= 3) {
+            /* BUILD_TUPLE n + UNPACK_SEQUENCE n: a swap, no constant */
+            qpc_peep_clear(c);
+            return SUCCESS;
+        }
+        return qpc_fold_tuple(c);
+    case QPC_PI_BUILDN:
+        return qpc_fold_list_set(c, iter);
+    case QPC_PI_BUILD0:
+        /* optimize_lists_and_sets of 0 items: () / frozenset() */
+        return iter ? qpc_fold_list_set(c, TRUE) : SUCCESS;
+    case QPC_PI_APPEND:
+        if (iter && qpc_fold_seq(c, u->u_npeep - 2, FALSE, top->is_set, top->loc) < 0)
+            return ERROR;
+        return SUCCESS;
+    default:
+        return SUCCESS;
+    }
+}
+
+/* Folds done by the instruction itself (BINARY_OP, UNARY_*, TO_BOOL,
+   LIST_TO_TUPLE): 1 if the instruction was replaced by a constant. */
+static int qpc_peep_fold(compiler *c, location loc, int opcode, int subop, int arg)
+{
+    compiler_unit *u = c->u;
+    int nconst = qpc_peep_nconst(u), top = u->u_npeep - 1;
+    JSValue r;
+
+    if (opcode == OP_drop) {
+        /* remove_redundant_nops_and_pairs: LOAD_CONST + POP_TOP */
+        if (nconst < 1)
+            return 0;
+        qpc_peep_truncate(c, top);
+        return 1;
+    }
+    if (opcode == OP_lnot) {
+        if (nconst < 1)
+            return 0;
+        r = qpc_fold_unop_value(c, u->u_peep[top].v, -1);
+    }
+    else if (opcode != OP_py) {
+        return 0;
+    }
+    else if (subop == QP_OP_binop || subop == QP_OP_getitem) {
+        if (nconst < 2)
+            return 0;
+        r = qpc_fold_binop_value(c, u->u_peep[top - 1].v,
+                                 subop == QP_OP_getitem ? QP_NB_SUBSCR : arg,
+                                 u->u_peep[top].v);
+        if (JS_IsException(r))
+            return 0;
+        RETURN_IF_ERROR(qpc_consts_add_late(c, r));
+        RETURN_IF_ERROR(qpc_peep_replace(c, top - 1, loc, r, 0));
+        return 1;
+    }
+    else if (subop == QP_OP_unop) {
+        if (nconst < 1)
+            return 0;
+        r = qpc_fold_unop_value(c, u->u_peep[top].v, arg);
+    }
+    else if (subop == QP_OP_to_bool) {
+        /* optimize_load_const: LOAD_CONST c + TO_BOOL -> LOAD_CONST bool(c) */
+        int t;
+        if (nconst < 1 || !u->u_peep[top].phase1)
+            return 0;
+        t = qp_bool(c->ctx, u->u_peep[top].v);
+        if (t < 0) {
+            qpc_clear_exception(c->ctx);
+            return 0;
+        }
+        RETURN_IF_ERROR(qpc_peep_replace(c, top, loc, JS_NewBool(c->ctx, t), 1));
+        return 1;
+    }
+    else if (subop == QP_OP_intrinsic1 && arg == QP_INTRINSIC1_LIST_TO_TUPLE) {
+        return qpc_fold_seq(c, top, TRUE, FALSE, loc);
+    }
+    else {
+        return 0;
+    }
+    /* unary operators */
+    if (JS_IsException(r))
+        return 0;
+    RETURN_IF_ERROR(qpc_consts_add_late(c, r));
+    RETURN_IF_ERROR(qpc_peep_replace(c, top, loc, r, 0));
+    return 1;
+}
+
+/* optimize_load_const: TO_BOOL + POP_JUMP_IF_FALSE/TRUE (jump_if_false /
+   jump_if_true) of a phase1 constant, or JUMP_IF_FALSE/TRUE (COPY 1 +
+   jump_if_*) of one, becomes a JUMP or nothing.  1 if done. */
+static int qpc_peep_jump(compiler *c, location loc, int subop, jump_target_label lbl)
+{
+    compiler_unit *u = c->u;
+    qpc_peep_insn *top;
+    int t, top_idx;
+
+    if (u->u_peep_raw || (subop != QP_OP_jump_if_false && subop != QP_OP_jump_if_true))
+        return 0;
+    RETURN_IF_ERROR(qpc_peep_next(c, OP_py, subop, 0));
+    top_idx = u->u_npeep - 1;
+    if (top_idx < 0)
+        return 0;
+    top = &u->u_peep[top_idx];
+    if (top->kind == QPC_PI_DUPCONST) {
+        if (top_idx < 1)
+            return 0;
+        t = qp_bool(c->ctx, u->u_peep[top_idx - 1].v);
+    }
+    else if (top->kind == QPC_PI_CONST && top->phase1) {
+        t = qp_bool(c->ctx, top->v);
+    }
+    else {
+        return 0;
+    }
+    if (t < 0) {
+        qpc_clear_exception(c->ctx);
+        return 0;
+    }
+    qpc_peep_truncate(c, top_idx);
+    qpc_peep_clear(c);
+    /* the folded test keeps its line event, as CPython's NOP does
+       (`while True:`) */
+    if (loc.lineno != u->u_last_loc.lineno)
+        RETURN_IF_ERROR(qpc_op(c, loc, OP_nop));
+    if (t == (subop == QP_OP_jump_if_true))
+        RETURN_IF_ERROR(qpc_jump(c, loc, OP_goto, lbl));
+    return 1;
+}
+
+/* Record the instruction just emitted at pos (its operand bytes follow) */
+static int qpc_peep_record(compiler *c, int opcode, int subop, int arg,
+                           uint32_t pos, location last_loc, location loc)
+{
+    compiler_unit *u = c->u;
+    int kind = -1, n = 0, is_set = 0;
+
+    if (opcode == OP_array_from || (opcode == OP_py && subop == QP_OP_build_set)) {
+        n = arg;
+        is_set = opcode == OP_py;
+        if (n == 0)
+            kind = QPC_PI_BUILD0;
+        else if (n <= QPC_STACK_USE_GUIDELINE && qpc_peep_nconst(u) >= n)
+            kind = QPC_PI_BUILDN;
+    }
+    else if (opcode == OP_py && subop == QP_OP_build_tuple) {
+        n = arg;
+        if (n <= QPC_STACK_USE_GUIDELINE && qpc_peep_nconst(u) >= n)
+            kind = QPC_PI_TUPLEN;
+    }
+    else if (opcode == OP_py && (subop == QP_OP_list_append || subop == QP_OP_set_add) &&
+             arg == 1 && qpc_peep_nconst(u) >= 1) {
+        kind = QPC_PI_APPEND;
+        is_set = subop == QP_OP_set_add;
+    }
+    else if (opcode == OP_dup && qpc_peep_nconst(u) >= 1 &&
+             u->u_peep[u->u_npeep - 1].phase1) {
+        kind = QPC_PI_DUPCONST;
+    }
+    if (kind < 0) {
+        qpc_peep_clear(c);
+        return SUCCESS;
+    }
+    RETURN_IF_ERROR(qpc_peep_push(c, kind, pos, last_loc, loc, JS_UNDEFINED));
+    u->u_peep[u->u_npeep - 1].n = n;
+    u->u_peep[u->u_npeep - 1].is_set = is_set;
+    return SUCCESS;
+}
+
+/* ---- constant loads (ADDOP_LOAD_CONST) ------------------------------------ */
+
+/* LOAD_CONST v (consumed): a codegen constant of co_consts */
+static int qpc_load_const_value(compiler *c, location loc, JSValue v)
+{
+    if (JS_IsException(v))
+        return ERROR;
+    if (qpc_consts_add(c, v) < 0 ||
+        (!c->u->u_peep_raw && qpc_peep_next(c, OP_push_const, -1, 0) < 0)) {
+        JS_FreeValue(c->ctx, v);
+        return ERROR;
+    }
+    return qpc_emit_const_rec(c, loc, v, 1);
+}
+
 static int qpc_load_none(compiler *c, location loc)
 {
-    return qpc_op(c, loc, OP_undefined);
+    return qpc_load_const_value(c, loc, JS_UNDEFINED);
 }
 
 static int qpc_load_bool(compiler *c, location loc, int b)
 {
-    return qpc_op(c, loc, b ? OP_push_true : OP_push_false);
+    return qpc_load_const_value(c, loc, JS_NewBool(c->ctx, b));
 }
 
 static int qpc_load_small_int(compiler *c, location loc, int32_t v)
 {
-    return qpc_op_u32(c, loc, OP_push_i32, (uint32_t)v);
-}
-
-static int qpc_load_const_value(compiler *c, location loc, JSValue v)
-{
-    int idx;
-    if (JS_IsException(v))
-        return ERROR;
-    switch (JS_VALUE_GET_TAG(v)) {
-    case JS_TAG_UNDEFINED:
-        return qpc_load_none(c, loc);
-    case JS_TAG_BOOL:
-        return qpc_load_bool(c, loc, JS_VALUE_GET_BOOL(v));
-    case JS_TAG_INT:
-        return qpc_load_small_int(c, loc, JS_VALUE_GET_INT(v));
-    default:
-        break;
-    }
-    idx = qpc_add_const(c, v);
-    if (idx < 0)
-        return ERROR;
-    return qpc_op_u32(c, loc, OP_push_const, idx);
+    return qpc_load_const_value(c, loc, JS_NewInt32(c->ctx, v));
 }
 
 static JSValue qpc_const_value(compiler *c, qp_const *k)
@@ -1021,6 +2148,16 @@ static void compiler_unit_free(compiler *c, compiler_unit *u)
     js_free(ctx, u->u_deferred_annotations);
     js_free(ctx, u->u_overrides);
     js_free(ctx, u->u_comp_codes);
+    qpc_ctab_free(ctx, &u->u_consts);
+    qpc_ctab_free(ctx, &u->u_cpool_keys);
+    for (int i = 0; i < u->u_n_late_consts; i++)
+        JS_FreeValue(ctx, u->u_late_consts[i]);
+    js_free(ctx, u->u_late_consts);
+    js_free(ctx, u->u_code_keys);
+    for (int i = 0; i < u->u_npeep; i++)
+        JS_FreeValue(ctx, u->u_peep[i].v);
+    js_free(ctx, u->u_peep);
+    js_free(ctx, u->u_lbl_jumps);
     js_free(ctx, u);
 }
 
@@ -1164,6 +2301,7 @@ static int _PyCompile_EnterScope(compiler *c, JSAtom name, int scope_type,
     u->u_name = JS_ATOM_NULL;
     u->u_qualname = JS_ATOM_NULL;
     u->u_last_loc = NO_LOCATION;
+    u->u_last_loc_idx = -1;
     u->u_stopiter_handler = NO_LABEL;
     u->u_ann_label = NO_LABEL;
     u->u_ann_body_label = NO_LABEL;
@@ -1361,6 +2499,13 @@ static JSFunctionDef *qpc_finish_unit(compiler *c, int add_return)
     QPCodeInfo *ci = u->u_fd->py_code;
     if (add_return >= 0 && _PyCodegen_AddReturnAtEnd(c, add_return) < 0)
         return NULL;
+    if (qpc_peep_next(c, -1, -1, 0) < 0)
+        return NULL;
+    qpc_peep_clear(c);
+    if (qpc_consts_finish(c) < 0)
+        return NULL;
+    c->c_finished_key = u->u_ste->ste_id;
+    c->c_finished_fd = u->u_fd;
     ci->co_flags = compute_code_flags(c);
     ci->argcount = u->u_argcount + u->u_posonlyargcount;
     ci->posonlyargcount = u->u_posonlyargcount;
@@ -1371,6 +2516,10 @@ static JSFunctionDef *qpc_finish_unit(compiler *c, int add_return)
     return u->u_fd;
 }
 
+/* The `return None` at the end: when several flows reach it, its location
+   is that of the fallthrough (or of the first jump) and resolve_labels
+   gives each jump a copy with the jump's location (CPython
+   duplicate_exits_without_lineno / inline_small_or_no_lineno_blocks). */
 static int _PyCodegen_AddReturnAtEnd(compiler *c, int addNone)
 {
     /* Make sure every instruction stream that falls off the end returns None. */
@@ -1386,10 +2535,11 @@ static int codegen_make_closure(compiler *c, location loc, JSFunctionDef *fd, in
 {
     int idx;
     assert(fd->parent == c->u->u_fd);
-    idx = qpc_add_const(c, JS_UNDEFINED);
+    idx = qpc_add_closure_slot(c);
     if (idx < 0)
         return ERROR;
     fd->parent_cpool_idx = idx;
+    RETURN_IF_ERROR(qpc_consts_add_code(c, fd == c->c_finished_fd ? c->c_finished_key : fd, idx));
     RETURN_IF_ERROR(qpc_op_u32(c, loc, OP_fclosure, idx));
     if (flags & QP_FUNC_ATTR_ANNOTATIONS) {
         RETURN_IF_ERROR(qpc_py_u8(c, loc, QP_OP_set_func_attr, QP_FUNC_ATTR_ANNOTATIONS));
@@ -1431,7 +2581,9 @@ static int codegen_enter_scope(compiler *c, JSAtom name, int scope_type,
         u->u_ann_body_label = qpc_new_label(c);
         if (!IS_JUMP_TARGET_LABEL(u->u_ann_label) || !IS_JUMP_TARGET_LABEL(u->u_ann_body_label))
             return ERROR;
-        RETURN_IF_ERROR(qpc_jump(c, NO_LOCATION, OP_goto, u->u_ann_label));
+        location none = NO_LOCATION;
+        none.lineno = QPC_LOC_NONE;     /* (not the RESUME's: threaded away) */
+        RETURN_IF_ERROR(qpc_jump(c, none, OP_goto, u->u_ann_label));
         USE_LABEL(c, u->u_ann_body_label);
     }
     return SUCCESS;
@@ -2124,21 +3276,22 @@ static int codegen_default_arguments(compiler *c, location loc, arguments_ty arg
    (codegen_wrap_in_stopiteration_handler). */
 static int qpc_stopiteration_begin(compiler *c)
 {
+    location none = NO_LOCATION;
     NEW_JUMP_TARGET_LABEL(c, handler);
     c->u->u_stopiter_handler = handler;
-    return qpc_setup(c, NO_LOCATION, handler);
+    none.lineno = QPC_LOC_NONE;     /* (a pseudo instruction: not the RESUME's location) */
+    return qpc_setup(c, none, handler);
 }
 
 static int codegen_wrap_in_stopiteration_handler(compiler *c)
 {
     jump_target_label handler = c->u->u_stopiter_handler;
     assert(IS_JUMP_TARGET_LABEL(handler));
-    RETURN_IF_ERROR(qpc_load_none(c, NO_LOCATION));
-    RETURN_IF_ERROR(qpc_return(c, NO_LOCATION));
+    RETURN_IF_ERROR(_PyCodegen_AddReturnAtEnd(c, 1));
     USE_LABEL(c, handler);
     RETURN_IF_ERROR(qpc_py_u8(c, NO_LOCATION, QP_OP_intrinsic1,
                               QP_INTRINSIC1_STOPITERATION_ERROR));
-    RETURN_IF_ERROR(qpc_py(c, NO_LOCATION, QP_OP_reraise));
+    RETURN_IF_ERROR(qpc_py_u8(c, NO_LOCATION, QP_OP_reraise, 1));
     c->u->u_stopiter_handler = NO_LABEL;
     return SUCCESS;
 }
@@ -2263,6 +3416,7 @@ static int codegen_emit_function_body(compiler *c, asdl_stmt_seq *body)
             if (idx < 0)
                 return ERROR;
             c->u->u_fd->py_code->doc_cpool_idx = idx;
+            RETURN_IF_ERROR(qpc_consts_add(c, c->u->u_fd->cpool[idx]));
         }
     }
 
@@ -2853,9 +4007,10 @@ static int codegen_sync_comprehension_generator(compiler *c, location loc,
     if (IS_JUMP_TARGET_LABEL(start)) {
         RETURN_IF_ERROR(qpc_jump(c, elt_loc, OP_goto, start));
         USE_LABEL(c, anchor);
-        /* END_FOR is not emitted; POP_ITER = two drops */
-        RETURN_IF_ERROR(qpc_op(c, NO_LOCATION, OP_drop));
-        RETURN_IF_ERROR(qpc_op(c, NO_LOCATION, OP_drop));
+        /* END_FOR is not emitted; POP_ITER = two drops, at the location of
+           FOR_ITER (propagate_line_numbers) */
+        RETURN_IF_ERROR(qpc_op(c, LOC(gen->iter), OP_drop));
+        RETURN_IF_ERROR(qpc_op(c, LOC(gen->iter), OP_drop));
     }
     return SUCCESS;
 }
@@ -3117,6 +4272,7 @@ static int codegen_comprehension(compiler *c, expr_ty e, int type,
         compiler_unit *u = c->u;
         for (int i = 0; i < u->u_n_comp_codes; i++) {
             if (u->u_comp_codes[i].key == (void *)e) {
+                RETURN_IF_ERROR(qpc_consts_add_code(c, (void *)e, u->u_comp_codes[i].idx));
                 RETURN_IF_ERROR(qpc_op_u32(c, loc, OP_fclosure, u->u_comp_codes[i].idx));
                 goto make_call;
             }
@@ -3200,7 +4356,10 @@ static int codegen_comprehension(compiler *c, expr_ty e, int type,
 make_call:
     VISIT(c, expr, outermost->iter);
     if (type == COMP_GENEXP) {
-        /* the genexp's GET_ITER / GET_AITER runs at creation time */
+        /* the genexp's GET_ITER / GET_AITER runs at creation time; for
+           constant folding the next instruction is CPython's CALL */
+        RETURN_IF_ERROR(qpc_peep_next(c, OP_py, QP_OP_call_method, 0));
+        qpc_peep_clear(c);
         if (outermost->is_async) {
             RETURN_IF_ERROR(qpc_py(c, LOC(outermost->iter), QP_OP_get_aiter));
         }
@@ -4179,6 +5338,32 @@ codegen_compare_jump(compiler *c, location loc, cmpop_ty op, int jump_if_true,
     return qpc_jump(c, loc, jump_if_true ? OP_if_true : OP_if_false, target);
 }
 
+/* bool(value) of a constant of the AST, -1 if not known without running
+   code */
+static int qpc_const_truth(qp_const *v)
+{
+    switch (v->kind) {
+    case QP_CONST_NONE:
+    case QP_CONST_FALSE:
+        return 0;
+    case QP_CONST_TRUE:
+    case QP_CONST_ELLIPSIS:
+        return 1;
+    case QP_CONST_INT:
+        if (JS_VALUE_GET_TAG(v->v) == JS_TAG_INT)
+            return JS_VALUE_GET_INT(v->v) != 0;
+        return -1;
+    case QP_CONST_FLOAT:
+    case QP_CONST_COMPLEX:
+        return JS_VALUE_GET_FLOAT64(v->v) != 0.0 || isnan(JS_VALUE_GET_FLOAT64(v->v));
+    case QP_CONST_STR:
+    case QP_CONST_BYTES:
+        return JS_VALUE_GET_STRING(v->v)->len != 0;
+    default:
+        return -1;
+    }
+}
+
 static int
 codegen_jump_if(compiler *c, location loc,
                 expr_ty e, jump_target_label next, int cond)
@@ -4261,6 +5446,17 @@ codegen_jump_if(compiler *c, location loc,
     default:
         /* fallback to general implementation */
         break;
+    }
+
+    /* constant test (CPython's flowgraph folds LOAD_CONST + POP_JUMP_IF_*
+       into a JUMP or a NOP keeping the line; the dead branch goes) */
+    if (e->kind == Constant_kind) {
+        int truth = qpc_const_truth(e->v.Constant.value);
+        if (truth >= 0) {
+            if (truth == !!cond)
+                return qpc_jump(c, LOC(e), OP_goto, next);
+            return qpc_op(c, LOC(e), OP_nop);
+        }
     }
 
     /* general implementation */
@@ -4838,6 +6034,18 @@ update_start_location_to_match_attr(compiler *c, location loc,
     return loc;
 }
 
+/* The NOP after LOAD_SUPER_ATTR / LOAD_SUPER_METHOD with the location of
+   the attribute name: only emitted when it starts another line (else
+   CPython's remove_redundant_nops drops it) */
+static int qpc_super_nop(compiler *c, location loc, expr_ty attr)
+{
+    location nloc = update_start_location_to_match_attr(c, loc, attr);
+
+    if (nloc.lineno == loc.lineno)
+        return SUCCESS;
+    return qpc_op(c, nloc, OP_nop);
+}
+
 /* Stack: [func] on entry.  Optimized path (func is the real builtin):
    [list|set]? [gen, NULL] loop with for_iter (list_append/set_add 3 reach
    the container below [gen, idx]); the exhausted branch of for_iter lands
@@ -5012,12 +6220,12 @@ maybe_optimize_method_call(compiler *c, expr_ty e)
     RETURN_IF_ERROR(ret);
     if (ret) {
         RETURN_IF_ERROR(load_args_for_super(c, meth->v.Attribute.value));
-        /* LOAD_SUPER_METHOD / LOAD_ZERO_SUPER_METHOD; the trailing NOP
-           only carries a location: not emitted */
+        /* LOAD_SUPER_METHOD / LOAD_ZERO_SUPER_METHOD */
         int flags = asdl_seq_LEN(meth->v.Attribute.value->v.Call.args) ?
             QP_SUPER_TWO_ARGS : 0;
         RETURN_IF_ERROR(qpc_addop_name(c, loc, QP_OP_load_super_method,
                                        meth->v.Attribute.attr, flags));
+        RETURN_IF_ERROR(qpc_super_nop(c, loc, meth));
     } else {
         VISIT(c, expr, meth->v.Attribute.value);
         loc = update_start_location_to_match_attr(c, loc, meth);
@@ -5394,6 +6602,231 @@ codegen_visit_keyword(compiler *c, keyword_ty k)
     return SUCCESS;
 }
 
+/* ---- `%` formatting (ast_preprocess.c fold_binop / optimize_format) ------
+ * `'...' % (a, b)` with only %s / %r / %a units (flags, width <= 2 digits,
+ * precision) is compiled as the f-string CPython's AST preprocessing turns
+ * it into: a JoinedStr of the literal parts and FormattedValue(arg,
+ * conversion, spec) nodes, built here as temporary nodes. */
+
+typedef struct qpc_fmt_nodes {
+    struct _expr *nodes;        /* JoinedStr, then the parts */
+    qp_const *consts;
+    asdl_expr_seq *seq;
+    int n, nconsts;
+} qpc_fmt_nodes;
+
+static void qpc_fmt_nodes_free(compiler *c, qpc_fmt_nodes *f)
+{
+    for (int i = 0; i < f->nconsts; i++)
+        JS_FreeValue(c->ctx, f->consts[i].v);
+    js_free(c->ctx, f->nodes);
+    js_free(c->ctx, f->consts);
+    js_free(c->ctx, f->seq);
+}
+
+/* New Constant node of str s (consumed), NULL on error */
+static expr_ty qpc_fmt_const(compiler *c, qpc_fmt_nodes *f, JSValue s)
+{
+    expr_ty e;
+    if (JS_IsException(s))
+        return NULL;
+    f->consts[f->nconsts].kind = QP_CONST_STR;
+    f->consts[f->nconsts].v = s;
+    e = &f->nodes[f->n++];
+    e->kind = Constant_kind;
+    e->v.Constant.value = &f->consts[f->nconsts++];
+    e->v.Constant.kind = JS_ATOM_NULL;
+    e->lineno = e->end_lineno = e->col_offset = e->end_col_offset = -1;
+    return e;
+}
+
+#define QPC_FMT_MAXDIGITS 3
+
+/* parse_literal: literal text from *ppos to the next lone '%' ('%%' ->
+   '%'); NULL (no error) when empty */
+static int qpc_fmt_literal(compiler *c, qpc_fmt_nodes *f, JSString *p,
+                           uint32_t *ppos, expr_ty *pe)
+{
+    uint32_t pos = *ppos, start = pos;
+    BOOL has_percents = FALSE;
+    JSValue s;
+    *pe = NULL;
+    while (pos < p->len) {
+        if (string_get(p, pos) != '%') {
+            pos++;
+        }
+        else if (pos + 1 < p->len && string_get(p, pos + 1) == '%') {
+            has_percents = TRUE;
+            pos += 2;
+        }
+        else {
+            break;
+        }
+    }
+    *ppos = pos;
+    if (pos == start)
+        return SUCCESS;
+    if (has_percents) {
+        StringBuffer sb;
+        if (string_buffer_init(c->ctx, &sb, pos - start))
+            return ERROR;
+        for (uint32_t i = start; i < pos; i++) {
+            uint32_t ch = string_get(p, i);
+            if (ch == '%' && i + 1 < pos && string_get(p, i + 1) == '%')
+                i++;
+            if (string_buffer_putc16(&sb, ch)) {
+                string_buffer_free(&sb);
+                return ERROR;
+            }
+        }
+        s = string_buffer_end(&sb);
+    }
+    else {
+        s = js_sub_string(c->ctx, p, start, pos);
+    }
+    *pe = qpc_fmt_const(c, f, s);
+    return *pe ? SUCCESS : ERROR;
+}
+
+/* simple_format_arg_parse + parse_format after a '%': the FormattedValue
+   node of arg; NULL (no error) for an unsupported unit */
+static int qpc_fmt_unit(compiler *c, qpc_fmt_nodes *f, JSString *p, uint32_t *ppos,
+                        expr_ty arg, expr_ty *pe)
+{
+    uint32_t pos = *ppos;
+    int ch, ljust = 0, width = -1, prec = -1, digits;
+    char buf[1 + QPC_FMT_MAXDIGITS + 1 + QPC_FMT_MAXDIGITS + 1], *q = buf;
+    expr_ty e, spec = NULL;
+
+    *pe = NULL;
+#define QPC_NEXTC do { if (pos >= p->len) return SUCCESS; ch = string_get(p, pos); pos++; } while (0)
+    for (;;) {
+        QPC_NEXTC;
+        if (ch == '-')
+            ljust = 1;
+        else if (ch != '+' && ch != ' ' && ch != '#' && ch != '0')
+            break;
+    }
+    if ('0' <= ch && ch <= '9') {
+        width = 0;
+        digits = 0;
+        while ('0' <= ch && ch <= '9') {
+            width = width * 10 + (ch - '0');
+            QPC_NEXTC;
+            if (++digits >= QPC_FMT_MAXDIGITS)
+                return SUCCESS;
+        }
+    }
+    if (ch == '.') {
+        QPC_NEXTC;
+        prec = 0;
+        if ('0' <= ch && ch <= '9') {
+            digits = 0;
+            while ('0' <= ch && ch <= '9') {
+                prec = prec * 10 + (ch - '0');
+                QPC_NEXTC;
+                if (++digits >= QPC_FMT_MAXDIGITS)
+                    return SUCCESS;
+            }
+        }
+    }
+#undef QPC_NEXTC
+    *ppos = pos;
+    if (ch != 's' && ch != 'r' && ch != 'a')
+        return SUCCESS;
+    if (!ljust && width > 0)
+        *q++ = '>';
+    if (width >= 0)
+        q += snprintf(q, QPC_FMT_MAXDIGITS + 1, "%d", width);
+    if (prec >= 0)
+        q += snprintf(q, QPC_FMT_MAXDIGITS + 2, ".%d", prec);
+    if (q != buf) {
+        spec = qpc_fmt_const(c, f, JS_NewStringLen(c->ctx, buf, q - buf));
+        if (!spec)
+            return ERROR;
+    }
+    e = &f->nodes[f->n++];
+    e->kind = FormattedValue_kind;
+    e->v.FormattedValue.value = arg;
+    e->v.FormattedValue.conversion = ch;
+    e->v.FormattedValue.format_spec = spec;
+    e->lineno = arg->lineno;
+    e->col_offset = arg->col_offset;
+    e->end_lineno = arg->end_lineno;
+    e->end_col_offset = arg->end_col_offset;
+    *pe = e;
+    return SUCCESS;
+}
+
+/* optimize_format: 1 if e was compiled as an f-string, 0 if it does not
+   qualify, ERROR */
+static int codegen_percent_format(compiler *c, expr_ty e)
+{
+    expr_ty lhs = e->v.BinOp.left, rhs = e->v.BinOp.right, part;
+    asdl_expr_seq *elts;
+    Py_ssize_t i, nelts, cnt = 0;
+    qpc_fmt_nodes f;
+    JSString *p;
+    uint32_t pos = 0;
+    int ret = ERROR;
+
+    if (e->v.BinOp.op != Mod || lhs->kind != Constant_kind ||
+        lhs->v.Constant.value->kind != QP_CONST_STR ||
+        JS_VALUE_GET_TAG(lhs->v.Constant.value->v) != JS_TAG_STRING ||
+        rhs->kind != Tuple_kind)
+        return 0;
+    elts = rhs->v.Tuple.elts;
+    nelts = asdl_seq_LEN(elts);
+    for (i = 0; i < nelts; i++) {
+        if (asdl_seq_GET(elts, i)->kind == Starred_kind)
+            return 0;
+    }
+    p = JS_VALUE_GET_STRING(lhs->v.Constant.value->v);
+    memset(&f, 0, sizeof(f));
+    /* JoinedStr + at most 2 * nelts + 1 parts + nelts format specs */
+    f.nodes = js_mallocz(c->ctx, sizeof(f.nodes[0]) * (3 * nelts + 2));
+    f.consts = js_mallocz(c->ctx, sizeof(f.consts[0]) * (2 * nelts + 1));
+    f.seq = js_mallocz(c->ctx, sizeof(*f.seq) + sizeof(expr_ty) * (2 * nelts + 1));
+    if (!f.nodes || !f.consts || !f.seq)
+        goto done;
+    f.n = 1;
+    f.seq->elements = (void **)f.seq->typed_elements;
+    for (;;) {
+        if (qpc_fmt_literal(c, &f, p, &pos, &part) < 0)
+            goto done;
+        if (part)
+            f.seq->typed_elements[f.seq->size++] = part;
+        if (pos >= p->len)
+            break;
+        if (cnt >= nelts) {
+            /* More format units than items. */
+            ret = 0;
+            goto done;
+        }
+        pos++;
+        if (qpc_fmt_unit(c, &f, p, &pos, asdl_seq_GET(elts, cnt), &part) < 0)
+            goto done;
+        cnt++;
+        if (!part) {
+            ret = 0;
+            goto done;
+        }
+        f.seq->typed_elements[f.seq->size++] = part;
+    }
+    if (cnt < nelts) {
+        /* More items than format units. */
+        ret = 0;
+        goto done;
+    }
+    f.nodes[0] = *e;
+    f.nodes[0].kind = JoinedStr_kind;
+    f.nodes[0].v.JoinedStr.values = f.seq;
+    ret = codegen_visit_expr(c, &f.nodes[0]) < 0 ? ERROR : 1;
+ done:
+    qpc_fmt_nodes_free(c, &f);
+    return ret;
+}
+
 /* ---- expressions ------------------------------------------------------ */
 
 static int
@@ -5413,11 +6846,17 @@ codegen_visit_expr(compiler *c, expr_ty e)
         break;
     case BoolOp_kind:
         return codegen_boolop(c, e);
-    case BinOp_kind:
+    case BinOp_kind: {
+        int r = codegen_percent_format(c, e);
+        RETURN_IF_ERROR(r);
+        if (r) {
+            break;
+        }
         VISIT(c, expr, e->v.BinOp.left);
         VISIT(c, expr, e->v.BinOp.right);
         ADDOP_BINARY(c, loc, e->v.BinOp.op);
         break;
+    }
     case UnaryOp_kind:
         VISIT(c, expr, e->v.UnaryOp.operand);
         if (e->v.UnaryOp.op == UAdd) {
@@ -5504,12 +6943,12 @@ codegen_visit_expr(compiler *c, expr_ty e)
             RETURN_IF_ERROR(ret);
             if (ret) {
                 RETURN_IF_ERROR(load_args_for_super(c, e->v.Attribute.value));
-                /* LOAD_SUPER_ATTR / LOAD_ZERO_SUPER_ATTR; the trailing NOP
-                   only carries a location: not emitted */
+                /* LOAD_SUPER_ATTR / LOAD_ZERO_SUPER_ATTR */
                 int flags = asdl_seq_LEN(e->v.Attribute.value->v.Call.args) ?
                     QP_SUPER_TWO_ARGS : 0;
-                return qpc_addop_name(c, loc, QP_OP_load_super_attr,
-                                      e->v.Attribute.attr, flags);
+                RETURN_IF_ERROR(qpc_addop_name(c, loc, QP_OP_load_super_attr,
+                                               e->v.Attribute.attr, flags));
+                return qpc_super_nop(c, loc, e);
             }
         }
         RETURN_IF_ERROR(_PyCompile_MaybeAddStaticAttributeToClass(c, e));
@@ -5642,8 +7081,29 @@ codegen_slice(compiler *c, expr_ty s)
     int n = 2;
     assert(s->kind == Slice_kind);
 
-    /* CPython folds constant slices (is_constant_slice) into a slice
-       constant; slices are never constants here: built at runtime. */
+    if (is_constant_slice(s)) {
+        JSValue start = QP_NULL, stop = QP_NULL, step = QP_NULL, slice;
+        if (s->v.Slice.lower) {
+            start = qpc_const_value(c, s->v.Slice.lower->v.Constant.value);
+        }
+        if (s->v.Slice.upper) {
+            stop = qpc_const_value(c, s->v.Slice.upper->v.Constant.value);
+        }
+        if (s->v.Slice.step) {
+            step = qpc_const_value(c, s->v.Slice.step->v.Constant.value);
+        }
+        if (JS_IsException(start) || JS_IsException(stop) || JS_IsException(step)) {
+            slice = JS_EXCEPTION;
+        }
+        else {
+            slice = qp_slice_new(c->ctx, start, stop, step);
+        }
+        JS_FreeValue(c->ctx, start);
+        JS_FreeValue(c->ctx, stop);
+        JS_FreeValue(c->ctx, step);
+        return qpc_load_const_value(c, LOC(s), slice);
+    }
+
     RETURN_IF_ERROR(codegen_slice_two_parts(c, s));
 
     if (s->v.Slice.step) {
@@ -5749,6 +7209,8 @@ static int
 codegen_add_yield_from(compiler *c, location loc, int await)
 {
     (void)await;
+    /* the None sent first (CPython's caller loads it with LOAD_CONST) */
+    RETURN_IF_ERROR(qpc_consts_add(c, JS_UNDEFINED));
     NEW_JUMP_TARGET_LABEL(c, send);
     NEW_JUMP_TARGET_LABEL(c, fail);
     NEW_JUMP_TARGET_LABEL(c, exit);
@@ -5784,7 +7246,7 @@ codegen_pop_except_and_reraise(compiler *c, location loc)
      */
     RETURN_IF_ERROR(qpc_copy(c, loc, 3));
     RETURN_IF_ERROR(qpc_py(c, loc, QP_OP_pop_except));
-    return qpc_py(c, loc, QP_OP_reraise);
+    return qpc_py_u8(c, loc, QP_OP_reraise, 1);
 }
 
 /* Unwind a frame block.  If preserve_tos is true, the TOS before
@@ -6032,9 +7494,10 @@ codegen_for(compiler *c, stmt_ty s)
     RETURN_IF_ERROR(qpc_jump(c, NO_LOCATION, OP_goto, start));
 
     USE_LABEL(c, cleanup);
-    /* END_FOR is not emitted; POP_ITER */
-    RETURN_IF_ERROR(qpc_op(c, NO_LOCATION, OP_drop));
-    RETURN_IF_ERROR(qpc_op(c, NO_LOCATION, OP_drop));
+    /* END_FOR is not emitted; POP_ITER (the location of FOR_ITER, its only
+       predecessor: propagate_line_numbers) */
+    RETURN_IF_ERROR(qpc_op(c, loc, OP_drop));
+    RETURN_IF_ERROR(qpc_op(c, loc, OP_drop));
 
     _PyCompile_PopFBlock(c, COMPILE_FBLOCK_FOR_LOOP, start);
 
@@ -6144,13 +7607,15 @@ codegen_return(compiler *c, stmt_ty s)
     if (preserve_tos) {
         VISIT(c, expr, s->v.Return.value);
     } else {
-        /* (CPython emits a NOP with the value's line number) */
+        /* Emit instruction with line number for return value */
         if (s->v.Return.value != NULL) {
             loc = LOC(s->v.Return.value);
+            RETURN_IF_ERROR(qpc_op(c, loc, OP_nop));
         }
     }
     if (s->v.Return.value == NULL || s->v.Return.value->lineno != s->lineno) {
         loc = LOC(s);
+        RETURN_IF_ERROR(qpc_op(c, loc, OP_nop));
     }
 
     RETURN_IF_ERROR(codegen_unwind_fblock_stack(c, &loc, preserve_tos, NULL));
@@ -6168,7 +7633,8 @@ codegen_break(compiler *c, location loc)
 {
     fblockinfo *loop = NULL;
     location origin_loc = loc;
-    /* (CPython emits a NOP with the line number) */
+    /* Emit instruction with line number */
+    RETURN_IF_ERROR(qpc_op(c, loc, OP_nop));
     RETURN_IF_ERROR(codegen_unwind_fblock_stack(c, &loc, 0, &loop));
     if (loop == NULL) {
         return qpc_error(c, origin_loc, "'break' outside loop");
@@ -6182,7 +7648,8 @@ codegen_continue(compiler *c, location loc)
 {
     fblockinfo *loop = NULL;
     location origin_loc = loc;
-    /* (CPython emits a NOP with the line number) */
+    /* Emit instruction with line number */
+    RETURN_IF_ERROR(qpc_op(c, loc, OP_nop));
     RETURN_IF_ERROR(codegen_unwind_fblock_stack(c, &loc, 0, &loop));
     if (loop == NULL) {
         return qpc_error(c, origin_loc, "'continue' not properly in loop");
@@ -6247,7 +7714,7 @@ codegen_try_finally(compiler *c, stmt_ty s)
     _PyCompile_PopFBlock(c, COMPILE_FBLOCK_FINALLY_END, end);
 
     loc = NO_LOCATION;
-    RETURN_IF_ERROR(qpc_py(c, loc, QP_OP_reraise));
+    RETURN_IF_ERROR(qpc_py_u8(c, loc, QP_OP_reraise, 0));
 
     USE_LABEL(c, cleanup);
     POP_EXCEPT_AND_RERAISE(c, loc);
@@ -6298,7 +7765,7 @@ codegen_try_star_finally(compiler *c, stmt_ty s)
 
     _PyCompile_PopFBlock(c, COMPILE_FBLOCK_FINALLY_END, end);
     loc = NO_LOCATION;
-    RETURN_IF_ERROR(qpc_py(c, loc, QP_OP_reraise));
+    RETURN_IF_ERROR(qpc_py_u8(c, loc, QP_OP_reraise, 0));
 
     USE_LABEL(c, cleanup);
     POP_EXCEPT_AND_RERAISE(c, loc);
@@ -6428,7 +7895,7 @@ codegen_try_except(compiler *c, stmt_ty s)
             RETURN_IF_ERROR(
                 codegen_nameop(c, NO_LOCATION, handler->v.ExceptHandler.name, Del));
 
-            RETURN_IF_ERROR(qpc_py(c, NO_LOCATION, QP_OP_reraise));
+            RETURN_IF_ERROR(qpc_py_u8(c, NO_LOCATION, QP_OP_reraise, 1));
         }
         else {
             NEW_JUMP_TARGET_LABEL(c, cleanup_body);
@@ -6452,7 +7919,7 @@ codegen_try_except(compiler *c, stmt_ty s)
     }
     /* artificial */
     _PyCompile_PopFBlock(c, COMPILE_FBLOCK_EXCEPTION_HANDLER, NO_LABEL);
-    RETURN_IF_ERROR(qpc_py(c, NO_LOCATION, QP_OP_reraise));
+    RETURN_IF_ERROR(qpc_py_u8(c, NO_LOCATION, QP_OP_reraise, 0));
 
     USE_LABEL(c, cleanup);
     POP_EXCEPT_AND_RERAISE(c, NO_LOCATION);
@@ -6673,7 +8140,7 @@ codegen_try_star_except(compiler *c, stmt_ty s)
     RETURN_IF_ERROR(qpc_op(c, NO_LOCATION, OP_nip));
     RETURN_IF_ERROR(qpc_swap(c, NO_LOCATION, 2));
     RETURN_IF_ERROR(qpc_py(c, NO_LOCATION, QP_OP_pop_except));
-    RETURN_IF_ERROR(qpc_py(c, NO_LOCATION, QP_OP_reraise));
+    RETURN_IF_ERROR(qpc_py_u8(c, NO_LOCATION, QP_OP_reraise, 0));
 
     USE_LABEL(c, cleanup);
     POP_EXCEPT_AND_RERAISE(c, NO_LOCATION);
@@ -6939,8 +8406,9 @@ codegen_stmt_expr(compiler *c, location loc, expr_ty value)
     }
 
     if (value->kind == Constant_kind) {
-        /* ignore constant statement (CPython's NOP is not emitted) */
-        return SUCCESS;
+        /* ignore constant statement: CPython's NOP keeps its line (LINE
+           events, like `pass`) */
+        return qpc_op(c, loc, OP_nop);
     }
 
     VISIT(c, expr, value);
@@ -7087,7 +8555,7 @@ static int
 codegen_with_except_finish(compiler *c, jump_target_label cleanup) {
     NEW_JUMP_TARGET_LABEL(c, suppress);
     RETURN_IF_ERROR(qpc_py_jump(c, NO_LOCATION, QP_OP_jump_if_true, suppress));
-    RETURN_IF_ERROR(qpc_py(c, NO_LOCATION, QP_OP_reraise));
+    RETURN_IF_ERROR(qpc_py_u8(c, NO_LOCATION, QP_OP_reraise, 2));
 
     USE_LABEL(c, suppress);
     /* the four copies of with_except_start's inputs */
@@ -7989,9 +9457,79 @@ qpc_pattern_error_duplicate_key(compiler *c, location loc, qp_const *k)
     return ERROR;
 }
 
-/* seen: CPython set of Constant keys, here an array of *n_seen constants. */
+/* ast_preprocess.c fold_const_match_patterns: the constant a MatchValue
+   value or a MatchMapping key folds to (-c, +c of a constant; x + c,
+   x - c of a constant or folded x and a constant c).  1 with *pv (new
+   reference), 0 if it does not fold, ERROR. */
 static int
-codegen_pattern_mapping_key(compiler *c, qp_const **seen, Py_ssize_t *n_seen,
+qpc_match_fold(compiler *c, expr_ty e, JSValue *pv)
+{
+    JSContext *ctx = c->ctx;
+    JSValue a, b, r;
+    int k;
+    switch (e->kind) {
+    case Constant_kind:
+        *pv = qpc_const_value(c, e->v.Constant.value);
+        return JS_IsException(*pv) ? ERROR : 1;
+    case UnaryOp_kind:
+        if ((e->v.UnaryOp.op != USub && e->v.UnaryOp.op != UAdd) ||
+            e->v.UnaryOp.operand->kind != Constant_kind) {
+            return 0;
+        }
+        a = qpc_const_value(c, e->v.UnaryOp.operand->v.Constant.value);
+        if (JS_IsException(a)) {
+            return ERROR;
+        }
+        r = qp_unop(ctx, a, e->v.UnaryOp.op == USub ? QP_UNOP_NEG : QP_UNOP_POS);
+        JS_FreeValue(ctx, a);
+        break;
+    case BinOp_kind:
+        if ((e->v.BinOp.op != Add && e->v.BinOp.op != Sub) ||
+            e->v.BinOp.right->kind != Constant_kind) {
+            return 0;
+        }
+        k = qpc_match_fold(c, e->v.BinOp.left, &a);
+        if (k <= 0) {
+            return k;
+        }
+        b = qpc_const_value(c, e->v.BinOp.right->v.Constant.value);
+        if (JS_IsException(b)) {
+            JS_FreeValue(ctx, a);
+            return ERROR;
+        }
+        r = qp_binop(ctx, a, b, e->v.BinOp.op == Add ? QP_NB_ADD : QP_NB_SUBTRACT);
+        JS_FreeValue(ctx, a);
+        JS_FreeValue(ctx, b);
+        break;
+    default:
+        return 0;
+    }
+    if (JS_IsException(r)) {
+        qpc_clear_exception(ctx);
+        return 0;
+    }
+    *pv = r;
+    return 1;
+}
+
+/* VISIT of a MatchValue value / MatchMapping key, folded first */
+static int
+qpc_visit_match_value(compiler *c, expr_ty e)
+{
+    JSValue v;
+    int r = e->kind == Constant_kind ? 0 : qpc_match_fold(c, e, &v);
+    RETURN_IF_ERROR(r);
+    if (r) {
+        return qpc_load_const_value(c, LOC(e), v);
+    }
+    VISIT(c, expr, e);
+    return SUCCESS;
+}
+
+/* seen: CPython set of Constant keys (folded ones included), here an array
+   of *n_seen constants (values owned). */
+static int
+codegen_pattern_mapping_key(compiler *c, qp_const *seen, Py_ssize_t *n_seen,
                             pattern_ty p, Py_ssize_t i)
 {
     asdl_expr_seq *keys = p->v.MatchMapping.keys;
@@ -8004,16 +9542,33 @@ codegen_pattern_mapping_key(compiler *c, qp_const **seen, Py_ssize_t *n_seen,
         return qpc_error(c, loc, "%s", e);
     }
 
-    if (key->kind == Constant_kind) {
+    qp_const folded;
+    int r = key->kind == Constant_kind ? 0 : qpc_match_fold(c, key, &folded.v);
+    RETURN_IF_ERROR(r);
+    if (key->kind == Constant_kind || r) {
         qp_const *k = key->v.Constant.value;
+        if (r) {
+            folded.kind = QP_CONST_OBJECT;
+            k = &folded;
+        }
         for (Py_ssize_t j = 0; j < *n_seen; j++) {
-            int in_seen = qpc_pattern_const_equal(c, seen[j], k);
-            RETURN_IF_ERROR(in_seen);
-            if (in_seen) {
+            int in_seen = qpc_pattern_const_equal(c, &seen[j], k);
+            if (in_seen != 0) {
+                if (r) {
+                    JS_FreeValue(c->ctx, folded.v);
+                }
+                RETURN_IF_ERROR(in_seen);
                 return qpc_pattern_error_duplicate_key(c, LOC(p), k);
             }
         }
-        seen[(*n_seen)++] = k;
+        seen[*n_seen] = *k;
+        if (!r) {
+            seen[*n_seen].v = JS_DupValue(c->ctx, k->v);
+        }
+        (*n_seen)++;
+        if (r) {
+            return qpc_load_const_value(c, LOC(key), JS_DupValue(c->ctx, folded.v));
+        }
     }
     else if (!MATCH_VALUE_EXPR(key)) {
         const char *e = "mapping pattern keys may only match literals and attribute lookups";
@@ -8067,18 +9622,20 @@ codegen_pattern_mapping(compiler *c, pattern_ty p,
     // Maintaining a set of Constant_kind kind keys allows us to raise a
     // SyntaxError in the case of duplicates.
     if (size) {
-        qp_const **seen = js_malloc(c->ctx, sizeof(qp_const *) * size);
+        qp_const *seen = js_malloc(c->ctx, sizeof(qp_const) * size);
         Py_ssize_t n_seen = 0;
+        int r = SUCCESS;
         if (seen == NULL) {
             return ERROR;
         }
-        for (Py_ssize_t i = 0; i < size; i++) {
-            if (codegen_pattern_mapping_key(c, seen, &n_seen, p, i) < 0) {
-                js_free(c->ctx, seen);
-                return ERROR;
-            }
+        for (Py_ssize_t i = 0; i < size && r == SUCCESS; i++) {
+            r = codegen_pattern_mapping_key(c, seen, &n_seen, p, i);
+        }
+        for (Py_ssize_t i = 0; i < n_seen; i++) {
+            JS_FreeValue(c->ctx, seen[i].v);
         }
         js_free(c->ctx, seen);
+        RETURN_IF_ERROR(r);
     }
 
     // all keys have been checked; there are no duplicates
@@ -8344,7 +9901,7 @@ codegen_pattern_value(compiler *c, pattern_ty p, pattern_context *pc)
         const char *e = "patterns may only match literals and attribute lookups";
         return qpc_error(c, LOC(p), "%s", e);
     }
-    VISIT(c, expr, value);
+    RETURN_IF_ERROR(qpc_visit_match_value(c, value));
     // COMPARE_OP Eq + TO_BOOL fused into the to-bool flag
     RETURN_IF_ERROR(qpc_py_u8(c, LOC(p), QP_OP_compare, QP_CMP_EQ | QP_CMP_TO_BOOL));
     RETURN_IF_ERROR(jump_to_fail_pop(c, LOC(p), pc, OP_if_false));
@@ -8429,8 +9986,9 @@ codegen_match_inner(compiler *c, stmt_ty s, pattern_context *pc)
         }
         // Success! Pop the subject off, we're done with it:
         if (i != cases - has_default - 1) {
-            /* Use the next location to give better locations for branch events */
-            RETURN_IF_ERROR(qpc_op(c, NEXT_LOCATION, OP_drop));
+            /* Use the next location to give better locations for branch events
+               (NEXT_LOCATION: the first statement of the body) */
+            RETURN_IF_ERROR(qpc_op(c, LOC((stmt_ty)asdl_seq_GET(m->body, 0)), OP_drop));
         }
         VISIT_SEQ(c, stmt, m->body);
         RETURN_IF_ERROR(qpc_jump(c, NO_LOCATION, OP_goto, end));
@@ -8639,7 +10197,7 @@ static JSValue qp_compile_source(JSContext *ctx, const char *src, size_t len,
                      "compile() mode 'func_type' requires flag PyCF_ONLY_AST");
         goto done;
     }
-    if (memchr(src, '\0', len) != NULL) {
+    if (!(flags & QP_PF_SOURCE_FILE) && memchr(src, '\0', len) != NULL) {
         qp_error_set(e, QP_ERR_SYNTAX, 0, 0, 0, 0,
                      "source code string cannot contain null bytes");
         goto done;

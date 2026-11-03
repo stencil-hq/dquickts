@@ -42,6 +42,11 @@
 #define QP_PF_TYPE_COMMENTS            0x1000  /* PyCF_TYPE_COMMENTS */
 #define QP_PF_TOP_LEVEL_AWAIT          0x2000  /* PyCF_ALLOW_TOP_LEVEL_AWAIT */
 #define QP_PF_ALLOW_INCOMPLETE_INPUT   0x4000  /* PyCF_ALLOW_INCOMPLETE_INPUT */
+/* Private (not a PyCF_* value): src is the contents of a source file run
+   by the interpreter (_PyParser_ASTFromFile): a null byte is the
+   tokenizer's SyntaxError "source code cannot contain null bytes" at its
+   line, not compile()'s "source code string ..." up front. */
+#define QP_PF_SOURCE_FILE          0x20000000
 #define QP_PF_BARRY_AS_BDFL        0x400000    /* CO_FUTURE_BARRY_AS_BDFL */
 
 /* Start rules (mode argument of qp_parse_string). */
@@ -428,7 +433,7 @@ static __maybe_unused Parser *_PyPegen_Parser_New(struct tok_state *, int, int, 
 static __maybe_unused void _PyPegen_Parser_Free(Parser *);
 static __maybe_unused void *_PyPegen_run_parser(Parser *);
 static __maybe_unused mod_ty _PyPegen_run_parser_from_string(const char *, int, const char *,
-                                                             JSValueConst, int, PyArena *);
+                                                             JSValueConst, int, PyArena *, int);
 static __maybe_unused asdl_stmt_seq *_PyPegen_interactive_exit(Parser *);
 
 // Generated function in parse.c - function definition in python.gram

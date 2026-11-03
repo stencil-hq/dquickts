@@ -232,6 +232,11 @@ typedef struct QPCapiKindOps {
     /* release the C references/buffers owned by the mirror fields (runs
        without a context: only Py_DECREF/qp_sys_free/js_free_rt) */
     void (*clear)(JSRuntime *rt, PyObject *op);
+    /* the cycle collector's clear (default: clear): break the cycles but
+       keep what the tp_clear of the other garbage still reads, as
+       CPython's type_clear keeps tp_base (PyObject_GetTypeData of a
+       metaclass instance); clear releases the rest at dealloc */
+    void (*gc_clear)(JSRuntime *rt, PyObject *op);
 } QPCapiKindOps;
 
 /* Borrowed-reference pins (unit A).  An owner mirror keeps one counted
@@ -314,6 +319,10 @@ static void qp_capi_free_cycle_node(JSRuntime *rt, JSGCObjectHeader *gp);
 /* free_object() before the class finalizer when p->py_has_mirror: weak
    mirror -> released (tp_dealloc for natives); live mirror -> ORPHAN. */
 static void qp_capi_object_freed(JSRuntime *rt, JSObject *p);
+/* __JS_FreeValueRT of an object with py_has_mirror whose last JS reference
+   is gone: TRUE when a bare Py_INCREF revived its weak mirror, which then
+   owns J again (J survives). */
+static BOOL qp_capi_object_revived(JSRuntime *rt, JSObject *p);
 /* JS_FreeContext of the C-API context (before QPState is freed): drops the
    JS references of every live node and unlinks the nodes (C-side memory
    still referenced by extension globals is leaked), resets the
@@ -479,7 +488,10 @@ static int qp_capi_init_types(JSContext *ctx);
     X(PyDictRevIterKey_Type, dict_reversekeyiterator)                        \
     X(PyDictRevIterValue_Type, dict_reversevalueiterator)                    \
     X(PyDictRevIterItem_Type, dict_reverseitemiterator)                      \
-    X(PyDictProxy_Type, mappingproxy) X(PySet_Type, set)                     \
+    X(PyDictProxy_Type, mappingproxy) X(PyODict_Type, OrderedDict)           \
+    X(PyODictKeys_Type, odict_keys) X(PyODictValues_Type, odict_values)      \
+    X(PyODictItems_Type, odict_items) X(PyODictIter_Type, odict_iterator)    \
+    X(PySet_Type, set)                                                       \
     X(PyFrozenSet_Type, frozenset) X(PySetIter_Type, set_iterator)           \
     X(PyBytes_Type, bytes) X(PyByteArray_Type, bytearray)                    \
     X(PyMemoryView_Type, memoryview) X(PyTraceBack_Type, traceback)          \
@@ -487,23 +499,22 @@ static int qp_capi_init_types(JSContext *ctx);
     X(PyAsyncGen_Type, async_generator) X(PyEnum_Type, enumerate)            \
     X(PyReversed_Type, reversed) X(PyFilter_Type, filter) X(PyMap_Type, map) \
     X(PyZip_Type, zip) X(Py_GenericAliasType, GenericAlias)                  \
-    X(PySentinel_Type, sentinel) X(PyStdPrinter_Type, StdPrinter)            \
+    X(PySentinel_Type, sentinel)                                             \
     X(_PyAsyncGenASend_Type, async_generator_asend)                          \
     X(PyModule_Type, module)
 /* Other PyAPI_DATA types of the public headers:
    - C-API-only types implemented by the capi units as static extension
      types (readied like any extension type, instances of JS class
      PY_NATIVE): PyCapsule_Type (E1), PyInstanceMethod_Type,
-     PyModuleDef_Type (B), PyPickleBuffer_Type (D);
+     PyModuleDef_Type (B), PyPickleBuffer_Type (D), PyStdPrinter_Type
+     (python/capi_stable.c: PyFile_NewStdPrinter);
    - types of runtime modules, bound when that module is first imported by
      qp_capi_init_runtime / qp_capi_init_containers: PyContext_Type,
      PyContextVar_Type, PyContextToken_Type (E2, module _contextvars),
      _PyWeakref_RefType, _PyWeakref_ProxyType, _PyWeakref_CallableProxyType
      (E1, module _weakref);
    - never instantiated here (defined, immortal, so the *_Check macros are
-     false): PyODict_Type and its views/iterator (no C OrderedDict:
-     collections keeps its pure-Python class), PyFrameLocalsProxy_Type
-     (B owns these definitions). */
+     false): PyFrameLocalsProxy_Type (B owns this definition). */
 
 /* PyTypeObject* <-> QPType* (static types: tp_cache; heap/extension types:
    tp_cache too).  qp_capi_type_from_qp returns a borrowed type mirror
@@ -638,6 +649,8 @@ static int qp_capi_tm_tracing;
 static void *qp_capi_tm_raw_alloc(size_t nelem, size_t elsize, BOOL zero);
 static void *qp_capi_tm_raw_realloc(void *ptr, size_t new_size);
 static void qp_capi_tm_raw_free(void *ptr);
+/* _PyMem_DumpTraceback (the debug hooks on the allocators) */
+static void qp_capi_tm_dump_traceback(int fd, const void *ptr);
 /* tracemalloc.stop() when the C-API context goes away */
 static void qp_capi_tm_context_free(JSContext *ctx);
 
