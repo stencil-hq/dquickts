@@ -429,15 +429,79 @@ typedef struct QPMain {
     char *envwarn;              /* PYTHONWARNINGS copy split in place */
     char *run_filename;         /* cfg.run_filename storage (made absolute) */
     int opt_R;                  /* -R: random hash seed even with PYTHONHASHSEED */
+    int system_exit;            /* a SystemExit ended the code: no event loop */
 } QPMain;
 
 static int qp_main_err_print(JSContext *ctx, QPMain *m)
 {
     int kb = 0;
-    int code = qp_err_print_uncaught(ctx, &kb);
+    int code;
+
+    if (!QP_STATE(ctx)->config.inspect && qp_exc_pending_matches(ctx, QP_EXC(ctx, SystemExit)))
+        m->system_exit = 1;
+    code = qp_err_print_uncaught(ctx, &kb);
     if (kb)
         m->kb = 1;
     return code;
+}
+
+/* qp_set_host() (NULL: none) */
+static const QPHost *qp_main_host;
+
+void qp_set_host(const QPHost *host)
+{
+    qp_main_host = host;
+}
+
+/* The pending exception of a job or a callback of the event loop:
+   SystemExit, KeyboardInterrupt and the uncatchable errors end the loop
+   (1, *exitcode is set), the others are reported like an uncaught
+   exception (0). */
+static int qp_main_loop_exception(JSContext *ctx, QPMain *m, int *exitcode)
+{
+    if (ctx->rt->current_exception_is_uncatchable ||
+        qp_exc_pending_matches(ctx, QP_EXC(ctx, SystemExit)) ||
+        qp_exc_pending_matches(ctx, QP_EXC(ctx, KeyboardInterrupt))) {
+        *exitcode = qp_main_err_print(ctx, m);
+        return 1;
+    }
+    qp_main_err_print(ctx, m);
+    return 0;
+}
+
+/* The event loop of the host after __main__ (and after the -i REPL), as
+   in Node: the JS jobs, timers (js.setTimeout()...) and handlers run
+   until none is left, the main thread letting the other Python threads
+   run while it waits.  A callback that raises is reported like an
+   uncaught exception (sys.excepthook) and the loop goes on, as qjs does
+   for its handlers: the exit status does not change.  SystemExit and
+   KeyboardInterrupt (a SIGINT during the wait included) end it with
+   their exit status.  It does not run after an uncaught exception or a
+   SystemExit. */
+static void qp_main_run_loop(JSContext *ctx, QPMain *m, int *exitcode)
+{
+    JSContext *ctx1;
+    int r;
+
+    if (!qp_main_host || *exitcode != 0 || m->system_exit)
+        return;
+    for (;;) {
+        r = JS_ExecutePendingJob(ctx->rt, &ctx1);
+        if (r > 0)
+            continue;
+        if (r == 0) {
+            /* the Python signal handlers: a signal ends the wait */
+            if (qp_signal_check(ctx) < 0) {
+                r = -2;
+            } else {
+                r = qp_main_host->poll(ctx);
+                if (r == -1)
+                    break;
+            }
+        }
+        if (r < 0 && qp_main_loop_exception(ctx, m, exitcode))
+            break;
+    }
 }
 
 /* stdin_is_interactive */
@@ -1259,6 +1323,7 @@ static void qp_main_repl(JSContext *ctx, QPMain *m, int *exitcode)
     m->cfg.inspect = 0;
     QP_STATE(ctx)->config.inspect = 0;
     *exitcode = qp_main_run_repl(ctx, m);
+    qp_main_run_loop(ctx, m, exitcode);
 }
 
 /* pymain_header */
@@ -3060,7 +3125,7 @@ int qp_main(int argc, char **argv)
     JSRuntime *rt;
     JSContext *ctx;
     JSValue main_module;
-    int exitcode = 0, rc, nthreads, main_importer = 0;
+    int exitcode = 0, rc, nthreads, main_importer = 0, host_ready = 0;
 
     memset(&m, 0, sizeof(m));
     /* _Py_SetLocaleFromEnv(LC_CTYPE) (pymain_init) */
@@ -3118,6 +3183,15 @@ int qp_main(int argc, char **argv)
         }
 #endif
     }
+    /* the environment of the JS side (after the base snapshot, which does
+       not hold host state) */
+    if (qp_main_host) {
+        host_ready = 1;
+        if (qp_main_host->init(ctx, m.cfg.argc, m.cfg.argv) < 0) {
+            exitcode = qp_main_err_print(ctx, &m);
+            goto done;
+        }
+    }
     /* _PyFaulthandler_Init */
     if (m.cfg.faulthandler && qp_faulthandler_init_enable(ctx) < 0) {
         exitcode = qp_main_err_print(ctx, &m);
@@ -3159,6 +3233,7 @@ int qp_main(int argc, char **argv)
         exitcode = qp_main_run_file(ctx, &m);
     else
         exitcode = qp_main_run_stdin(ctx, &m);
+    qp_main_run_loop(ctx, &m, &exitcode);
     qp_main_repl(ctx, &m, &exitcode);
 
  done:
@@ -3173,6 +3248,8 @@ int qp_main(int argc, char **argv)
         return m.kb ? qp_main_exit_sigint() : exitcode;
     /* like qjs: release everything (the state keeps pointers into m.cfg),
        so that leaks and teardown bugs are visible */
+    if (host_ready)
+        qp_main_host->fini(rt);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     qp_main_free(&m);

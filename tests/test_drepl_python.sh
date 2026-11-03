@@ -160,7 +160,10 @@ echo 'raise SystemExit(3)' | run
 # 6. a session file only loads in the mode that wrote it
 "$QJS" --drepl "$snap" < /dev/null > "$out" 2>&1 && fail "JS mode loaded a Python session"
 expect "a Python session (add --python)"
-printf 'let a = 1\n\\q\n' | "$QJS" --drepl "$dir/js.snap" > /dev/null 2>&1
+# the durable runtime has no timers (host state)
+printf 'let a = 1\nprint("timers:", typeof setTimeout, typeof clearInterval)\n\\q\n' |
+    "$QJS" --drepl "$dir/js.snap" > "$out" 2>&1
+expect "timers: undefined undefined"
 [ -s "$dir/js.snap" ] || fail "no JS session file"
 "$QJS" --drepl "$dir/js.snap" --python < /dev/null > "$out" 2>&1 && fail "Python mode loaded a JS session"
 expect "not a Python session"
@@ -237,8 +240,10 @@ class P:
 
 show = js.eval("(o) => o.x + 1")
 print("show:", show(P()))
+print("timers:", hasattr(js, "setTimeout"), hasattr(js, "setInterval"))
 EOF
 expect "show: 42"
+expect "timers: False False"
 grep -qF "not saved" "$out" && fail "session 8 not saved"
 run <<'EOF'
 shop.add("pears", 2)

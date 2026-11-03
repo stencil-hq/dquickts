@@ -37,8 +37,27 @@ JSModuleDef *js_init_module_std(JSContext *ctx, const char *module_name);
 JSModuleDef *js_init_module_os(JSContext *ctx, const char *module_name);
 /* the 'bjson' module: JS_ReadObject() and JS_WriteObject() from JS */
 JSModuleDef *js_init_module_bjson(JSContext *ctx, const char *module_name);
+/* define the globals print(), console.log(), scriptArgs (if argc >= 0),
+   setTimeout(), clearTimeout(), setInterval() and clearInterval() (the
+   timers of the 'os' module: they need js_std_init_handlers()) */
 void js_std_add_helpers(JSContext *ctx, int argc, char **argv);
 void js_std_loop(JSContext *ctx);
+/* one event of js_std_loop() after the jobs: wait for a signal, an
+   expired timer, a file descriptor of os.setReadHandler() /
+   os.setWriteHandler() or a worker message and run its handler. Return
+   0 if an event was handled or the wait ended (e.g. by a signal), -1 if
+   there is no timer and no handler left (or poll() failed) or -2 if the
+   handler threw (the exception is pending in the runtime). */
+int js_std_poll(JSContext *ctx);
+/* functions called by the event loop of the runtime 'rt' around its
+   waits (poll(), Sleep()) for a host whose other threads run code in the
+   runtime under a lock (the GIL of the Python threads:
+   JS_PythonSaveThread() and JS_PythonRestoreThread()): 'enter' releases
+   it and returns a value which is passed to 'leave', which takes it
+   again. A timer or a handler added by another thread during the wait
+   ends it. Requires js_std_init_handlers(). */
+void js_std_set_wait_hooks(JSRuntime *rt, void *(*enter)(JSRuntime *rt),
+                           void (*leave)(JSRuntime *rt, void *state));
 /* one step of js_std_loop() for a host which runs its own event loop:
    run the pending jobs, then the handler of at most one expired timer.
    Return 0 if there is more work to do now, the delay in ms until the

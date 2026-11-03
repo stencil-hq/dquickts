@@ -23,4 +23,5 @@ run() {
 
 run test_interop.js "$QJS" -m "$dir/test_interop.js"
 run test_interop.py "$QPY" "$dir/test_interop.py"
+run test_timers.py env QJS="$QJS" "$QPY" "$dir/test_timers.py"
 exit $fail

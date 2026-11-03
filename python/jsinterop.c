@@ -2046,6 +2046,16 @@ JSValue JS_PythonImport(JSContext *ctx, const char *module)
     return qp_import_module(ctx, module);
 }
 
+void *JS_PythonSaveThread(JSRuntime *rt)
+{
+    return qp_gil_release_rt(rt);
+}
+
+void JS_PythonRestoreThread(JSRuntime *rt, void *state)
+{
+    qp_gil_acquire_ts(state);
+}
+
 /* ========================================================================= */
 /* ES modules importing .py files                                             */
 /* ========================================================================= */

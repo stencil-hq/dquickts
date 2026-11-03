@@ -6,6 +6,8 @@
 #include <string.h>
 #include <time.h>
 #include <stdatomic.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #include "../quickjs-libc.h"
 
@@ -222,6 +224,114 @@ static void test_loop_once(void)
     eval_check(ctx, "os.setReadHandler(fds[0], null);"
                "os.close(fds[0]); os.close(fds[1]);");
     check(js_std_loop_once(ctx) == -1, "loop_once: idle at the end");
+
+    js_std_free_handlers(rt);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+static int wait_enter_count, wait_leave_count;
+
+static void *count_wait_enter(JSRuntime *rt)
+{
+    wait_enter_count++;
+    return &wait_enter_count;
+}
+
+static void count_wait_leave(JSRuntime *rt, void *state)
+{
+    check(state == &wait_enter_count, "wait hooks: state");
+    wait_leave_count++;
+}
+
+/* a thread which adds a timer while the event loop waits (the wait
+   hooks give it the runtime, as the GIL of Python does) */
+static pthread_t wake_thread;
+static int wake_thread_started;
+static JSContext *wake_ctx;
+
+static void *wake_thread_func(void *opaque)
+{
+    JSContext *ctx = opaque;
+    usleep(20 * 1000);
+    JS_UpdateStackTop(JS_GetRuntime(ctx));
+    eval_check(ctx, "setTimeout(() => log.push('woken'), 0);");
+    return NULL;
+}
+
+static void *wake_wait_enter(JSRuntime *rt)
+{
+    if (!wake_thread_started) {
+        check(pthread_create(&wake_thread, NULL, wake_thread_func, wake_ctx) == 0,
+              "cannot create the thread");
+        wake_thread_started = 1;
+    }
+    return NULL;
+}
+
+static void wake_wait_leave(JSRuntime *rt, void *state)
+{
+    if (wake_thread_started == 1) {
+        pthread_join(wake_thread, NULL);
+        wake_thread_started = 2;
+    }
+    JS_UpdateStackTop(rt);
+}
+
+/* the timers of js_std_add_helpers() without the 'os' module,
+   js_std_poll() and js_std_set_wait_hooks() */
+static void test_global_timers(void)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+    int ret, i;
+    int64_t t0;
+
+    rt = JS_NewRuntime();
+    check(rt != NULL, "cannot create the runtime");
+    ctx = JS_NewContext(rt);
+    check(ctx != NULL, "cannot create the context");
+    /* without the event loop, the timers throw */
+    js_std_add_helpers(ctx, -1, NULL);
+    check(!JS_HasException(ctx), "add_helpers failed");
+    check(JS_IsException(eval_str(ctx, "setTimeout(() => 0, 0)", JS_EVAL_TYPE_GLOBAL)),
+          "setTimeout without js_std_init_handlers()");
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    js_std_init_handlers(rt);
+
+    /* js_std_loop() runs them */
+    eval_check(ctx, "globalThis.log = [];"
+               "setTimeout(() => log.push('t'), 10);"
+               "globalThis.iid = setInterval(() => { log.push('i'); clearInterval(iid); }, 5);");
+    js_std_loop(ctx);
+    check(eval_int(ctx, "log.join() == 'i,t'"), "loop: global timers");
+
+    /* js_std_poll(): one event per call, the waits between the hooks,
+       the exceptions left to the host */
+    js_std_set_wait_hooks(rt, count_wait_enter, count_wait_leave);
+    check(js_std_poll(ctx) == -1, "poll: idle");
+    eval_check(ctx, "log = []; setTimeout(() => { throw Error('timer') }, 15);"
+               "setTimeout(() => log.push(1), 5);");
+    for(i = 0; i < 100 && (ret = js_std_poll(ctx)) == 0; i++)
+        continue;
+    check(ret == -2, "poll: throwing timer");
+    check_exception(ctx, "timer");
+    check(eval_int(ctx, "log.join() == '1'"), "poll: timer before the throwing one");
+    check(js_std_poll(ctx) == -1, "poll: idle after the timers");
+    check(wait_enter_count > 0 && wait_enter_count == wait_leave_count,
+          "poll: wait hooks");
+
+    /* a timer added by another thread during the wait ends it */
+    wake_ctx = ctx;
+    js_std_set_wait_hooks(rt, wake_wait_enter, wake_wait_leave);
+    eval_check(ctx, "log = []; globalThis.tid = setTimeout(() => log.push('late'), 5000);");
+    t0 = now_ms();
+    for(i = 0; i < 100 && !eval_int(ctx, "log.length"); i++)
+        check(js_std_poll(ctx) == 0, "poll: wake");
+    check(eval_int(ctx, "log.join() == 'woken'"), "poll: timer of the other thread");
+    check(now_ms() - t0 < 2000, "poll: the wait was not ended");
+    eval_check(ctx, "clearTimeout(tid);");
+    js_std_set_wait_hooks(rt, NULL, NULL);
 
     js_std_free_handlers(rt);
     JS_FreeContext(ctx);
@@ -463,6 +573,8 @@ static void test_init_oom(void)
 
 int main(int argc, char **argv)
 {
+    /* first: no 'os' module was imported before */
+    test_global_timers();
     test_eval_script_interrupt();
     test_loop_once();
     test_worker_new_runtime();

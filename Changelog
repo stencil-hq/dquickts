@@ -14,6 +14,23 @@ unreleased:
 - qjs REPL: with stdin not a terminal, every REPL reads plain lines
   (no echo, no colors), runs them one input at a time (waiting for
   asynchronous results) and quits at the end of the input
+- global setTimeout(), clearTimeout(), setInterval() and clearInterval()
+  (the os timers, ids shared) defined by js_std_add_helpers(): qjs scripts
+  and REPL, workers, qjsc programs; js_std_loop() runs them without the os
+  module; not in the qjs --drepl runtime. Expired timers run in the order
+  of their expiration
+- quickjs-libc: js_std_poll() (one event of js_std_loop(), exceptions left
+  to the host), js_std_set_wait_hooks() (functions around the waits of the
+  event loop; a timer or handler added by another thread ends the wait)
+- Python launchers (qpy, qjs file.py, qjs --python): the JS side has the
+  qjs environment (std/os/bjson modules, global timers, print(),
+  console.log(), scriptArgs, the quickjs-libc module loader) through a
+  host hook (QPHost, qp_set_host()); after __main__ the event loop runs
+  until no timer or handler is left, then the interpreter finalizes; an
+  exception of a callback is reported through sys.excepthook and the loop
+  goes on, SystemExit/KeyboardInterrupt end it with their status; the GIL
+  is released while the loop waits (JS_PythonSaveThread(),
+  JS_PythonRestoreThread())
 - Python snapshots: a runtime that used the js module can be saved (the
   interop functions, e.g. Function.prototype.callKw, were unregistered
   natives, so `import js` made every later qjs --drepl --python save fail);

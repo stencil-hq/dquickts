@@ -62,6 +62,25 @@ int qp_dump_ast_json_batch(JSContext *ctx, FILE *in, FILE *out);
    KeyboardInterrupt).  Used by qpy and by `qjs file.py` / `qjs --python`. */
 int qp_main(int argc, char **argv);
 
+/* The host environment of qp_main(), given by the launcher (qpy.c,
+   qjs.c) so that libquickjs does not depend on quickjs-libc: the JS side
+   of the runtime of the Python program gets the environment of qjs (the
+   std, os and bjson modules, setTimeout() and the other globals of
+   js_std_add_helpers(), its module loader) and its event loop runs after
+   __main__.  init() sets up the runtime and the global object of the
+   context (fresh or restored from the base snapshot) before Python code
+   runs, argc/argv being sys.argv; it returns 0, or -1 with an exception
+   pending.  poll() handles one event of the event loop with the contract
+   of js_std_poll().  fini() releases the host state of the runtime after
+   the finalization of the interpreter.  qp_set_host() is called before
+   qp_main(); 'host' must stay valid. */
+typedef struct QPHost {
+    int (*init)(JSContext *ctx, int argc, char **argv);
+    int (*poll)(JSContext *ctx);
+    void (*fini)(JSRuntime *rt);
+} QPHost;
+void qp_set_host(const QPHost *host);
+
 /* The base snapshot of qp_main (python/pythonrun.c, plan section 1): the
    interpreter state after the part of the startup that does not depend on
    the process, written at build time by qp_write_base_snapshot() (`qpy

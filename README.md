@@ -71,6 +71,7 @@ fork adds:
 | Standard decorators (2023-05), auto-accessors, `Symbol.metadata`; TypeScript legacy decorators and decorator metadata | `JS_EVAL_FLAG_TS_LEGACY_DECORATORS`, `JS_EVAL_FLAG_TS_DECORATOR_METADATA` |
 | Explicit resource management (ES2026) | `using`, `await using`, `DisposableStack`, `AsyncDisposableStack` |
 | Ports from [quickjs-ng](https://github.com/quickjs-ng/quickjs) | `queueMicrotask()`, `atob()`/`btoa()`, `DOMException`, the V8 stack trace API, promise hooks, immutable `ArrayBuffer`s, `performance`, `os.setInterval()`, `std.writeFile()`, the `bjson` module, a re-entrant event loop, C closures, private symbols, runtime dump flags, and bug fixes |
+| Global timers in `qjs`, its workers and the embedders of `js_std_add_helpers()` (the `os` timers, ids shared) | `setTimeout()`, `clearTimeout()`, `setInterval()`, `clearInterval()` |
 | Embedder helpers | `JS_IsEqual()`, `JS_NewProxy()`, `JS_GetProxyTarget()`, `JS_PromiseMarkAsHandled()`, and others |
 | A REPL whose functions and variables survive restarts | `qjs --drepl FILE` |
 | A REPL that switches between JS/TypeScript and Python from one input to the next, in one runtime | `\py`, `\js` in `qjs` and `qjs --drepl FILE --python` |
@@ -130,8 +131,8 @@ the standard objects plus `print()` and `console.log()`:
 
 Limits:
 
-- The `std` and `os` modules are not available. Their files, timers and handlers are host state
-  that a snapshot cannot save.
+- The `std` and `os` modules and the global timers (`setTimeout()`...) are not available. Their
+  files, timers and handlers are host state that a snapshot cannot save.
 - `\load file` evaluates a file inside the session.
 - Ctrl-C interrupts a running command. The session is not affected.
 - A session file only loads into the `qjs` build that wrote it.
@@ -792,6 +793,23 @@ reports the ones that fail for another reason than a listed C module quickpy doe
   thrown value is its `js_error` attribute).
 - An ES `import` of a `.py` file loads the Python module: its public globals are the named
   exports and the module object is the default export.
+- In a program started by `qpy`, `qjs file.py` or `qjs --python`, the JS side has the
+  environment of `qjs`: `js.import_module("os")` (and `std`, `bjson`), `js.setTimeout()`,
+  `js.setInterval()` and their `clear` functions (a Python callable is a valid callback),
+  `print()`, `console.log()` and `scriptArgs` (`sys.argv`). After the main module, the event loop
+  runs until no timer or handler is left, as in Node, then the interpreter finalizes (`atexit`,
+  flushed streams). Other Python threads run while it waits. A callback that raises is reported
+  through `sys.excepthook` and the loop goes on, as `qjs` does for its handlers (the exit status
+  does not change). `SystemExit` and `KeyboardInterrupt` (Ctrl-C) end it with their exit status.
+  The loop does not run after an uncaught exception or `sys.exit()` in the main module.
+  `js.run()` only drives the job queue.
+
+```python
+# timer.py: prints "main done", then "fired" 0.3 s later
+import js
+js.setTimeout(lambda: print("fired"), 300)
+print("main done")
+```
 
 ```js
 // main.js
@@ -813,6 +831,10 @@ The API is in [`quickjs.h`](quickjs.h):
   `JS_PY_EVAL_FLAG_ASYNC` top-level `await` is allowed and the result is a promise settled by
   the job queue. A Python exception is the pending JS exception.
 - `JS_PythonImport(ctx, name)` is `importlib.import_module(name)`.
+- `JS_PythonSaveThread(rt)` and `JS_PythonRestoreThread(rt, state)` release and take back the
+  GIL around a blocking wait of the host, like `Py_BEGIN_ALLOW_THREADS`. Passed to
+  `js_std_set_wait_hooks()`, they let the other Python threads run while the quickjs-libc event
+  loop waits.
 - `JS_FreeRuntime()` finalizes Python first, as `Py_FinalizeEx()` does at the exit of `qpy`
   (`threading._shutdown`, `atexit`, flushed streams, finalized modules), then frees the C
   extension state, so nothing leaks.
@@ -860,8 +882,9 @@ Third-party extensions load with `dlopen` (the C API symbols are exported by `qp
 ### Runtime features
 
 - **Threads**: `_thread`/`threading` run real OS threads under a GIL (`sys.getswitchinterval()`,
-  blocking calls and `time.sleep()` release it), with `fork()`, signals delivered to the main
-  thread, `_thread.interrupt_main()` and `sys._current_frames()`.
+  blocking calls, `time.sleep()` and the wait of the event loop for a JS timer release it), with
+  `fork()`, signals delivered to the main thread, `_thread.interrupt_main()` and
+  `sys._current_frames()`.
 - **Tracing**: `sys.settrace()`/`sys.setprofile()` (and `threading.settrace_all_threads()`)
   follow CPython's legacy tracing, including `frame.f_lineno` jumps, so `pdb`, `bdb`, `trace`,
   `profile` and `cProfile` work (`test_sys_settrace` 448/448, `test_pdb` 235/237).

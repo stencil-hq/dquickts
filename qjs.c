@@ -239,6 +239,23 @@ static int add_qjs_globals(JSContext *ctx)
     return -1;
 }
 
+/* the system modules and the qjs globals of a context */
+static int init_custom_context(JSContext *ctx)
+{
+    if (!js_init_module_std(ctx, "std") || !js_init_module_os(ctx, "os") ||
+        !js_init_module_bjson(ctx, "bjson"))
+        return -1;
+    if (add_qjs_globals(ctx) < 0)
+        return -1;
+#ifdef CONFIG_TEMPORAL_INTL
+    if (enable_experimental) {
+        JS_AddIntrinsicTemporal(ctx);
+        JS_AddIntrinsicIntl(ctx);
+    }
+#endif
+    return 0;
+}
+
 /* also used to initialize the worker context */
 static JSContext *JS_NewCustomContext(JSRuntime *rt)
 {
@@ -246,22 +263,42 @@ static JSContext *JS_NewCustomContext(JSRuntime *rt)
     ctx = JS_NewContext(rt);
     if (!ctx)
         return NULL;
-    /* system modules */
-    js_init_module_std(ctx, "std");
-    js_init_module_os(ctx, "os");
-    js_init_module_bjson(ctx, "bjson");
-    if (add_qjs_globals(ctx) < 0) {
+    if (init_custom_context(ctx) < 0) {
         JS_FreeContext(ctx);
         return NULL;
     }
-#ifdef CONFIG_TEMPORAL_INTL
-    if (enable_experimental) {
-        JS_AddIntrinsicTemporal(ctx);
-        JS_AddIntrinsicIntl(ctx);
-    }
-#endif
     return ctx;
 }
+
+#ifdef CONFIG_PYTHON
+/* the TypeScript flags of the options before --python */
+static int python_ts_flags;
+
+/* The JS side of a Python program (`qjs file.py`, `qjs --python`) gets
+   the environment of the qjs scripts (QPHost of qp_main()); the Python
+   threads run while the event loop waits. */
+static int python_host_init(JSContext *ctx, int argc, char **argv)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+
+    js_std_set_worker_new_context_func(JS_NewCustomContext);
+    js_std_init_handlers(rt);
+    js_std_set_wait_hooks(rt, JS_PythonSaveThread, JS_PythonRestoreThread);
+    js_std_set_typescript_flags(rt, python_ts_flags);
+    JS_SetModuleLoaderFunc2(rt, js_module_normalize, js_module_loader,
+                            js_module_check_attributes, NULL);
+    if (init_custom_context(ctx) < 0)
+        return -1;
+    js_std_add_helpers(ctx, argc, argv);
+    return JS_HasException(ctx) ? -1 : 0;
+}
+
+static const QPHost python_host = {
+    python_host_init,
+    js_std_poll,
+    js_std_free_handlers,
+};
+#endif
 
 #if defined(__APPLE__)
 #define MALLOC_OVERHEAD  0
@@ -1767,14 +1804,26 @@ int main(int argc, char **argv)
     }
 
 #ifdef CONFIG_PYTHON
-    /* a .py script runs with the Python launcher; the slot before the
-       Python arguments receives the program name (CPython's argv[0]) */
+    /* a .py script runs with the Python launcher, whose argv is the
+       program name (CPython's argv[0]) followed by the Python arguments
+       (a copy: execArgv keeps the command line) */
     if (optind < argc && !expr && !drepl_path) {
         size_t len = strlen(argv[optind]);
         if (len > 3 && !strcmp(argv[optind] + len - 3, ".py")) {
+            char **py_argv;
         run_python:
-            argv[optind - 1] = argv[0];
-            return qp_main(argc - optind + 1, argv + optind - 1);
+            py_argv = malloc(sizeof(py_argv[0]) * (argc - optind + 2));
+            if (!py_argv) {
+                fprintf(stderr, "qjs: out of memory\n");
+                return 1;
+            }
+            py_argv[0] = argv[0];
+            memcpy(py_argv + 1, argv + optind, sizeof(argv[0]) * (argc - optind + 1));
+            python_ts_flags = ts_flags;
+            qp_set_host(&python_host);
+            i = qp_main(argc - optind + 1, py_argv);
+            free(py_argv);
+            return i;
         }
     }
 #endif

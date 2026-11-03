@@ -168,6 +168,9 @@ static BOOL qp_thread_is_main_rt(JSRuntime *rt);
    js_malloc).  No-ops while the runtime has a single Python thread. */
 static QPThreadState *qp_gil_release(JSContext *ctx);
 static void qp_gil_acquire(JSContext *ctx, QPThreadState *ts);
+/* the same without context (JS_PythonSaveThread/JS_PythonRestoreThread) */
+static QPThreadState *qp_gil_release_rt(JSRuntime *rt);
+static void qp_gil_acquire_ts(QPThreadState *ts);
 #define QP_BEGIN_ALLOW_THREADS(ctx) \
     { QPThreadState *qp_gil_saved_ = qp_gil_release(ctx);
 #define QP_END_ALLOW_THREADS(ctx) \
