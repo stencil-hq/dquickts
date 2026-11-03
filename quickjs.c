@@ -495,6 +495,21 @@ typedef struct {
     JSWeakRefHeaderTypeEnum weakref_type;
 } JSWeakRefHeader;
 
+/* index of the entries of an array by an integer key (open addressing,
+   see index_hash_find()). It only speeds up lookups: when it cannot be
+   allocated, the array is searched linearly. */
+typedef struct {
+    uint64_t key;
+    int val; /* -1 if the slot is empty */
+} JSIndexHashEntry;
+
+typedef struct {
+    JSIndexHashEntry *tab; /* NULL if not allocated */
+    uint32_t mask;
+    uint32_t count;
+    int indexed; /* number of array entries in the table */
+} JSIndexHash;
+
 typedef struct JSVarRef {
     JSGCObjectHeader header; /* must come first */
     uint8_t is_detached;
@@ -6116,6 +6131,79 @@ static JSValue JS_ConcatString(JSContext *ctx, JSValue op1, JSValue op2)
         }
     }
     return js_new_string_rope(ctx, op1, op2);
+}
+
+/* Index hash tables. The keys are exact (atoms, indexes or pointers), so
+   a collision only costs a probe. */
+
+static inline uint32_t index_hash_key(uint64_t key)
+{
+    key ^= key >> 33;
+    key *= 0xff51afd7ed558ccdULL;
+    key ^= key >> 33;
+    return (uint32_t)key;
+}
+
+/* return the entry of 'key' or NULL */
+static JSIndexHashEntry *index_hash_find(const JSIndexHash *h, uint64_t key)
+{
+    uint32_t i;
+    if (!h->tab)
+        return NULL;
+    for(i = index_hash_key(key) & h->mask; h->tab[i].val >= 0;
+        i = (i + 1) & h->mask) {
+        if (h->tab[i].key == key)
+            return &h->tab[i];
+    }
+    return NULL;
+}
+
+/* return the entry of 'key', with val = -1 if it was not present (the
+   caller must set it), or NULL if out of memory */
+static JSIndexHashEntry *index_hash_add(JSRuntime *rt, JSIndexHash *h,
+                                        uint64_t key)
+{
+    JSIndexHashEntry *tab, *e;
+    uint32_t i, j, size;
+
+    size = h->tab ? h->mask + 1 : 0;
+    if ((h->count + 1) * 2 > size) {
+        uint32_t new_size = size ? size * 2 : 64;
+        tab = js_malloc_rt(rt, sizeof(tab[0]) * new_size);
+        if (!tab)
+            return NULL;
+        for(i = 0; i < new_size; i++)
+            tab[i].val = -1;
+        for(i = 0; i < size; i++) {
+            if (h->tab[i].val >= 0) {
+                for(j = index_hash_key(h->tab[i].key) & (new_size - 1);
+                    tab[j].val >= 0; j = (j + 1) & (new_size - 1))
+                    continue;
+                tab[j] = h->tab[i];
+            }
+        }
+        js_free_rt(rt, h->tab);
+        h->tab = tab;
+        h->mask = new_size - 1;
+    }
+    for(i = index_hash_key(key) & h->mask; h->tab[i].val >= 0;
+        i = (i + 1) & h->mask) {
+        if (h->tab[i].key == key)
+            return &h->tab[i];
+    }
+    e = &h->tab[i];
+    e->key = key;
+    h->count++;
+    return e;
+}
+
+static void index_hash_free(JSRuntime *rt, JSIndexHash *h)
+{
+    js_free_rt(rt, h->tab);
+    h->tab = NULL;
+    h->mask = 0;
+    h->count = 0;
+    h->indexed = 0;
 }
 
 /* Shape support */
@@ -26269,6 +26357,10 @@ typedef struct JSVarScope {
     /* local holding the await state of the disposal of the 'await
        using' resources (see OP_dispose_scope), -1 if none */
     int using_await_idx;
+    /* index into fd->vars of the variable which follows the variables
+       of this scope in the scope chain (vd->scope_next of the first
+       variable of the scope) */
+    int exit;
 } JSVarScope;
 
 typedef struct JSVarDef {
@@ -26456,6 +26548,17 @@ typedef struct JSFunctionDef {
     int *ts_elidable_reqs; /* req_module_entries of import declarations */
     int ts_elidable_req_count;
     int ts_elidable_req_size;
+
+    /* lookup indexes, used by the functions with many variables (kept
+       out of the frequently used fields above) */
+    BOOL has_with_var; /* a 'with' statement defines a _with_ variable */
+    BOOL vars_relinked; /* scope chains recomputed by js_create_function() */
+    /* (scope_level, var_name) -> last variable of 'vars' with this name
+       in this scope, see var_hash_update() */
+    JSIndexHash var_hash;
+    int *var_hash_next; /* previous variable with the same key or -1 */
+    int var_hash_next_size;
+    JSIndexHash global_var_hash; /* var_name -> first global variable */
 } JSFunctionDef;
 
 typedef struct JSToken {
@@ -28586,14 +28689,79 @@ static int find_arg(JSContext *ctx, JSFunctionDef *fd, JSAtom name)
     return -1;
 }
 
+/* below this number of variables or global variables, they are searched
+   linearly */
+#define JS_INDEX_HASH_MIN 16
+
+static inline uint64_t var_hash_key(int scope_level, JSAtom name)
+{
+    return ((uint64_t)(uint32_t)scope_level << 32) | name;
+}
+
+/* Index the variables added since the last call (their scope_level is
+   final when they are looked up). Return FALSE if the variables must be
+   searched linearly (few variables or out of memory). */
+static BOOL var_hash_update(JSContext *ctx, JSFunctionDef *fd)
+{
+    JSIndexHashEntry *e;
+    JSVarDef *vd;
+    int i;
+
+    if (fd->var_count < JS_INDEX_HASH_MIN)
+        return FALSE;
+    if (fd->var_hash_next_size < fd->var_count) {
+        int new_size = max_int(fd->var_count, fd->var_size);
+        int *tab = js_realloc_rt(ctx->rt, fd->var_hash_next,
+                                 sizeof(tab[0]) * new_size);
+        if (!tab)
+            return FALSE;
+        fd->var_hash_next = tab;
+        fd->var_hash_next_size = new_size;
+    }
+    for(i = fd->var_hash.indexed; i < fd->var_count; i++) {
+        vd = &fd->vars[i];
+        e = index_hash_add(ctx->rt, &fd->var_hash,
+                           var_hash_key(vd->scope_level, vd->var_name));
+        if (!e)
+            return FALSE;
+        fd->var_hash_next[i] = e->val;
+        e->val = i;
+        fd->var_hash.indexed = i + 1;
+    }
+    return TRUE;
+}
+
+/* last variable named 'name' in the scope 'scope_level', or -1. The
+   previous ones are linked by fd->var_hash_next[]. */
+static int var_hash_last(JSFunctionDef *fd, int scope_level, JSAtom name)
+{
+    JSIndexHashEntry *e;
+    e = index_hash_find(&fd->var_hash, var_hash_key(scope_level, name));
+    return e ? e->val : -1;
+}
+
 static int find_var(JSContext *ctx, JSFunctionDef *fd, JSAtom name)
 {
     int i;
-    for(i = fd->var_count; i-- > 0;) {
-        if (fd->vars[i].var_name == name && fd->vars[i].scope_level == 0)
+    if (var_hash_update(ctx, fd)) {
+        i = var_hash_last(fd, 0, name);
+        if (i >= 0)
             return i;
+    } else {
+        for(i = fd->var_count; i-- > 0;) {
+            if (fd->vars[i].var_name == name && fd->vars[i].scope_level == 0)
+                return i;
+        }
     }
     return find_arg(ctx, fd, name);
+}
+
+/* TRUE if the variables of 'scope_level' are all in its scope chain.
+   While parsing, the 'var' variables have the scope level 0 but are not
+   in the chain of the scope 0. */
+static inline BOOL var_hash_scope_is_chained(JSFunctionDef *fd, int scope_level)
+{
+    return scope_level != 0 || fd->vars_relinked;
 }
 
 /* find a variable declaration in a given scope */
@@ -28601,6 +28769,18 @@ static int find_var_in_scope(JSContext *ctx, JSFunctionDef *fd,
                              JSAtom name, int scope_level)
 {
     int scope_idx;
+
+    if (var_hash_scope_is_chained(fd, scope_level) && var_hash_update(ctx, fd)) {
+        /* the variables of the scope in its chain are the ones at or
+           before its last chained variable */
+        int first = fd->scopes[scope_level].first;
+        if (first < 0 || fd->vars[first].scope_level != scope_level)
+            return -1;
+        for(scope_idx = var_hash_last(fd, scope_level, name);
+            scope_idx > first; scope_idx = fd->var_hash_next[scope_idx])
+            continue;
+        return scope_idx;
+    }
     for(scope_idx = fd->scopes[scope_level].first; scope_idx >= 0;
         scope_idx = fd->vars[scope_idx].scope_next) {
         if (fd->vars[scope_idx].scope_level != scope_level)
@@ -28624,11 +28804,20 @@ static BOOL is_child_scope(JSContext *ctx, JSFunctionDef *fd,
     return FALSE;
 }
 
-/* find a 'var' declaration in the same scope or a child scope */
+/* find a 'var' declaration in the same scope or a child scope (any of
+   them if several) */
 static int find_var_in_child_scope(JSContext *ctx, JSFunctionDef *fd,
                                    JSAtom name, int scope_level)
 {
     int i;
+
+    if (var_hash_update(ctx, fd)) {
+        for(i = var_hash_last(fd, 0, name); i >= 0; i = fd->var_hash_next[i]) {
+            if (is_child_scope(ctx, fd, fd->vars[i].scope_next, scope_level))
+                return i;
+        }
+        return -1;
+    }
     for(i = 0; i < fd->var_count; i++) {
         JSVarDef *vd = &fd->vars[i];
         if (vd->var_name == name && vd->scope_level == 0) {
@@ -28640,10 +28829,27 @@ static int find_var_in_child_scope(JSContext *ctx, JSFunctionDef *fd,
     return -1;
 }
 
-
 static JSGlobalVar *find_global_var(JSFunctionDef *fd, JSAtom name)
 {
+    JSIndexHash *h = &fd->global_var_hash;
+    JSIndexHashEntry *e;
     int i;
+
+    if (h->indexed > fd->global_var_count)
+        index_hash_free(fd->ctx->rt, h); /* the global variables were reset */
+    if (fd->global_var_count >= JS_INDEX_HASH_MIN) {
+        for(i = h->indexed; i < fd->global_var_count; i++) {
+            e = index_hash_add(fd->ctx->rt, h, fd->global_vars[i].var_name);
+            if (!e)
+                goto linear;
+            if (e->val < 0)
+                e->val = i;
+            h->indexed = i + 1;
+        }
+        e = index_hash_find(h, name);
+        return e ? &fd->global_vars[e->val] : NULL;
+    }
+ linear:
     for(i = 0; i < fd->global_var_count; i++) {
         JSGlobalVar *hf = &fd->global_vars[i];
         if (hf->var_name == name)
@@ -28662,17 +28868,60 @@ static JSGlobalVar *find_lexical_global_var(JSFunctionDef *fd, JSAtom name)
         return NULL;
 }
 
+typedef enum {
+    JS_CHAIN_FIND_ANY,
+    JS_CHAIN_FIND_LEXICAL,       /* lexical variable */
+    JS_CHAIN_FIND_LEXICAL_CATCH, /* lexical or catch variable */
+} JSChainFindEnum;
+
+/* Return the first variable named 'name' (and matching 'kind') of the
+   scope chain starting at the variable 'idx', or the index which ends
+   the chain (-1 or ARG_SCOPE_END). With the variable hash table, the
+   variables of a scope are searched at once: in a scope chain, the
+   variables of a scope are contiguous, in reverse order of definition,
+   and are followed by fd->scopes[scope].exit. The _with_ variables are
+   not tested: the caller handles them. */
+static int find_in_scope_chain(JSContext *ctx, JSFunctionDef *fd, int idx,
+                               JSAtom name, JSChainFindEnum kind)
+{
+    BOOL hashed = var_hash_update(ctx, fd);
+    JSVarDef *vd;
+    int scope, i;
+
+#define CHAIN_MATCH(vd) (kind == JS_CHAIN_FIND_ANY || (vd)->is_lexical ||  \
+                         (kind == JS_CHAIN_FIND_LEXICAL_CATCH &&           \
+                          (vd)->var_kind == JS_VAR_CATCH))
+    while (idx >= 0) {
+        vd = &fd->vars[idx];
+        scope = vd->scope_level;
+        if (hashed && var_hash_scope_is_chained(fd, scope)) {
+            /* the variables of 'scope' at or before 'idx' */
+            for(i = var_hash_last(fd, scope, name); i > idx;
+                i = fd->var_hash_next[i])
+                continue;
+            for(; i >= 0; i = fd->var_hash_next[i]) {
+                if (CHAIN_MATCH(&fd->vars[i]))
+                    return i;
+            }
+            idx = fd->scopes[scope].exit;
+        } else {
+            if (vd->var_name == name && CHAIN_MATCH(vd))
+                return idx;
+            idx = vd->scope_next;
+        }
+    }
+#undef CHAIN_MATCH
+    return idx;
+}
+
 static int find_lexical_decl(JSContext *ctx, JSFunctionDef *fd, JSAtom name,
                              int scope_idx, BOOL check_catch_var)
 {
-    while (scope_idx >= 0) {
-        JSVarDef *vd = &fd->vars[scope_idx];
-        if (vd->var_name == name &&
-            (vd->is_lexical || (vd->var_kind == JS_VAR_CATCH &&
-                                check_catch_var)))
-            return scope_idx;
-        scope_idx = vd->scope_next;
-    }
+    scope_idx = find_in_scope_chain(ctx, fd, scope_idx, name,
+                                    check_catch_var ? JS_CHAIN_FIND_LEXICAL_CATCH :
+                                    JS_CHAIN_FIND_LEXICAL);
+    if (scope_idx >= 0)
+        return scope_idx;
 
     if (fd->is_eval && fd->eval_type == JS_EVAL_TYPE_GLOBAL) {
         if (find_lexical_global_var(fd, name))
@@ -28715,6 +28964,7 @@ static int push_scope(JSParseState *s) {
         fd->scope_count++;
         fd->scopes[scope].parent = fd->scope_level;
         fd->scopes[scope].first = fd->scope_first;
+        fd->scopes[scope].exit = fd->scope_first;
         fd->scopes[scope].using_be = NULL;
         fd->scopes[scope].using_await_idx = -1;
         emit_op(s, OP_enter_scope);
@@ -33665,7 +33915,7 @@ static BOOL has_with_scope(JSFunctionDef *s, int scope_level)
 {
     while (s) {
         /* no with in strict mode */
-        if (!(s->js_mode & JS_MODE_STRICT)) {
+        if (s->has_with_var && !(s->js_mode & JS_MODE_STRICT)) {
             int scope_idx = s->scopes[scope_level].first;
             while (scope_idx >= 0) {
                 JSVarDef *vd = &s->vars[scope_idx];
@@ -38991,6 +39241,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                                   JS_VAR_DEF_WITH);
             if (with_idx < 0)
                 goto fail;
+            s->cur_func->has_with_var = TRUE;
             emit_op(s, OP_to_object);
             emit_op(s, OP_put_loc);
             emit_u16(s, with_idx);
@@ -42090,6 +42341,7 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
     fd->scope_size = countof(fd->def_scope_array);
     fd->scope_count = 1;
     fd->scopes[0].first = -1;
+    fd->scopes[0].exit = -1;
     fd->scopes[0].parent = -1;
     fd->scopes[0].using_be = NULL;
     fd->scopes[0].using_await_idx = -1;
@@ -42213,6 +42465,9 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
         JS_FreeAtom(ctx, fd->global_vars[i].var_name);
     }
     js_free(ctx, fd->global_vars);
+    index_hash_free(ctx->rt, &fd->global_var_hash);
+    index_hash_free(ctx->rt, &fd->var_hash);
+    js_free(ctx, fd->var_hash_next);
 
     for(i = 0; i < fd->closure_var_count; i++) {
         JSClosureVar *cv = &fd->closure_var[i];
@@ -43274,7 +43529,12 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
 
     /* resolve local scoped variables */
     var_idx = -1;
-    for (idx = s->scopes[scope_level].first; idx >= 0;) {
+    idx = s->scopes[scope_level].first;
+    if (!s->has_with_var) {
+        /* go to the variable or to the end of the chain */
+        idx = find_in_scope_chain(ctx, s, idx, var_name, JS_CHAIN_FIND_ANY);
+    }
+    while (idx >= 0) {
         vd = &s->vars[idx];
         if (vd->var_name == var_name) {
             if (op == OP_scope_put_var || op == OP_scope_make_ref) {
@@ -43457,7 +43717,12 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
     for (fd = s; fd->parent;) {
         scope_level = fd->parent_scope_level;
         fd = fd->parent;
-        for (idx = fd->scopes[scope_level].first; idx >= 0;) {
+        idx = fd->scopes[scope_level].first;
+        if (!fd->has_with_var) {
+            /* go to the variable or to the end of the chain */
+            idx = find_in_scope_chain(ctx, fd, idx, var_name, JS_CHAIN_FIND_ANY);
+        }
+        while (idx >= 0) {
             vd = &fd->vars[idx];
             if (vd->var_name == var_name) {
                 if (op == OP_scope_put_var || op == OP_scope_make_ref) {
@@ -46783,6 +47048,16 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
             vd->scope_next = fd->scopes[scope].first;
         }
     }
+    for (scope = 0; scope < fd->scope_count; scope++) {
+        JSVarScope *sd = &fd->scopes[scope];
+        if (scope >= 2)
+            sd->exit = fd->scopes[sd->parent].first;
+        else if (scope == ARG_SCOPE_INDEX && fd->has_parameter_expressions)
+            sd->exit = ARG_SCOPE_END;
+        else
+            sd->exit = -1;
+    }
+    fd->vars_relinked = TRUE;
 
     /* if the function contains an eval call, the closure variables
        are used to compile the eval and they must be ordered by scope,
@@ -47006,6 +47281,9 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     }
 
     js_free_function_def_ts(ctx, fd);
+    index_hash_free(ctx->rt, &fd->var_hash);
+    js_free(ctx, fd->var_hash_next);
+    index_hash_free(ctx->rt, &fd->global_var_hash);
     js_free(ctx, fd);
     return JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b);
  fail:

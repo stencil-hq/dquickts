@@ -674,6 +674,43 @@ function test_number_literals()
     assert_throws(SyntaxError, () => eval('0.a'));
 }
 
+/* variable lookups in functions with many variables (indexed by hash)
+   must resolve like in small functions */
+function test_many_bindings()
+{
+    var bodies = [
+        'let x = 1, r = []; { let x = 2; r.push(x); { r.push(x); let y = x; { const x = 3; r.push(x, y); } } } r.push(x); return r.join();',
+        'let r = []; try { r.push(t); } catch (e) { r.push(e.name); } let t = 1; r.push(t); return r.join();',
+        'var r = []; try { throw 1; } catch (e) { var e = 2; r.push(e); } r.push(typeof e); return r.join();',
+        'let fs = []; for (let i = 0; i < 3; i++) fs.push(() => i); return fs.map(f => f()).join();',
+        'var r = []; { eval("var ev = 5"); r.push(ev); } let q = 1; r.push(eval("q + 1")); return r.join();',
+        'var o = { w: 1 }, r = [], w = 2; with (o) { r.push(w); let w2 = 3; r.push(w2); } r.push(w); return r.join();',
+        'return (function (a, b = a + 1, c = () => b) { let r = [a, b, c(), arguments.length]; { let a = 9; r.push(a); } return r.join(); })(1);',
+        'var f = function g(n) { return n ? g(n - 1) + 1 : 0; }; return f(3) + typeof g;',
+        'switch (1) { case 1: let s1 = 4; return s1; }',
+        'class C { #p = 1; static #s = 2; static get(o) { return o.#p + C.#s; } } return C.get(new C());',
+        'const k = 1; try { k = 2; } catch (e) { return e.name; } return "no";',
+        'let a = 1; function f() { let b = 2; return function () { let c = 3; return () => a + b + c; }; } return f()()();',
+        'let r = []; { let x = 1; { let x = 2; r.push(x); } let z = 0; r.push(x); { let x = 3; } let w = 0; r.push(x, z, w); } let x = 4; { let x = 5; } let z = 6; r.push(x, z); return r.join();',
+        'var r = []; for (var v of [1, 2]) { let v2 = v * 2; r.push(() => v2); } return r.map(f => f()).join() + v;',
+        'let r = []; label: { let x = 5; r.push(x); break label; } try { r.push(x); } catch (e) { r.push(e.name); } return r.join();',
+        'let arguments2 = 1; return typeof arguments + arguments2;',
+    ];
+    var errors = [ 'let z; var z;', 'let z; { var z; }', 'const c; ', 'let d; let d;' ];
+    var pad = "", i, j, f0, f1;
+    for (i = 0; i < 40; i++)
+        pad += "var pv" + i + " = " + i + "; let pl" + i + " = " + i + ";\n";
+    for (i = 0; i < bodies.length; i++) {
+        f0 = (0, eval)("(function () {\n" + bodies[i] + "\n})");
+        f1 = (0, eval)("(function () {\n" + pad + bodies[i] + "\n})");
+        assert(f1(), f0(), bodies[i]);
+    }
+    for (j = 0; j < errors.length; j++) {
+        assert_throws(SyntaxError, () => (0, eval)("(function () {" + errors[j] + "})"));
+        assert_throws(SyntaxError, () => (0, eval)("(function () {" + pad + errors[j] + "})"));
+    }
+}
+
 test_op1();
 test_cvt();
 test_eq();
@@ -701,3 +738,4 @@ test_parse_arrow_function();
 test_unicode_ident();
 test_global_var_opt();
 test_number_literals();
+test_many_bindings();
