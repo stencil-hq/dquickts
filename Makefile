@@ -646,6 +646,46 @@ endif # CONFIG_LTO
 libquickjs.fuzz.a: $(patsubst %.o, %.fuzz.o, $(QJS_LIB_OBJS)) $(QJS_CAPI_OBJS)
 	$(AR) rcs $@ $^
 
+# qbun: the Bun/Node.js runtime (qbun.c, node/*.c, the TypeScript
+# library node/lib). Needs libuv, libcurl (with WebSocket support), OpenSSL,
+# sqlite3, zlib, libffi, libzstd, brotli and the image codecs libpng,
+# libjpeg(-turbo), libwebp and giflib (found with pkg-config, Homebrew
+# prefixes on macOS; giflib has no .pc file).
+ifdef CONFIG_DARWIN
+QBUN_EMPTY:=
+QBUN_SPACE:=$(QBUN_EMPTY) $(QBUN_EMPTY)
+QBUN_BREW_PREFIXES:=$(shell brew --prefix curl openssl sqlite zlib zstd libffi brotli libpng jpeg-turbo webp 2>/dev/null)
+QBUN_GIF_PREFIX:=$(shell brew --prefix giflib 2>/dev/null)
+QBUN_PKG_CONFIG=PKG_CONFIG_PATH="$(subst $(QBUN_SPACE),:,$(addsuffix /lib/pkgconfig,$(QBUN_BREW_PREFIXES)))$${PKG_CONFIG_PATH:+:$$PKG_CONFIG_PATH}" $(PKG_CONFIG)
+QBUN_LDEXPORT=-Wl,-export_dynamic
+else
+QBUN_PKG_CONFIG=$(PKG_CONFIG)
+QBUN_LDEXPORT=-rdynamic
+endif
+QBUN_PKGS=libuv libcurl openssl sqlite3 zlib libffi libzstd libbrotlienc libbrotlidec \
+	libpng libjpeg libwebp libwebpdemux libsharpyuv
+QBUN_CFLAGS:=$(shell $(QBUN_PKG_CONFIG) --cflags $(QBUN_PKGS) 2>/dev/null)
+QBUN_LIBS:=$(shell $(QBUN_PKG_CONFIG) --libs $(QBUN_PKGS) 2>/dev/null)
+ifneq ($(QBUN_GIF_PREFIX),)
+QBUN_CFLAGS+=-I$(QBUN_GIF_PREFIX)/include
+QBUN_LIBS+=-L$(QBUN_GIF_PREFIX)/lib
+endif
+QBUN_LIBS+=-lgif
+QBUN_NODE_OBJS=$(addprefix $(OBJDIR)/node/, core.o fs.o os.o process.o net.o tls.o crypto.o \
+	zlib.o text.o http.o sqlite.o ffi.o napi.o worker.o async.o misc.o image.o)
+
+qbun$(EXE): $(OBJDIR)/qbun.o $(QBUN_NODE_OBJS) $(QJS_LIB_OBJS) $(QJS_CAPI_OBJS)
+	$(CC) $(LDFLAGS) $(QBUN_LDEXPORT) -o $@ $^ $(LIBS) $(QBUN_LIBS)
+
+$(OBJDIR)/node/napi.o: $(wildcard node/napi/*.h)
+
+$(OBJDIR)/node/%.o: node/%.c node/qbun.h | $(OBJDIR)
+	@mkdir -p $(OBJDIR)/node
+	$(CC) $(CFLAGS_OPT) $(QBUN_CFLAGS) -c -o $@ $<
+
+$(OBJDIR)/qbun.o: qbun.c node/qbun.h | $(OBJDIR)
+	$(CC) $(CFLAGS_OPT) $(QBUN_CFLAGS) -DCONFIG_QBUN_LIB=\"$(CURDIR)/node/lib\" -c -o $@ $<
+
 repl.c: $(QJSC) repl.js
 	$(QJSC) -s -c -o $@ -m repl.js
 
@@ -704,7 +744,7 @@ unicode_gen: $(OBJDIR)/unicode_gen.host.o $(OBJDIR)/cutils.host.o libunicode.c u
 clean:
 	rm -f repl.c out.c
 	rm -f *.a *.o *.d *~ unicode_gen regexp_test fuzz_eval fuzz_compile fuzz_regexp $(PROGS)
-	rm -f qpy$(EXE) fuzz_py_compile
+	rm -f qpy$(EXE) qbun$(EXE) fuzz_py_compile
 	rm -rf build/testpy/capi-testmods
 	rm -f hello.c test_fib.c
 	rm -f examples/*.so tests/*.so tests/test_std_api$(EXE) tests/test_api$(EXE)

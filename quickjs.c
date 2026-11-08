@@ -399,6 +399,10 @@ struct JSRuntime {
     /* promise whose then() is creating the derived promise, given to
        the JS_PROMISE_HOOK_INIT hook (only set when a hook is set) */
     struct JSValueLink *parent_promise;
+    /* the async context (JS_SetAsyncContext()): owned, JS_UNDEFINED by
+       default. Captured by the promise reactions and the jobs, not
+       swapped between Python threads (runtime-wide like the job queue) */
+    JSValue async_context;
 
     struct list_head job_list; /* list of JSJobEntry.link */
 
@@ -420,6 +424,9 @@ struct JSRuntime {
     BOOL can_block : 8; /* TRUE if Atomics.wait can block */
     /* used to allocate, free and clone SharedArrayBuffers */
     JSSharedArrayBufferFunctions sab_funcs;
+    /* host of the global structuredClone() (JS_SetStructuredCloneHost()) */
+    const JSStructuredCloneHost *sc_host;
+    void *sc_host_opaque;
     /* see JS_SetStripInfo() */
     uint8_t strip_flags;
     
@@ -1165,6 +1172,8 @@ typedef struct JSJobEntry {
     struct list_head link;
     JSContext *realm;
     JSJobFunc *job_func;
+    /* async context current while the job runs (owned) */
+    JSValue async_context;
     int argc;
     JSValue argv[0];
 } JSJobEntry;
@@ -2614,6 +2623,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     init_list_head(&rt->string_list);
 #endif
     init_list_head(&rt->job_list);
+    rt->async_context = JS_UNDEFINED;
 
     if (JS_InitAtoms(rt))
         goto fail;
@@ -2879,8 +2889,11 @@ int JS_GetStripInfo(JSRuntime *rt)
     return rt->strip_flags;
 }
 
-static int JS_EnqueueJob2(JSContext *ctx, JSJobFunc *job_func,
-                          int argc, JSValueConst *argv, BOOL no_exception)
+/* enqueue a job which runs with the async context 'async_context' */
+static int js_enqueue_job_with_context(JSContext *ctx, JSJobFunc *job_func,
+                                       int argc, JSValueConst *argv,
+                                       BOOL no_exception,
+                                       JSValueConst async_context)
 {
     JSRuntime *rt = ctx->rt;
     JSJobEntry *e;
@@ -2894,12 +2907,21 @@ static int JS_EnqueueJob2(JSContext *ctx, JSJobFunc *job_func,
         return -1;
     e->realm = JS_DupContext(ctx);
     e->job_func = job_func;
+    e->async_context = JS_DupValueRT(rt, async_context);
     e->argc = argc;
     for(i = 0; i < argc; i++) {
         e->argv[i] = JS_DupValue(ctx, argv[i]);
     }
     list_add_tail(&e->link, &rt->job_list);
     return 0;
+}
+
+/* the job runs with the async context current when it is enqueued */
+static int JS_EnqueueJob2(JSContext *ctx, JSJobFunc *job_func,
+                          int argc, JSValueConst *argv, BOOL no_exception)
+{
+    return js_enqueue_job_with_context(ctx, job_func, argc, argv,
+                                       no_exception, ctx->rt->async_context);
 }
 
 /* return 0 if OK, < 0 if exception */
@@ -2928,7 +2950,7 @@ static int js_execute_first_job(JSRuntime *rt, JSContext **pctx)
 {
     JSContext *ctx;
     JSJobEntry *e;
-    JSValue res;
+    JSValue res, saved_async_context;
     int i, ret;
     BOOL saved_in_job;
 
@@ -2939,7 +2961,14 @@ static int js_execute_first_job(JSRuntime *rt, JSContext **pctx)
        native continuation */
     saved_in_job = rt->in_job;
     rt->in_job = TRUE;
+    /* the job runs in its async context; the context in place before
+       is put back afterwards, whatever the job set */
+    saved_async_context = rt->async_context;
+    rt->async_context = e->async_context;
+    e->async_context = JS_UNDEFINED;
     res = e->job_func(ctx, e->argc, (JSValueConst *)e->argv);
+    JS_FreeValueRT(rt, rt->async_context);
+    rt->async_context = saved_async_context;
     rt->in_job = saved_in_job;
     for(i = 0; i < e->argc; i++)
         JS_FreeValue(ctx, e->argv[i]);
@@ -3094,10 +3123,13 @@ void JS_FreeRuntime(JSRuntime *rt)
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
         for(i = 0; i < e->argc; i++)
             JS_FreeValueRT(rt, e->argv[i]);
+        JS_FreeValueRT(rt, e->async_context);
         JS_FreeContext(e->realm);
         js_free_rt(rt, e);
     }
     init_list_head(&rt->job_list);
+    JS_FreeValueRT(rt, rt->async_context);
+    rt->async_context = JS_UNDEFINED;
 
 #ifdef CONFIG_PYTHON_CAPI
     /* the C API holds JS references from C globals (static types, module
@@ -40626,10 +40658,22 @@ static JSModuleDef *js_host_resolve_imported_module(JSContext *ctx,
     JS_FreeAtom(ctx, module_name);
 
 #ifdef CONFIG_PYTHON
-    /* M4 jsinterop: `.py` specifiers load Python modules */
+    /* M4 jsinterop: `.py` specifiers load Python modules, except with a
+       'type' import attribute (with { type: "text" }), which asks the
+       host loader for the file as data */
     {
         size_t len = strlen(cname);
-        if (len > 3 && !strcmp(cname + len - 3, ".py")) {
+        BOOL has_type = FALSE;
+        if (JS_IsObject(attributes)) {
+            JSValue type = JS_GetPropertyStr(ctx, attributes, "type");
+            if (JS_IsException(type)) {
+                js_free(ctx, cname);
+                return NULL;
+            }
+            has_type = !JS_IsUndefined(type);
+            JS_FreeValue(ctx, type);
+        }
+        if (!has_type && len > 3 && !strcmp(cname + len - 3, ".py")) {
             m = qp_jsi_load_py_module(ctx, cname);
             js_free(ctx, cname);
             return m;
@@ -41668,6 +41712,42 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
     JS_FreeValue(ctx, resolving_funcs[0]);
     JS_FreeValue(ctx, resolving_funcs[1]);
     return promise;
+}
+
+JSValue JS_LoadModuleSync(JSContext *ctx, const char *basename,
+                          const char *filename, JSValueConst attributes)
+{
+    JSModuleDef *m;
+    JSValue promise, ret;
+
+    m = js_host_resolve_imported_module(ctx, basename, filename, attributes);
+    if (!m)
+        return JS_EXCEPTION;
+    /* a cycle through require(): the namespace of the module being
+       evaluated, whose bindings may still be uninitialized */
+    if (m->status == JS_MODULE_STATUS_EVALUATING)
+        return JS_GetModuleNamespace(ctx, m);
+    if (js_resolve_module(ctx, m) < 0) {
+        js_free_modules(ctx, JS_FREE_MODULE_NOT_RESOLVED);
+        return JS_EXCEPTION;
+    }
+    promise = JS_EvalFunction(ctx, JS_NewModuleValue(ctx, m));
+    if (JS_IsException(promise))
+        return JS_EXCEPTION;
+    switch (JS_PromiseState(ctx, promise)) {
+    case JS_PROMISE_FULFILLED:
+        ret = JS_GetModuleNamespace(ctx, m);
+        break;
+    case JS_PROMISE_REJECTED:
+        JS_PromiseMarkAsHandled(ctx, promise);
+        ret = JS_Throw(ctx, JS_PromiseResult(ctx, promise));
+        break;
+    default:
+        ret = JS_ThrowTypeError(ctx, "require() of the module '%s' that uses top-level await", filename);
+        break;
+    }
+    JS_FreeValue(ctx, promise);
+    return ret;
 }
 
 static JSValue js_dynamic_import_job(JSContext *ctx,
@@ -68573,6 +68653,9 @@ typedef struct JSPromiseReactionData {
     struct list_head link; /* not used in promise_reaction_job */
     JSValue resolving_funcs[2];
     JSValue handler;
+    /* async context when the reaction was registered (then/await): the
+       reaction job runs in it */
+    JSValue async_context;
 } JSPromiseReactionData;
 
 JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValue promise)
@@ -68616,6 +68699,7 @@ static void promise_reaction_data_free(JSRuntime *rt,
     JS_FreeValueRT(rt, rd->resolving_funcs[0]);
     JS_FreeValueRT(rt, rd->resolving_funcs[1]);
     JS_FreeValueRT(rt, rd->handler);
+    JS_FreeValueRT(rt, rd->async_context);
     js_free_rt(rt, rd);
 }
 
@@ -68682,6 +68766,18 @@ void JS_SetPromiseHook(JSRuntime *rt, JSPromiseHook *promise_hook,
     rt->promise_hook_opaque = opaque;
 }
 
+JSValue JS_GetAsyncContext(JSRuntime *rt)
+{
+    return JS_DupValueRT(rt, rt->async_context);
+}
+
+void JS_SetAsyncContext(JSRuntime *rt, JSValue value)
+{
+    JSValue old = rt->async_context;
+    rt->async_context = value;
+    JS_FreeValueRT(rt, old);
+}
+
 /* only called when rt->promise_hook is set */
 static void js_call_promise_hook(JSContext *ctx, JSPromiseHookType type,
                                  JSValueConst promise,
@@ -68729,7 +68825,8 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
         args[2] = rd->handler;
         args[3] = JS_NewBool(ctx, is_reject);
         args[4] = value;
-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+        js_enqueue_job_with_context(ctx, promise_reaction_job, 5, args,
+                                    FALSE, rd->async_context);
         list_del(&rd->link);
         promise_reaction_data_free(ctx->rt, rd);
     }
@@ -68939,6 +69036,7 @@ static void js_promise_mark(JSRuntime *rt, JSValueConst val,
             JS_MarkValue(rt, rd->resolving_funcs[0], mark_func);
             JS_MarkValue(rt, rd->resolving_funcs[1], mark_func);
             JS_MarkValue(rt, rd->handler, mark_func);
+            JS_MarkValue(rt, rd->async_context, mark_func);
         }
     }
     JS_MarkValue(rt, s->promise_result, mark_func);
@@ -69818,6 +69916,7 @@ static __exception int perform_promise_then(JSContext *ctx,
         if (!JS_IsFunction(ctx, handler))
             handler = JS_UNDEFINED;
         rd->handler = JS_DupValue(ctx, handler);
+        rd->async_context = JS_DupValue(ctx, ctx->rt->async_context);
         rd_array[i] = rd;
     }
 
@@ -69842,7 +69941,8 @@ static __exception int perform_promise_then(JSContext *ctx,
         args[2] = rd->handler;
         args[3] = JS_NewBool(ctx, i);
         args[4] = s->promise_result;
-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+        js_enqueue_job_with_context(ctx, promise_reaction_job, 5, args,
+                                    FALSE, rd->async_context);
         for(i = 0; i < 2; i++)
             promise_reaction_data_free(ctx->rt, rd_array[i]);
     }
@@ -71350,6 +71450,9 @@ static JSValue js_global_queueMicrotask(JSContext *ctx, JSValueConst this_val,
 
 /* global object */
 
+static JSValue js_global_structuredClone(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv);
+
 static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("parseInt", 2, js_parseInt ),
     JS_CFUNC_DEF("parseFloat", 1, js_parseFloat ),
@@ -71363,6 +71466,7 @@ static const JSCFunctionListEntry js_global_funcs[] = {
     JS_CFUNC_DEF("escape", 1, js_global_escape ),
     JS_CFUNC_DEF("unescape", 1, js_global_unescape ),
     JS_CFUNC_DEF("queueMicrotask", 1, js_global_queueMicrotask ),
+    JS_CFUNC_DEF("structuredClone", 1, js_global_structuredClone ),
     JS_PROP_DOUBLE_DEF("Infinity", 1.0 / 0.0, 0 ),
     JS_PROP_DOUBLE_DEF("NaN", NAN, 0 ),
     JS_PROP_UNDEFINED_DEF("undefined", 0 ),
@@ -78095,7 +78199,9 @@ static void finrec_delete_weakref(JSRuntime *rt, JSWeakRefHeader *wh)
             args[0] = frd->cb;
             args[1] = fre->held_val;
             /* no exception is raised to avoid recursing into the GC */
-            JS_EnqueueJob2(frd->realm, js_finrec_job, 2, args, TRUE);
+            /* enqueued by the collector: no async context */
+            js_enqueue_job_with_context(frd->realm, js_finrec_job, 2, args,
+                                        TRUE, JS_UNDEFINED);
                 
             js_weakref_free(rt, fre->target);
             js_weakref_free(rt, fre->token);
@@ -78699,6 +78805,1993 @@ int JS_AddPerformance(JSContext *ctx)
     js_performance_init(ctx);
     return JS_SetPropertyFunctionList(ctx, ctx->global_obj, js_performance_obj,
                                       countof(js_performance_obj));
+}
+
+/* HTML structured clone (StructuredSerializeInternal() and
+   StructuredDeserialize()), see JS_StructuredSerialize().
+
+   Format: "QSC", a version byte, the transfer list (LEB128 count, then
+   one ArrayBuffer each) and the value. The integers are LEB128 (zigzag
+   for the signed ones), the float64 and the UTF-16 code units little
+   endian. Every object takes the next reference index (the transferred
+   ArrayBuffers first) when its tag is met, before its contents, so that
+   JS_SC_TAG_REFERENCE can refer to it, cycles included. */
+
+#define JS_SC_VERSION 1
+#define JS_SC_HEADER_SIZE 4
+
+enum {
+    JS_SC_TAG_UNDEFINED = '_',
+    JS_SC_TAG_NULL = '0',
+    JS_SC_TAG_TRUE = 'T',
+    JS_SC_TAG_FALSE = 'F',
+    JS_SC_TAG_INT32 = 'I',          /* sleb128 */
+    JS_SC_TAG_FLOAT64 = 'N',        /* float64 */
+    JS_SC_TAG_BIG_INT = 'Z',        /* bigint */
+    JS_SC_TAG_STRING = 'S',         /* string */
+    JS_SC_TAG_REFERENCE = 'R',      /* leb128 reference index */
+    JS_SC_TAG_HOLE = 'h',           /* element of JS_SC_TAG_DENSE_ARRAY */
+    /* objects */
+    JS_SC_TAG_OBJECT = 'o',         /* properties */
+    JS_SC_TAG_DENSE_ARRAY = 'A',    /* length, n, n values, properties */
+    JS_SC_TAG_ARRAY = 'a',          /* length, properties */
+    JS_SC_TAG_DATE = 'D',           /* float64 */
+    JS_SC_TAG_REGEXP = 'r',         /* string source, leb128 flags */
+    JS_SC_TAG_BOOLEAN_OBJECT = 'B', /* u8 */
+    JS_SC_TAG_NUMBER_OBJECT = 'n',  /* float64 */
+    JS_SC_TAG_STRING_OBJECT = 's',  /* string */
+    JS_SC_TAG_BIG_INT_OBJECT = 'z', /* bigint */
+    JS_SC_TAG_MAP = 'M',            /* n, n keys and values */
+    JS_SC_TAG_SET = 'E',            /* n, n values */
+    JS_SC_TAG_ARRAY_BUFFER = 'b',   /* u8 flags, length, [max length], bytes */
+    JS_SC_TAG_SHARED_ARRAY_BUFFER = 'x', /* index, u8 flags, length, [max length] */
+    JS_SC_TAG_VIEW = 'V',           /* u8 type, u8 flags, offset, [length], buffer */
+    JS_SC_TAG_ERROR = 'e',          /* u8 kind, u8 flags, [message], [stack], [cause] */
+    JS_SC_TAG_DOM_EXCEPTION = 'X',  /* name, message, u8 flags, [stack] */
+    JS_SC_TAG_HOST = 'H',           /* data of the host */
+};
+
+/* property keys (leb128), a list ends with JS_SC_KEY_END */
+#define JS_SC_KEY_END    0
+#define JS_SC_KEY_STRING 1 /* string: a new key */
+#define JS_SC_KEY_INDEX  2 /* leb128: an array index */
+#define JS_SC_KEY_REF    3 /* + the index of a key written before */
+
+/* ArrayBuffer flags */
+#define JS_SC_AB_RESIZABLE (1 << 0)
+#define JS_SC_AB_IMMUTABLE (1 << 1)
+#define JS_SC_AB_STOLEN    (1 << 2) /* transfer list of JS_StructuredClone(): leb128 index */
+
+/* view type: JSTypedArrayEnum or JS_SC_VIEW_DATAVIEW */
+#define JS_SC_VIEW_DATAVIEW 12
+#define JS_SC_VIEW_TRACKING (1 << 0) /* length tracking view: no length */
+
+#define JS_SC_ERROR_MESSAGE (1 << 0)
+#define JS_SC_ERROR_STACK   (1 << 1)
+#define JS_SC_ERROR_CAUSE   (1 << 2)
+
+static const char * const js_sc_error_names[] = {
+    "Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError",
+    "TypeError", "URIError",
+};
+
+static const uint8_t js_sc_error_kinds[] = {
+    JS_PLAIN_ERROR, JS_EVAL_ERROR, JS_RANGE_ERROR, JS_REFERENCE_ERROR,
+    JS_SYNTAX_ERROR, JS_TYPE_ERROR, JS_URI_ERROR,
+};
+
+/* memory of an ArrayBuffer transferred by JS_StructuredClone() */
+typedef struct JSSCBuffer {
+    uint8_t *data;
+    int byte_length;
+    int max_byte_length; /* -1 if not resizable */
+    JSFreeArrayBufferDataFunc *free_func;
+    void *opaque;
+    BOOL consumed;
+} JSSCBuffer;
+
+struct JSStructuredWriter {
+    JSContext *ctx;
+    DynBuf dbuf;
+    JSObjectList objects; /* object -> reference index */
+    JSValue *refs;        /* the same objects, kept alive */
+    int refs_count, refs_size;
+    /* property keys already written: keys[i] has the index i */
+    JSAtom *keys;
+    int keys_count, keys_size;
+    uint32_t *keys_hash;  /* key index + 1, 0 if free */
+    uint32_t keys_hash_size;
+    /* transfer list */
+    JSValue *transfer;    /* ArrayBuffers */
+    int transfer_count, transfer_size;
+    JSValue *host_transfer;
+    int host_transfer_count, host_transfer_size;
+    BOOL allow_sab;
+    uint8_t **sab_tab;
+    int sab_tab_len, sab_tab_size;
+    /* JS_StructuredClone() */
+    BOOL is_clone;
+    JSValue *sab_objs;
+    int sab_objs_count, sab_objs_size;
+    JSSCBuffer *stolen;
+    int stolen_count;
+    const JSStructuredCloneHost *host;
+    void *opaque;
+};
+
+struct JSStructuredReader {
+    JSContext *ctx;
+    const uint8_t *ptr, *end;
+    JSValue *objs; /* reference index -> object (JS_UNDEFINED while being read) */
+    int objs_count, objs_size;
+    JSAtom *keys;
+    int keys_count, keys_size;
+    uint8_t * const *sab_tab;
+    size_t sab_tab_len;
+    /* JS_StructuredClone() */
+    JSValue *sab_objs;
+    int sab_objs_count;
+    JSSCBuffer *stolen;
+    int stolen_count;
+    const JSStructuredCloneHost *host;
+    void *opaque;
+};
+
+JSValue __attribute__((format(printf, 2, 3))) JS_ThrowDataCloneError(JSContext *ctx, const char *fmt, ...)
+{
+    JSValue obj, ret, argv[2];
+    va_list ap;
+    char buf[256], *msg;
+
+    va_start(ap, fmt);
+    msg = js_format_message(ctx->rt, buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (!JS_IsObject(ctx->class_proto[JS_CLASS_DOM_EXCEPTION])) {
+        ret = JS_ThrowTypeError(ctx, "%s", msg);
+    } else {
+        ret = JS_EXCEPTION;
+        argv[0] = JS_NewString(ctx, msg);
+        argv[1] = JS_NewString(ctx, "DataCloneError");
+        if (!JS_IsException(argv[0]) && !JS_IsException(argv[1])) {
+            obj = js_domexception_create(ctx, JS_UNDEFINED, 2,
+                                         (JSValueConst *)argv, 0);
+            if (!JS_IsException(obj))
+                JS_Throw(ctx, obj);
+        }
+        JS_FreeValue(ctx, argv[0]);
+        JS_FreeValue(ctx, argv[1]);
+    }
+    if (msg != buf)
+        js_free_rt(ctx->rt, msg);
+    return ret;
+}
+
+/* "<value> could not be cloned." */
+static int js_sc_throw_uncloneable(JSContext *ctx, JSValueConst val)
+{
+    char buf[ATOM_GET_STR_BUF_SIZE];
+    JSAtom atom;
+
+    switch(JS_VALUE_GET_NORM_TAG(val)) {
+    case JS_TAG_SYMBOL:
+        atom = js_get_atom_index(ctx->rt, JS_VALUE_GET_PTR(val));
+        JS_ThrowDataCloneError(ctx, "Symbol(%s) could not be cloned.",
+                               JS_AtomGetStr(ctx, buf, sizeof(buf), atom));
+        break;
+    case JS_TAG_OBJECT:
+        {
+            JSObject *p = JS_VALUE_GET_OBJ(val);
+            if (JS_IsFunction(ctx, val) && p->class_id != JS_CLASS_PROXY) {
+                JSValue str;
+                const char *s;
+                size_t len, n;
+
+                str = js_function_toString(ctx, val, 0, NULL);
+                if (JS_IsException(str))
+                    return -1;
+                s = JS_ToCStringLen(ctx, &len, str);
+                JS_FreeValue(ctx, str);
+                if (!s)
+                    return -1;
+                /* the first line, as a summary */
+                for(n = 0; n < len && n < 100 && s[n] != '\n'; n++)
+                    continue;
+                JS_ThrowDataCloneError(ctx, "%.*s could not be cloned.",
+                                       (int)n, s);
+                JS_FreeCString(ctx, s);
+            } else {
+                JS_ThrowDataCloneError(ctx, "#<%s> could not be cloned.",
+                                       p->class_id == JS_CLASS_PROXY ? "Object" :
+                                       JS_AtomGetStr(ctx, buf, sizeof(buf),
+                                                     ctx->rt->class_array[p->class_id].class_name));
+            }
+        }
+        break;
+    default:
+        JS_ThrowDataCloneError(ctx, "The value could not be cloned.");
+        break;
+    }
+    return -1;
+}
+
+static void js_sc_put_u64(DynBuf *s, uint64_t v)
+{
+    if (is_be())
+        v = bswap64(v);
+    dbuf_put(s, (const uint8_t *)&v, sizeof(v));
+}
+
+static void js_sc_put_float64(DynBuf *s, double d)
+{
+    JSFloat64Union u;
+    u.d = d;
+    js_sc_put_u64(s, u.u64);
+}
+
+/* a number value: int32 if possible */
+static void js_sc_put_number(DynBuf *s, double d)
+{
+    if (d >= INT32_MIN && d <= INT32_MAX && (double)(int32_t)d == d &&
+        !(d == 0 && signbit(d))) {
+        dbuf_putc(s, JS_SC_TAG_INT32);
+        dbuf_put_sleb128(s, (int32_t)d);
+    } else {
+        dbuf_putc(s, JS_SC_TAG_FLOAT64);
+        js_sc_put_float64(s, d);
+    }
+}
+
+static void js_sc_put_jsstring(DynBuf *s, JSString *p)
+{
+    uint32_t i;
+
+    dbuf_put_leb128(s, ((uint32_t)p->len << 1) | p->is_wide_char);
+    if (!p->is_wide_char) {
+        dbuf_put(s, p->u.str8, p->len);
+    } else if (is_be()) {
+        for(i = 0; i < p->len; i++)
+            dbuf_put_u16(s, bswap16(p->u.str16[i]));
+    } else {
+        dbuf_put(s, (const uint8_t *)p->u.str16, (size_t)p->len * 2);
+    }
+}
+
+/* 'str' is a string or a rope */
+static int js_sc_put_string(JSStructuredWriter *w, JSValueConst str)
+{
+    JSValue v;
+
+    v = JS_ToString(w->ctx, str);
+    if (JS_IsException(v))
+        return -1;
+    js_sc_put_jsstring(&w->dbuf, JS_VALUE_GET_STRING(v));
+    JS_FreeValue(w->ctx, v);
+    return 0;
+}
+
+/* the two's complement little endian bytes of a BigInt */
+static void js_sc_put_bigint(DynBuf *s, JSValueConst val)
+{
+    JSBigIntBuf buf;
+    JSBigInt *p;
+    uint32_t len, i;
+    js_limb_t v, b;
+    int shift;
+
+    if (JS_VALUE_GET_TAG(val) == JS_TAG_SHORT_BIG_INT)
+        p = js_bigint_set_short(&buf, val);
+    else
+        p = JS_VALUE_GET_PTR(val);
+    if (p->len == 1 && p->tab[0] == 0) {
+        len = 0;
+    } else {
+        len = p->len * (JS_LIMB_BITS / 8);
+        v = p->tab[p->len - 1];
+        shift = JS_LIMB_BITS - 8;
+        while (shift > 0) {
+            b = (v >> shift) & 0xff;
+            if (b != 0x00 && b != 0xff)
+                break;
+            if ((b & 1) != ((v >> (shift - 1)) & 1))
+                break;
+            shift -= 8;
+            len--;
+        }
+    }
+    dbuf_put_leb128(s, len);
+    for(i = 0; i < len; i++) {
+        dbuf_putc(s, (p->tab[i / (JS_LIMB_BITS / 8)] >>
+                      ((i % (JS_LIMB_BITS / 8)) * 8)) & 0xff);
+    }
+}
+
+static uint32_t js_sc_key_hash(JSAtom atom, uint32_t hash_size)
+{
+    return (atom * 2654435761u) & (hash_size - 1);
+}
+
+static int js_sc_put_key(JSStructuredWriter *w, JSAtom atom)
+{
+    JSContext *ctx = w->ctx;
+    uint32_t idx, h, i, new_size, *new_hash;
+
+    if (JS_AtomIsArrayIndex(ctx, &idx, atom)) {
+        dbuf_put_leb128(&w->dbuf, JS_SC_KEY_INDEX);
+        dbuf_put_leb128(&w->dbuf, idx);
+        return 0;
+    }
+    if (w->keys_hash_size != 0) {
+        h = js_sc_key_hash(atom, w->keys_hash_size);
+        while ((i = w->keys_hash[h]) != 0) {
+            if (w->keys[i - 1] == atom) {
+                dbuf_put_leb128(&w->dbuf, JS_SC_KEY_REF + i - 1);
+                return 0;
+            }
+            h = (h + 1) & (w->keys_hash_size - 1);
+        }
+    }
+    /* new key */
+    if ((uint32_t)(w->keys_count + 1) * 2 > w->keys_hash_size) {
+        new_size = max_int(w->keys_hash_size * 2, 32);
+        new_hash = js_mallocz(ctx, sizeof(new_hash[0]) * new_size);
+        if (!new_hash)
+            return -1;
+        for(i = 0; i < w->keys_count; i++) {
+            h = js_sc_key_hash(w->keys[i], new_size);
+            while (new_hash[h] != 0)
+                h = (h + 1) & (new_size - 1);
+            new_hash[h] = i + 1;
+        }
+        js_free(ctx, w->keys_hash);
+        w->keys_hash = new_hash;
+        w->keys_hash_size = new_size;
+    }
+    if (js_resize_array(ctx, (void **)&w->keys, sizeof(w->keys[0]),
+                        &w->keys_size, w->keys_count + 1))
+        return -1;
+    w->keys[w->keys_count++] = JS_DupAtom(ctx, atom);
+    h = js_sc_key_hash(atom, w->keys_hash_size);
+    while (w->keys_hash[h] != 0)
+        h = (h + 1) & (w->keys_hash_size - 1);
+    w->keys_hash[h] = w->keys_count;
+    dbuf_put_leb128(&w->dbuf, JS_SC_KEY_STRING);
+    js_sc_put_jsstring(&w->dbuf, ctx->rt->atom_array[atom]);
+    return 0;
+}
+
+static int js_sc_add_ref(JSStructuredWriter *w, JSValueConst obj)
+{
+    if (js_object_list_add(w->ctx, &w->objects, JS_VALUE_GET_OBJ(obj)))
+        return -1;
+    if (js_resize_array(w->ctx, (void **)&w->refs, sizeof(w->refs[0]),
+                        &w->refs_size, w->refs_count + 1))
+        return -1;
+    w->refs[w->refs_count++] = JS_DupValue(w->ctx, obj);
+    return 0;
+}
+
+/* 1 and the value of the own property 'atom' of 'obj' (the getters are
+   called), 0 if there is none, -1 if exception */
+static int js_sc_get_own(JSContext *ctx, JSValueConst obj, JSAtom atom,
+                         JSValue *pval)
+{
+    JSPropertyDescriptor desc;
+    int ret;
+
+    *pval = JS_UNDEFINED;
+    ret = JS_GetOwnPropertyInternal(ctx, &desc, JS_VALUE_GET_OBJ(obj), atom);
+    if (ret <= 0)
+        return ret;
+    if (desc.flags & JS_PROP_GETSET) {
+        JS_FreeValue(ctx, desc.getter);
+        JS_FreeValue(ctx, desc.setter);
+        *pval = JS_GetProperty(ctx, obj, atom);
+        if (JS_IsException(*pval))
+            return -1;
+    } else {
+        *pval = desc.value;
+    }
+    return 1;
+}
+
+/* 1 and the value of the own data property 'atom', 0 if none or an
+   accessor, -1 if exception */
+static int js_sc_get_own_data(JSContext *ctx, JSValueConst obj, JSAtom atom,
+                              JSValue *pval)
+{
+    JSPropertyDescriptor desc;
+    int ret;
+
+    *pval = JS_UNDEFINED;
+    ret = JS_GetOwnPropertyInternal(ctx, &desc, JS_VALUE_GET_OBJ(obj), atom);
+    if (ret <= 0)
+        return ret;
+    if (desc.flags & JS_PROP_GETSET) {
+        JS_FreeValue(ctx, desc.getter);
+        JS_FreeValue(ctx, desc.setter);
+        return 0;
+    }
+    *pval = desc.value;
+    return 1;
+}
+
+static int js_sc_write(JSStructuredWriter *w, JSValueConst val);
+
+/* the enumerable own string keyed properties, without the array indexes
+   below 'skip' */
+static int js_sc_write_props(JSStructuredWriter *w, JSValueConst obj,
+                             uint32_t skip)
+{
+    JSContext *ctx = w->ctx;
+    JSPropertyEnum *tab;
+    uint32_t len, i, idx;
+    JSAtom atom;
+    JSValue v;
+    int ret;
+
+    if (JS_GetOwnPropertyNamesInternal(ctx, &tab, &len, JS_VALUE_GET_OBJ(obj),
+                                       JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY))
+        return -1;
+    for(i = 0; i < len; i++) {
+        atom = tab[i].atom;
+        if (skip != 0 && JS_AtomIsArrayIndex(ctx, &idx, atom) && idx < skip)
+            continue;
+        /* a getter may have deleted it */
+        ret = js_sc_get_own(ctx, obj, atom, &v);
+        if (ret < 0)
+            goto fail;
+        if (ret == 0)
+            continue;
+        if (js_sc_put_key(w, atom) || js_sc_write(w, v)) {
+            JS_FreeValue(ctx, v);
+            goto fail;
+        }
+        JS_FreeValue(ctx, v);
+    }
+    JS_FreePropertyEnum(ctx, tab, len);
+    dbuf_put_leb128(&w->dbuf, JS_SC_KEY_END);
+    return 0;
+ fail:
+    JS_FreePropertyEnum(ctx, tab, len);
+    return -1;
+}
+
+static int js_sc_write_array(JSStructuredWriter *w, JSValueConst val)
+{
+    JSContext *ctx = w->ctx;
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    uint32_t len, count, i;
+    JSAtom atom;
+    JSValue v;
+    int ret;
+
+    if (js_get_length32(ctx, &len, val))
+        return -1;
+    if (!p->fast_array) {
+        dbuf_putc(&w->dbuf, JS_SC_TAG_ARRAY);
+        dbuf_put_leb128(&w->dbuf, len);
+        return js_sc_write_props(w, val, 0);
+    }
+    count = min_uint32(p->u.array.count, len);
+    dbuf_putc(&w->dbuf, JS_SC_TAG_DENSE_ARRAY);
+    dbuf_put_leb128(&w->dbuf, len);
+    dbuf_put_leb128(&w->dbuf, count);
+    for(i = 0; i < count; i++) {
+        if (p->fast_array && i < p->u.array.count) {
+            v = JS_DupValue(ctx, p->u.array.u.values[i]);
+        } else {
+            /* modified by a getter */
+            atom = JS_NewAtomUInt32(ctx, i);
+            if (atom == JS_ATOM_NULL)
+                return -1;
+            ret = js_sc_get_own(ctx, val, atom, &v);
+            JS_FreeAtom(ctx, atom);
+            if (ret < 0)
+                return -1;
+            if (ret == 0) {
+                dbuf_putc(&w->dbuf, JS_SC_TAG_HOLE);
+                continue;
+            }
+        }
+        ret = js_sc_write(w, v);
+        JS_FreeValue(ctx, v);
+        if (ret)
+            return -1;
+    }
+    return js_sc_write_props(w, val, count);
+}
+
+static int js_sc_write_error(JSStructuredWriter *w, JSValueConst val)
+{
+    JSContext *ctx = w->ctx;
+    JSValue name, msg = JS_UNDEFINED, stack = JS_UNDEFINED, cause = JS_UNDEFINED;
+    const char *str;
+    int kind = 0, flags = 0, ret, i;
+
+    name = JS_GetProperty(ctx, val, JS_ATOM_name);
+    if (JS_IsException(name))
+        return -1;
+    if (JS_IsString(name)) {
+        str = JS_ToCString(ctx, name);
+        if (!str) {
+            JS_FreeValue(ctx, name);
+            return -1;
+        }
+        for(i = 1; i < countof(js_sc_error_names); i++) {
+            if (!strcmp(str, js_sc_error_names[i])) {
+                kind = i;
+                break;
+            }
+        }
+        JS_FreeCString(ctx, str);
+    }
+    JS_FreeValue(ctx, name);
+    ret = js_sc_get_own_data(ctx, val, JS_ATOM_message, &msg);
+    if (ret < 0)
+        goto fail;
+    if (ret) {
+        msg = JS_ToStringFree(ctx, msg);
+        if (JS_IsException(msg))
+            goto fail;
+        flags |= JS_SC_ERROR_MESSAGE;
+    }
+    stack = JS_GetProperty(ctx, val, JS_ATOM_stack);
+    if (JS_IsException(stack))
+        goto fail;
+    if (JS_IsString(stack)) {
+        flags |= JS_SC_ERROR_STACK;
+    } else {
+        JS_FreeValue(ctx, stack);
+        stack = JS_UNDEFINED;
+    }
+    ret = js_sc_get_own_data(ctx, val, JS_ATOM_cause, &cause);
+    if (ret < 0)
+        goto fail;
+    if (ret)
+        flags |= JS_SC_ERROR_CAUSE;
+    dbuf_putc(&w->dbuf, JS_SC_TAG_ERROR);
+    dbuf_putc(&w->dbuf, kind);
+    dbuf_putc(&w->dbuf, flags);
+    if ((flags & JS_SC_ERROR_MESSAGE) && js_sc_put_string(w, msg))
+        goto fail;
+    if ((flags & JS_SC_ERROR_STACK) && js_sc_put_string(w, stack))
+        goto fail;
+    if ((flags & JS_SC_ERROR_CAUSE) && js_sc_write(w, cause))
+        goto fail;
+    JS_FreeValue(ctx, msg);
+    JS_FreeValue(ctx, stack);
+    JS_FreeValue(ctx, cause);
+    return 0;
+ fail:
+    JS_FreeValue(ctx, msg);
+    JS_FreeValue(ctx, stack);
+    JS_FreeValue(ctx, cause);
+    return -1;
+}
+
+static int js_sc_write_dom_exception(JSStructuredWriter *w, JSValueConst val)
+{
+    JSContext *ctx = w->ctx;
+    JSDOMExceptionData *s = JS_VALUE_GET_OBJ(val)->u.opaque;
+    JSValue stack;
+    int ret = -1;
+
+    if (!s)
+        return js_sc_throw_uncloneable(ctx, val);
+    stack = JS_GetProperty(ctx, val, JS_ATOM_stack);
+    if (JS_IsException(stack))
+        return -1;
+    dbuf_putc(&w->dbuf, JS_SC_TAG_DOM_EXCEPTION);
+    if (js_sc_put_string(w, s->name) || js_sc_put_string(w, s->message))
+        goto done;
+    if (JS_IsString(stack)) {
+        dbuf_putc(&w->dbuf, JS_SC_ERROR_STACK);
+        if (js_sc_put_string(w, stack))
+            goto done;
+    } else {
+        dbuf_putc(&w->dbuf, 0);
+    }
+    ret = 0;
+ done:
+    JS_FreeValue(ctx, stack);
+    return ret;
+}
+
+static int js_sc_write_array_buffer(JSStructuredWriter *w, JSValueConst val)
+{
+    JSArrayBuffer *abuf = JS_VALUE_GET_OBJ(val)->u.array_buffer;
+    int flags = 0;
+
+    if (abuf->detached) {
+        JS_ThrowDataCloneError(w->ctx, "An ArrayBuffer is detached and could not be cloned.");
+        return -1;
+    }
+    if (array_buffer_is_resizable(abuf))
+        flags |= JS_SC_AB_RESIZABLE;
+    if (abuf->immutable)
+        flags |= JS_SC_AB_IMMUTABLE;
+    dbuf_putc(&w->dbuf, JS_SC_TAG_ARRAY_BUFFER);
+    dbuf_putc(&w->dbuf, flags);
+    dbuf_put_leb128(&w->dbuf, abuf->byte_length);
+    if (flags & JS_SC_AB_RESIZABLE)
+        dbuf_put_leb128(&w->dbuf, abuf->max_byte_length);
+    dbuf_put(&w->dbuf, abuf->data, abuf->byte_length);
+    return 0;
+}
+
+static int js_sc_write_shared_array_buffer(JSStructuredWriter *w,
+                                           JSValueConst val)
+{
+    JSContext *ctx = w->ctx;
+    JSArrayBuffer *abuf = JS_VALUE_GET_OBJ(val)->u.array_buffer;
+    int idx;
+
+    if (!w->allow_sab)
+        return js_sc_throw_uncloneable(ctx, val);
+    array_buffer_sync_length(abuf);
+    if (w->is_clone) {
+        if (js_resize_array(ctx, (void **)&w->sab_objs, sizeof(w->sab_objs[0]),
+                            &w->sab_objs_size, w->sab_objs_count + 1))
+            return -1;
+        idx = w->sab_objs_count++;
+        w->sab_objs[idx] = JS_DupValue(ctx, val);
+    } else {
+        if (!ctx->rt->sab_funcs.sab_dup) {
+            JS_ThrowDataCloneError(ctx, "SharedArrayBuffer cannot be serialized without the shared array buffer functions");
+            return -1;
+        }
+        if (js_resize_array(ctx, (void **)&w->sab_tab, sizeof(w->sab_tab[0]),
+                            &w->sab_tab_size, w->sab_tab_len + 1))
+            return -1;
+        idx = w->sab_tab_len++;
+        w->sab_tab[idx] = array_buffer_get_alloc_ptr(abuf);
+    }
+    dbuf_putc(&w->dbuf, JS_SC_TAG_SHARED_ARRAY_BUFFER);
+    dbuf_put_leb128(&w->dbuf, idx);
+    dbuf_putc(&w->dbuf, array_buffer_is_resizable(abuf) ? JS_SC_AB_RESIZABLE : 0);
+    dbuf_put_leb128(&w->dbuf, abuf->byte_length);
+    if (array_buffer_is_resizable(abuf))
+        dbuf_put_leb128(&w->dbuf, abuf->max_byte_length);
+    return 0;
+}
+
+static int js_sc_write_view(JSStructuredWriter *w, JSValueConst val)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    JSTypedArray *ta = p->u.typed_array;
+    uint32_t length;
+    int type, flags;
+    BOOL oob;
+
+    if (p->class_id == JS_CLASS_DATAVIEW) {
+        oob = dataview_is_oob(p);
+        type = JS_SC_VIEW_DATAVIEW;
+        length = ta->length;
+    } else {
+        oob = typed_array_is_oob(p);
+        type = p->class_id - JS_CLASS_UINT8C_ARRAY;
+        length = ta->length >> typed_array_size_log2(p->class_id);
+    }
+    if (oob) {
+        if (ta->buffer->u.array_buffer->detached)
+            JS_ThrowDataCloneError(w->ctx, "An ArrayBuffer is detached and could not be cloned.");
+        else
+            JS_ThrowDataCloneError(w->ctx, "An out of bounds view could not be cloned.");
+        return -1;
+    }
+    flags = ta->track_rab ? JS_SC_VIEW_TRACKING : 0;
+    dbuf_putc(&w->dbuf, JS_SC_TAG_VIEW);
+    dbuf_putc(&w->dbuf, type);
+    dbuf_putc(&w->dbuf, flags);
+    dbuf_put_leb128(&w->dbuf, ta->offset);
+    if (!(flags & JS_SC_VIEW_TRACKING))
+        dbuf_put_leb128(&w->dbuf, length);
+    return js_sc_write(w, JS_MKPTR(JS_TAG_OBJECT, ta->buffer));
+}
+
+static int js_sc_write_map(JSStructuredWriter *w, JSValueConst val,
+                           BOOL is_set)
+{
+    JSContext *ctx = w->ctx;
+    JSMapState *ms = JS_VALUE_GET_OBJ(val)->u.map_state;
+    struct list_head *el;
+    JSMapRecord *mr;
+    JSValue *tab;
+    uint32_t n, max_n, i;
+    int ret = 0;
+
+    /* the entries are copied first: the serialization of a key or a
+       value may modify the map */
+    max_n = ms->record_count * (is_set ? 1 : 2);
+    tab = js_malloc(ctx, sizeof(tab[0]) * max_int(max_n, 1));
+    if (!tab)
+        return -1;
+    n = 0;
+    list_for_each(el, &ms->records) {
+        mr = list_entry(el, JSMapRecord, link);
+        if (mr->empty)
+            continue;
+        if (n + (is_set ? 1 : 2) > max_n)
+            break;
+        tab[n++] = JS_DupValue(ctx, mr->key);
+        if (!is_set)
+            tab[n++] = JS_DupValue(ctx, mr->value);
+    }
+    dbuf_putc(&w->dbuf, is_set ? JS_SC_TAG_SET : JS_SC_TAG_MAP);
+    dbuf_put_leb128(&w->dbuf, is_set ? n : n / 2);
+    for(i = 0; i < n; i++) {
+        if (js_sc_write(w, tab[i])) {
+            ret = -1;
+            break;
+        }
+    }
+    for(i = 0; i < n; i++)
+        JS_FreeValue(ctx, tab[i]);
+    js_free(ctx, tab);
+    return ret;
+}
+
+static int js_sc_write_object(JSStructuredWriter *w, JSValueConst val)
+{
+    JSContext *ctx = w->ctx;
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    size_t pos;
+    double d;
+    int idx, ret;
+
+    idx = js_object_list_find(ctx, &w->objects, p);
+    if (idx >= 0) {
+        dbuf_putc(&w->dbuf, JS_SC_TAG_REFERENCE);
+        dbuf_put_leb128(&w->dbuf, idx);
+        return 0;
+    }
+    if (p->class_id == JS_CLASS_PROXY)
+        return js_sc_throw_uncloneable(ctx, val);
+    if (js_sc_add_ref(w, val))
+        return -1;
+    if (w->host && w->host->write) {
+        pos = w->dbuf.size;
+        dbuf_putc(&w->dbuf, JS_SC_TAG_HOST);
+        ret = w->host->write(ctx, w, val, w->opaque);
+        if (ret < 0)
+            return -1;
+        if (ret > 0)
+            return 0;
+        w->dbuf.size = pos;
+    }
+    switch(p->class_id) {
+    case JS_CLASS_OBJECT:
+        dbuf_putc(&w->dbuf, JS_SC_TAG_OBJECT);
+        return js_sc_write_props(w, val, 0);
+    case JS_CLASS_ARRAY:
+        return js_sc_write_array(w, val);
+    case JS_CLASS_ERROR:
+        return js_sc_write_error(w, val);
+    case JS_CLASS_DOM_EXCEPTION:
+        return js_sc_write_dom_exception(w, val);
+    case JS_CLASS_BOOLEAN:
+        dbuf_putc(&w->dbuf, JS_SC_TAG_BOOLEAN_OBJECT);
+        dbuf_putc(&w->dbuf, JS_ToBool(ctx, p->u.object_data));
+        return 0;
+    case JS_CLASS_NUMBER:
+    case JS_CLASS_DATE:
+        if (JS_ToFloat64(ctx, &d, p->u.object_data))
+            return -1;
+        dbuf_putc(&w->dbuf, p->class_id == JS_CLASS_DATE ?
+                  JS_SC_TAG_DATE : JS_SC_TAG_NUMBER_OBJECT);
+        js_sc_put_float64(&w->dbuf, d);
+        return 0;
+    case JS_CLASS_STRING:
+        dbuf_putc(&w->dbuf, JS_SC_TAG_STRING_OBJECT);
+        return js_sc_put_string(w, p->u.object_data);
+    case JS_CLASS_BIG_INT:
+        dbuf_putc(&w->dbuf, JS_SC_TAG_BIG_INT_OBJECT);
+        js_sc_put_bigint(&w->dbuf, p->u.object_data);
+        return 0;
+    case JS_CLASS_REGEXP:
+        {
+            JSRegExp *re = &p->u.regexp;
+            dbuf_putc(&w->dbuf, JS_SC_TAG_REGEXP);
+            js_sc_put_jsstring(&w->dbuf, re->pattern);
+            dbuf_put_leb128(&w->dbuf, lre_get_flags(re->bytecode->u.str8) &
+                            BC_REGEXP_FLAGS);
+        }
+        return 0;
+    case JS_CLASS_ARRAY_BUFFER:
+        return js_sc_write_array_buffer(w, val);
+    case JS_CLASS_SHARED_ARRAY_BUFFER:
+        return js_sc_write_shared_array_buffer(w, val);
+    case JS_CLASS_MAP:
+    case JS_CLASS_SET:
+        return js_sc_write_map(w, val, p->class_id == JS_CLASS_SET);
+    default:
+        if (p->class_id >= JS_CLASS_UINT8C_ARRAY &&
+            p->class_id <= JS_CLASS_DATAVIEW)
+            return js_sc_write_view(w, val);
+        return js_sc_throw_uncloneable(ctx, val);
+    }
+}
+
+static int js_sc_write(JSStructuredWriter *w, JSValueConst val)
+{
+    JSContext *ctx = w->ctx;
+
+    if (js_check_stack_overflow(ctx->rt, 0)) {
+        JS_ThrowStackOverflow(ctx);
+        return -1;
+    }
+    switch(JS_VALUE_GET_NORM_TAG(val)) {
+    case JS_TAG_UNDEFINED:
+        dbuf_putc(&w->dbuf, JS_SC_TAG_UNDEFINED);
+        break;
+    case JS_TAG_NULL:
+        dbuf_putc(&w->dbuf, JS_SC_TAG_NULL);
+        break;
+    case JS_TAG_BOOL:
+        dbuf_putc(&w->dbuf, JS_VALUE_GET_INT(val) ? JS_SC_TAG_TRUE : JS_SC_TAG_FALSE);
+        break;
+    case JS_TAG_INT:
+        dbuf_putc(&w->dbuf, JS_SC_TAG_INT32);
+        dbuf_put_sleb128(&w->dbuf, JS_VALUE_GET_INT(val));
+        break;
+    case JS_TAG_FLOAT64:
+        js_sc_put_number(&w->dbuf, JS_VALUE_GET_FLOAT64(val));
+        break;
+    case JS_TAG_STRING:
+    case JS_TAG_STRING_ROPE:
+        dbuf_putc(&w->dbuf, JS_SC_TAG_STRING);
+        return js_sc_put_string(w, val);
+    case JS_TAG_SHORT_BIG_INT:
+    case JS_TAG_BIG_INT:
+        dbuf_putc(&w->dbuf, JS_SC_TAG_BIG_INT);
+        js_sc_put_bigint(&w->dbuf, val);
+        break;
+    case JS_TAG_OBJECT:
+        return js_sc_write_object(w, val);
+    default:
+        return js_sc_throw_uncloneable(ctx, val);
+    }
+    return 0;
+}
+
+static void js_sc_writer_init(JSStructuredWriter *w, JSContext *ctx,
+                              const JSStructuredCloneHost *host, void *opaque)
+{
+    memset(w, 0, sizeof(*w));
+    w->ctx = ctx;
+    js_dbuf_init(ctx, &w->dbuf);
+    js_object_list_init(&w->objects);
+    w->host = host;
+    w->opaque = opaque;
+}
+
+static void js_sc_writer_free(JSStructuredWriter *w)
+{
+    JSContext *ctx = w->ctx;
+    int i;
+
+    dbuf_free(&w->dbuf);
+    js_object_list_end(ctx, &w->objects);
+    for(i = 0; i < w->refs_count; i++)
+        JS_FreeValue(ctx, w->refs[i]);
+    js_free(ctx, w->refs);
+    for(i = 0; i < w->keys_count; i++)
+        JS_FreeAtom(ctx, w->keys[i]);
+    js_free(ctx, w->keys);
+    js_free(ctx, w->keys_hash);
+    for(i = 0; i < w->transfer_count; i++)
+        JS_FreeValue(ctx, w->transfer[i]);
+    js_free(ctx, w->transfer);
+    for(i = 0; i < w->host_transfer_count; i++)
+        JS_FreeValue(ctx, w->host_transfer[i]);
+    js_free(ctx, w->host_transfer);
+    js_free(ctx, w->sab_tab);
+    for(i = 0; i < w->sab_objs_count; i++)
+        JS_FreeValue(ctx, w->sab_objs[i]);
+    js_free(ctx, w->sab_objs);
+    for(i = 0; i < w->stolen_count; i++) {
+        JSSCBuffer *b = &w->stolen[i];
+        if (!b->consumed && b->free_func)
+            b->free_func(ctx->rt, b->opaque, b->data);
+    }
+    js_free(ctx, w->stolen);
+}
+
+static int js_sc_add_transfer1(JSStructuredWriter *w, JSValueConst v)
+{
+    JSContext *ctx = w->ctx;
+    JSObject *p;
+    JSArrayBuffer *abuf;
+    int i, ret;
+
+    if (!JS_IsObject(v))
+        goto invalid;
+    p = JS_VALUE_GET_OBJ(v);
+    if (p->class_id == JS_CLASS_ARRAY_BUFFER) {
+        abuf = p->u.array_buffer;
+        if (js_object_list_find(ctx, &w->objects, p) >= 0) {
+            JS_ThrowDataCloneError(ctx, "Transfer list contains duplicate ArrayBuffer");
+            return -1;
+        }
+        if (abuf->detached) {
+            JS_ThrowDataCloneError(ctx, "An ArrayBuffer is detached and could not be transferred.");
+            return -1;
+        }
+        if (abuf->immutable) {
+            JS_ThrowDataCloneError(ctx, "An immutable ArrayBuffer could not be transferred.");
+            return -1;
+        }
+        /* the transferred ArrayBuffers take the first reference indexes */
+        if (js_sc_add_ref(w, v))
+            return -1;
+        if (js_resize_array(ctx, (void **)&w->transfer, sizeof(w->transfer[0]),
+                            &w->transfer_size, w->transfer_count + 1))
+            return -1;
+        w->transfer[w->transfer_count++] = JS_DupValue(ctx, v);
+        return 0;
+    }
+    if (p->class_id == JS_CLASS_SHARED_ARRAY_BUFFER) {
+        JS_ThrowDataCloneError(ctx, "A SharedArrayBuffer could not be transferred.");
+        return -1;
+    }
+    for(i = 0; i < w->host_transfer_count; i++) {
+        if (JS_VALUE_GET_OBJ(w->host_transfer[i]) == p) {
+            JS_ThrowDataCloneError(ctx, "Transfer list contains duplicate value");
+            return -1;
+        }
+    }
+    if (!w->host || !w->host->transfer)
+        goto invalid;
+    ret = w->host->transfer(ctx, v, w->opaque);
+    if (ret < 0)
+        return -1;
+    if (ret == 0)
+        goto invalid;
+    if (js_resize_array(ctx, (void **)&w->host_transfer,
+                        sizeof(w->host_transfer[0]),
+                        &w->host_transfer_size, w->host_transfer_count + 1))
+        return -1;
+    w->host_transfer[w->host_transfer_count++] = JS_DupValue(ctx, v);
+    return 0;
+ invalid:
+    JS_ThrowDataCloneError(ctx, "Found invalid value in transferList.");
+    return -1;
+}
+
+static int js_sc_add_transfer(JSStructuredWriter *w, JSValueConst transfer)
+{
+    JSContext *ctx = w->ctx;
+    JSValue arr, v;
+    uint32_t len, i;
+    int ret = -1;
+
+    if (JS_IsUndefined(transfer) || JS_IsNull(transfer))
+        return 0;
+    if (!JS_IsObject(transfer)) {
+        JS_ThrowTypeError(ctx, "the transfer list is not iterable");
+        return -1;
+    }
+    arr = iterator_to_array(ctx, transfer);
+    if (JS_IsException(arr))
+        return -1;
+    if (js_get_length32(ctx, &len, arr))
+        goto done;
+    for(i = 0; i < len; i++) {
+        v = JS_GetPropertyUint32(ctx, arr, i);
+        if (JS_IsException(v))
+            goto done;
+        if (js_sc_add_transfer1(w, v)) {
+            JS_FreeValue(ctx, v);
+            goto done;
+        }
+        JS_FreeValue(ctx, v);
+    }
+    ret = 0;
+ done:
+    JS_FreeValue(ctx, arr);
+    return ret;
+}
+
+/* JS_StructuredClone(): move the memory of the ArrayBuffer 'obj' to 'b'
+   and detach it */
+static int js_sc_steal_array_buffer(JSContext *ctx, JSSCBuffer *b,
+                                    JSValueConst obj)
+{
+    JSArrayBuffer *abuf = JS_VALUE_GET_OBJ(obj)->u.array_buffer;
+
+    b->byte_length = abuf->byte_length;
+    b->max_byte_length = abuf->max_byte_length;
+    if (array_buffer_is_resizable(abuf) &&
+        abuf->free_func != js_array_buffer_free) {
+        /* a resizable ArrayBuffer needs memory of js_malloc() */
+        b->data = js_malloc(ctx, max_int(abuf->byte_length, 1));
+        if (!b->data)
+            return -1;
+        memcpy(b->data, abuf->data, abuf->byte_length);
+        b->free_func = js_array_buffer_free;
+        b->opaque = NULL;
+        JS_DetachArrayBuffer(ctx, obj);
+    } else {
+        b->data = abuf->data;
+        b->free_func = abuf->free_func;
+        b->opaque = abuf->opaque;
+        abuf->data = NULL;
+        abuf->byte_length = 0;
+        abuf->detached = TRUE;
+        abuf->free_func = NULL;
+        abuf->opaque = NULL;
+        js_array_buffer_update_typed_arrays(abuf);
+    }
+    return 0;
+}
+
+/* insert the transfer list after the header and detach the transferred
+   ArrayBuffers */
+static int js_sc_write_transfer(JSStructuredWriter *w)
+{
+    JSContext *ctx = w->ctx;
+    JSArrayBuffer *abuf;
+    DynBuf sec;
+    int i;
+
+    for(i = 0; i < w->transfer_count; i++) {
+        abuf = JS_VALUE_GET_OBJ(w->transfer[i])->u.array_buffer;
+        if (abuf->detached || abuf->immutable) {
+            JS_ThrowDataCloneError(ctx, "An ArrayBuffer is detached and could not be transferred.");
+            return -1;
+        }
+    }
+    js_dbuf_init(ctx, &sec);
+    dbuf_put_leb128(&sec, w->transfer_count);
+    if (w->is_clone) {
+        w->stolen = js_mallocz(ctx, sizeof(w->stolen[0]) * w->transfer_count);
+        if (!w->stolen)
+            goto fail;
+        for(i = 0; i < w->transfer_count; i++) {
+            if (js_sc_steal_array_buffer(ctx, &w->stolen[i], w->transfer[i]))
+                goto fail;
+            w->stolen_count = i + 1;
+            dbuf_putc(&sec, JS_SC_AB_STOLEN);
+            dbuf_put_leb128(&sec, i);
+        }
+    } else {
+        for(i = 0; i < w->transfer_count; i++) {
+            abuf = JS_VALUE_GET_OBJ(w->transfer[i])->u.array_buffer;
+            dbuf_putc(&sec, array_buffer_is_resizable(abuf) ? JS_SC_AB_RESIZABLE : 0);
+            dbuf_put_leb128(&sec, abuf->byte_length);
+            if (array_buffer_is_resizable(abuf))
+                dbuf_put_leb128(&sec, abuf->max_byte_length);
+            dbuf_put(&sec, abuf->data, abuf->byte_length);
+        }
+    }
+    if (dbuf_error(&sec) || dbuf_claim(&w->dbuf, sec.size)) {
+        JS_ThrowOutOfMemory(ctx);
+        goto fail;
+    }
+    memmove(w->dbuf.buf + JS_SC_HEADER_SIZE + sec.size,
+            w->dbuf.buf + JS_SC_HEADER_SIZE, w->dbuf.size - JS_SC_HEADER_SIZE);
+    memcpy(w->dbuf.buf + JS_SC_HEADER_SIZE, sec.buf, sec.size);
+    w->dbuf.size += sec.size;
+    dbuf_free(&sec);
+    if (!w->is_clone) {
+        for(i = 0; i < w->transfer_count; i++)
+            JS_DetachArrayBuffer(ctx, w->transfer[i]);
+    }
+    return 0;
+ fail:
+    dbuf_free(&sec);
+    return -1;
+}
+
+/* return the output (to be freed with js_free()) or NULL */
+static uint8_t *js_sc_serialize(JSStructuredWriter *w, size_t *psize,
+                                JSValueConst val, JSValueConst transfer)
+{
+    uint8_t *buf;
+
+    dbuf_put(&w->dbuf, (const uint8_t *)"QSC", 3);
+    dbuf_putc(&w->dbuf, JS_SC_VERSION);
+    if (js_sc_add_transfer(w, transfer))
+        return NULL;
+    if (w->transfer_count == 0)
+        dbuf_put_leb128(&w->dbuf, 0);
+    if (js_sc_write(w, val))
+        return NULL;
+    if (dbuf_error(&w->dbuf)) {
+        JS_ThrowOutOfMemory(w->ctx);
+        return NULL;
+    }
+    if (w->transfer_count != 0 && js_sc_write_transfer(w))
+        return NULL;
+    buf = w->dbuf.buf;
+    *psize = w->dbuf.size;
+    w->dbuf.buf = NULL;
+    w->dbuf.size = 0;
+    return buf;
+}
+
+uint8_t *JS_StructuredSerialize(JSContext *ctx, size_t *psize,
+                                JSValueConst val, JSValueConst transfer,
+                                uint8_t ***psab_tab, size_t *psab_tab_len,
+                                const JSStructuredCloneHost *host,
+                                void *opaque)
+{
+    JSStructuredWriter ws, *w = &ws;
+    uint8_t *buf;
+
+    js_sc_writer_init(w, ctx, host, opaque);
+    w->allow_sab = (psab_tab != NULL);
+    *psize = 0;
+    buf = js_sc_serialize(w, psize, val, transfer);
+    if (psab_tab) {
+        if (buf) {
+            *psab_tab = w->sab_tab;
+            *psab_tab_len = w->sab_tab_len;
+            w->sab_tab = NULL;
+        } else {
+            *psab_tab = NULL;
+            *psab_tab_len = 0;
+        }
+    }
+    js_sc_writer_free(w);
+    return buf;
+}
+
+int JS_StructuredWriteUint32(JSStructuredWriter *w, uint32_t v)
+{
+    dbuf_put_leb128(&w->dbuf, v);
+    if (dbuf_error(&w->dbuf)) {
+        JS_ThrowOutOfMemory(w->ctx);
+        return -1;
+    }
+    return 0;
+}
+
+int JS_StructuredWriteBytes(JSStructuredWriter *w, const uint8_t *buf,
+                            size_t len)
+{
+    if (len > UINT32_MAX) {
+        JS_ThrowRangeError(w->ctx, "too many bytes");
+        return -1;
+    }
+    dbuf_put_leb128(&w->dbuf, len);
+    dbuf_put(&w->dbuf, buf, len);
+    if (dbuf_error(&w->dbuf)) {
+        JS_ThrowOutOfMemory(w->ctx);
+        return -1;
+    }
+    return 0;
+}
+
+int JS_StructuredWriteValue(JSStructuredWriter *w, JSValueConst val)
+{
+    return js_sc_write(w, val);
+}
+
+/* deserialization */
+
+static JSValue js_sc_invalid(JSStructuredReader *r)
+{
+    return JS_ThrowDataCloneError(r->ctx, "Unable to deserialize cloned data.");
+}
+
+static int js_sc_get_u8(JSStructuredReader *r, uint8_t *pv)
+{
+    if (r->ptr >= r->end) {
+        js_sc_invalid(r);
+        return -1;
+    }
+    *pv = *r->ptr++;
+    return 0;
+}
+
+static int js_sc_get_leb128(JSStructuredReader *r, uint32_t *pv)
+{
+    int n = get_leb128(pv, r->ptr, r->end);
+    if (n < 0) {
+        js_sc_invalid(r);
+        return -1;
+    }
+    r->ptr += n;
+    return 0;
+}
+
+static int js_sc_get_sleb128(JSStructuredReader *r, int32_t *pv)
+{
+    int n = get_sleb128(pv, r->ptr, r->end);
+    if (n < 0) {
+        js_sc_invalid(r);
+        return -1;
+    }
+    r->ptr += n;
+    return 0;
+}
+
+static int js_sc_get_float64(JSStructuredReader *r, double *pd)
+{
+    JSFloat64Union u;
+
+    if (r->end - r->ptr < 8) {
+        js_sc_invalid(r);
+        return -1;
+    }
+    memcpy(&u.u64, r->ptr, 8);
+    if (is_be())
+        u.u64 = bswap64(u.u64);
+    r->ptr += 8;
+    *pd = u.d;
+    return 0;
+}
+
+static JSValue js_sc_get_string(JSStructuredReader *r)
+{
+    JSContext *ctx = r->ctx;
+    uint32_t len, i;
+    size_t size;
+    BOOL is_wide_char;
+    JSString *p;
+    JSValue v;
+
+    if (js_sc_get_leb128(r, &len))
+        return JS_EXCEPTION;
+    is_wide_char = len & 1;
+    len >>= 1;
+    size = (size_t)len << is_wide_char;
+    if (len > JS_STRING_LEN_MAX || (size_t)(r->end - r->ptr) < size)
+        return js_sc_invalid(r);
+    if (!is_wide_char) {
+        v = js_new_string8_len(ctx, (const char *)r->ptr, len);
+    } else {
+        p = js_alloc_string(ctx, len, 1);
+        if (!p)
+            return JS_EXCEPTION;
+        memcpy(p->u.str16, r->ptr, size);
+        if (is_be()) {
+            for(i = 0; i < len; i++)
+                p->u.str16[i] = bswap16(p->u.str16[i]);
+        }
+        v = JS_MKPTR(JS_TAG_STRING, p);
+    }
+    r->ptr += size;
+    return v;
+}
+
+static JSValue js_sc_get_bigint(JSStructuredReader *r)
+{
+    JSContext *ctx = r->ctx;
+    uint32_t len, i, n;
+    JSBigInt *p;
+    js_limb_t v;
+    int shift;
+
+    if (js_sc_get_leb128(r, &len))
+        return JS_EXCEPTION;
+    if (len == 0)
+        return __JS_NewShortBigInt(ctx, 0);
+    if ((size_t)(r->end - r->ptr) < len)
+        return js_sc_invalid(r);
+    n = (len - 1) / (JS_LIMB_BITS / 8) + 1;
+    p = js_bigint_new(ctx, n);
+    if (!p)
+        return JS_EXCEPTION;
+    for(i = 0; i < n; i++)
+        p->tab[i] = 0;
+    for(i = 0; i < len; i++) {
+        p->tab[i / (JS_LIMB_BITS / 8)] |=
+            (js_limb_t)r->ptr[i] << ((i % (JS_LIMB_BITS / 8)) * 8);
+    }
+    r->ptr += len;
+    /* extend the sign */
+    shift = JS_LIMB_BITS - (len % (JS_LIMB_BITS / 8)) * 8;
+    if (shift != JS_LIMB_BITS) {
+        v = p->tab[n - 1];
+        p->tab[n - 1] = (js_slimb_t)(v << shift) >> shift;
+    }
+    return JS_CompactBigInt(ctx, p);
+}
+
+/* reserve the next reference index */
+static int js_sc_reserve(JSStructuredReader *r)
+{
+    if (js_resize_array(r->ctx, (void **)&r->objs, sizeof(r->objs[0]),
+                        &r->objs_size, r->objs_count + 1))
+        return -1;
+    r->objs[r->objs_count] = JS_UNDEFINED;
+    return r->objs_count++;
+}
+
+static void js_sc_set_ref(JSStructuredReader *r, int idx, JSValueConst obj)
+{
+    r->objs[idx] = JS_DupValue(r->ctx, obj);
+}
+
+static JSValue js_sc_read(JSStructuredReader *r);
+
+static int js_sc_read_props(JSStructuredReader *r, JSValueConst obj)
+{
+    JSContext *ctx = r->ctx;
+    uint32_t k, idx;
+    JSAtom atom, tmp_atom;
+    JSValue str, v;
+    int ret;
+
+    for(;;) {
+        if (js_sc_get_leb128(r, &k))
+            return -1;
+        tmp_atom = JS_ATOM_NULL;
+        if (k == JS_SC_KEY_END) {
+            return 0;
+        } else if (k == JS_SC_KEY_STRING) {
+            str = js_sc_get_string(r);
+            if (JS_IsException(str))
+                return -1;
+            atom = JS_NewAtomStr(ctx, JS_VALUE_GET_STRING(str));
+            if (atom == JS_ATOM_NULL)
+                return -1;
+            if (js_resize_array(ctx, (void **)&r->keys, sizeof(r->keys[0]),
+                                &r->keys_size, r->keys_count + 1)) {
+                JS_FreeAtom(ctx, atom);
+                return -1;
+            }
+            r->keys[r->keys_count++] = atom;
+        } else if (k == JS_SC_KEY_INDEX) {
+            if (js_sc_get_leb128(r, &idx))
+                return -1;
+            atom = tmp_atom = JS_NewAtomUInt32(ctx, idx);
+            if (atom == JS_ATOM_NULL)
+                return -1;
+        } else {
+            k -= JS_SC_KEY_REF;
+            if (k >= r->keys_count) {
+                js_sc_invalid(r);
+                return -1;
+            }
+            atom = r->keys[k];
+        }
+        v = js_sc_read(r);
+        if (JS_IsException(v)) {
+            JS_FreeAtom(ctx, tmp_atom);
+            return -1;
+        }
+        ret = JS_DefinePropertyValue(ctx, obj, atom, v,
+                                     JS_PROP_C_W_E | JS_PROP_THROW);
+        JS_FreeAtom(ctx, tmp_atom);
+        if (ret < 0)
+            return -1;
+    }
+}
+
+/* contents of an ArrayBuffer after its flags */
+static JSValue js_sc_read_array_buffer(JSStructuredReader *r, int flags)
+{
+    JSContext *ctx = r->ctx;
+    uint32_t len, max_len;
+    uint64_t max_len64;
+    JSValue obj;
+
+    if (flags & ~(JS_SC_AB_RESIZABLE | JS_SC_AB_IMMUTABLE))
+        return js_sc_invalid(r);
+    if (js_sc_get_leb128(r, &len))
+        return JS_EXCEPTION;
+    max_len = len;
+    if ((flags & JS_SC_AB_RESIZABLE) && js_sc_get_leb128(r, &max_len))
+        return JS_EXCEPTION;
+    if (max_len < len || (size_t)(r->end - r->ptr) < len)
+        return js_sc_invalid(r);
+    max_len64 = max_len;
+    obj = js_array_buffer_constructor3(ctx, JS_UNDEFINED, len,
+                                       (flags & JS_SC_AB_RESIZABLE) ? &max_len64 : NULL,
+                                       JS_CLASS_ARRAY_BUFFER,
+                                       (uint8_t *)r->ptr, js_array_buffer_free,
+                                       NULL, TRUE);
+    if (JS_IsException(obj))
+        return obj;
+    r->ptr += len;
+    if (flags & JS_SC_AB_IMMUTABLE)
+        JS_VALUE_GET_OBJ(obj)->u.array_buffer->immutable = TRUE;
+    return obj;
+}
+
+static JSValue js_sc_read_shared_array_buffer(JSStructuredReader *r)
+{
+    JSContext *ctx = r->ctx;
+    JSRuntime *rt = ctx->rt;
+    JSArrayBuffer *abuf;
+    uint32_t idx, len, max_len;
+    uint64_t max_len64;
+    uint8_t flags;
+
+    if (js_sc_get_leb128(r, &idx) || js_sc_get_u8(r, &flags) ||
+        js_sc_get_leb128(r, &len))
+        return JS_EXCEPTION;
+    if (flags & ~JS_SC_AB_RESIZABLE)
+        return js_sc_invalid(r);
+    max_len = len;
+    if ((flags & JS_SC_AB_RESIZABLE) && js_sc_get_leb128(r, &max_len))
+        return JS_EXCEPTION;
+    if (max_len < len)
+        return js_sc_invalid(r);
+    if (r->sab_objs) {
+        JSValueConst src;
+        if (idx >= r->sab_objs_count)
+            return js_sc_invalid(r);
+        src = r->sab_objs[idx];
+        if (!rt->sab_funcs.sab_dup)
+            return JS_DupValue(ctx, src);
+        /* a new object sharing the memory */
+        abuf = JS_VALUE_GET_OBJ(src)->u.array_buffer;
+        array_buffer_sync_length(abuf);
+        max_len64 = abuf->max_byte_length;
+        return js_array_buffer_constructor3(ctx, JS_UNDEFINED, abuf->byte_length,
+                                            array_buffer_is_resizable(abuf) ? &max_len64 : NULL,
+                                            JS_CLASS_SHARED_ARRAY_BUFFER,
+                                            array_buffer_get_alloc_ptr(abuf),
+                                            NULL, NULL, FALSE);
+    }
+    if (!r->sab_tab || idx >= r->sab_tab_len)
+        return js_sc_invalid(r);
+    if (!rt->sab_funcs.sab_dup)
+        return JS_ThrowDataCloneError(ctx, "SharedArrayBuffer cannot be deserialized without the shared array buffer functions");
+    max_len64 = max_len;
+    return js_array_buffer_constructor3(ctx, JS_UNDEFINED, len,
+                                        (flags & JS_SC_AB_RESIZABLE) ? &max_len64 : NULL,
+                                        JS_CLASS_SHARED_ARRAY_BUFFER,
+                                        r->sab_tab[idx], NULL, NULL, FALSE);
+}
+
+static JSValue js_sc_read_view(JSStructuredReader *r, int idx)
+{
+    JSContext *ctx = r->ctx;
+    uint8_t type, flags;
+    uint32_t offset, length = 0;
+    JSValue buffer, obj, args[3];
+    int argc, class_id;
+
+    if (js_sc_get_u8(r, &type) || js_sc_get_u8(r, &flags) ||
+        js_sc_get_leb128(r, &offset))
+        return JS_EXCEPTION;
+    if (type > JS_SC_VIEW_DATAVIEW || (flags & ~JS_SC_VIEW_TRACKING))
+        return js_sc_invalid(r);
+    if (!(flags & JS_SC_VIEW_TRACKING) && js_sc_get_leb128(r, &length))
+        return JS_EXCEPTION;
+    buffer = js_sc_read(r);
+    if (JS_IsException(buffer))
+        return buffer;
+    class_id = JS_GetClassID(buffer);
+    if (class_id != JS_CLASS_ARRAY_BUFFER &&
+        class_id != JS_CLASS_SHARED_ARRAY_BUFFER) {
+        JS_FreeValue(ctx, buffer);
+        return js_sc_invalid(r);
+    }
+    args[0] = buffer;
+    args[1] = JS_NewUint32(ctx, offset);
+    args[2] = JS_NewUint32(ctx, length);
+    argc = (flags & JS_SC_VIEW_TRACKING) ? 2 : 3;
+    if (type == JS_SC_VIEW_DATAVIEW)
+        obj = js_dataview_constructor(ctx, JS_UNDEFINED, argc,
+                                      (JSValueConst *)args);
+    else
+        obj = js_typed_array_constructor(ctx, JS_UNDEFINED, argc,
+                                         (JSValueConst *)args,
+                                         JS_CLASS_UINT8C_ARRAY + type);
+    JS_FreeValue(ctx, buffer);
+    if (!JS_IsException(obj))
+        js_sc_set_ref(r, idx, obj);
+    return obj;
+}
+
+static JSValue js_sc_read_error(JSStructuredReader *r, int idx)
+{
+    JSContext *ctx = r->ctx;
+    JSValue msg = JS_UNDEFINED, stack = JS_UNDEFINED, obj, cause;
+    JSErrorEnum error_num;
+    JSObject *p;
+    uint8_t kind, flags;
+
+    if (js_sc_get_u8(r, &kind) || js_sc_get_u8(r, &flags))
+        return JS_EXCEPTION;
+    if (kind >= countof(js_sc_error_kinds) ||
+        (flags & ~(JS_SC_ERROR_MESSAGE | JS_SC_ERROR_STACK | JS_SC_ERROR_CAUSE)))
+        return js_sc_invalid(r);
+    if (flags & JS_SC_ERROR_MESSAGE) {
+        msg = js_sc_get_string(r);
+        if (JS_IsException(msg))
+            return msg;
+    }
+    if (flags & JS_SC_ERROR_STACK) {
+        stack = js_sc_get_string(r);
+        if (JS_IsException(stack)) {
+            JS_FreeValue(ctx, msg);
+            return stack;
+        }
+    }
+    error_num = js_sc_error_kinds[kind];
+    obj = js_new_error_object(ctx, js_get_error_proto(ctx, error_num),
+                              error_num, msg);
+    if (JS_IsException(obj)) {
+        JS_FreeValue(ctx, stack);
+        return obj;
+    }
+    if (flags & JS_SC_ERROR_STACK) {
+        /* the [[ErrorData]] stack, as if captured */
+        p = JS_VALUE_GET_OBJ(obj);
+        JS_FreeValue(ctx, p->u.error.stack);
+        p->u.error.stack = stack;
+    }
+    js_sc_set_ref(r, idx, obj);
+    if (flags & JS_SC_ERROR_CAUSE) {
+        cause = js_sc_read(r);
+        if (JS_IsException(cause) ||
+            JS_DefinePropertyValue(ctx, obj, JS_ATOM_cause, cause,
+                                   JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE |
+                                   JS_PROP_THROW) < 0) {
+            JS_FreeValue(ctx, obj);
+            return JS_EXCEPTION;
+        }
+    }
+    return obj;
+}
+
+static JSValue js_sc_read_dom_exception(JSStructuredReader *r)
+{
+    JSContext *ctx = r->ctx;
+    JSValue args[2], stack = JS_UNDEFINED, obj = JS_EXCEPTION;
+    uint8_t flags;
+
+    args[0] = JS_UNDEFINED;
+    args[1] = js_sc_get_string(r);   /* name */
+    if (JS_IsException(args[1]))
+        return JS_EXCEPTION;
+    args[0] = js_sc_get_string(r);   /* message */
+    if (JS_IsException(args[0]))
+        goto done;
+    if (js_sc_get_u8(r, &flags))
+        goto done;
+    if (flags & ~JS_SC_ERROR_STACK) {
+        js_sc_invalid(r);
+        goto done;
+    }
+    if (flags & JS_SC_ERROR_STACK) {
+        stack = js_sc_get_string(r);
+        if (JS_IsException(stack))
+            goto done;
+    }
+    if (!JS_IsObject(ctx->class_proto[JS_CLASS_DOM_EXCEPTION])) {
+        JS_ThrowTypeError(ctx, "DOMException is not available");
+        goto done;
+    }
+    obj = js_domexception_create(ctx, JS_UNDEFINED, 2, (JSValueConst *)args, 0);
+    if (!JS_IsException(obj) && JS_IsString(stack)) {
+        if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_stack, stack,
+                                   JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE |
+                                   JS_PROP_THROW) < 0) {
+            JS_FreeValue(ctx, obj);
+            obj = JS_EXCEPTION;
+        }
+        stack = JS_UNDEFINED;
+    }
+ done:
+    JS_FreeValue(ctx, args[0]);
+    JS_FreeValue(ctx, args[1]);
+    JS_FreeValue(ctx, stack);
+    return obj;
+}
+
+static JSValue js_sc_read_object(JSStructuredReader *r, int tag)
+{
+    JSContext *ctx = r->ctx;
+    JSValue obj = JS_UNDEFINED, v, args[2];
+    uint32_t len, count, i;
+    uint8_t b;
+    double d;
+    int idx;
+
+    idx = js_sc_reserve(r);
+    if (idx < 0)
+        return JS_EXCEPTION;
+    switch(tag) {
+    case JS_SC_TAG_OBJECT:
+        obj = JS_NewObject(ctx);
+        if (JS_IsException(obj))
+            return obj;
+        js_sc_set_ref(r, idx, obj);
+        if (js_sc_read_props(r, obj))
+            goto fail;
+        return obj;
+    case JS_SC_TAG_DENSE_ARRAY:
+        if (js_sc_get_leb128(r, &len) || js_sc_get_leb128(r, &count))
+            return JS_EXCEPTION;
+        if (count > len || count > (size_t)(r->end - r->ptr))
+            return js_sc_invalid(r);
+        obj = JS_NewArray(ctx);
+        if (JS_IsException(obj))
+            return obj;
+        js_sc_set_ref(r, idx, obj);
+        for(i = 0; i < count; i++) {
+            if (r->ptr < r->end && *r->ptr == JS_SC_TAG_HOLE) {
+                r->ptr++;
+                continue;
+            }
+            v = js_sc_read(r);
+            if (JS_IsException(v))
+                goto fail;
+            if (JS_DefinePropertyValueUint32(ctx, obj, i, v,
+                                             JS_PROP_C_W_E | JS_PROP_THROW) < 0)
+                goto fail;
+        }
+        if (js_sc_read_props(r, obj))
+            goto fail;
+        if (JS_SetProperty(ctx, obj, JS_ATOM_length, JS_NewUint32(ctx, len)) < 0)
+            goto fail;
+        return obj;
+    case JS_SC_TAG_ARRAY:
+        if (js_sc_get_leb128(r, &len))
+            return JS_EXCEPTION;
+        obj = JS_NewArray(ctx);
+        if (JS_IsException(obj))
+            return obj;
+        js_sc_set_ref(r, idx, obj);
+        if (JS_SetProperty(ctx, obj, JS_ATOM_length, JS_NewUint32(ctx, len)) < 0 ||
+            js_sc_read_props(r, obj))
+            goto fail;
+        return obj;
+    case JS_SC_TAG_DATE:
+        if (js_sc_get_float64(r, &d))
+            return JS_EXCEPTION;
+        obj = JS_NewDate(ctx, d);
+        break;
+    case JS_SC_TAG_REGEXP:
+        {
+            JSValue pattern, bc;
+            uint32_t re_flags;
+
+            pattern = js_sc_get_string(r);
+            if (JS_IsException(pattern))
+                return pattern;
+            if (js_sc_get_leb128(r, &re_flags)) {
+                JS_FreeValue(ctx, pattern);
+                return JS_EXCEPTION;
+            }
+            if (re_flags & ~BC_REGEXP_FLAGS) {
+                JS_FreeValue(ctx, pattern);
+                return js_sc_invalid(r);
+            }
+            if (!ctx->regexp_shape) {
+                JS_FreeValue(ctx, pattern);
+                return JS_ThrowTypeError(ctx, "RegExp is not supported");
+            }
+            bc = js_compile_regexp_flags(ctx, pattern, re_flags);
+            if (JS_IsException(bc)) {
+                JS_FreeValue(ctx, pattern);
+                return bc;
+            }
+            obj = JS_NewRegexp(ctx, pattern, bc);
+        }
+        break;
+    case JS_SC_TAG_BOOLEAN_OBJECT:
+        if (js_sc_get_u8(r, &b))
+            return JS_EXCEPTION;
+        obj = JS_ToObject(ctx, JS_NewBool(ctx, b != 0));
+        break;
+    case JS_SC_TAG_NUMBER_OBJECT:
+        if (js_sc_get_float64(r, &d))
+            return JS_EXCEPTION;
+        obj = JS_ToObject(ctx, JS_NewFloat64(ctx, d));
+        break;
+    case JS_SC_TAG_STRING_OBJECT:
+    case JS_SC_TAG_BIG_INT_OBJECT:
+        v = tag == JS_SC_TAG_STRING_OBJECT ? js_sc_get_string(r) : js_sc_get_bigint(r);
+        if (JS_IsException(v))
+            return v;
+        obj = JS_ToObject(ctx, v);
+        JS_FreeValue(ctx, v);
+        break;
+    case JS_SC_TAG_MAP:
+    case JS_SC_TAG_SET:
+        {
+            int magic = (tag == JS_SC_TAG_SET) ? MAGIC_SET : 0;
+            JSValue ret;
+
+            if (js_sc_get_leb128(r, &count))
+                return JS_EXCEPTION;
+            if (count > (size_t)(r->end - r->ptr))
+                return js_sc_invalid(r);
+            obj = js_map_constructor(ctx, JS_UNDEFINED, 0, NULL, magic);
+            if (JS_IsException(obj))
+                return obj;
+            js_sc_set_ref(r, idx, obj);
+            for(i = 0; i < count; i++) {
+                args[0] = js_sc_read(r);
+                if (JS_IsException(args[0]))
+                    goto fail;
+                args[1] = JS_UNDEFINED;
+                if (!magic) {
+                    args[1] = js_sc_read(r);
+                    if (JS_IsException(args[1])) {
+                        JS_FreeValue(ctx, args[0]);
+                        goto fail;
+                    }
+                }
+                ret = js_map_set(ctx, obj, 2, (JSValueConst *)args, magic);
+                JS_FreeValue(ctx, args[0]);
+                JS_FreeValue(ctx, args[1]);
+                if (JS_IsException(ret))
+                    goto fail;
+                JS_FreeValue(ctx, ret);
+            }
+        }
+        return obj;
+    case JS_SC_TAG_ARRAY_BUFFER:
+        if (js_sc_get_u8(r, &b))
+            return JS_EXCEPTION;
+        obj = js_sc_read_array_buffer(r, b);
+        break;
+    case JS_SC_TAG_SHARED_ARRAY_BUFFER:
+        obj = js_sc_read_shared_array_buffer(r);
+        break;
+    case JS_SC_TAG_VIEW:
+        return js_sc_read_view(r, idx);
+    case JS_SC_TAG_ERROR:
+        return js_sc_read_error(r, idx);
+    case JS_SC_TAG_DOM_EXCEPTION:
+        obj = js_sc_read_dom_exception(r);
+        break;
+    case JS_SC_TAG_HOST:
+        if (!r->host || !r->host->read)
+            return js_sc_invalid(r);
+        obj = r->host->read(ctx, r, r->opaque);
+        break;
+    default:
+        return js_sc_invalid(r);
+    }
+    /* objects without contents */
+    if (!JS_IsException(obj))
+        js_sc_set_ref(r, idx, obj);
+    return obj;
+ fail:
+    JS_FreeValue(ctx, obj);
+    return JS_EXCEPTION;
+}
+
+static JSValue js_sc_read(JSStructuredReader *r)
+{
+    JSContext *ctx = r->ctx;
+    uint8_t tag;
+    uint32_t idx;
+    int32_t v;
+    double d;
+
+    if (js_check_stack_overflow(ctx->rt, 0))
+        return JS_ThrowStackOverflow(ctx);
+    if (js_sc_get_u8(r, &tag))
+        return JS_EXCEPTION;
+    switch(tag) {
+    case JS_SC_TAG_UNDEFINED:
+        return JS_UNDEFINED;
+    case JS_SC_TAG_NULL:
+        return JS_NULL;
+    case JS_SC_TAG_TRUE:
+        return JS_TRUE;
+    case JS_SC_TAG_FALSE:
+        return JS_FALSE;
+    case JS_SC_TAG_INT32:
+        if (js_sc_get_sleb128(r, &v))
+            return JS_EXCEPTION;
+        return JS_NewInt32(ctx, v);
+    case JS_SC_TAG_FLOAT64:
+        if (js_sc_get_float64(r, &d))
+            return JS_EXCEPTION;
+        return JS_NewFloat64(ctx, d);
+    case JS_SC_TAG_STRING:
+        return js_sc_get_string(r);
+    case JS_SC_TAG_BIG_INT:
+        return js_sc_get_bigint(r);
+    case JS_SC_TAG_REFERENCE:
+        if (js_sc_get_leb128(r, &idx))
+            return JS_EXCEPTION;
+        if (idx >= r->objs_count || JS_IsUndefined(r->objs[idx]))
+            return js_sc_invalid(r);
+        return JS_DupValue(ctx, r->objs[idx]);
+    default:
+        return js_sc_read_object(r, tag);
+    }
+}
+
+static void js_sc_reader_init(JSStructuredReader *r, JSContext *ctx,
+                              const uint8_t *buf, size_t len,
+                              const JSStructuredCloneHost *host, void *opaque)
+{
+    memset(r, 0, sizeof(*r));
+    r->ctx = ctx;
+    r->ptr = buf;
+    r->end = buf + len;
+    r->host = host;
+    r->opaque = opaque;
+}
+
+static void js_sc_reader_free(JSStructuredReader *r)
+{
+    JSContext *ctx = r->ctx;
+    int i;
+
+    for(i = 0; i < r->objs_count; i++)
+        JS_FreeValue(ctx, r->objs[i]);
+    js_free(ctx, r->objs);
+    for(i = 0; i < r->keys_count; i++)
+        JS_FreeAtom(ctx, r->keys[i]);
+    js_free(ctx, r->keys);
+}
+
+static JSValue js_sc_deserialize(JSStructuredReader *r)
+{
+    JSContext *ctx = r->ctx;
+    uint32_t n, i, k;
+    uint8_t flags;
+    uint64_t max_len64;
+    JSSCBuffer *b;
+    JSValue v;
+    int idx;
+
+    if (r->end - r->ptr < JS_SC_HEADER_SIZE || memcmp(r->ptr, "QSC", 3))
+        return js_sc_invalid(r);
+    if (r->ptr[3] != JS_SC_VERSION)
+        return JS_ThrowDataCloneError(ctx, "Unsupported structured clone version %d",
+                                      r->ptr[3]);
+    r->ptr += JS_SC_HEADER_SIZE;
+    /* the transfer list */
+    if (js_sc_get_leb128(r, &n))
+        return JS_EXCEPTION;
+    if (n > (size_t)(r->end - r->ptr))
+        return js_sc_invalid(r);
+    for(i = 0; i < n; i++) {
+        idx = js_sc_reserve(r);
+        if (idx < 0 || js_sc_get_u8(r, &flags))
+            return JS_EXCEPTION;
+        if (flags == JS_SC_AB_STOLEN) {
+            if (js_sc_get_leb128(r, &k))
+                return JS_EXCEPTION;
+            if (!r->stolen || k >= r->stolen_count || r->stolen[k].consumed)
+                return js_sc_invalid(r);
+            b = &r->stolen[k];
+            max_len64 = b->max_byte_length;
+            v = js_array_buffer_constructor3(ctx, JS_UNDEFINED, b->byte_length,
+                                             b->max_byte_length >= 0 ? &max_len64 : NULL,
+                                             JS_CLASS_ARRAY_BUFFER, b->data,
+                                             b->free_func, b->opaque, FALSE);
+            if (JS_IsException(v))
+                return v;
+            b->consumed = TRUE;
+        } else {
+            if (flags & ~JS_SC_AB_RESIZABLE)
+                return js_sc_invalid(r);
+            v = js_sc_read_array_buffer(r, flags);
+            if (JS_IsException(v))
+                return v;
+        }
+        r->objs[idx] = v;
+    }
+    v = js_sc_read(r);
+    if (JS_IsException(v))
+        return v;
+    if (r->ptr != r->end) {
+        JS_FreeValue(ctx, v);
+        return js_sc_invalid(r);
+    }
+    return v;
+}
+
+JSValue JS_StructuredDeserialize(JSContext *ctx, const uint8_t *buf,
+                                 size_t buf_len, uint8_t * const *sab_tab,
+                                 size_t sab_tab_len,
+                                 const JSStructuredCloneHost *host,
+                                 void *opaque)
+{
+    JSStructuredReader rs, *r = &rs;
+    JSValue ret;
+
+    js_sc_reader_init(r, ctx, buf, buf_len, host, opaque);
+    r->sab_tab = sab_tab;
+    r->sab_tab_len = sab_tab ? sab_tab_len : 0;
+    ret = js_sc_deserialize(r);
+    js_sc_reader_free(r);
+    return ret;
+}
+
+int JS_StructuredReadUint32(JSStructuredReader *r, uint32_t *pv)
+{
+    return js_sc_get_leb128(r, pv);
+}
+
+int JS_StructuredReadBytes(JSStructuredReader *r, const uint8_t **pbuf,
+                           size_t *plen)
+{
+    uint32_t len;
+
+    *pbuf = NULL;
+    *plen = 0;
+    if (js_sc_get_leb128(r, &len))
+        return -1;
+    if ((size_t)(r->end - r->ptr) < len) {
+        js_sc_invalid(r);
+        return -1;
+    }
+    *pbuf = r->ptr;
+    *plen = len;
+    r->ptr += len;
+    return 0;
+}
+
+JSValue JS_StructuredReadValue(JSStructuredReader *r)
+{
+    return js_sc_read(r);
+}
+
+JSValue JS_StructuredClone(JSContext *ctx, JSValueConst val,
+                           JSValueConst transfer,
+                           const JSStructuredCloneHost *host, void *opaque)
+{
+    JSStructuredWriter ws, *w = &ws;
+    JSStructuredReader rs, *r = &rs;
+    uint8_t *buf;
+    size_t len;
+    JSValue ret;
+
+    js_sc_writer_init(w, ctx, host, opaque);
+    w->is_clone = TRUE;
+    w->allow_sab = TRUE;
+    buf = js_sc_serialize(w, &len, val, transfer);
+    if (!buf) {
+        js_sc_writer_free(w);
+        return JS_EXCEPTION;
+    }
+    js_sc_reader_init(r, ctx, buf, len, host, opaque);
+    r->sab_objs = w->sab_objs;
+    r->sab_objs_count = w->sab_objs_count;
+    r->stolen = w->stolen;
+    r->stolen_count = w->stolen_count;
+    ret = js_sc_deserialize(r);
+    js_sc_reader_free(r);
+    js_free(ctx, buf);
+    /* frees the memory of the transferred ArrayBuffers not read */
+    js_sc_writer_free(w);
+    return ret;
+}
+
+void JS_SetStructuredCloneHost(JSRuntime *rt, const JSStructuredCloneHost *host,
+                               void *opaque)
+{
+    rt->sc_host = host;
+    rt->sc_host_opaque = opaque;
+}
+
+const JSStructuredCloneHost *JS_GetStructuredCloneHost(JSRuntime *rt,
+                                                       void **popaque)
+{
+    if (popaque)
+        *popaque = rt->sc_host_opaque;
+    return rt->sc_host;
+}
+
+/* structuredClone(value, { transfer }) */
+static JSValue js_global_structuredClone(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValue transfer = JS_UNDEFINED, ret;
+
+    if (argc < 1)
+        return JS_ThrowTypeError(ctx, "The \"value\" argument must be specified");
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        if (!JS_IsObject(argv[1]))
+            return JS_ThrowTypeError(ctx, "The \"options\" argument must be of type object");
+        transfer = JS_GetPropertyStr(ctx, argv[1], "transfer");
+        if (JS_IsException(transfer))
+            return transfer;
+    }
+    ret = JS_StructuredClone(ctx, argv[0], transfer, rt->sc_host,
+                             rt->sc_host_opaque);
+    JS_FreeValue(ctx, transfer);
+    return ret;
 }
 
 /* heap snapshots (JS_WriteSnapshot(), JS_ReadSnapshot()) */

@@ -57,7 +57,7 @@
  */
 
 static const uint8_t snap_magic[8] = { 'Q', 'J', 'S', 'S', 'N', 'A', 'P', '\n' };
-#define SNAP_FORMAT_VERSION 10
+#define SNAP_FORMAT_VERSION 11
 
 typedef enum {
     SNAP_KIND_FULL,
@@ -1829,7 +1829,11 @@ uint8_t *JS_WriteSnapshot(JSContext *ctx, size_t *psize,
             if (snap_put_value(w, e->argv[i]))
                 goto fail;
         }
+        if (snap_put_value(w, e->async_context))
+            goto fail;
     }
+    if (snap_put_value(w, rt->async_context))
+        goto fail;
     bc_put_u64(&w->bc, rt->module_async_evaluation_next_timestamp);
     bc_put_leb128(&w->bc, root_count);
     for(i = 0; i < root_count; i++) {
@@ -3419,6 +3423,7 @@ static int snap_read_roots(SnapReader *r, JSSnapshotResult *res)
         }
         e->realm = realm;
         e->job_func = func;
+        e->async_context = JS_UNDEFINED;
         e->argc = argc;
         for(j = 0; j < argc; j++)
             e->argv[j] = JS_UNDEFINED;
@@ -3427,7 +3432,15 @@ static int snap_read_roots(SnapReader *r, JSSnapshotResult *res)
             if (snap_get_value(r, &e->argv[j]))
                 return -1;
         }
+        if (snap_get_value(r, &e->async_context))
+            return -1;
     }
+
+    /* async context */
+    JS_FreeValueRT(rt, rt->async_context);
+    rt->async_context = JS_UNDEFINED;
+    if (snap_get_value(r, &rt->async_context))
+        return -1;
 
     {
         uint64_t ts;

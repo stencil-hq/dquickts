@@ -1363,6 +1363,25 @@ typedef void JSPromiseHook(JSContext *ctx, JSPromiseHookType type,
 /* NULL removes the hook */
 void JS_SetPromiseHook(JSRuntime *rt, JSPromiseHook *promise_hook, void *opaque);
 
+/* Async context (V8's "continuation preserved embedder data"): one value
+   per runtime, JS_UNDEFINED by default, that the engine carries along
+   asynchronous continuations:
+   - a promise reaction (then(), catch(), finally(), await, for await,
+     JS_PromiseThen()) captures the async context current when it is
+     registered, and its job runs with that context;
+   - any other job (queueMicrotask(), thenable resolution, host
+     JS_EnqueueJob()) captures the context current when it is enqueued;
+     FinalizationRegistry callbacks run with JS_UNDEFINED.
+   While a job runs, its context is the current one; afterwards the
+   context in place before the job is put back, whatever the job set.
+   Hosts implement AsyncLocalStorage on top of it (an immutable value,
+   e.g. a frozen map of the stores, replaced as a whole). Without a
+   context set, the cost is a copy of JS_UNDEFINED per reaction/job. */
+/* return the current async context (a new reference) */
+JSValue JS_GetAsyncContext(JSRuntime *rt);
+/* replace the current async context (takes ownership of 'value') */
+void JS_SetAsyncContext(JSRuntime *rt, JSValue value);
+
 /* is_handled = TRUE means that the rejection is handled */
 typedef void JSHostPromiseRejectionTracker(JSContext *ctx, JSValueConst promise,
                                            JSValueConst reason,
@@ -1579,6 +1598,112 @@ JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len,
    js_malloc(), if not NULL) the memory of the SharedArrayBuffers read */
 JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
                        int flags, uint8_t ***psab_tab, size_t *psab_tab_len);
+
+/* HTML structured clone (structuredClone(), postMessage()).
+
+   Supported: the primitives (BigInt and -0 included), the Boolean,
+   Number, String and BigInt objects, Date, RegExp (source and flags,
+   lastIndex reset), ArrayBuffer (resizable and immutable ones
+   included), SharedArrayBuffer (shared, see below), the typed arrays
+   and DataView (views of one buffer keep sharing it), Map, Set (in
+   insertion order), Array (length, holes and the other enumerable own
+   string keyed properties), Error and its native subclasses (name
+   among Error, EvalError, RangeError, ReferenceError, SyntaxError,
+   TypeError and URIError, else "Error"; message, stack and cause),
+   DOMException (name, message, stack) and the other objects as plain
+   objects of their enumerable own string keyed properties (getters are
+   invoked, the prototype is dropped). Shared references and cycles are
+   kept. The other values (functions, symbols, Proxy, Promise, WeakMap,
+   WeakSet, WeakRef, FinalizationRegistry, generators, module
+   namespaces, the objects of the host classes...) throw a
+   DOMException named "DataCloneError" (needs
+   JS_AddIntrinsicDOMException(), a TypeError otherwise).
+
+   'transfer' is undefined or an iterable of objects: its ArrayBuffers
+   are moved (they are detached in the source once the serialization
+   succeeded; a detached, immutable or duplicate ArrayBuffer and a
+   SharedArrayBuffer throw a DataCloneError). Any other object must be
+   accepted by the 'transfer' function of the host.
+
+   The serialized form is versioned, self-describing and little endian.
+   JS_StructuredDeserialize() validates its input: malformed data
+   throws a DataCloneError (or a RangeError/TypeError raised while
+   building an object), it never crashes. */
+typedef struct JSStructuredWriter JSStructuredWriter;
+typedef struct JSStructuredReader JSStructuredReader;
+
+typedef struct JSStructuredCloneHost {
+    /* called for every object (but a Proxy) before the built-in
+       handling. Return 0 to let the engine serialize 'obj' (nothing
+       must have been written), 1 if 'obj' was serialized with the
+       JS_StructuredWrite*() functions, -1 if exception. NULL: no host
+       objects. */
+    int (*write)(JSContext *ctx, JSStructuredWriter *w, JSValueConst obj,
+                 void *opaque);
+    /* rebuild an object serialized by write() with the
+       JS_StructuredRead*() functions, reading exactly what write()
+       wrote. Its nested values (JS_StructuredReadValue()) cannot refer
+       to the object being read. */
+    JSValue (*read)(JSContext *ctx, JSStructuredReader *r, void *opaque);
+    /* 'obj' (not an ArrayBuffer or a SharedArrayBuffer) is in the
+       transfer list: return 1 if it is transferable (write() then
+       handles it when it is met in the value), 0 if not (DataCloneError)
+       or -1 if exception. NULL: only ArrayBuffers are transferable. */
+    int (*transfer)(JSContext *ctx, JSValueConst obj, void *opaque);
+} JSStructuredCloneHost;
+
+/* Serialize 'val' (see above). Return a buffer allocated with
+   js_malloc() and its size in *psize, or NULL if exception. If
+   'psab_tab' is not NULL, the SharedArrayBuffers are allowed (they need
+   JS_SetSharedArrayBufferFunctions()) and *psab_tab (allocated with
+   js_malloc(), NULL if none) receives their memory, as the sab_alloc
+   function returned it: the caller must keep it alive (sab_dup) until
+   the data is deserialized. If NULL, a SharedArrayBuffer throws a
+   DataCloneError. 'host' may be NULL. */
+uint8_t *JS_StructuredSerialize(JSContext *ctx, size_t *psize,
+                                JSValueConst val, JSValueConst transfer,
+                                uint8_t ***psab_tab, size_t *psab_tab_len,
+                                const JSStructuredCloneHost *host,
+                                void *opaque);
+/* Deserialize the output of JS_StructuredSerialize() (possibly in
+   another runtime of the process). 'sab_tab' must be the table
+   returned with the data (NULL if none): a SharedArrayBuffer is only
+   accepted with it. */
+JSValue JS_StructuredDeserialize(JSContext *ctx, const uint8_t *buf,
+                                 size_t buf_len, uint8_t * const *sab_tab,
+                                 size_t sab_tab_len,
+                                 const JSStructuredCloneHost *host,
+                                 void *opaque);
+/* structured clone of 'val' in the same context: the transferred
+   ArrayBuffers keep their memory and the SharedArrayBuffers are
+   shared (the same object is returned without the shared array buffer
+   functions). */
+JSValue JS_StructuredClone(JSContext *ctx, JSValueConst val,
+                           JSValueConst transfer,
+                           const JSStructuredCloneHost *host, void *opaque);
+/* host used by the global structuredClone() of the contexts of 'rt'
+   (none by default) */
+void JS_SetStructuredCloneHost(JSRuntime *rt, const JSStructuredCloneHost *host,
+                               void *opaque);
+const JSStructuredCloneHost *JS_GetStructuredCloneHost(JSRuntime *rt,
+                                                       void **popaque);
+/* data of the host objects. The integers are written as LEB128, the
+   bytes with their length. Return -1 if exception. */
+int JS_StructuredWriteUint32(JSStructuredWriter *w, uint32_t v);
+int JS_StructuredWriteBytes(JSStructuredWriter *w, const uint8_t *buf,
+                            size_t len);
+/* a nested value, sharing the references of the whole serialization */
+int JS_StructuredWriteValue(JSStructuredWriter *w, JSValueConst val);
+int JS_StructuredReadUint32(JSStructuredReader *r, uint32_t *pv);
+/* *pbuf points into the input, valid until the end of the
+   deserialization */
+int JS_StructuredReadBytes(JSStructuredReader *r, const uint8_t **pbuf,
+                           size_t *plen);
+JSValue JS_StructuredReadValue(JSStructuredReader *r);
+/* throw a DOMException named "DataCloneError" (a TypeError without
+   JS_AddIntrinsicDOMException()) */
+JSValue __js_printf_like(2, 3) JS_ThrowDataCloneError(JSContext *ctx, const char *fmt, ...);
+
 /* instantiate and evaluate a bytecode function. Only used when
    reading a script or module with JS_ReadObject() */
 JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj);
@@ -1716,6 +1841,14 @@ JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels);
 /* only exported for os.Worker() */
 JSValue JS_LoadModule(JSContext *ctx, const char *basename,
                       const char *filename);
+/* load, link and evaluate the module 'filename' imported from
+   'basename' with 'attributes' (object or undefined) without waiting,
+   as require() of an ES module does: return its namespace, or throw
+   its evaluation error, or a TypeError if it uses top-level await. A
+   module in the middle of its evaluation (a cycle) returns its
+   namespace as is. */
+JSValue JS_LoadModuleSync(JSContext *ctx, const char *basename,
+                          const char *filename, JSValueConst attributes);
 
 /* C function definition */
 typedef enum JSCFunctionEnum {  /* XXX: should rename for namespace isolation */

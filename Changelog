@@ -1,4 +1,24 @@
 unreleased:
+- qbun: a Bun/Node.js runtime (qbun.c, node/): runs TypeScript and
+  JavaScript programs written for Bun or Node.js on a libuv event loop
+  with Bun's module resolution (node_modules, package.json exports and
+  imports, TypeScript sources, CommonJS with require() of ES modules,
+  JSON/TOML/YAML/text/file imports, JSX through Bun.Transpiler), the
+  node: modules, the Bun APIs (Bun.file, Bun.spawn, Bun.$, Bun.serve,
+  bun:sqlite, bun:ffi...), the web globals (fetch, WebSocket, URL, web
+  streams, WebCrypto...), N-API addons and worker threads; compiled
+  modules are cached as bytecode (~/.cache/qbun, QBUN_NO_CACHE=1)
+- structuredClone() global and the HTML structured clone C API
+  (JS_StructuredSerialize(), JS_StructuredDeserialize(),
+  JS_StructuredClone(), JS_SetStructuredCloneHost()): Error, DataView,
+  transfer lists, shared references and cycles, host objects and
+  transferables through a JSStructuredCloneHost, DataCloneError
+- JS_LoadModuleSync(): load, link and evaluate a module without waiting
+  (require() of ES modules)
+- async context (JS_GetAsyncContext(), JS_SetAsyncContext()): a value per
+  runtime that promise reactions (then, await) capture when registered and
+  other jobs (queueMicrotask, thenable resolution) when enqueued, and run
+  with; saved in snapshots (snapshot format version 11)
 - REPL: Python inputs are syntax-highlighted (keywords, soft keywords at
   the start of a statement, strings with their prefixes, numbers,
   comments, decorators, def/class names), and the rest of a '\py CODE' or

@@ -16,6 +16,8 @@ qjs
 qjs.exe
 qjsc
 qjsc.exe
+qbun
+qbun.exe
 host-qjsc
 qjscalc
 qjscalc.c

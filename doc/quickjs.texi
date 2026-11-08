@@ -648,6 +648,9 @@ The string @code{"quickjs/"} followed by the QuickJS version.
 @code{performance.now()} and @code{performance.timeOrigin} are part of
 the engine (@code{JS_AddPerformance()}, added by @code{JS_NewContext()}).
 
+@code{structuredClone()} is a global of every context (see the
+structured clone C API).
+
 @subsection @code{std} module
 
 The @code{std} module provides wrappers to the libc @file{stdlib.h}
@@ -1712,6 +1715,42 @@ another thread and for host-class objects with opaque data when no
 @code{save_opaque} hook is given. Like bytecode, a snapshot is trusted
 input: truncated or mismatched snapshots are rejected, malicious ones
 are not detected.
+
+@subsection Structured clone
+
+The global @code{structuredClone(value, @{ transfer @})} of every context
+implements the HTML structured clone algorithm. The C API exposes it
+for the embedders (@code{postMessage()} between threads, persistent
+storage):
+
+@itemize
+@item @code{JS_StructuredSerialize()} writes a value to a self-describing,
+versioned, little endian buffer; @code{JS_StructuredDeserialize()} reads
+it back in any runtime of the process. The input is validated: malformed
+data throws a @code{DataCloneError} and never crashes.
+@item @code{JS_StructuredClone()} clones in the same context (the
+transferred ArrayBuffers keep their memory).
+@item The SharedArrayBuffers are shared, never copied: the serializer
+returns their memory (like @code{JS_WriteObject2()}) and the deserializer
+only accepts them with that table, so they need
+@code{JS_SetSharedArrayBufferFunctions()}.
+@item A @code{JSStructuredCloneHost} lets the host serialize its own kinds
+of objects (@code{write} / @code{read} hooks, using
+@code{JS_StructuredWrite*()} and @code{JS_StructuredRead*()}) and accept
+transferables other than ArrayBuffers (@code{transfer} hook).
+@code{JS_SetStructuredCloneHost()} sets the host used by the global
+@code{structuredClone()} of a runtime.
+@end itemize
+
+The supported values are the primitives, the Boolean, Number, String
+and BigInt objects, Date, RegExp, ArrayBuffer (resizable and immutable
+ones included), SharedArrayBuffer, the typed arrays, DataView, Map, Set,
+Array, the errors (name, message, stack and cause), DOMException and the
+plain objects (enumerable own string keyed properties, the prototype is
+dropped). Shared references and cycles are preserved. The other values
+(functions, symbols, Proxy, Promise, the weak collections, the objects
+of the host classes without a host...) throw a DOMException named
+@code{DataCloneError}.
 
 @chapter Internals
 

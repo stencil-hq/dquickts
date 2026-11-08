@@ -155,7 +155,8 @@ static int snap_write_promise(SnapWriter *w, JSPromiseData *s)
         list_for_each(el, &s->promise_reactions[i]) {
             JSPromiseReactionData *rd = list_entry(el, JSPromiseReactionData, link);
             if (snap_put_values(w, rd->resolving_funcs, 2) ||
-                snap_put_value(w, rd->handler))
+                snap_put_value(w, rd->handler) ||
+                snap_put_value(w, rd->async_context))
                 return -1;
         }
     }
@@ -534,9 +535,11 @@ static int snap_read_promise(SnapReader *r, JSObject *p)
                 return -1;
             snap_init_values(rd->resolving_funcs, 2);
             rd->handler = JS_UNDEFINED;
+            rd->async_context = JS_UNDEFINED;
             list_add_tail(&rd->link, &s->promise_reactions[i]);
             if (snap_get_values(r, rd->resolving_funcs, 2) ||
-                snap_get_value(r, &rd->handler))
+                snap_get_value(r, &rd->handler) ||
+                snap_get_value(r, &rd->async_context))
                 return -1;
         }
     }

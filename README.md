@@ -50,6 +50,7 @@ make test-snapshot   # builds and runs the suspension and snapshot test hosts
   - [Known deviations](#known-deviations)
   - [Testing Python](#testing-python)
 - [Rust bindings](#rust-bindings)
+- [qbun: Bun and Node.js programs](#qbun-bun-and-nodejs-programs)
 - [Testing](#testing)
 - [Documentation](#documentation)
 - [Credits and license](#credits-and-license)
@@ -1018,6 +1019,35 @@ assert_eq!(total, 5);
 
 The crates are not published to crates.io. The rquickjs [README](rquickjs/README.md) lists what
 was removed (QuickJS-NG-only APIs) and the supported targets.
+
+## qbun: Bun and Node.js programs
+
+`qbun` runs programs written for Bun or Node.js:
+
+```sh
+make qbun
+./qbun app.ts --flag          # also: qbun run app.ts, qbun -e 'console.log(Bun.version)'
+```
+
+- **Modules.** Bun's resolution: `node_modules`, `package.json` `exports`/`imports`/`main`,
+  TypeScript sources behind `.js` specifiers, CommonJS with `require()` of ES modules, JSON,
+  TOML, YAML and text imports (`with { type: "text" }`), other files as their path (Bun's
+  `file` loader), JSX through `Bun.Transpiler`, and N-API addons (`.node`).
+- **APIs.** The `node:` modules (fs, path, child_process, net, http, https, tls, crypto, zlib,
+  stream, worker_threads, async_hooks, readline, util...), the `Bun` global and `"bun"`
+  (`Bun.file`, `Bun.write`, `Bun.spawn`, `Bun.$`, `Bun.serve`, `Bun.Glob`, `Bun.hash`,
+  `Bun.Image`, `Bun.Archive`, parsers...), `bun:sqlite`, `bun:ffi`, `bun:jsc`, and the web
+  globals (`fetch`, `WebSocket`, `URL`, web streams, `crypto.subtle`, `structuredClone`...).
+- **Runtime.** A libuv event loop with Node's phases (timers, I/O, immediates, `nextTick`),
+  `AsyncLocalStorage` carried across `await` by the engine's async context
+  (`JS_SetAsyncContext()`), uncaught errors and unhandled rejections handled like Node, and
+  worker threads with their own runtime and loop.
+- **Bytecode cache.** Compiled modules are cached in `$QBUN_CACHE_DIR` (default
+  `~/.cache/qbun`), keyed by path and source; `QBUN_NO_CACHE=1` turns it off.
+
+The native bindings are in `node/*.c` (C modules `qbun:<name>` on libuv, libcurl, OpenSSL,
+sqlite3, zlib/brotli/zstd, libffi and the image codecs) and the library in `node/lib`
+(TypeScript, read at run time from `$QBUN_LIB` or the build's `node/lib`).
 
 ## Testing
 
