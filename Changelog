@@ -313,6 +313,11 @@ unreleased:
 - faster strings: UTF-8 decoding and the atom lookup of UTF-8 keys scan
   several bytes at a time, String.prototype.repeat() of one character
   uses memset
+- 's += x' on a string only referenced by a local variable builds a flat
+  string with 1/8 of headroom, also when the variable holds a rope or
+  the string needs 16 bit characters, so that reading it between appends
+  no longer flattens it again (an append and a charCodeAt() per
+  iteration was O(n^2): 400k iterations took 2.4 s)
 - JS_GetTypedArrayBuffer() returns the current length of length-tracking
   views
 

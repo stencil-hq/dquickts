@@ -197,6 +197,9 @@ static uint8_t const typed_array_size_log2[JS_TYPED_ARRAY_COUNT];
 #define JS_STRING_ROPE_SHORT2_LEN 8192
 /* rope depth at which we rebalance */
 #define JS_STRING_ROPE_MAX_DEPTH 60
+/* 's += x' builds a flat string with headroom from this length (see
+   js_concat_string_grow()); shorter strings keep being copied */
+#define JS_STRING_GROW_MIN_LEN 512
 
 #define __exception __attribute__((warn_unused_result))
 
@@ -5447,7 +5450,9 @@ static int string_buffer_fill(StringBuffer *s, int c, int count)
     return 0;
 }
 
-static JSValue string_buffer_end(StringBuffer *s)
+/* 'shrink' = FALSE keeps the allocated size of the buffer, for a string
+   which is going to be appended to */
+static JSValue string_buffer_end2(StringBuffer *s, BOOL shrink)
 {
     JSString *str;
     str = s->str;
@@ -5458,7 +5463,7 @@ static JSValue string_buffer_end(StringBuffer *s)
         s->str = NULL;
         return JS_AtomToString(s->ctx, JS_ATOM_empty_string);
     }
-    if (s->len < s->size) {
+    if (shrink && s->len < s->size) {
         /* smaller size so js_realloc should not fail, but OK if it does */
         /* XXX: should add some slack to avoid unnecessary calls */
         /* XXX: might need to use malloc+free to ensure smaller size */
@@ -5477,6 +5482,11 @@ static JSValue string_buffer_end(StringBuffer *s)
     str->len = s->len;
     s->str = NULL;
     return JS_MKPTR(JS_TAG_STRING, str);
+}
+
+static JSValue string_buffer_end(StringBuffer *s)
+{
+    return string_buffer_end2(s, TRUE);
 }
 
 /* create a string from a UTF-8 buffer */
@@ -5937,6 +5947,87 @@ static JSValue JS_ConcatString1(JSContext *ctx,
         copy_str16(p->u.str16 + p1->len, p2, 0, p2->len);
     }
     return JS_MKPTR(JS_TAG_STRING, p);
+}
+
+/* 's += x' where the variable holds the only reference to 's' (a string
+   or a rope) and 'x' is a string: the result is a flat string allocated
+   with 1/8 of headroom (as the lists of CPython), so a sequence of
+   appends stays a flat string in amortized O(1) per append. A rope would
+   be flattened again by each read of the string between two appends
+   (charCodeAt(), indexOf(), comparisons...), in O(n^2). The string is
+   reallocated in place when possible; a rope, or an 8 bit string
+   receiving 16 bit characters, is copied once into a new string. Return
+   0 if done, -1 if exception, 1 if the fast path does not apply ('s' is
+   shared, an atom or short). */
+static int js_concat_string_grow(JSContext *ctx, JSValue *pv, JSValueConst op2)
+{
+    JSString *p1, *p2 = JS_VALUE_GET_STRING(op2), *p;
+    uint32_t len1, len, size;
+    int is_wide_char;
+    StringBuffer b_s, *b = &b_s;
+    JSValue ret;
+
+    if (js_rc(JS_VALUE_GET_PTR(*pv))->ref_count != 1)
+        return 1;
+    if (JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING) {
+        p1 = JS_VALUE_GET_STRING(*pv);
+        if (p1->atom_type != 0)
+            return 1;
+        len1 = p1->len;
+        is_wide_char = p1->is_wide_char;
+    } else {
+        JSStringRope *r = JS_VALUE_GET_STRING_ROPE(*pv);
+        p1 = NULL;
+        len1 = r->len;
+        is_wide_char = r->is_wide_char;
+    }
+    len = len1 + p2->len;
+    if (len < JS_STRING_GROW_MIN_LEN || len > JS_STRING_LEN_MAX)
+        return 1;
+    size = min_uint32(len + len / 8, JS_STRING_LEN_MAX);
+    if (p1 && p1->is_wide_char >= p2->is_wide_char) {
+#ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+        list_del(&p1->link);
+#endif
+        p = js_realloc_rt(ctx->rt, p1, sizeof(JSString) +
+                          (size << p1->is_wide_char) + 1 - p1->is_wide_char);
+        if (p)
+            p1 = p;
+#ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+        list_add_tail(&p1->link, &ctx->rt->string_list);
+#endif
+        if (!p)
+            return 1; /* the string is unchanged */
+        if (p1->is_wide_char) {
+            if (p2->is_wide_char) {
+                memcpy(p1->u.str16 + len1, p2->u.str16, p2->len << 1);
+            } else {
+                uint32_t i;
+                for(i = 0; i < p2->len; i++)
+                    p1->u.str16[len1 + i] = p2->u.str8[i];
+            }
+        } else {
+            memcpy(p1->u.str8 + len1, p2->u.str8, p2->len);
+            p1->u.str8[len] = '\0';
+        }
+        p1->len = len;
+        *pv = JS_MKPTR(JS_TAG_STRING, p1);
+        return 0;
+    }
+    /* rope or widening */
+    if (string_buffer_init2(ctx, b, size, is_wide_char | p2->is_wide_char))
+        return -1;
+    if (string_buffer_concat_value(b, *pv) ||
+        string_buffer_concat(b, p2, 0, p2->len)) {
+        string_buffer_free(b);
+        return -1;
+    }
+    ret = string_buffer_end2(b, FALSE);
+    if (JS_IsException(ret))
+        return -1;
+    JS_FreeValue(ctx, *pv);
+    *pv = ret;
+    return 0;
 }
 
 static BOOL JS_ConcatStringInPlace(JSContext *ctx, JSString *p1, JSValueConst op2) {
@@ -24741,12 +24832,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     *pv = __JS_NewFloat64(ctx, JS_VALUE_GET_FLOAT64(*pv) +
                                                JS_VALUE_GET_FLOAT64(op2));
                     sp--;
-                } else if (JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING &&
+                } else if ((JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING ||
+                            JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING_ROPE) &&
                            JS_VALUE_GET_TAG(op2) == JS_TAG_STRING) {
+                    int ret;
                     sp--;
                     sf->cur_pc = pc;
-                    if (JS_ConcatStringInPlace(ctx, JS_VALUE_GET_STRING(*pv), op2)) {
+                    if (JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING &&
+                        JS_ConcatStringInPlace(ctx, JS_VALUE_GET_STRING(*pv), op2)) {
+                        ret = 0;
+                    } else {
+                        ret = js_concat_string_grow(ctx, pv, op2);
+                    }
+                    if (ret <= 0) {
                         JS_FreeValue(ctx, op2);
+                        if (ret < 0)
+                            goto exception;
                     } else {
                         op2 = JS_ConcatString(ctx, JS_DupValue(ctx, *pv), op2);
                         if (JS_IsException(op2))
