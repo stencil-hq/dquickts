@@ -2560,6 +2560,7 @@ static int snap_read_fast_array(SnapReader *r, JSObject *p)
         tab[i] = JS_UNDEFINED;
     p->u.array.u.values = tab;
     p->u.array.count = count;
+    p->u.array.offset = 0;
     if (p->class_id == JS_CLASS_ARRAY)
         p->u.array.u1.size = count;
     for(i = 0; i < count; i++) {

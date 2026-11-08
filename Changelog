@@ -379,6 +379,9 @@ unreleased:
   lastIndexOf(), includes(), split(), replace() and replaceAll() use the
   Two-Way algorithm for long needles (no allocation), instead of a naive
   search in O(n * m) (a 16k character needle in 1 MB took 12 s)
+- Array.prototype.shift() of a fast array is O(1) instead of moving all
+  the elements: the freed slots before the elements are reused when the
+  array grows (queues using push() and shift() were O(n^2))
 
 2026-06-04:
 

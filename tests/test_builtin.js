@@ -1490,10 +1490,75 @@ function test_string_search()
     assert(h.includes(n), false);
 }
 
+/* shift() leaves free slots before the elements of a fast array: they
+   must be reused or kept through the other array mutations */
+function test_array_shift()
+{
+    var a = [], ref = [], seed = 5, it, op, v, i, s, n;
+    function rnd(n) {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        return seed % n;
+    }
+    function check() {
+        assert(a.length, ref.length);
+        for (i = 0; i < ref.length; i++)
+            assert(a[i], ref[i]);
+    }
+    for (it = 0; it < 3000; it++) {
+        op = rnd(8);
+        v = it;
+        switch (op) {
+        case 0: case 1: case 2:
+            a.push(v);
+            ref[ref.length] = v;
+            break;
+        case 3: case 4:
+            assert(a.shift(), ref.length ? ref[0] : undefined);
+            ref = ref.slice(1);
+            break;
+        case 5:
+            a.unshift(v);
+            ref = [v].concat(ref);
+            break;
+        case 6:
+            s = rnd(ref.length + 1);
+            n = rnd(3);
+            a.splice(s, n, v);
+            ref = ref.slice(0, s).concat([v], ref.slice(s + n));
+            break;
+        case 7:
+            if (rnd(10) == 0) {
+                n = rnd(ref.length + 1);
+                a.length = n;
+                ref.length = n;
+            }
+            break;
+        }
+        if ((it & 7) == 0)
+            check();
+    }
+    check();
+    /* queue at a constant size: the free slots are reused */
+    a = [];
+    for (i = 0; i < 1000; i++)
+        a.push(i);
+    for (i = 0; i < 10000; i++)
+        a.push(a.shift());
+    assert(a.length, 1000);
+    for (i = 0; i < 1000; i++)
+        assert(a[i], i);
+    /* drained to empty then refilled */
+    while (a.length)
+        a.shift();
+    a.push(1, 2, 3);
+    assert(a.join(), "1,2,3");
+}
+
 test();
 test_function();
 test_enum();
 test_array();
+test_array_shift();
 test_string();
 test_string_search();
 test_math();
