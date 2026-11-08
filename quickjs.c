@@ -22328,6 +22328,43 @@ static JSValue js_decorator_helper(JSContext *ctx, JSValueConst a,
 #pragma GCC diagnostic ignored "-Wunused-label"
 #endif
 
+#ifdef CONFIG_CHECK_TDZ
+/* debug build: a let, const or class variable read without the
+   'uninitialized' check must be initialized, otherwise
+   resolve_variables() removed a TDZ check which was needed (see
+   lexical_var_needs_check()). The private names are left out: they
+   are always read without check, an uninitialized one makes the
+   private field access throw a TypeError. */
+static no_inline void js_check_tdz(JSContext *ctx, JSFunctionBytecode *b,
+                                   const uint8_t *pc, int idx)
+{
+    JSBytecodeVarDef *vd;
+    char buf1[ATOM_GET_STR_BUF_SIZE], buf2[ATOM_GET_STR_BUF_SIZE];
+
+#ifdef CONFIG_PYTHON
+    if (b->is_py)
+        return;
+#endif
+    if (!b->vardefs)
+        return;
+    vd = &b->vardefs[b->arg_count + idx];
+    if (!vd->is_lexical || vd->var_kind >= JS_VAR_PRIVATE_FIELD)
+        return;
+    fprintf(stderr, "CONFIG_CHECK_TDZ: uninitialized '%s' read without check in %s at pc=%d\n",
+            JS_AtomGetStrRT(ctx->rt, buf1, sizeof(buf1), vd->var_name),
+            JS_AtomGetStrRT(ctx->rt, buf2, sizeof(buf2), b->func_name),
+            (int)(pc - b->byte_code_buf));
+    abort();
+}
+#define CHECK_TDZ(v, idx)                                               \
+    do {                                                                \
+        if (unlikely(JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED))      \
+            js_check_tdz(ctx, b, pc, idx);                              \
+    } while (0)
+#else
+#define CHECK_TDZ(v, idx) do { } while (0)
+#endif
+
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
 static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                JSValueConst this_obj, JSValueConst new_target,
@@ -23445,6 +23482,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
+                CHECK_TDZ(var_buf[idx], idx);
                 sp[0] = JS_DupValue(ctx, var_buf[idx]);
                 sp++;
             }
@@ -23494,14 +23532,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
 #if SHORT_OPCODES
-        CASE(OP_get_loc8): *sp++ = JS_DupValue(ctx, var_buf[*pc++]); BREAK;
+        CASE(OP_get_loc8):
+            CHECK_TDZ(var_buf[*pc], *pc);
+            *sp++ = JS_DupValue(ctx, var_buf[*pc++]);
+            BREAK;
         CASE(OP_put_loc8): set_value(ctx, &var_buf[*pc++], *--sp); BREAK;
         CASE(OP_set_loc8): set_value(ctx, &var_buf[*pc++], JS_DupValue(ctx, sp[-1])); BREAK;
 
-        CASE(OP_get_loc0): *sp++ = JS_DupValue(ctx, var_buf[0]); BREAK;
-        CASE(OP_get_loc1): *sp++ = JS_DupValue(ctx, var_buf[1]); BREAK;
-        CASE(OP_get_loc2): *sp++ = JS_DupValue(ctx, var_buf[2]); BREAK;
-        CASE(OP_get_loc3): *sp++ = JS_DupValue(ctx, var_buf[3]); BREAK;
+        CASE(OP_get_loc0): CHECK_TDZ(var_buf[0], 0); *sp++ = JS_DupValue(ctx, var_buf[0]); BREAK;
+        CASE(OP_get_loc1): CHECK_TDZ(var_buf[1], 1); *sp++ = JS_DupValue(ctx, var_buf[1]); BREAK;
+        CASE(OP_get_loc2): CHECK_TDZ(var_buf[2], 2); *sp++ = JS_DupValue(ctx, var_buf[2]); BREAK;
+        CASE(OP_get_loc3): CHECK_TDZ(var_buf[3], 3); *sp++ = JS_DupValue(ctx, var_buf[3]); BREAK;
         CASE(OP_put_loc0): set_value(ctx, &var_buf[0], *--sp); BREAK;
         CASE(OP_put_loc1): set_value(ctx, &var_buf[1], *--sp); BREAK;
         CASE(OP_put_loc2): set_value(ctx, &var_buf[2], *--sp); BREAK;
@@ -24728,6 +24769,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
                 op2 = sp[-1];
                 pv = &var_buf[idx];
+                CHECK_TDZ(*pv, idx);
                 if (likely(JS_VALUE_IS_BOTH_INT(*pv, op2))) {
                     int64_t r;
                     r = (int64_t)JS_VALUE_GET_INT(*pv) + JS_VALUE_GET_INT(op2);
@@ -25031,6 +25073,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 1;
 
                 op1 = var_buf[idx];
+                CHECK_TDZ(op1, idx);
                 if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
                     val = JS_VALUE_GET_INT(op1);
                     if (unlikely(val == INT32_MAX))
@@ -25057,6 +25100,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 1;
 
                 op1 = var_buf[idx];
+                CHECK_TDZ(op1, idx);
                 if (JS_VALUE_GET_TAG(op1) == JS_TAG_INT) {
                     val = JS_VALUE_GET_INT(op1);
                     if (unlikely(val == INT32_MIN))
@@ -27232,6 +27276,9 @@ typedef enum JSParseExportEnum {
 typedef struct JSVarScope {
     int parent;  /* index into fd->scopes of the enclosing scope */
     int first;   /* index into fd->vars of the last variable in this scope */
+    /* TRUE for the body of a switch statement: a case label jumps past
+       the lexical declarations before it */
+    BOOL is_switch;
     /* if not NULL, 'using' declarations are allowed directly in the
        scope: break entry of the disposal of their resources, owned by
        the statement which created the scope (see using_scope_init()) */
@@ -27255,6 +27302,10 @@ typedef struct JSVarDef {
     uint8_t is_captured : 1; /* XXX: could remove and use a var_ref_idx value */
     uint8_t is_static_private : 1; /* only used during private class field parsing */
     uint8_t var_kind : 4; /* see JSVarKindEnum */
+    /* resolve_variables(): the declaration of this lexical variable
+       initialized it, so the following references of the function in
+       its scope do not need the 'uninitialized' check */
+    uint8_t is_initialized : 1;
     /* if is_captured = TRUE, provides, the index of the corresponding
        JSVarRef on stack */
     uint16_t var_ref_idx;
@@ -29749,6 +29800,7 @@ static int push_scope(JSParseState *s) {
         fd->scopes[scope].first = fd->scope_first;
         fd->scopes[scope].using_be = NULL;
         fd->scopes[scope].using_await_idx = -1;
+        fd->scopes[scope].is_switch = FALSE;
         emit_op(s, OP_enter_scope);
         emit_u16(s, scope);
         return fd->scope_level = scope;
@@ -39751,6 +39803,9 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
 
             if (push_scope(s) < 0)
                 goto fail;
+            /* the case labels jump past the declarations of the body:
+               keep their TDZ checks (see lexical_var_needs_check()) */
+            s->cur_func->scopes[s->cur_func->scope_level].is_switch = TRUE;
             label_break = new_label(s);
             push_break_entry(s->cur_func, &break_entry,
                              label_name, label_break, -1, 1);
@@ -43136,6 +43191,7 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
     fd->scopes[0].parent = -1;
     fd->scopes[0].using_be = NULL;
     fd->scopes[0].using_await_idx = -1;
+    fd->scopes[0].is_switch = FALSE;
     fd->scope_level = 0;  /* 0: var/arg scope */
     fd->scope_first = -1;
     fd->body_scope = -1;
@@ -44308,6 +44364,35 @@ static int ts_elide_imports(JSContext *ctx, JSFunctionDef *fd)
     return 0;
 }
 
+/* TDZ checks. resolve_variables() reads the code in the order it was
+   emitted: a reference of a function to its lexical variable after the
+   initialization done by the declaration, in the scope of the variable,
+   can only run once the declaration has run in the current entry of the
+   scope. This relies on two properties of the code generator:
+   - the entry of a scope (OP_enter_scope) makes its lexical variables
+     uninitialized again, and loops jump back before it;
+   - no jump enters a scope past a declaration, except the case labels
+     of a switch: its body scope has is_switch set and keeps the checks.
+   A new construct which jumps into a block must set is_switch (or a
+   similar flag) on its scope. Building with CONFIG_CHECK_TDZ=y makes the
+   reads without check abort on an uninitialized variable (run test262
+   with it). The references of the closures keep their check. */
+static BOOL lexical_var_needs_check(JSFunctionDef *s, int var_idx)
+{
+    JSVarDef *vd = &s->vars[var_idx];
+    return vd->is_lexical && !vd->is_initialized;
+}
+
+/* 'scope_level' is the scope of the initialization */
+static void mark_lexical_var_initialized(JSFunctionDef *s, int var_idx,
+                                         int scope_level)
+{
+    JSVarDef *vd = &s->vars[var_idx];
+    if (vd->scope_level == scope_level &&
+        !s->scopes[scope_level].is_switch)
+        vd->is_initialized = 1;
+}
+
 /* return the position of the next opcode or -1 if error */
 static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                              JSAtom var_name, int scope_level, int op,
@@ -44413,7 +44498,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                     get_op = OP_get_arg;
                     var_idx -= ARGUMENT_VAR_OFFSET;
                 } else {
-                    if (s->vars[var_idx].is_lexical)
+                    if (lexical_var_needs_check(s, var_idx))
                         get_op = OP_get_loc_check;
                     else
                         get_op = OP_get_loc;
@@ -44461,18 +44546,25 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                     if (s->vars[var_idx].is_lexical) {
                         if (op == OP_scope_put_var_init) {
                             /* 'this' can only be initialized once */
-                            if (var_name == JS_ATOM_this)
+                            if (var_name == JS_ATOM_this) {
                                 dbuf_putc(bc, OP_put_loc_check_init);
-                            else
+                            } else {
                                 dbuf_putc(bc, OP_put_loc);
-                        } else {
+                                mark_lexical_var_initialized(s, var_idx,
+                                                             scope_level);
+                            }
+                        } else if (lexical_var_needs_check(s, var_idx)) {
                             dbuf_putc(bc, OP_put_loc_check);
+                        } else {
+                            dbuf_putc(bc, OP_put_loc);
                         }
                     } else {
                         dbuf_putc(bc, OP_put_loc);
                     }
                 } else {
-                    if (s->vars[var_idx].is_lexical) {
+                    if (s->vars[var_idx].is_lexical &&
+                        (op == OP_scope_get_var_checkthis ||
+                         lexical_var_needs_check(s, var_idx))) {
                         if (op == OP_scope_get_var_checkthis) {
                             /* only used for 'this' return in derived class constructors */
                             dbuf_putc(bc, OP_get_loc_checkthis);

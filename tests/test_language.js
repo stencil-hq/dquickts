@@ -631,6 +631,84 @@ function test_optional_chaining()
     assert((a?.["b"])().c, 42);
 }
 
+/* the 'uninitialized' checks of let, const and class are only removed
+   after their declaration, in its scope: every TDZ access still throws */
+function test_tdz()
+{
+    var i, r, f;
+    function tdz(f) {
+        try {
+            f();
+        } catch (e) {
+            return e instanceof ReferenceError;
+        }
+        return false;
+    }
+    /* before the declaration */
+    assert_throws(ReferenceError, () => { x; let x = 1; });
+    assert_throws(ReferenceError, () => { x = 2; let x = 1; });
+    assert_throws(ReferenceError, () => { x += 1; let x = 1; });
+    assert_throws(ReferenceError, () => { let x = x; });
+    assert_throws(ReferenceError, () => { const c = c + 1; });
+    assert_throws(ReferenceError, () => { class C extends C {} });
+    assert_throws(ReferenceError, () => { for (let x of x) ; });
+    assert_throws(ReferenceError, () => { let [a = b, b] = []; });
+    /* each entry of a loop body scope uninitializes again */
+    r = 0;
+    for (i = 0; i < 3; i++) {
+        if (i > 0 && tdz(() => y))
+            r++;
+        let y = i;
+        assert(y, i);
+    }
+    assert(r, 2);
+    r = 0;
+    for (i = 0; i < 3; i++) {
+        if (tdz(() => { w++; }))
+            r++;
+        let w = i;
+        w++;
+        assert(w, i + 1);
+    }
+    assert(r, 3);
+    /* a case label jumps past the declarations of the switch body */
+    function sw(v) {
+        switch (v) {
+        case 0:
+            let a = 1;
+            return a;
+        case 1:
+            return a;
+        case 2:
+            a = 3;
+            return 0;
+        }
+    }
+    assert(sw(0), 1);
+    assert_throws(ReferenceError, () => sw(1));
+    assert_throws(ReferenceError, () => sw(2));
+    /* closures */
+    f = (function () { let g = () => v; let v = 5; return g; })();
+    assert(f(), 5);
+    assert_throws(ReferenceError, () => { let g = () => v; g(); let v = 1; });
+    /* derived class constructor: 'this' before super() in a branch */
+    class A {}
+    class B extends A { constructor(c) { if (c) super(); this.x = 1; } }
+    assert(new B(true).x, 1);
+    assert_throws(ReferenceError, () => new B(false));
+    /* after the declaration */
+    {
+        let s = "", n = 0;
+        const k = 2;
+        for (i = 0; i < 1000; i++)
+            s += "ab";
+        assert(s.length, 2000);
+        n += k;
+        n++;
+        assert(n, 3);
+    }
+}
+
 function test_unicode_ident()
 {
     var Ãµ = 3;
@@ -697,6 +775,7 @@ test_argument_scope();
 test_function_expr_name();
 test_parse_semicolon();
 test_optional_chaining();
+test_tdz();
 test_parse_arrow_function();
 test_unicode_ident();
 test_global_var_opt();

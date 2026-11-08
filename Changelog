@@ -310,6 +310,9 @@ unreleased:
   error objects reuse a cached shape and the messages are built without
   printf (throw + catch about 4x faster); the JS_Throw*Error() messages
   are no longer cut at 255 bytes
+- the references of a function to its let, const and class variables
+  after their declaration skip the uninitialized check, so they get the
+  same compact bytecode as 'var' (a 'c += 1' loop on a let: 2x faster)
 - faster strings: UTF-8 decoding and the atom lookup of UTF-8 keys scan
   several bytes at a time, String.prototype.repeat() of one character
   uses memset

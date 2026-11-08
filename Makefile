@@ -74,6 +74,9 @@ PREFIX?=/usr/local
 #CONFIG_TSAN=y
 # compile the debug dumps selected with JS_SetDumpFlags() / qjs -D
 #CONFIG_DUMPS=y
+# abort when a variable read without TDZ check is uninitialized (checks the
+# TDZ checks removed by the compiler, see lexical_var_needs_check())
+#CONFIG_CHECK_TDZ=y
 
 # TEST262 bootstrap config: commit id and shallow "since" parameter
 TEST262_COMMIT?=7ab7fafa0003f73fc85c1b95d88094d33f7eb8bd
@@ -185,6 +188,9 @@ endif
 endif
 ifdef CONFIG_TEMPORAL_INTL
 DEFINES+=-DCONFIG_TEMPORAL_INTL
+endif
+ifdef CONFIG_CHECK_TDZ
+DEFINES+=-DCONFIG_CHECK_TDZ
 endif
 ifdef CONFIG_DUMPS
 DEFINES+=-DENABLE_DUMPS
