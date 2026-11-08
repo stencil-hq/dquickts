@@ -232,6 +232,45 @@ function test_array()
     assert(err && a.toString() === "1,2,3,4");
 }
 
+/* a fast array that shrinks releases its storage: the elements that
+   remain and the later additions must be kept */
+function test_array_shrink()
+{
+    var a, i;
+    a = [];
+    for (i = 0; i < 1000; i++)
+        a.push(i);
+    while (a.length > 10)
+        a.pop();
+    assert(a.join(), "0,1,2,3,4,5,6,7,8,9");
+    a.push(10);
+    assert(a[10], 10);
+    /* the remaining elements are after free slots left by shift() */
+    for (i = 11; i < 1000; i++)
+        a.push(i);
+    while (a.length > 10)
+        a.shift();
+    assert(a.join(), "990,991,992,993,994,995,996,997,998,999");
+    a.unshift(-1);
+    assert(a[0], -1);
+    assert(a.length, 11);
+    a.length = 0;
+    assert(a.length, 0);
+    assert(a[0], undefined);
+    a.push(1, 2);
+    assert(a.join(), "1,2");
+    /* trailing holes: the length is larger than the element count */
+    a = [];
+    for (i = 0; i < 1000; i++)
+        a.push(i);
+    a.length = 3;
+    a.length = 5;
+    assert(a.length, 5);
+    assert(a[2], 2);
+    assert(a[3], undefined);
+    assert(3 in a, false);
+}
+
 function test_string()
 {
     var a;
@@ -1491,6 +1530,7 @@ test();
 test_function();
 test_enum();
 test_array();
+test_array_shrink();
 test_array_shift();
 test_string();
 test_math();

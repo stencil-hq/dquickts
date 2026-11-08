@@ -250,6 +250,10 @@ unreleased:
     decorator syntax errors
 - snapshot format version 8
 - fixed an atom leak when reading truncated bytecode
+- a fast array releases its storage when its element count falls below a
+  quarter of the allocation (pop(), shift(), setting the length): an
+  array emptied by 'a.length = 0' kept 16 bytes per element of its
+  largest size
 - qjsc -fno-unused: omits the built-ins the compiled code does not
   reference (added JS_EnumCodeNames()); the qjsc executables are linked
   with the unused functions removed (the library is compiled with

@@ -12343,6 +12343,42 @@ static int call_setter(JSContext *ctx, JSObject *setter,
     }
 }
 
+/* release the storage of a fast array whose element count fell below a
+   quarter of its allocation: the elements are moved to the start of the
+   block, which is reallocated to 1.5 times the count (freed if the array
+   is empty). With the 1.5 growth of expand_fast_array(), alternating
+   additions and removals do not reallocate. */
+static void fast_array_shrink(JSContext *ctx, JSObject *p)
+{
+    uint32_t count = p->u.array.count;
+    uint32_t total = p->u.array.u1.size + p->u.array.offset;
+    uint32_t new_size;
+    JSValue *base, *new_base;
+
+    if (total <= 64 || count >= total / 4)
+        return;
+    base = fast_array_base(p);
+    if (count == 0) {
+        js_free(ctx, base);
+        p->u.array.u.values = NULL;
+        p->u.array.u1.size = 0;
+        p->u.array.offset = 0;
+        return;
+    }
+    if (p->u.array.offset != 0)
+        memmove(base, p->u.array.u.values, sizeof(JSValue) * count);
+    new_size = count + count / 2;
+    new_base = js_realloc_rt(ctx->rt, base, sizeof(JSValue) * new_size);
+    if (!new_base) {
+        /* keep the block, with the elements at its start */
+        new_base = base;
+        new_size = total;
+    }
+    p->u.array.u.values = new_base;
+    p->u.array.u1.size = new_size;
+    p->u.array.offset = 0;
+}
+
 /* set the array length and remove the array elements if necessary. */
 static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
                             int flags)
@@ -12367,6 +12403,10 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
             p->u.array.count = len;
         }
         p->prop[0].u.value = JS_NewUint32(ctx, len);
+        /* pop() and shift() remove the element before setting the
+           length */
+        if (p->class_id == JS_CLASS_ARRAY)
+            fast_array_shrink(ctx, p);
     } else {
         /* Note: length is always a uint32 because the object is an
            array */
