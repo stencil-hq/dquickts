@@ -1,0 +1,54 @@
+ternary true yes
+ternary false no
+ternary nested neg
+sign -3 neg
+sign 0 zero
+sign 4 pos
+nested ternary assoc 3
+ternary lazy 1 ['cond', 'a']
+or first truthy 'x'
+or all falsy None
+or last falsy []
+or first [1]
+and first falsy 0
+and all truthy [3]
+and empty str ''
+and/or mix 2
+or/and precedence 1
+and binds tighter False
+default idiom 'default'
+guard idiom []
+float zero or -0.0
+neg zero and -0.0
+and short-circuit 0 ['x']
+or short-circuit 5 ['x']
+or all evaluated 0 ['x', 'y', 'z']
+not 0 True
+not 1 False
+not empty str True
+not list False
+not None True
+not not str True
+type not bool
+not precedence True
+not with and 0
+not with or True
+  __bool__ p
+or returns object B(q)
+  __bool__ p
+and returns object B(q)
+  __bool__ n
+not object False
+bool and True False
+ternary in call 3
+ternary in comp ['even', 'odd', 'even', 'odd']
+ternary lambdas L
+chain or True
+chain and False
+result type float 2.5
+result type float 2.5
+result type bytes b''
+result type list []
+result type NoneType None
+absval 7 7 0
+greet Hello, world Hello, Ann Hello, world

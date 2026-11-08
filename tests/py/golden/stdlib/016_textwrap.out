@@ -1,0 +1,52 @@
+wrap 30 ['The quick brown fox jumps over', 'the lazy dog. Pack my box with', 'five dozen liquor jugs. How', 'vexingly quick daft zebras', 'jump!']
+wrap 10 ['supercalif', 'ragilistic', 'word']
+wrap no break long ['supercalifragilistic', 'word']
+wrap hyphen ['well-known', 'state-of-', 'the-art']
+wrap no hyphen break ['well-known s', 'tate-of-the-', 'art']
+wrap empty [] []
+wrap whitespace ['a       b c   d']
+wrap tabsize ['a   b']
+wrap max_lines ['The quick brown fox jumps', 'over the lazy dog. [...]']
+wrap max_lines placeholder ['The quick brown fox jumps', 'over the lazy dog. [more]']
+wrap drop ws off ['  lead  ', 'and  ', 'trail  ']
+fix_sentence ['End.  Next one.']
+width 0 ValueError invalid width 0 (must be > 0)
+fill 40:
+The quick brown fox jumps over the lazy
+dog. Pack my box with five dozen liquor
+jugs. How vexingly quick daft zebras
+jump!
+fill indents:
+* The quick brown fox jumps over the
+  lazy dog. Pack my box with five
+  dozen liquor jugs. How vexingly
+  quick daft zebras jump!
+TextWrapper:
+> one two three four
+> five six seven
+> eight nine ten
+TextWrapper wrap ['> short']
+dedent:
+
+def f(x):
+    if x:
+        return 1
+    return 0
+dedent mixed 'a\n  b\nc'
+dedent blank lines 'a\n\nb\n'
+dedent ws-only line 'a\n\nb'
+dedent tabs vs spaces '\ta\n  b'
+dedent none 'a\n  b'
+indent '  a\n  b\n\n  c\n'
+indent pred '# a\n# \n# b'
+indent pred odd 'x\n-y\nz\n'
+indent crlf '> a\r\n> b\r\n'
+shorten 'The quick brown fox [...]'
+shorten fits 'Hello world!'
+shorten placeholder 'The quick brown fox...'
+shorten collapse 'many spaces here'
+shorten too small ValueError placeholder too large for max width
+shorten word only '[...]'
+widths 5 ['aa bb', 'cc dd', 'ee ff', 'gg hh', 'ii'] 5
+widths 15 ['aa bb cc dd ee', 'ff gg hh ii'] 14
+widths 25 ['aa bb cc dd ee ff gg hh', 'ii'] 23

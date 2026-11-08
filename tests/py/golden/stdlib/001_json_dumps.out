@@ -1,0 +1,80 @@
+default {"b": [1, 2.5, null], "a": true, "c": {"z": "x", "y": false}}
+sort_keys {"a": true, "b": [1, 2.5, null], "c": {"y": false, "z": "x"}}
+compact {"b":[1,2.5,null],"a":true,"c":{"z":"x","y":false}}
+custom seps [1 ; {"k" = 2}]
+indent 2
+{
+  "a": true,
+  "b": [
+    1,
+    2.5,
+    null
+  ],
+  "c": {
+    "y": false,
+    "z": "x"
+  }
+}
+indent tab
+{
+	"x": [
+		1,
+		{
+			"y": []
+		}
+	],
+	"e": {}
+}
+indent 0
+[
+1,
+[
+2
+]
+]
+indent seps '{\n "a": [\n  1,\n  2\n ]\n}'
+none null
+bools [true, false]
+int 12345678901234567890123
+neg int -7
+float [0.1, 1.0, -0.0, 1e+100, 1.5e-07, 3.14]
+tuple [1, [2, 3]]
+str esc "quote\" back\\ nl\n tab\t ctl\u0001"
+empty [] {} ""
+ascii {"name": "caf\u00e9 \u2615 \u65e5\u672c \ud83d\ude00"}
+unicode {"name": "café ☕ 日本 😀"}
+lone surrogate "\ud800"
+keys {"1": "t", "2.5": "f", "null": "n"}
+tuple key TypeError keys must be str, int, float, bool or None, not tuple
+skipkeys {"ok": 1}
+special [NaN, Infinity, -Infinity]
+allow_nan ValueError Out of range float values are not JSON compliant: nan
+default fn {"p": {"x": 1, "y": 2}, "s": [1, 2, 3]}
+default raise TypeError cannot encode object
+no default TypeError Object of type Point is not JSON serializable
+bytes TypeError Object of type bytes is not JSON serializable
+encoder cls {"c": [1.0, 2.0]}
+circular ValueError Circular reference detected
+nested {"l1": {"l2": {"l3": [1, [2, [3, {"deep": "yes"}]]]}}}
+nested indent
+{
+ "l1": {
+  "l2": {
+   "l3": [
+    1,
+    [
+     2,
+     [
+      3,
+      {
+       "deep": "yes"
+      }
+     ]
+    ]
+   ]
+  }
+ }
+}
+int subclass [5, true]
+dump '{\n  "k": [\n    1,\n    2\n  ]\n}'
+dump unicode '"é"'

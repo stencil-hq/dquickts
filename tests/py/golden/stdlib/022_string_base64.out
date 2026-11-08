@@ -1,0 +1,55 @@
+ascii_letters abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ
+lowercase/uppercase abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ
+digits 0123456789 0123456789abcdefABCDEF 01234567
+punctuation !"#$%&'()*+,-./:;<=>?@[\]^_`{|}~
+whitespace ' \t\n\r\x0b\x0c'
+printable len 100 ' \t\n\r\x0b\x0c'
+capwords Hello Big World A-B c-D
+substitute tim likes kung paos, costs $5
+substitute mapping ann likes tacos, costs $5
+substitute mapping+kw kw likes ys, costs $5
+missing KeyError 'what'
+safe_substitute tim likes ${what}s, costs $5
+safe bad placeholder 1 $ and ${
+invalid ValueError Invalid placeholder in string: line 1, col 7
+identifiers ['what', 'who'] True
+template attr $who likes ${what}s, costs $$5
+custom delimiter job is 100% done
+Formatter a-n-   b
+Formatter parse [('x', '0', '>5', 'r'), ('y', 'name', '', None), ('z', None, None, None)]
+b64encode b'TWFueSBoYW5kcyBtYWtlIGxpZ2h0IHdvcmsu'
+b64decode b'Many hands make light work.'
+padding 0 b''
+padding 1 b'YQ=='
+padding 2 b'YWI='
+padding 3 b'YWJj'
+padding 4 b'YWJjZA=='
+standard b'+/+/AD4='
+urlsafe b'-_-_AD4='
+urlsafe decode True
+altchars b'._._AD4='
+decode str b'hi'
+decode nonalphabet skipped b'hi'
+validate Error Only base64 data is allowed
+bad padding Error Incorrect padding
+b32 b'NBSWY3DP' b'hello'
+b32 lower b'hello'
+b32hex b'D1IMOR3F'
+b16 b'01ABFF' b'\x01\xab\xff'
+b16 lowercase Error Non-base16 digit found
+b16 casefold b'\x01\xab\xff'
+b85 b'Xk~0{Zv' b'hello'
+a85 b'BOu!rDZ' b'z'
+encodebytes b'eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4\neHh4\n'
+standard_b64 b'/w==' b'\xff'
+hexlify b'007f80ff'
+hexlify sep b'01-02-03' b'0102:0304'
+unhexlify b'\xde\xad\xbe\xef' b'\x00\xff'
+odd length Error Odd number of hexadecimal digits
+non-hex Error Non-hexadecimal digit found
+crc32 222957957 0x0
+crc32 incremental 222957957
+crc_hqx 50018
+b2a_base64 b'aGk=\n' b'aGk='
+a2b_base64 b'hi'
+bytes.hex abcd abcd ef b'\xab\xcd'

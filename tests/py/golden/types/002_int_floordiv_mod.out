@@ -1,0 +1,56 @@
+pair 7 2 // 3 % 1 divmod (3, 1) ok True
+pair -7 2 // -4 % 1 divmod (-4, 1) ok True
+pair 7 -2 // -4 % -1 divmod (-4, -1) ok True
+pair -7 -2 // 3 % -1 divmod (3, -1) ok True
+pair 6 3 // 2 % 0 divmod (2, 0) ok True
+pair -6 3 // -2 % 0 divmod (-2, 0) ok True
+pair 6 -3 // -2 % 0 divmod (-2, 0) ok True
+pair -6 -3 // 2 % 0 divmod (2, 0) ok True
+pair 0 5 // 0 % 0 divmod (0, 0) ok True
+pair 0 -5 // 0 % 0 divmod (0, 0) ok True
+pair 1 3 // 0 % 1 divmod (0, 1) ok True
+pair -1 3 // -1 % 2 divmod (-1, 2) ok True
+pair 1 -3 // -1 % -2 divmod (-1, -2) ok True
+pair -1 -3 // 0 % -1 divmod (0, -1) ok True
+pair 5 10 // 0 % 5 divmod (0, 5) ok True
+pair -5 10 // -1 % 5 divmod (-1, 5) ok True
+pair 5 -10 // -1 % -5 divmod (-1, -5) ok True
+pair 1 100000000000000000000 // 0 % 1 divmod (0, 1) ok True
+pair -1 100000000000000000000 // -1 % 99999999999999999999 divmod (-1, 99999999999999999999) ok True
+pair 1 -100000000000000000000 // -1 % -99999999999999999999 divmod (-1, -99999999999999999999) ok True
+pair 100000000000000000000 -3 // -33333333333333333334 % -2 divmod (-33333333333333333334, -2) ok True
+pair -100000000000000000000 3 // -33333333333333333334 % 2 divmod (-33333333333333333334, 2) ok True
+pair 100000000000000000001 10000000000 // 10000000000 % 1 divmod (10000000000, 1) ok True
+pair 9223372036854775808 -1 // -9223372036854775808 % 0 divmod (-9223372036854775808, 0) ok True
+pair -9223372036854775808 -1 // 9223372036854775808 % 0 divmod (9223372036854775808, 0) ok True
+pair -2147483648 -1 // 2147483648 % 0 divmod (2147483648, 0) ok True
+pair -2147483648 2147483648 // -1 % 0 divmod (-1, 0) ok True
+pair 1267650600228229401496703205376 1125899906842625 // 1125899906842623 % 1 divmod (1125899906842623, 1) ok True
+pair -1267650600228229401496703205376 1125899906842625 // -1125899906842624 % 1125899906842624 divmod (-1125899906842624, 1125899906842624) ok True
+sign of % follows divisor
+   -9 % 4 = 3 ; -9 % -4 = -1
+   -1 % 4 = 3 ; -1 % -4 = -1
+   0 % 4 = 0 ; 0 % -4 = 0
+   1 % 4 = 1 ; 1 % -4 = -3
+   9 % 4 = 1 ; 9 % -4 = -3
+floor vs truncation
+   -7 2 floor -4 trunc -3
+   7 -2 floor -4 trunc -3
+   -1 2 floor -1 trunc 0
+divmod type tuple
+divmod bool (0, 1) (7, 0)
+1 // 0 ZeroDivisionError division by zero
+1 % 0 ZeroDivisionError division by zero
+divmod(1, 0) ZeroDivisionError division by zero
+0 // 0 ZeroDivisionError division by zero
+big // 0 ZeroDivisionError division by zero
+big % 0 ZeroDivisionError division by zero
+1 // False ZeroDivisionError division by zero
+1 // 'a' TypeError unsupported operand type(s) for //: 'int' and 'str'
+divmod('a', 1) TypeError unsupported operand type(s) for divmod(): 'str' and 'int'
+1 % None TypeError unsupported operand type(s) for %: 'int' and 'NoneType'
+augmented //= -4
+augmented %= 3
+augmented %= neg -3
+chained -5 2
+precedence -8 -6 2

@@ -1,0 +1,90 @@
+1 == 1.0 == True True
+1 == 1+0j True
+0 == 0.0 == False == -0.0 == 0j True
+dict merge {1: 'c'}
+dict merge float first {1.0: 'b'}
+dict merge complex {(2+0j): 'z'}
+set merge {1}
+set merge float first {1.0}
+set zeros {0.0}
+len set mixed 3
+keys kept [1]
+lookup by float 'bool'
+lookup by complex 'bool'
+'1' in d False
+hash int 0 0
+hash int 1 1
+hash int -1 -2
+hash int -2 -2
+hash int 2 2
+hash int 7 7
+hash int -7 -7
+hash int 2147483648 2147483648
+hash int 2305843009213693950 2305843009213693950
+hash int 2305843009213693951 0
+hash int 2305843009213693952 1
+hash int 4611686018427387904 2
+hash int -2305843009213693951 0
+hash int -2305843009213693952 -2
+hash int 1000000000000000000000000000000 465258685558744706
+hash int -1000000000000000000000000000000 -465258685558744706
+hash int True 1
+hash int False 0
+hash(-1) -2
+hash(-2) -2
+hash(-1) == hash(-2) True
+hash(1) == hash(1.0) True
+hash(1) == hash(True) True
+hash(1) == hash(1+0j) True
+hash(2**61-1) 0
+hash float 0.0 0
+hash float -0.0 0
+hash float 0.5 1152921504606846976
+hash float 1.5 1152921504606846977
+hash float -1.5 -1152921504606846977
+hash float 0.1 230584300921369408
+hash float 1e+100 1822893315824342674
+hash float 2.305843009213694e+18 1
+hash float 1.1805916207174113e+21 512
+hash float 5e-324 16777216
+hash float -1.0 -2
+hash float 1e+300 1224995262755759164
+hash(inf) 314159
+hash(-inf) -314159
+hash(1e100) == hash(int(1e100)) True
+hash(2.0**70) == hash(2**70) True
+hash(1j) 1000003
+hash(1+2j) 2000007
+hash(-1+0j) -2
+hash(())  5740354900026072187
+hash((1, 2)) -3550055125485641917
+hash((1, 2)) == hash((1.0, 2.0)) True
+hash(None) type 'int'
+hash(frozenset())  133146708735736
+hash(frozenset({1, 2})) -1826646154956904602
+hash(range(3)) == hash(range(3)) True
+hash([]) TypeError unhashable type: 'list'
+hash({}) TypeError unhashable type: 'dict'
+hash(set()) TypeError unhashable type: 'set'
+hash(bytearray()) TypeError unhashable type: 'bytearray'
+hash(slice(1,2)) True
+hash((1, [2])) TypeError unhashable type: 'list'
+0.5 == 1/2 True
+0.1 + 0.2 == 0.3 False
+1 == '1' False
+1 != '1' True
+1 == [1] False
+1 == None False
+1.0 is not 1 True
+[1, 2] == [1.0, 2.0] True
+(1, 2) == (True, 2.0) True
+{1: 2} == {1.0: 2.0} True
+{1} == {1.0} True
+[0.0] == [-0.0] True
+big == float True
+big+1 != float True
+hash big+1 differs True
+1 in [1.0] True
+True in {1: 0} True
+[1.0, True].index(1) 0
+[1, 1.0, True].count(True) 3

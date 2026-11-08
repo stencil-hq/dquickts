@@ -1,0 +1,53 @@
+semicolons 1 2 3
+one-line if
+second statement in suite
+backslash continuation 6
+implicit continuation [1, 2, 3]
+call continuation 20
+chained same same same
+chained unpack a b a b
+expression statements ok
+sep, 1, 2, 3
+sep emptyab
+end | continues on same line
+no args then empty line:
+
+sep None 1 2
+end None
+flush x
+star+args
+multiline sep
+a
+b
+bad sep TypeError sep must be None or a string, not int
+bad end TypeError end must be None or a string, not bytes
+str of obj S.__str__ [S.__repr__] (S.__repr__,) {'k': S.__repr__}
+str returns non-str TypeError BadStr.__str__() must return a str, not int
+TabError 'if True:\n\tx = 1\n        y = 2\n' inconsistent use of tabs and spaces in indentation 3
+IndentationError 'if True:\nx = 1\n' expected an indented block after 'if' statement on line 1 2
+IndentationError '  x = 1\n' unexpected indent 1
+IndentationError 'if True:\n    x = 1\n  y = 2\n' unindent does not match any outer indentation level 3
+IndentationError 'x = 1\n    y = 2\n' unexpected indent 2
+IndentationError 'for i in range(3):\n' expected an indented block after 'for' statement on line 1 1
+syntax 'True = 1' cannot assign to True
+syntax 'None = 0' cannot assign to None
+syntax 'def = 1' invalid syntax
+syntax 'class = 2' invalid syntax
+syntax '__debug__ = 1' cannot assign to __debug__
+syntax 'f() = 1' cannot assign to function call here. Maybe you meant '==' instead of '='?
+syntax '1 = x' cannot assign to literal here. Maybe you meant '==' instead of '='?
+syntax 'x + 1 = 2' cannot assign to expression here. Maybe you meant '==' instead of '='?
+compiles '(a, b) = 1, 2'
+compiles '[a, b] = 1, 2'
+compiles 'a.b = 1'
+compiles 'a[0] = 1'
+soft keyword type shadowed type builtin
+builtin type back int
+underscore underscore is a name
+__debug__ True
+module name __main__
+ellipsis Ellipsis Ellipsis True
+one-line compound None Empty
+multi-line expression 6
+unicode identifiers 3.14159 2 6.28318
+NFKC identifier ligature normalized

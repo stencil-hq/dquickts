@@ -1,0 +1,21 @@
+global inc 1 2 2
+read global without decl 20
+local shadows local 2
+created global created inside function
+unbound local UnboundLocalError cannot access local variable 'x' where it is not associated with a value
+conditional assigned 1
+conditional unbound UnboundLocalError cannot access local variable 'y' where it is not associated with a value
+nonlocal 2
+accumulator (5, [5]) (15, [5, 10])
+independent closures (1, [1])
+nearest scope ('L1', 'L3 changed L2')
+late binding assigned after def
+loop closures [2, 2, 2]
+global skips enclosing module g
+syntax 'def f():\n    nonlocal q\n' no binding for nonlocal 'q' found
+syntax 'nonlocal z\n' nonlocal declaration not allowed at module level
+syntax 'def f(a):\n    global a\n' name 'a' is parameter and global
+syntax 'def f():\n    x = 1\n    global x\n' name 'x' is assigned to before global declaration
+syntax 'def f():\n    print(x)\n    global x\n' name 'x' is used prior to global declaration
+syntax 'def o():\n    a = 1\n    def i():\n        global a\n        nonlocal a\n' name 'a' is nonlocal and global
+deleted global NameError name 'brand_new' is not defined

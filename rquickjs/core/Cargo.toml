@@ -87,6 +87,31 @@ futures = ["dep:async-lock"]
 # Allows transferring objects between different contexts of the same runtime.
 multi-ctx = []
 
+# Embed the Python 3.15 runtime of the engine (Ctx::init_python, Ctx::eval_python,
+# Ctx::python_import)
+python = ["rquickjs-sys/python"]
+
+# CPython C modules that link a system library (found with pkg-config, else
+# linked by name; the self-contained C modules come with `python`)
+# zlib (zlib)
+python-zlib = ["python", "rquickjs-sys/python-zlib"]
+# _bz2 (bzip2)
+python-bz2 = ["python", "rquickjs-sys/python-bz2"]
+# _lzma (liblzma)
+python-lzma = ["python", "rquickjs-sys/python-lzma"]
+# _sqlite3 (sqlite3)
+python-sqlite3 = ["python", "rquickjs-sys/python-sqlite3"]
+# _ssl and _hashlib (OpenSSL)
+python-ssl = ["python", "rquickjs-sys/python-ssl"]
+# _zstd (libzstd)
+python-zstd = ["python", "rquickjs-sys/python-zstd"]
+# _ctypes (libffi)
+python-ctypes = ["python", "rquickjs-sys/python-ctypes"]
+# readline (GNU readline or libedit)
+python-readline = ["python", "rquickjs-sys/python-readline"]
+# _uuid (libuuid; built without it on macOS)
+python-uuid = ["python", "rquickjs-sys/python-uuid"]
+
 # Enable QuickJS dumps for debug
 dump-bytecode = ["rquickjs-sys/dump-bytecode"]
 dump-gc = ["rquickjs-sys/dump-gc"]

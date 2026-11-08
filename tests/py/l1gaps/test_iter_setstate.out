@@ -1,0 +1,114 @@
+list 'x' TypeError an integer is required
+tuple 'x' TypeError an integer is required
+range 'x' TypeError 'str' object cannot be interpreted as an integer
+longrange 'x' TypeError state must be an int, not str
+str 'x' TypeError an integer is required
+str-wide 'x' TypeError an integer is required
+bytes 'x' TypeError an integer is required
+bytearray 'x' TypeError an integer is required
+reversed 'x' TypeError an integer is required
+array 'x' TypeError an integer is required
+seq 'x' TypeError an integer is required
+list None TypeError an integer is required
+tuple None TypeError an integer is required
+range None TypeError 'NoneType' object cannot be interpreted as an integer
+longrange None TypeError state must be an int, not NoneType
+str None TypeError an integer is required
+str-wide None TypeError an integer is required
+bytes None TypeError an integer is required
+bytearray None TypeError an integer is required
+reversed None TypeError an integer is required
+array None TypeError an integer is required
+seq None TypeError an integer is required
+list 1.5 TypeError an integer is required
+tuple 1.5 TypeError an integer is required
+range 1.5 TypeError 'float' object cannot be interpreted as an integer
+longrange 1.5 TypeError state must be an int, not float
+str 1.5 TypeError an integer is required
+str-wide 1.5 TypeError an integer is required
+bytes 1.5 TypeError an integer is required
+bytearray 1.5 TypeError an integer is required
+reversed 1.5 TypeError an integer is required
+array 1.5 TypeError an integer is required
+seq 1.5 TypeError an integer is required
+list Index() TypeError an integer is required
+tuple Index() TypeError an integer is required
+range Index() ok [1, 2]
+longrange Index() TypeError state must be an int, not Index
+str Index() TypeError an integer is required
+str-wide Index() TypeError an integer is required
+bytes Index() TypeError an integer is required
+bytearray Index() TypeError an integer is required
+reversed Index() TypeError an integer is required
+array Index() TypeError an integer is required
+seq Index() TypeError an integer is required
+list True ok [2, 3]
+tuple True ok [2, 3]
+range True ok [1, 2]
+longrange True TypeError state must be an int, not bool
+str True ok ['b', 'c']
+str-wide True ok ['€', 'b']
+bytes True ok [98, 99]
+bytearray True ok [98, 99]
+reversed True ok [2, 1]
+array True ok [2, 3]
+seq True ok seq-end
+list 1267650600228229401496703205376 OverflowError Python int too large to convert to C ssize_t
+tuple 1267650600228229401496703205376 OverflowError Python int too large to convert to C ssize_t
+range 1267650600228229401496703205376 OverflowError Python int too large to convert to C long
+longrange 1267650600228229401496703205376 ok []
+str 1267650600228229401496703205376 OverflowError Python int too large to convert to C ssize_t
+str-wide 1267650600228229401496703205376 OverflowError Python int too large to convert to C ssize_t
+bytes 1267650600228229401496703205376 OverflowError Python int too large to convert to C ssize_t
+bytearray 1267650600228229401496703205376 OverflowError Python int too large to convert to C ssize_t
+reversed 1267650600228229401496703205376 OverflowError Python int too large to convert to C ssize_t
+array 1267650600228229401496703205376 OverflowError Python int too large to convert to C ssize_t
+seq 1267650600228229401496703205376 OverflowError Python int too large to convert to C ssize_t
+list -1267650600228229401496703205376 OverflowError Python int too large to convert to C ssize_t
+tuple -1267650600228229401496703205376 OverflowError Python int too large to convert to C ssize_t
+range -1267650600228229401496703205376 OverflowError Python int too large to convert to C long
+longrange -1267650600228229401496703205376 ok [1180591620717411303424, 1180591620717411303425, 1180591620717411303426]
+str -1267650600228229401496703205376 OverflowError Python int too large to convert to C ssize_t
+str-wide -1267650600228229401496703205376 OverflowError Python int too large to convert to C ssize_t
+bytes -1267650600228229401496703205376 OverflowError Python int too large to convert to C ssize_t
+bytearray -1267650600228229401496703205376 OverflowError Python int too large to convert to C ssize_t
+reversed -1267650600228229401496703205376 OverflowError Python int too large to convert to C ssize_t
+array -1267650600228229401496703205376 OverflowError Python int too large to convert to C ssize_t
+seq -1267650600228229401496703205376 OverflowError Python int too large to convert to C ssize_t
+list -5 ok []
+tuple -5 ok [1, 2, 3]
+range -5 ok [0, 1, 2]
+longrange -5 ok [1180591620717411303424, 1180591620717411303425, 1180591620717411303426]
+str -5 ok ['a', 'b', 'c']
+str-wide -5 ok ['a', '€', 'b']
+bytes -5 ok [97, 98, 99]
+bytearray -5 ok []
+reversed -5 ok []
+array -5 ok [1, 2, 3]
+seq -5 ok seq-end
+list 1 ok [2, 3]
+tuple 1 ok [2, 3]
+range 1 ok [1, 2]
+longrange 1 ok [1180591620717411303425, 1180591620717411303426]
+str 1 ok ['b', 'c']
+str-wide 1 ok ['€', 'b']
+bytes 1 ok [98, 99]
+bytearray 1 ok [98, 99]
+reversed 1 ok [2, 1]
+array 1 ok [2, 3]
+seq 1 ok seq-end
+list 100 ok []
+tuple 100 ok []
+range 100 ok []
+longrange 100 ok []
+str 100 ok []
+str-wide 100 ok []
+bytes 100 ok []
+bytearray 100 ok []
+reversed 100 ok [3, 2, 1]
+array 100 ok []
+seq 100 ok seq-end
+deque False
+enumerate False
+callable False
+zip True

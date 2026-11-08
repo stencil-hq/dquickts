@@ -1,0 +1,24 @@
+type async_generator agen
+anext first
+  agen received 'hello'
+asend second
+athrow handled boom
+anext after throw last
+exhausted StopAsyncIteration
+TypeError can't send non-None value to a just-started async generator
+async for over async gen [0, 1, 2, 3]
+async comprehension [1, 3, 5]
+  genexp type async_generator
+async genexp [0, 10, 20]
+before aclose 1
+  async gen finally
+aclose result None
+closed gen raises StopAsyncIteration
+RuntimeError async generator ignored GeneratorExit
+athrow propagates KeyError 'k'
+StopAsyncIteration inside RuntimeError async generator raised StopAsyncIteration
+await inside async gen awaited value
+aclose unstarted None
+unstarted closed is exhausted
+anext builtin default empty
+aiter is self True

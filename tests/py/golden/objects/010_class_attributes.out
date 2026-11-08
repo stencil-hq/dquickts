@@ -1,0 +1,26 @@
+class counter 2 2 2
+shared list [1, 2] [1, 2] [1, 2]
+same object True
+shadowing instance class class
+instance dict {'name': 'a', 'label': 'instance'}
+after del class
+AttributeError 'Counter' object has no attribute 'label'
+instance count 100 2
+class change visible changed changed
+rebinding breaks sharing ['own'] [1, 2]
+lookup base child
+dynamic lookup base2
+instance first inst base2 base2
+class dict has False True
+added later added later 1
+class attr not in instance dict {'anything': 1}
+AttributeError 'Empty' object has no attribute 'nope'
+AttributeError type object 'Empty' has no attribute 'nope'
+instance override method instance override method
+class patched class patched
+attached function external WithMethodsAsAttrs
+class name attrs Counter __main__
+bases True True
+class of instance True True
+augmented copy [0] [0] []
+augmented in place [1, 1]

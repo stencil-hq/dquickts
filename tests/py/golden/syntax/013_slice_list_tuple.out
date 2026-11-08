@@ -1,0 +1,45 @@
+full copy [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] True True
+[3:7] [3, 4, 5, 6]
+[-4:] [6, 7, 8, 9]
+[:-7] [0, 1, 2]
+[::2] [0, 2, 4, 6, 8]
+[1::3] [1, 4, 7]
+[::-1] [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+[7:1:-2] [7, 5, 3]
+[-1:-5:-1] [9, 8, 7, 6]
+[5:2] empty []
+[2:5:-1] empty []
+[20:30] empty []
+[-20:2] [0, 1]
+[-20::-1] empty []
+[20::-4] [9, 5, 1]
+tuple [1:4] ('y', 't', 'h')
+tuple [::-1] ('n', 'o', 'h', 't', 'y', 'p')
+tuple [::2] ('p', 't', 'o')
+tuple empty () tuple
+tuple full copy eq True tuple
+tuple index p n p
+chain slice [3, 5, 7]
+shallow copy [[1, 2, 99], [3, 4]] [[1, 2, 99], 'replaced']
+reverse ways [3, 2, 1] [3, 2, 1] [1, 2, 3]
+neg index 9 0 None
+list index 10 IndexError list index out of range
+list index -11 IndexError list index out of range
+list index 99 IndexError list index out of range
+tuple index 6 IndexError tuple index out of range
+tuple index -7 IndexError tuple index out of range
+empty list index IndexError list index out of range
+empty tuple index IndexError tuple index out of range
+list str index TypeError list indices must be integers or slices, not str
+tuple float index TypeError tuple indices must be integers or slices, not float
+list step 0 ValueError slice step cannot be zero
+list tuple index TypeError list indices must be integers or slices, not tuple
+list None index TypeError list indices must be integers or slices, not NoneType
+bool index 1 0
+__index__ 3 8 [1, 2, 3]
+grid 6 4 [2, 3] [2, 5]
+tuple setitem TypeError 'tuple' object does not support item assignment
+tuple delitem TypeError 'tuple' object doesn't support item deletion
+step > len [1] [3]
+windows [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
+pairs [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9)]

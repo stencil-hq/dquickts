@@ -1,0 +1,31 @@
+iterator is own iter True
+list [1, 2, 3]
+single use []
+next default done
+reiterable [1, 2, 3] [1, 2, 3]
+nested loops [(1, 2), (1, 3), (2, 3)]
+independent iterators 1 2 1
+iter callable sentinel [1, 2, 3]
+sentinel never hit stops by break 7
+sentinel with next method ['a', 'b'] ['c']
+TypeError iter(v, w): v must be callable
+TypeError 'int' object is not iterable
+TypeError 'float' object is not iterable
+TypeError 'NoneType' object is not iterable
+TypeError 'builtin_function_or_method' object is not iterable
+TypeError 'list' object is not an iterator
+TypeError 'str' object is not an iterator
+TypeError 'tuple' object is not an iterator
+next default on empty None 0
+next no default StopIteration ()
+list iterator sees appends [2, 3, 4]
+RuntimeError dictionary changed size during iteration
+RuntimeError Set changed size during iteration
+iterator types ['list_iterator', 'tuple_iterator', 'dict_keyiterator', 'range_iterator', 'dict_itemiterator']
+infinite iterator [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+for with break [0, 1, 1, 2, 3]
+error from __next__ ValueError next failed
+unpacking iterator 1 2 3 4
+star unpack 1 [2, 3, 4]
+ValueError too many values to unpack (expected 2)
+dict from iterator of pairs {1: 'a', 2: 'b', 3: 'c'}

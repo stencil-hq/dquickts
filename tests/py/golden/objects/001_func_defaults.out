@@ -1,0 +1,27 @@
+defaults evaluated at def ['b', 'c']
+call 1 (1, 'b', 'c')
+call 2 (1, 2, 3)
+no re-evaluation ['b', 'c']
+gotcha 1 [1]
+gotcha 2 [1, 2]
+gotcha explicit [3]
+gotcha 3 [1, 2, 4]
+shared default ([1, 2, 4],)
+safe 1 [1]
+safe 2 [2]
+__defaults__ f ('b',)
+__kwdefaults__ f {'c': 'c'}
+__defaults__ none None
+__kwdefaults__ none None
+patched defaults 11
+patched both 300
+TypeError g() missing 2 required positional arguments: 'a' and 'b'
+TypeError __defaults__ must be set to a tuple object
+kw only defaults {'k': 1}
+patched kwdefaults (5, 6)
+TypeError h() missing 2 required keyword-only arguments: 'k' and 'm'
+global default 1 1 1
+default captured value 5 99
+dict default {'a': 2, 'b': 1}
+lambda default 5
+defaults are tuple tuple

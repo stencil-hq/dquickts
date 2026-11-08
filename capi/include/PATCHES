@@ -1,0 +1,785 @@
+# capi/include patches against cpython v3.15.2 (tools/capi_sync.py --record).
+
+--- a/Python.h
++++ b/Python.h
+@@ -1,6 +1,11 @@
+ // Entry point of the Python C API.
+ // C extensions should only #include <Python.h>, and not include directly
+ // the other Python header files included by <Python.h>.
++//
++// dquickts: CPython 3.15 Include/ (public + cpython/) adapted to the D5
++// mirror model (Tier S); see local://capi-design.md "Header strategy" for
++// the list of changed headers.  Internal pycore_*.h shims live in
++// capi/compat/.  PSF-2.0.
+ 
+ #ifndef Py_PYTHON_H
+ #define Py_PYTHON_H
+
+--- a/cpython/abstract.h
++++ b/cpython/abstract.h
+@@ -97,8 +97,11 @@
+      (PyList_Check(o) ? PyList_GET_ITEM((o), (i)) : PyTuple_GET_ITEM((o), (i)))
+ 
+ /* Return a pointer to the underlying item array for
+-   an object returned by PySequence_Fast */
++   an object returned by PySequence_Fast.
++   dquickts: for a list, an array of borrowed item mirrors materialized in
++   the list mirror (valid until the list is next mutated, as in CPython). */
++PyAPI_FUNC(PyObject **) _PyQp_ListItems(PyObject *list);
+ #define PySequence_Fast_ITEMS(sf) \
+-    (PyList_Check(sf) ? ((PyListObject *)(sf))->ob_item \
++    (PyList_Check(sf) ? _PyQp_ListItems(_PyObject_CAST(sf)) \
+                       : ((PyTupleObject *)(sf))->ob_item)
+ 
+--- a/cpython/bytearrayobject.h
++++ b/cpython/bytearrayobject.h
+@@ -2,20 +2,17 @@
+ #  error "this header file must not be included directly"
+ #endif
+ 
+-/* Object layout */
++/* Object layout.
++   dquickts (D5): a bytearray is the shared JS object over a resizable
++   ArrayBuffer.  Its storage moves when Python code resizes it, so the data
++   pointer and the size (_Py_QP_LIVE_SIZE_FLAG) are read through calls; the
++   CPython fields are private placeholders (same sizeof as CPython). */
+ typedef struct {
+     PyObject_VAR_HEAD
+-    /* How many bytes allocated in ob_bytes
++    Py_ssize_t _qp_private[5];
++} PyByteArrayObject;
+ 
+-       In the current implementation this is equivalent to Py_SIZE(ob_bytes_object).
+-       The value is always loaded and stored atomically for thread safety.
+-       There are API compatibilty concerns with removing so keeping for now. */
+-    Py_ssize_t ob_alloc;
+-    char *ob_bytes;        /* Physical backing buffer */
+-    char *ob_start;        /* Logical start inside ob_bytes */
+-    Py_ssize_t ob_exports; /* How many buffer exports */
+-    PyObject *ob_bytes_object;  /* PyBytes for zero-copy bytes conversion */
+-} PyByteArrayObject;
++PyAPI_FUNC(char *) _PyQp_ByteArrayData(PyObject *op);
+ 
+ /* Macros and static inline functions, trading safety for speed */
+ #define _PyByteArray_CAST(op) \
+@@ -23,7 +20,7 @@
+ 
+ static inline char* PyByteArray_AS_STRING(PyObject *op)
+ {
+-    return _PyByteArray_CAST(op)->ob_start;
++    return _PyQp_ByteArrayData(_PyObject_CAST(_PyByteArray_CAST(op)));
+ }
+ #define PyByteArray_AS_STRING(self) PyByteArray_AS_STRING(_PyObject_CAST(self))
+ 
+--- a/cpython/bytesobject.h
++++ b/cpython/bytesobject.h
+@@ -2,16 +2,16 @@
+ #  error "this header file must not be included directly"
+ #endif
+ 
++/* dquickts (D5): bytes are immutable JS objects over an ArrayBuffer; the
++   mirror points at that storage (zero copy) instead of embedding ob_sval.
++   The pointer is stable for the life of the object, NUL-terminated
++   (data[ob_size] == 0) and writable only for bytes created by C code that
++   have not crossed into Python yet (PyBytes_FromStringAndSize(NULL, n)).
++   sizeof(PyBytesObject) equals CPython's on 64-bit hosts. */
+ typedef struct {
+     PyObject_VAR_HEAD
+     Py_DEPRECATED(3.11) Py_hash_t ob_shash;
+-    char ob_sval[1];
+-
+-    /* Invariants:
+-     *     ob_sval contains space for 'ob_size+1' elements.
+-     *     ob_sval[ob_size] == 0.
+-     *     ob_shash is the hash of the byte string or -1 if not computed yet.
+-     */
++    char *_qp_sval;
+ } PyBytesObject;
+ 
+ PyAPI_FUNC(int) _PyBytes_Resize(PyObject **, Py_ssize_t);
+@@ -22,7 +22,7 @@
+ 
+ static inline char* PyBytes_AS_STRING(PyObject *op)
+ {
+-    return _PyBytes_CAST(op)->ob_sval;
++    return _PyBytes_CAST(op)->_qp_sval;
+ }
+ #define PyBytes_AS_STRING(op) PyBytes_AS_STRING(_PyObject_CAST(op))
+ 
+--- a/cpython/cellobject.h
++++ b/cpython/cellobject.h
+@@ -9,8 +9,9 @@
+ 
+ typedef struct {
+     PyObject_HEAD
+-    /* Content of the cell or NULL when empty */
+-    PyObject *ob_ref;
++    /* dquickts (D5): cells are shared JS cells; the content is reached
++       through PyCell_Get/PyCell_Set (field renamed, not maintained) */
++    PyObject *_qp_ob_ref;
+ } PyCellObject;
+ 
+ PyAPI_DATA(PyTypeObject) PyCell_Type;
+@@ -21,25 +22,20 @@
+ PyAPI_FUNC(PyObject *) PyCell_Get(PyObject *);
+ PyAPI_FUNC(int) PyCell_Set(PyObject *, PyObject *);
+ 
++/* dquickts: borrowed (pinned by the cell's mirror until the cell changes) */
++PyAPI_FUNC(PyObject *) _PyQp_CellGetBorrowed(PyObject *op);
+ static inline PyObject* PyCell_GET(PyObject *op) {
+-    PyObject *res;
+-    PyCellObject *cell;
+     assert(PyCell_Check(op));
+-    cell = _Py_CAST(PyCellObject*, op);
+-    Py_BEGIN_CRITICAL_SECTION(cell);
+-    res = cell->ob_ref;
+-    Py_END_CRITICAL_SECTION();
+-    return res;
++    return _PyQp_CellGetBorrowed(op);
+ }
+ #define PyCell_GET(op) PyCell_GET(_PyObject_CAST(op))
+ 
++/* dquickts: CPython's PyCell_SET steals `value` and does not release the
++   previous content; the runtime keeps that contract. */
++PyAPI_FUNC(void) _PyQp_CellSetSteal(PyObject *op, PyObject *value);
+ static inline void PyCell_SET(PyObject *op, PyObject *value) {
+-    PyCellObject *cell;
+     assert(PyCell_Check(op));
+-    cell = _Py_CAST(PyCellObject*, op);
+-    Py_BEGIN_CRITICAL_SECTION(cell);
+-    cell->ob_ref = value;
+-    Py_END_CRITICAL_SECTION();
++    _PyQp_CellSetSteal(op, value);
+ }
+ #define PyCell_SET(op, value) PyCell_SET(_PyObject_CAST(op), (value))
+ 
+--- a/cpython/dictobject.h
++++ b/cpython/dictobject.h
+@@ -8,10 +8,15 @@
+ /* The ma_values pointer is NULL for a combined table
+  * or points to an array of PyObject* for a split table
+  */
++/* dquickts (D5): dicts are the shared JS PY_DICT objects; PyDictObject is
++   the C-side handle (same sizeof as CPython).  ma_used is NOT maintained
++   (Python code mutates the dict): sizes come from PyDict_Size() /
++   PyDict_GET_SIZE(), which is a call; ma_keys/ma_values are private
++   runtime fields (borrowed-value pins of PyDict_GetItem and PyDict_Next). */
+ typedef struct {
+     PyObject_HEAD
+ 
+-    /* Number of items in the dictionary */
++    /* dquickts: unused (see above) */
+     Py_ssize_t ma_used;
+ 
+     /* This is a private field for CPython's internal use.
+@@ -49,18 +54,8 @@
+ PyAPI_FUNC(PyObject *) PyDict_SetDefault(
+     PyObject *mp, PyObject *key, PyObject *defaultobj);
+ 
+-/* Get the number of items of a dictionary. */
+-static inline Py_ssize_t PyDict_GET_SIZE(PyObject *op) {
+-    PyDictObject *mp;
+-    assert(PyAnyDict_Check(op));
+-    mp = _Py_CAST(PyDictObject*, op);
+-#ifdef Py_GIL_DISABLED
+-    return _Py_atomic_load_ssize_relaxed(&mp->ma_used);
+-#else
+-    return mp->ma_used;
+-#endif
+-}
+-#define PyDict_GET_SIZE(op) PyDict_GET_SIZE(_PyObject_CAST(op))
++/* Get the number of items of a dictionary (dquickts: a call). */
++#define PyDict_GET_SIZE(op) PyDict_Size(_PyObject_CAST(op))
+ 
+ PyAPI_FUNC(int) PyDict_ContainsString(PyObject *mp, const char *key);
+ 
+--- a/cpython/funcobject.h
++++ b/cpython/funcobject.h
+@@ -33,32 +33,23 @@
+  * executed so far.
+  */
+ 
++/* dquickts (D5): Python functions are shared JS bytecode functions; this
++   struct only reserves CPython's size.  Its fields are not maintained and
++   are renamed (direct access is a compile error): the PyFunction_GET_*
++   accessors below call PyFunction_Get* (borrowed results pinned by the
++   function's mirror). */
+ typedef struct {
+     PyObject_HEAD
+-    _Py_COMMON_FIELDS(func_)
+-    PyObject *func_doc;         /* The __doc__ attribute, can be anything */
+-    PyObject *func_dict;        /* The __dict__ attribute, a dict or NULL */
+-    PyObject *func_weakreflist; /* List of weak references */
+-    PyObject *func_module;      /* The __module__ attribute, can be anything */
+-    PyObject *func_annotations; /* Annotations, a dict or NULL */
+-    PyObject *func_annotate;    /* Callable to fill the annotations dictionary */
+-    PyObject *func_typeparams;  /* Tuple of active type variables or NULL */
+-    vectorcallfunc vectorcall;
+-    /* Version number for use by specializer.
+-     * Can set to non-zero when we want to specialize.
+-     * Will be set to zero if any of these change:
+-     *     defaults
+-     *     kwdefaults (only if the object changes, not the contents of the dict)
+-     *     code
+-     *     annotations
+-     *     vectorcall function pointer */
+-    uint32_t func_version;
+-
+-    /* Invariant:
+-     *     func_closure contains the bindings for func_code->co_freevars, so
+-     *     PyTuple_Size(func_closure) == PyCode_GetNumFree(func_code)
+-     *     (func_closure may be NULL if PyCode_GetNumFree(func_code) == 0).
+-     */
++    _Py_COMMON_FIELDS(_qp_func_)
++    PyObject *_qp_func_doc;
++    PyObject *_qp_func_dict;
++    PyObject *_qp_func_weakreflist;
++    PyObject *_qp_func_module;
++    PyObject *_qp_func_annotations;
++    PyObject *_qp_func_annotate;
++    PyObject *_qp_func_typeparams;
++    vectorcallfunc _qp_vectorcall;
++    uint32_t _qp_func_version;
+ } PyFunctionObject;
+ 
+ #undef _Py_COMMON_FIELDS
+@@ -88,37 +79,37 @@
+ /* Static inline functions for direct access to these values.
+    Type checks are *not* done, so use with care. */
+ static inline PyObject* PyFunction_GET_CODE(PyObject *func) {
+-    return _PyFunction_CAST(func)->func_code;
++    return PyFunction_GetCode(_PyObject_CAST(_PyFunction_CAST(func)));
+ }
+ #define PyFunction_GET_CODE(func) PyFunction_GET_CODE(_PyObject_CAST(func))
+ 
+ static inline PyObject* PyFunction_GET_GLOBALS(PyObject *func) {
+-    return _PyFunction_CAST(func)->func_globals;
++    return PyFunction_GetGlobals(_PyObject_CAST(_PyFunction_CAST(func)));
+ }
+ #define PyFunction_GET_GLOBALS(func) PyFunction_GET_GLOBALS(_PyObject_CAST(func))
+ 
+ static inline PyObject* PyFunction_GET_MODULE(PyObject *func) {
+-    return _PyFunction_CAST(func)->func_module;
++    return PyFunction_GetModule(_PyObject_CAST(_PyFunction_CAST(func)));
+ }
+ #define PyFunction_GET_MODULE(func) PyFunction_GET_MODULE(_PyObject_CAST(func))
+ 
+ static inline PyObject* PyFunction_GET_DEFAULTS(PyObject *func) {
+-    return _PyFunction_CAST(func)->func_defaults;
++    return PyFunction_GetDefaults(_PyObject_CAST(_PyFunction_CAST(func)));
+ }
+ #define PyFunction_GET_DEFAULTS(func) PyFunction_GET_DEFAULTS(_PyObject_CAST(func))
+ 
+ static inline PyObject* PyFunction_GET_KW_DEFAULTS(PyObject *func) {
+-    return _PyFunction_CAST(func)->func_kwdefaults;
++    return PyFunction_GetKwDefaults(_PyObject_CAST(_PyFunction_CAST(func)));
+ }
+ #define PyFunction_GET_KW_DEFAULTS(func) PyFunction_GET_KW_DEFAULTS(_PyObject_CAST(func))
+ 
+ static inline PyObject* PyFunction_GET_CLOSURE(PyObject *func) {
+-    return _PyFunction_CAST(func)->func_closure;
++    return PyFunction_GetClosure(_PyObject_CAST(_PyFunction_CAST(func)));
+ }
+ #define PyFunction_GET_CLOSURE(func) PyFunction_GET_CLOSURE(_PyObject_CAST(func))
+ 
+ static inline PyObject* PyFunction_GET_ANNOTATIONS(PyObject *func) {
+-    return _PyFunction_CAST(func)->func_annotations;
++    return PyFunction_GetAnnotations(_PyObject_CAST(_PyFunction_CAST(func)));
+ }
+ #define PyFunction_GET_ANNOTATIONS(func) PyFunction_GET_ANNOTATIONS(_PyObject_CAST(func))
+ 
+--- a/cpython/listobject.h
++++ b/cpython/listobject.h
+@@ -2,49 +2,47 @@
+ #  error "this header file must not be included directly"
+ #endif
+ 
++/* dquickts (D5): a list is always the shared JS Array; PyListObject is
++   only the C-side handle.  Its length is live (_Py_QP_LIVE_SIZE_FLAG:
++   Py_SIZE()/Py_SET_SIZE() call into the runtime) and items are reached
++   through calls.  PyList_GET_ITEM() returns a borrowed mirror that stays
++   valid while the list mirror lives and the slot still holds that value
++   (CPython's rule).  ob_item/allocated do not exist: code touching them
++   must use PyList_GET_ITEM/PyList_SET_ITEM/_PyList_ITEMS (patched in the
++   vendored modules, see capi/modules/PATCHES). */
+ typedef struct {
+     PyObject_VAR_HEAD
+-    /* Vector of pointers to list elements.  list[0] is ob_item[0], etc. */
+-    PyObject **ob_item;
+-
+-    /* ob_item contains space for 'allocated' elements.  The number
+-     * currently in use is ob_size.
+-     * Invariants:
+-     *     0 <= ob_size <= allocated
+-     *     len(list) == ob_size
+-     *     ob_item == NULL implies ob_size == allocated == 0
+-     * list.sort() temporarily sets allocated to -1 to detect mutations.
+-     *
+-     * Items must normally not be NULL, except during construction when
+-     * the list is not yet visible outside the function that builds it.
+-     */
+-    Py_ssize_t allocated;
++    /* private to the runtime (borrowed-item cache) */
++    PyObject **_qp_items;
++    Py_ssize_t _qp_nitems;
+ } PyListObject;
+ 
+ /* Cast argument to PyListObject* type. */
+ #define _PyList_CAST(op) \
+     (assert(PyList_Check(op)), _Py_CAST(PyListObject*, (op)))
+ 
++PyAPI_FUNC(PyObject *) _PyQp_ListGetItem(PyObject *op, Py_ssize_t index);
++PyAPI_FUNC(void) _PyQp_ListSetItem(PyObject *op, Py_ssize_t index, PyObject *value);
++
+ // Macros and static inline functions, trading safety for speed
+ 
+ static inline Py_ssize_t PyList_GET_SIZE(PyObject *op) {
+     PyListObject *list = _PyList_CAST(op);
+-#ifdef Py_GIL_DISABLED
+-    return _Py_atomic_load_ssize_relaxed(&(_PyVarObject_CAST(list)->ob_size));
+-#else
+     return Py_SIZE(list);
+-#endif
+ }
+ #define PyList_GET_SIZE(op) PyList_GET_SIZE(_PyObject_CAST(op))
+ 
+-#define PyList_GET_ITEM(op, index) (_PyList_CAST(op)->ob_item[(index)])
++/* borrowed reference */
++#define PyList_GET_ITEM(op, index) _PyQp_ListGetItem(_PyObject_CAST(op), (index))
+ 
++/* Steals a reference to value: it becomes the list mirror's borrowed-item
++   pin of that slot, so `value` stays valid while the list holds it.  As in
++   CPython it is meant for filling new lists (PyList_New(n) slots start as
++   NULL-equivalent placeholders). */
+ static inline void
+ PyList_SET_ITEM(PyObject *op, Py_ssize_t index, PyObject *value) {
+-    PyListObject *list = _PyList_CAST(op);
+     assert(0 <= index);
+-    assert(index < list->allocated);
+-    list->ob_item[index] = value;
++    _PyQp_ListSetItem(op, index, value);
+ }
+ #define PyList_SET_ITEM(op, index, value) \
+     PyList_SET_ITEM(_PyObject_CAST(op), (index), _PyObject_CAST(value))
+
+--- a/cpython/pyerrors.h
++++ b/cpython/pyerrors.h
+@@ -5,10 +5,15 @@
+ /* Error objects */
+ 
+ /* PyException_HEAD defines the initial segment of every exception class. */
+-#define PyException_HEAD PyObject_HEAD PyObject *dict;\
+-             PyObject *args; PyObject *notes; PyObject *traceback;\
+-             PyObject *context; PyObject *cause;\
+-             char suppress_context;
++/* dquickts (D5): exceptions are shared JS PY_EXCEPTION objects; these
++   structs only give C subtypes their sizes (tp_basicsize).  The fields are
++   not maintained by the runtime and are renamed so that direct access is a
++   compile error: use PyException_GetArgs/GetTraceback/GetCause/GetContext,
++   PyObject_GetAttr (e.g. "strerror") or the PyUnicode*Error_* accessors. */
++#define PyException_HEAD PyObject_HEAD PyObject *_qp_dict;\
++             PyObject *_qp_args; PyObject *_qp_notes; PyObject *_qp_traceback;\
++             PyObject *_qp_context; PyObject *_qp_cause;\
++             char _qp_suppress_context;
+ 
+ typedef struct {
+     PyException_HEAD
+@@ -16,72 +21,72 @@
+ 
+ typedef struct {
+     PyException_HEAD
+-    PyObject *msg;
+-    PyObject *excs;
+-    PyObject *excs_str;
++    PyObject *_qp_msg;
++    PyObject *_qp_excs;
++    PyObject *_qp_excs_str;
+ } PyBaseExceptionGroupObject;
+ 
+ typedef struct {
+     PyException_HEAD
+-    PyObject *msg;
+-    PyObject *filename;
+-    PyObject *lineno;
+-    PyObject *offset;
+-    PyObject *end_lineno;
+-    PyObject *end_offset;
+-    PyObject *text;
+-    PyObject *print_file_and_line;
+-    PyObject *metadata;
++    PyObject *_qp_msg;
++    PyObject *_qp_filename;
++    PyObject *_qp_lineno;
++    PyObject *_qp_offset;
++    PyObject *_qp_end_lineno;
++    PyObject *_qp_end_offset;
++    PyObject *_qp_text;
++    PyObject *_qp_print_file_and_line;
++    PyObject *_qp_metadata;
+ } PySyntaxErrorObject;
+ 
+ typedef struct {
+     PyException_HEAD
+-    PyObject *msg;
+-    PyObject *name;
+-    PyObject *path;
+-    PyObject *name_from;
++    PyObject *_qp_msg;
++    PyObject *_qp_name;
++    PyObject *_qp_path;
++    PyObject *_qp_name_from;
+ } PyImportErrorObject;
+ 
+ typedef struct {
+     PyException_HEAD
+-    PyObject *encoding;
+-    PyObject *object;
+-    Py_ssize_t start;
+-    Py_ssize_t end;
+-    PyObject *reason;
++    PyObject *_qp_encoding;
++    PyObject *_qp_object;
++    Py_ssize_t _qp_start;
++    Py_ssize_t _qp_end;
++    PyObject *_qp_reason;
+ } PyUnicodeErrorObject;
+ 
+ typedef struct {
+     PyException_HEAD
+-    PyObject *code;
++    PyObject *_qp_code;
+ } PySystemExitObject;
+ 
+ typedef struct {
+     PyException_HEAD
+-    PyObject *myerrno;
+-    PyObject *strerror;
+-    PyObject *filename;
+-    PyObject *filename2;
++    PyObject *_qp_myerrno;
++    PyObject *_qp_strerror;
++    PyObject *_qp_filename;
++    PyObject *_qp_filename2;
+ #ifdef MS_WINDOWS
+-    PyObject *winerror;
++    PyObject *_qp_winerror;
+ #endif
+-    Py_ssize_t written;   /* only for BlockingIOError, -1 otherwise */
++    Py_ssize_t _qp_written;   /* only for BlockingIOError, -1 otherwise */
+ } PyOSErrorObject;
+ 
+ typedef struct {
+     PyException_HEAD
+-    PyObject *value;
++    PyObject *_qp_value;
+ } PyStopIterationObject;
+ 
+ typedef struct {
+     PyException_HEAD
+-    PyObject *name;
++    PyObject *_qp_name;
+ } PyNameErrorObject;
+ 
+ typedef struct {
+     PyException_HEAD
+-    PyObject *obj;
+-    PyObject *name;
++    PyObject *_qp_obj;
++    PyObject *_qp_name;
+ } PyAttributeErrorObject;
+ 
+ /* Compatibility typedefs */
+
+--- a/cpython/setobject.h
++++ b/cpython/setobject.h
+@@ -33,39 +33,17 @@
+ 
+ */
+ 
++/* dquickts (D5): sets are the shared JS PY_SET/PY_FROZENSET objects;
++   PySetObject is the C-side handle.  The hash table is not exposed (fields
++   are private runtime state: borrowed-key pins of _PySet_NextEntry*), and
++   the size is a call. */
+ typedef struct {
+     PyObject_HEAD
+-
+-    Py_ssize_t fill;            /* Number active and dummy entries*/
+-    Py_ssize_t used;            /* Number active entries */
+-
+-    /* The table contains mask + 1 slots, and that's a power of 2.
+-     * We store the mask instead of the size because the mask is more
+-     * frequently needed.
+-     */
+-    Py_ssize_t mask;
+-
+-    /* The table points to a fixed-size smalltable for small tables
+-     * or to additional malloc'ed memory for bigger tables.
+-     * The table pointer is never NULL which saves us from repeated
+-     * runtime null-tests.
+-     */
+-    setentry *table;
+-    Py_hash_t hash;             /* Only used by frozenset objects */
+-    Py_ssize_t finger;          /* Search finger for pop() */
+-
+-    setentry smalltable[PySet_MINSIZE];
+-    PyObject *weakreflist;      /* List of weak references */
++    void *_qp_pins;
++    Py_ssize_t _qp_reserved;
+ } PySetObject;
+ 
+ #define _PySet_CAST(so) \
+     (assert(PyAnySet_Check(so)), _Py_CAST(PySetObject*, so))
+ 
+-static inline Py_ssize_t PySet_GET_SIZE(PyObject *so) {
+-#ifdef Py_GIL_DISABLED
+-    return _Py_atomic_load_ssize_relaxed(&(_PySet_CAST(so)->used));
+-#else
+-    return _PySet_CAST(so)->used;
+-#endif
+-}
+-#define PySet_GET_SIZE(so) PySet_GET_SIZE(_PyObject_CAST(so))
++#define PySet_GET_SIZE(so) PySet_Size(_PyObject_CAST(so))
+
+--- a/cpython/tupleobject.h
++++ b/cpython/tupleobject.h
+@@ -2,6 +2,13 @@
+ #  error "this header file must not be included directly"
+ #endif
+ 
++/* dquickts (D5): a tuple handed to C code is a mirror of the shared JS
++   tuple with CPython's exact layout.  ob_item[] is materialized when the
++   mirror is created (items of nested tuples too, iteratively; containers
++   of other types stay lazy), so PyTuple_GET_ITEM() and _PyTuple_ITEMS()
++   remain plain field reads and borrowed items live as long as the tuple
++   mirror.  A tuple created by C code (PyTuple_New + PyTuple_SET_ITEM) is
++   C-primary: its JS value is built when it first crosses into Python. */
+ typedef struct {
+     PyObject_VAR_HEAD
+     /* Cached hash.  Initially set to -1. */
+@@ -28,12 +35,19 @@
+ 
+ #define PyTuple_GET_ITEM(op, index) (_PyTuple_CAST(op)->ob_item[(index)])
+ 
+-/* Function *only* to be used to fill in brand new tuples */
++/* Function *only* to be used to fill in brand new tuples.
++   dquickts: a call, because a tuple whose JS value already exists (the
++   refcount-1 reuse idiom of itertools/functools) must drop or update it. */
++PyAPI_FUNC(void) _PyQp_TupleSetItem(PyObject *op, Py_ssize_t index, PyObject *value);
+ static inline void
+ PyTuple_SET_ITEM(PyObject *op, Py_ssize_t index, PyObject *value) {
+     PyTupleObject *tuple = _PyTuple_CAST(op);
+     assert(0 <= index);
+     assert(index < Py_SIZE(tuple));
++    if (_PyQp_HasFlag(_PyObject_CAST(tuple), _Py_QP_BOUND_FLAG)) {
++        _PyQp_TupleSetItem(op, index, value);
++        return;
++    }
+     tuple->ob_item[index] = value;
+ }
+ #define PyTuple_SET_ITEM(op, index, value) \
+
+--- a/cpython/weakrefobject.h
++++ b/cpython/weakrefobject.h
+@@ -5,39 +5,17 @@
+ /* PyWeakReference is the base struct for the Python ReferenceType, ProxyType,
+  * and CallableProxyType.
+  */
++/* dquickts (D5): weak references are the runtime's _weakref objects (over
++   QuickJS weak references); the struct only reserves CPython's size and its
++   fields are renamed (not maintained): use PyWeakref_GetRef(). */
+ struct _PyWeakReference {
+     PyObject_HEAD
+-
+-    /* The object to which this is a weak reference, or Py_None if none.
+-     * Note that this is a stealth reference:  wr_object's refcount is
+-     * not incremented to reflect this pointer.
+-     */
+-    PyObject *wr_object;
+-
+-    /* A callable to invoke when wr_object dies, or NULL if none. */
+-    PyObject *wr_callback;
+-
+-    /* A cache for wr_object's hash code.  As usual for hashes, this is -1
+-     * if the hash code isn't known yet.
+-     */
+-    Py_hash_t hash;
+-
+-    /* If wr_object is weakly referenced, wr_object has a doubly-linked NULL-
+-     * terminated list of weak references to it.  These are the list pointers.
+-     * If wr_object goes away, wr_object is set to Py_None, and these pointers
+-     * have no meaning then.
+-     */
+-    PyWeakReference *wr_prev;
+-    PyWeakReference *wr_next;
+-    vectorcallfunc vectorcall;
+-
+-#ifdef Py_GIL_DISABLED
+-    /* Pointer to the lock used when clearing in free-threaded builds.
+-     * Normally this can be derived from wr_object, but in some cases we need
+-     * to lock after wr_object has been set to Py_None.
+-     */
+-    PyMutex *weakrefs_lock;
+-#endif
++    PyObject *_qp_wr_object;
++    PyObject *_qp_wr_callback;
++    Py_hash_t _qp_hash;
++    PyWeakReference *_qp_wr_prev;
++    PyWeakReference *_qp_wr_next;
++    vectorcallfunc _qp_vectorcall;
+ };
+ 
+ PyAPI_FUNC(void) _PyWeakref_ClearRef(PyWeakReference *self);
+
+--- a/object.h
++++ b/object.h
+@@ -115,6 +115,35 @@
+  * This must be an integer literal with the value (1 << _PyGC_PREV_SHIFT), number of bytes.
+  */
+ #define _PyObject_MIN_ALIGNMENT 4
++
++/* dquickts C API (D5 Tier S): the default (GIL) 64-bit object layout only.
++   The free-threaded layout is not provided; abi3t extensions use the
++   opaque PyObject (_Py_OPAQUE_PYOBJECT) and never see these fields. */
++#if defined(Py_GIL_DISABLED)
++#  error "dquickts: the free-threaded (Py_GIL_DISABLED) ABI is not supported"
++#endif
++#if !defined(_Py_OPAQUE_PYOBJECT) && SIZEOF_VOID_P <= 4
++#  error "dquickts: the C API requires a 64-bit host"
++#endif
++
++/* dquickts per-object flags.  They are not ob_flags bits: limited-API
++   extensions built for Python < 3.12 (cp37-abi3 wheels, ...) increment and
++   decrement ob_refcnt as a whole Py_ssize_t, so a bit above the 32-bit
++   count would keep their Py_DECREF from ever reaching 0 (and calling
++   _Py_Dealloc).  They live in the 16-bit flags word of the mirror head that
++   precedes every heap object (2 bytes at ob - 6, QPCapiHead in
++   python/capi.h); statically allocated objects (_Py_STATICALLY_ALLOCATED_FLAG
++   = bit 2 of ob_flags) have no head and none of these flags.
++   _Py_QP_BOUND_FLAG: the object has a JS identity (a JS value shared with
++     Python/JS code).  Py_REFCNT() then also counts the references the JS
++     heap holds, so "uniquely referenced" fast paths stay correct.
++   _Py_QP_LIVE_SIZE_FLAG: list/bytearray mirror; Py_SIZE()/Py_SET_SIZE()
++     call _PyQp_GetLiveSize()/_PyQp_SetLiveSize(). */
++#define _Py_QP_BOUND_FLAG     0x1000
++#define _Py_QP_LIVE_SIZE_FLAG 0x2000
++#define _PyQp_HasFlag(ob, flag)                                              \
++    (!((ob)->ob_flags & (1 << 2) /* _Py_STATICALLY_ALLOCATED_FLAG */) &&    \
++     (((const uint16_t *)(ob))[-3] & (flag)) != 0)
+ 
+ /* Nothing is actually declared to be a PyObject, but every pointer to
+  * a Python object can be cast to a PyObject*.  This is inheritance built
+@@ -234,12 +263,22 @@
+     return ob->ob_type;
+ }
+ 
++/* dquickts (D5 mirror model): mirrors of mutable variable-size builtins
++   (list, bytearray) whose length lives in the shared JS object set
++   _Py_QP_LIVE_SIZE_FLAG; their size is read and written
++   through these functions instead of the (stale) ob_size field. */
++PyAPI_FUNC(Py_ssize_t) _PyQp_GetLiveSize(PyObject *ob);
++PyAPI_FUNC(void) _PyQp_SetLiveSize(PyVarObject *ob, Py_ssize_t size);
++
+ // bpo-39573: The Py_SET_SIZE() function must be used to set an object size.
+ static inline Py_ssize_t
+ _Py_SIZE_impl(PyObject *ob)
+ {
+     assert(Py_TYPE(ob) != &PyLong_Type);
+     assert(Py_TYPE(ob) != &PyBool_Type);
++    if (_PyQp_HasFlag(ob, _Py_QP_LIVE_SIZE_FLAG)) {
++        return _PyQp_GetLiveSize(ob);
++    }
+     return  _PyVarObject_CAST(ob)->ob_size;
+ }
+ 
+@@ -254,6 +293,10 @@
+ {
+     assert(Py_TYPE(_PyObject_CAST(ob)) != &PyLong_Type);
+     assert(Py_TYPE(_PyObject_CAST(ob)) != &PyBool_Type);
++    if (_PyQp_HasFlag(&ob->ob_base, _Py_QP_LIVE_SIZE_FLAG)) {
++        _PyQp_SetLiveSize(ob, size);
++        return;
++    }
+ #ifdef Py_GIL_DISABLED
+     _Py_atomic_store_ssize_relaxed(&ob->ob_size, size);
+ #else
+
+--- a/pyport.h
++++ b/pyport.h
+@@ -130,7 +130,13 @@
+  * unsigned integral type).  See PEP 353 for details.
+  * PY_SSIZE_T_MAX is the largest positive value of type Py_ssize_t.
+  */
+-#ifdef HAVE_PY_SSIZE_T
++/* dquickts: inside the quickjs.c translation unit (QP_CAPI_IMPL, see
++   python/capi.h) python/compat.h already defines Py_ssize_t (intptr_t, the
++   same width and signedness as ssize_t on every supported host) and the
++   limits; python/dictcore.h defines Py_hash_t/Py_uhash_t. */
++#if defined(QP_COMPAT_H)
++
++#elif defined(HAVE_PY_SSIZE_T)
+ 
+ #elif HAVE_SSIZE_T
+ typedef ssize_t         Py_ssize_t;
+@@ -143,14 +149,19 @@
+ #endif
+ 
+ /* Smallest negative value of type Py_ssize_t. */
++#ifndef PY_SSIZE_T_MIN
+ #define PY_SSIZE_T_MIN (-PY_SSIZE_T_MAX-1)
++#endif
+ 
+ /* Py_hash_t is the same size as a pointer. */
+ #define SIZEOF_PY_HASH_T SIZEOF_SIZE_T
++#define SIZEOF_PY_UHASH_T SIZEOF_SIZE_T
++#ifndef QP_PY_HASH_T_DEFINED
++#define QP_PY_HASH_T_DEFINED
+ typedef Py_ssize_t Py_hash_t;
+ /* Py_uhash_t is the unsigned equivalent needed to calculate numeric hash. */
+-#define SIZEOF_PY_UHASH_T SIZEOF_SIZE_T
+ typedef size_t Py_uhash_t;
++#endif
+ 
+ /* Now PY_SSIZE_T_CLEAN is mandatory. This is just for backward compatibility. */
+ typedef Py_ssize_t Py_ssize_clean_t;
+@@ -491,7 +502,7 @@
+ #ifdef WITH_THREAD
+ #  ifdef thread_local
+ #    define _Py_thread_local thread_local
+-#  elif _Py_STDC_VERSION >= 201112L && !defined(__STDC_NO_THREADS__)
++#  elif defined(_Py_STDC_VERSION) && _Py_STDC_VERSION >= 201112L && !defined(__STDC_NO_THREADS__)
+ #    define _Py_thread_local _Thread_local
+ #  elif defined(_MSC_VER)  /* AKA NT_THREADS */
+ #    define _Py_thread_local __declspec(thread)
+
+--- a/refcount.h
++++ b/refcount.h
+@@ -102,8 +102,14 @@
+ #elif defined(_Py_OPAQUE_PYOBJECT)
+     // Py_REFCNT() is also a function call in abi3t.
+ #else
++    /* dquickts: C references + references held by the JS heap (see
++       _Py_QP_BOUND_FLAG in object.h). */
++    PyAPI_FUNC(Py_ssize_t) _PyQp_RefcntBound(PyObject *ob);
+     static inline Py_ssize_t _Py_REFCNT(PyObject *ob) {
+     #if !defined(Py_GIL_DISABLED)
++        if (_PyQp_HasFlag(ob, _Py_QP_BOUND_FLAG)) {
++            return _PyQp_RefcntBound(ob);
++        }
+         return ob->ob_refcnt;
+     #else
+         uint32_t local = _Py_atomic_load_uint32_relaxed(&ob->ob_ref_local);
+
+--- a/unicodeobject.h
++++ b/unicodeobject.h
+@@ -87,9 +87,11 @@
+ 
+ /* Py_UCS4 and Py_UCS2 are typedefs for the respective
+    unicode representations. */
++#ifndef QP_UNICODETYPE_H   /* dquickts: python/unicodetype.h has the same typedefs */
+ typedef uint32_t Py_UCS4;
+ typedef uint16_t Py_UCS2;
+ typedef uint8_t Py_UCS1;
++#endif
+ 
+ #ifdef __cplusplus
+ extern "C" {

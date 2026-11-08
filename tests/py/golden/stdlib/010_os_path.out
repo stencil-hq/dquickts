@@ -1,0 +1,48 @@
+sep '/' '.' '.' '..' None
+posixpath is os.path True
+join a/b/c.txt
+join abs resets /c/d
+join trailing a/b a/ b
+join empty ''
+join bytes b'a/b'
+join mixed TypeError Can't mix strings and bytes in path components
+split '/usr/lib/libc.so.6' ('/usr/lib', 'libc.so.6') ext ('/usr/lib/libc.so', '.6') base 'libc.so.6' dir '/usr/lib'
+split 'a/b/' ('a/b', '') ext ('a/b/', '') base '' dir 'a/b'
+split 'file' ('', 'file') ext ('file', '') base 'file' dir ''
+split '/' ('/', '') ext ('/', '') base '' dir '/'
+split '' ('', '') ext ('', '') base '' dir ''
+split '.hidden' ('', '.hidden') ext ('.hidden', '') base '.hidden' dir ''
+split 'dir/.hidden.txt' ('dir', '.hidden.txt') ext ('dir/.hidden', '.txt') base '.hidden.txt' dir 'dir'
+split '//x' ('//', 'x') ext ('//x', '') base 'x' dir '//'
+split 'a.b/c' ('a.b', 'c') ext ('a.b/c', '') base 'c' dir 'a.b'
+splitdrive ('', '/x/y')
+splitroot ('', '//', 'a/b') ('', '/', '//a') ('', '', 'a/b')
+normpath 'a//b' -> 'a/b'
+normpath 'a/./b' -> 'a/b'
+normpath 'a/b/../c' -> 'a/c'
+normpath '/../x' -> '/x'
+normpath '../../a' -> '../../a'
+normpath 'a/..' -> '.'
+normpath '' -> '.'
+normpath '.' -> '.'
+normpath '//a//b/' -> '//a/b'
+normpath '///a' -> '/a'
+normpath '/a/b/../../..' -> '/'
+relpath b/c
+relpath up ../../x
+relpath same .
+relpath root ../..
+relpath rel ../y
+relpath empty ValueError no path specified
+isabs True False False
+commonpath /usr
+commonprefix /usr/l
+commonpath mix ValueError Can't mix absolute and relative paths
+commonpath empty ValueError commonpath() arg is an empty sequence
+normcase A/B
+expanduser no tilde a/~b
+splitext dots ('a.tar', '.gz') ('...', '') ('.a', '.b')
+fspath x b'y'
+fspath bad TypeError expected str, bytes or os.PathLike object, not int
+fsencode b'\xc3\xa9' é
+join bytes normpath b'/a'

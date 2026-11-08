@@ -1,0 +1,33 @@
+NamedTuple Employee(name='ann', dept='eng', level=1) ann@eng ('name', 'dept', 'level') {'dept': 'eng', 'level': 1}
+NamedTuple tuple True Employee(name='ann', dept='eng', level=3) {'name': 'ann', 'dept': 'eng', 'level': 1}
+NamedTuple annotations {'name': <class 'str'>, 'dept': <class 'str'>, 'level': <class 'int'>}
+NamedTuple missing TypeError Employee.__new__() missing 1 required positional argument: 'name'
+functional NamedTuple Pair(left=1, right=2)
+TypedDict is dict dict {'title': 'x', 'year': 1}
+required keys ['title', 'year'] ['rating']
+total True False
+TypedDict hints {'title': <class 'str'>, 'year': <class 'int'>, 'rating': <class 'float'>}
+TypedDict isinstance TypeError TypedDict does not support instance and class checks
+hints {'name': <class 'str'>, 'times': <class 'int'>, 'loud': bool | None, 'return': list[str]}
+hints raw True
+forward ref hints {'value': <class 'int'>, 'next': __main__.Node | None, 'count': typing.ClassVar[int]}
+Optional repr int | None int | str int | None | str
+Optional eq True True
+pipe union int | None True
+get_origin <class 'list'> True None
+get_args (<class 'str'>, list[int]) (<class 'int'>, <class 'NoneType'>) ([<class 'int'>, <class 'str'>], <class 'bool'>)
+Literal typing.Literal['a', 1] ('a', 1)
+generic alias list[int] dict[str, int] typing.List[int]
+Callable typing.Callable[..., int] typing.Callable[[int], str]
+Any typing.Any True
+TypeVar ~T T <class 'int'>
+Generic __main__.Box[int] 3 (~T,)
+PEP 695 class (U,) __main__.Stack[int]
+type alias Alias list[int] TypeAliasType
+Protocol True False
+cast not really 1
+overload 5 s
+TYPE_CHECKING False
+assert_never exists True reveal_type
+assert_never AssertionError Expected code to be unreachable, but got: 1
+Final/Annotated (<class 'int'>, 'meta') typing.Final[int]

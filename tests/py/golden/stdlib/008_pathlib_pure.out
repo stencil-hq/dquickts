@@ -1,0 +1,59 @@
+repr PurePosixPath('/usr/local/lib/python3.15/site.tar.gz')
+str /usr/local/lib/python3.15/site.tar.gz
+name site.tar.gz
+stem site.tar
+suffix .gz
+suffixes ['.tar', '.gz']
+parent /usr/local/lib/python3.15
+parents ['/usr/local/lib/python3.15', '/usr/local/lib', '/usr/local', '/usr', '/']
+parents[1] /usr/local/lib parents[-1] /
+parts ('/', 'usr', 'local', 'lib', 'python3.15', 'site.tar.gz')
+root/anchor '/' '/' ''
+is_absolute True False
+slash /a/b/c.txt
+slash abs /etc/x
+rslash rel/x
+joinpath a/b/c/d.py
+joinpath path a/b/c
+normalize a/b/c a . .
+dotdot kept a/../b
+double slash root //x/y /x
+edge '' '' '' '' [] .
+edge '.' '' '' '' [] .
+edge '/' '' '' '' [] /
+edge 'a.' 'a.' 'a' '.' ['.'] .
+edge '.bashrc' '.bashrc' '.bashrc' '' [] .
+edge 'a.b.c' 'a.b.c' 'a.b' '.c' ['.b', '.c'] .
+edge '/x/y/' 'y' 'y' '' [] /x
+edge 'archive.tar.gz' 'archive.tar.gz' 'archive.tar' '.gz' ['.tar', '.gz'] .
+edge 'noext' 'noext' 'noext' '' [] .
+edge '..' '..' '..' '' [] .
+edge 'a/..' '..' '..' '' [] a
+with_suffix dir/report.draft.md dir/report.draft
+with_name dir/other.csv
+with_stem dir/final.txt
+with error ValueError Invalid suffix 'md'
+with error ValueError Invalid name ''
+with error ValueError PurePosixPath('/') has an empty name
+with error ValueError Invalid name 'a/b'
+relative_to src/app/main.py
+relative_to self .
+is_relative_to True False
+prefix not component False
+relative_to error ValueError '/home/user/src/app/main.py' is not in the subpath of '/etc'
+walk_up ../../b/c
+match name True True False
+match abs False True
+full_match True False
+full_match exact True False
+eq True False True
+sorted ['a', 'a/z', 'b']
+as_posix x/y
+fspath 'a/b'
+bytes b'/\xc3\xa9'
+win parts ('C:\\', 'Users', 'Me', 'file.TXT') C: \ file.TXT .TXT
+win posix C:/Users/Me/file.TXT
+win eq case True
+win join D:b C:\x
+win unc \\server\share\
+win relative Me\file.TXT

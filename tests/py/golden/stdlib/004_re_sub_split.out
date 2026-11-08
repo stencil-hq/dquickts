@@ -1,0 +1,41 @@
+sub plain a b c
+sub backref Smith John, Doe Jane, Lee Bob
+sub named Smith, John, Doe, Jane, Lee, Bob
+sub g0 a<1>b<22>c<333>
+sub g num a0a0
+sub escape a\nb True
+sub tab template '\t'
+sub count f00 boo zoo
+sub empty matches -a-b-c-
+sub empty after match -b--c-
+sub no match abc
+sub unmatched group '[a][b]'
+sub func THE! CAT! SAT! on a MAT!
+sub lambda 2 + 40 = 42
+sub func groups Hello Big World
+subn ('bAnAnA', 3)
+subn count ('bAnana', 1)
+subn none ('banana', 0)
+pattern sub x#1y#22
+pattern subn ('N N 3', 2)
+bad template '\\3' PatternError invalid group reference 3 at position 1
+bad template '\\g<nope>' IndexError unknown group name 'nope'
+bad template '\\g<1' PatternError missing >, unterminated name at position 3
+bad template '\\' PatternError bad escape (end of pattern) at position 0
+split ws ['a', 'b', 'c', 'd']
+split none ['abc']
+split capture ['a', ',', 'b', ',', 'c']
+split 2 captures ['1', '-', None, '2', None, '+', '3']
+split maxsplit ['a', 'b', 'c,d']
+split maxsplit capture ['a', '1', 'b2c3d']
+split leading ['', 'a', '', 'b', '']
+split empty pattern ['', 'a', 'b', 'c', '']
+split zero width ['', 'Hello', 'Big', 'World']
+split flags ['a', 'b', 'c']
+pattern split ['a', 'b', 'c ', 'd']
+str split vs re split ['a', '', 'b'] ['a', '', 'b']
+escape a\.b\*c\?\(d\)\[e\]\{f\}\|g\^h\$i\\j\+k
+escape safe abc_123\ \-/
+escape unicode ü€
+escape use True
+escaped sub cost: VAL, VALy

@@ -1,0 +1,41 @@
+run echo 'hi\n' '' 0
+args ['echo', 'hi']
+repr CompletedProcess(args=['echo', 'hi'], returncode=0, stdout='hi\n', stderr='')
+bytes out b'bytes\n' bytes
+false rc 1 None
+true rc 0
+exit 7 7
+check_returncode ok None
+cat input 'line1\nline2\n'
+cat bytes b'\x00\x01binary'
+tr SHOUT None
+CalledProcessError 3 ['sh', '-c', 'echo out; echo err >&2; exit 3']
+  stdout 'out\n' output 'out\n'
+  stderr 'err\n'
+  str Command ['sh', '-c', 'echo out; echo err >&2; exit 3'] returned non-zero exit status 3.
+false check Command ['false'] returned non-zero exit status 1.
+signal -15 Command '['sh', '-c', 'kill -TERM $$']' died with <Signals.SIGTERM: 15>.
+shell 'X2\n'
+shell printf 'a-b-c-'
+shell exit 4
+TimeoutExpired ['sleep', '5'] 0.2 None
+  str Command '['sleep', '5']' timed out after 0.2 seconds
+timeout partial TimeoutExpired 0.5
+check_output b'co\n'
+check_output text 'a\nb'
+check_output fail 2 b'partial\n'
+check_call 0
+call 5
+getoutput 'go'
+getstatusoutput (3, 'gs')
+stderr->stdout 'to-out\nto-err\n' None
+devnull None None 0
+argv 'zero one two\n'
+env 'bar\n'
+Popen communicate 'via popen' None 0
+Popen wait 9 9
+self 42 0
+no such command FileNotFoundError ENOENT
+input+stdin ValueError stdin and input arguments may not both be used.
+capture+stdout ValueError stdout and stderr arguments may not be used with capture_output.
+constants -1 -2 -3

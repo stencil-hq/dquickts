@@ -1,0 +1,42 @@
+tuple target 1 2
+tuple target 3 4
+after loop 3 4
+paren tuple target x y
+list target 5 6
+nested target 1 2 3
+nested target 4 5 6
+two nested 1 2 3 4
+starred tail 1 [2, 3]
+starred tail 4 []
+starred tail 5 [6]
+starred head ['a', 'b'] c
+starred head [] z
+starred middle 0 [1, 2, 3] 4
+starred middle 1 [] 2
+nested starred 1 x ['y', 'z']
+items a 1
+items b 2
+enumerate items 0 p 10
+enumerate items 1 q 20
+zip strings a c
+zip strings b d
+unpack 2-char strings h i
+unpack 2-char strings y o
+single tuple target 1
+single tuple target 2
+trailing comma target 9
+ok pair 1 2
+too many ValueError too many values to unpack (expected 2, got 3)
+not enough ValueError not enough values to unpack (expected 2, got 1)
+non-iterable element TypeError cannot unpack non-iterable int object
+starred not enough ValueError not enough values to unpack (expected at least 2, got 1)
+subscript tuple target {'k': 3, 'v': 4}
+index uses freshly bound i ['a', None, 'c']
+overwritten outer 1
+shared name [3, 4, ('outer-after-inner', 4), 3, 4, ('outer-after-inner', 4)]
+by score cid 1
+by score bob 3
+by score amy 5
+deep nest 1 2 3 4
+only starred [1, 2]
+only starred []

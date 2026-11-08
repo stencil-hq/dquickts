@@ -1,0 +1,54 @@
+get 1
+get missing None
+get default 0
+get tuple key 'tuple'
+get unhashable TypeError cannot use 'list' as a dict key (unhashable type: 'list')
+get float==int key 'three'
+[] missing str KeyError 'missing'
+[] missing int KeyError 42
+[] missing tuple KeyError (9, 9)
+[] missing empty str KeyError ''
+[] missing None KeyError None
+[] unhashable TypeError cannot use 'dict' as a dict key (unhashable type: 'dict')
+KeyError args ('nope',) str 'nope' repr KeyError('nope')
+KeyError tuple str ('x',)
+setdefault new []
+setdefault existing 1
+setdefault no default None
+setdefault mutable [1]
+pop 1
+pop missing KeyError 'a'
+pop default 'dflt'
+pop default None None
+pop no args TypeError pop expected at least 1 argument, got 0
+in (True, False, True, True, False)
+in unhashable TypeError cannot use 'list' as a dict key (unhashable type: 'list')
+len 5
+popitem ('n', None)
+popitem empty KeyError 'popitem(): dictionary is empty'
+update chain {'x': 100, 'y': 2, 'z': 3, 'w': 4}
+update bad seq elem ValueError dictionary update sequence element #0 has length 3; 2 is required
+update bad seq elem 2 ValueError dictionary update sequence element #1 has length 1; 2 is required
+update non-iterable TypeError 'int' object is not iterable
+update two positional TypeError update expected at most 1 argument, got 2
+update returns None
+fromkeys shared value {'a': [1], 'b': [1]}
+fromkeys default None {'x': None, 'y': None}
+fromkeys range {0: 0, 1: 0, 2: 0}
+fromkeys unhashable TypeError cannot use 'list' as a dict key (unhashable type: 'list')
+copy shallow orig {'k': [1, 2, 3]}
+copy shallow copy {'k': [1, 2, 3], 'new': 1}
+copy is new True
+clear ({}, {})
+dict() {}
+dict(a=1) {'a': 1, 'b': 2}
+dict pairs {1: 2, 3: 4}
+dict pairs dup {1: 'b'}
+dict bad TypeError object is not iterable
+dict str pairs {'a': 'b', 'c': 'd'}
+dict comprehension {'a': 0, 'c': 2}
+dict int/str keys {1: 'int', '1': 'str', 1.5: 'float', None: 'none'}
+dict.get unbound 1
+keys type 'dict_keys'
+values type 'dict_values'
+items type 'dict_items'

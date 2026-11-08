@@ -1,0 +1,29 @@
+literal 0 zero
+literal 1 small
+literal 3 small
+literal -1 minus one
+literal 1.5 one and a half
+literal 2j imaginary
+literal (1+2j) complex
+literal 'hello' greeting
+literal 'b' a or b
+literal b'raw' bytes
+literal None none
+literal True small
+literal False zero
+literal 0.0 zero
+literal 1.0 small
+literal 'x' other
+literal [] other
+literal 4 other
+1 vs True small True vs 1 small 0.0 vs 0 zero
+capture zero captured 'anything' captured [1]
+wildcard matched
+wildcard no bind NameError
+or capture pair y='a' pair y='b' single-or-triple y='s' single-or-triple y=7 no match
+as bit 0 bit 1 whole [1, 2] whole (1, 2) str s none
+guards negative even odd nonempty str other other
+fallthrough after guard 5 5 [5]
+value patterns is red green or ok green or ok not found unknown
+subject once 1
+soft keywords still a name 1

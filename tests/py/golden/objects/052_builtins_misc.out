@@ -1,0 +1,41 @@
+repr builtin functions <built-in function len> <built-in function print> <built-in function isinstance> <built-in function sorted>
+repr classes <class 'int'> <class 'str'> <class 'type'> <class 'object'> <class '__main__.Foo'>
+repr exceptions classes <class 'ValueError'> <class 'BaseException'>
+repr None etc None NotImplemented Ellipsis Ellipsis
+repr builtin types <class 'NoneType'> <class 'builtin_function_or_method'> <class 'function'>
+str of class <class '__main__.Foo'> <class 'int'>
+method descriptors <method 'join' of 'str' objects> <slot wrapper '__add__' of 'int' objects> 'fromkeys'
+names len len Foo int
+builtin module builtins builtins __main__
+callable [True, True, False, True, False, False, True, True, True]
+callable instance True called
+instance __call__ ignored True called
+hash ints 0 1 -2 -2 848750603811160107 0 1
+hash bool float 1 1 1152921504606846976 0 1152921504606846977
+hash tuples True True False
+hash tuple values -3550055125485641917 -8753497827991233192 1192742280400060608
+hash frozenset eq True
+hash None callable True True
+TypeError unhashable type: 'list'
+TypeError unhashable type: 'dict'
+TypeError unhashable type: 'set'
+TypeError unhashable type: 'list'
+sentinel identity True False False True
+object type object True
+sentinel use no default given None 1
+AttributeError 'object' object has no attribute 'attr' and no __dict__ for setting new attributes
+is vs == True False True True
+None singleton True True
+singletons True True True True
+same object through names True True
+format 42 00042 3.500e+00   s   1   
+format bin hex 1010 0xa -12 1,234.57
+format percent 12.5% +5 -5  5
+ValueError Negative zero coercion (z) not allowed in integer format specifier
+ValueError Unknown format code 'd' for object of type 'str'
+type one arg <class 'int'> <class 'str'> <class '__main__.Foo'> <class 'type'>
+type three arg <class '__main__.T'> (<class '__main__.T'>, <class '__main__.Foo'>, <class 'object'>) 10 T
+type eq True False True
+isinstance basics True True True
+ascii 'h\xe9llo' ['\u20ac'] 1
+bool False False True False True False False False

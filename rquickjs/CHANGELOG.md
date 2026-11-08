@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Runtime::execute_pending_jobs` runs the pending jobs in one call (up to a limit), stopping at the first job that throws.
 - `String::to_str` borrows the contents of an ASCII string without copying.
 - `ObjectBuilder` builds a JS object from keys and values in one step, with the same result as `Object::new` followed by `set` calls.
+- Python 3.15 (feature `python`): `rquickjs-sys` compiles the engine's Python runtime (`CONFIG_PYTHON`, stdlib directory `QP_PYLIB_DIR` = the tree's `pylib` or `RQUICKJS_PYLIB_DIR`) and binds `JS_InitPython`, `JS_EvalPython`, `JS_PythonImport` (`JSPythonConfig`, `JS_PY_EVAL_*`); `Ctx::init_python` (`PythonConfig`), `Ctx::eval_python`, `Ctx::eval_python_with_options` (`PythonEvalOptions`, `PythonEvalMode`, top-level `await` returning a `Promise`) and `Ctx::python_import`. Python values are JS values, Python exceptions are `Error::Exception` with the exception object in `Ctx::catch`.
 
 ### Changed
 

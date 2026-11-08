@@ -1,0 +1,59 @@
+len('😀') 1
+len('a😀b') 3
+len('\U0010ffff') 1
+len family emoji 5
+len flag 2
+s[0] 'a'
+s[1] '😀'
+s[2] 'b'
+s[-1] 'b'
+s[-2] '😀'
+s[3] IndexError string index out of range
+s[::-1] 'b😀a'
+s[1:] '😀b'
+s[:2] 'a😀'
+s[1:2] '😀'
+s[::2] 'ab'
+list(s) ['a', '😀', 'b']
+[ord(c) for c in s] ['0x61', '0x1f600', '0x62']
+reversed 'z🎉y😀x'
+find 2
+rfind 3
+index 4
+count 3
+split ['a', 'b', 'c']
+partition ('a', '😀', 'b')
+replace 'a--b'
+upper 'A😀B'
+center '**😀**'
+ljust '😀😀..'
+zfill '00😀'
+strip 'x'
+startswith True
+endswith slice arg True
+in True
+half not in False
+compare True
+sorted ['a', '\uffff', '𐀀', '😀']
+max '😀'
+concat True
+mult len 10
+join len 5
+isalpha False
+isidentifier math True
+encode len 6
+utf-16 len 8
+chr round True
+escape forms equal True
+surrogate pair literal len 2
+surrogate pair != emoji False
+lone surrogate len 1
+enumerate [(0, '😀'), (1, '🎉')]
+slice assign via join 'aXb'
+format width '  😀'
+f-string width '[  😀  ]'
+% width '[  😀]'
+dict key 1
+set size 2
+str.translate 'a'
+iteration count 7

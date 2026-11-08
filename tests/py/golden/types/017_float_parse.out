@@ -1,0 +1,112 @@
+float('0') 0.0
+float('1') 1.0
+float('-1') -1.0
+float('+1') 1.0
+float('1.') 1.0
+float('.5') 0.5
+float('-.5') -0.5
+float('1.5') 1.5
+float('  2.5  ') 2.5
+float('\t\n3.25\r\n') 3.25
+float('1e3') 1000.0
+float('1E3') 1000.0
+float('1e+3') 1000.0
+float('1e-3') 0.001
+float('-1.5e-3') -0.0015
+float('1_0.5') 10.5
+float('1_000.000_1') 1000.0001
+float('1e1_0') 10000000000.0
+float('0.1') 0.1
+float('0.30000000000000004') 0.30000000000000004
+float('123456789012345678901234567890') 1.2345678901234568e+29
+float('1e308') 1e+308
+float('1.7976931348623157e308') 1.7976931348623157e+308
+float('1.7976931348623158e308') 1.7976931348623157e+308
+float('1.7976931348623159e308') inf
+float('1e309') inf
+float('-1e309') -inf
+float('5e-324') 5e-324
+float('2e-324') 0.0
+float('3e-324') 5e-324
+float('1e-400') 0.0
+float('-1e-400') -0.0
+float('inf') inf
+float('INF') inf
+float('-inf') -inf
+float('+inf') inf
+float('Inf') inf
+float('infinity') inf
+float('Infinity') inf
+float('-INFINITY') -inf
+float('  inf  ') inf
+float('nan') nan
+float('NaN') nan
+float('-nan') nan
+float('+NAN') nan
+float('0e0') 0.0
+float('-0') -0.0
+float('-0.0') -0.0
+float('00001.5') 1.5
+float('1.0000000000000002') 1.0000000000000002
+float('9007199254740993') 9007199254740992.0
+float('9007199254740993.0000000001') 9007199254740994.0
+float('١.٢') 1.2
+float('５') 5.0
+float('\xa01.5\u2003') 1.5
+float('2.2250738585072011e-308') 2.225073858507201e-308
+float('4.9406564584124654e-324') 5e-324
+float('') ValueError could not convert string to float: ''
+float(' ') ValueError could not convert string to float: ' '
+float('abc') ValueError could not convert string to float: 'abc'
+float('1.5.5') ValueError could not convert string to float: '1.5.5'
+float('1e') ValueError could not convert string to float: '1e'
+float('e3') ValueError could not convert string to float: 'e3'
+float('1e3.5') ValueError could not convert string to float: '1e3.5'
+float('1__0') ValueError could not convert string to float: '1__0'
+float('_1') ValueError could not convert string to float: '_1'
+float('1_') ValueError could not convert string to float: '1_'
+float('1_.5') ValueError could not convert string to float: '1_.5'
+float('1._5') ValueError could not convert string to float: '1._5'
+float('1e_3') ValueError could not convert string to float: '1e_3'
+float('0x10') ValueError could not convert string to float: '0x10'
+float('1,5') ValueError could not convert string to float: '1,5'
+float('- 1') ValueError could not convert string to float: '- 1'
+float('--1') ValueError could not convert string to float: '--1'
+float('infinit') ValueError could not convert string to float: 'infinit'
+float('infinityy') ValueError could not convert string to float: 'infinityy'
+float('nann') ValueError could not convert string to float: 'nann'
+float('in f') ValueError could not convert string to float: 'in f'
+float('1 e3') ValueError could not convert string to float: '1 e3'
+float('1j') ValueError could not convert string to float: '1j'
+float('\x00') ValueError could not convert string to float: '\x00'
+float('1.5\x00') ValueError could not convert string to float: '1.5\x00'
+float('½') ValueError could not convert string to float: '½'
+float('+') ValueError could not convert string to float: '+'
+float('.') ValueError could not convert string to float: '.'
+float('-.') ValueError could not convert string to float: '-.'
+float('e') ValueError could not convert string to float: 'e'
+float('0b1') ValueError could not convert string to float: '0b1'
+float() 0.0
+float(b'1.5') 1.5
+float(bytearray(b' -2 ')) -2.0
+float(b'inf') inf
+float(b'x') ValueError could not convert string to float: b'x'
+float(7) 7.0
+float(-7) -7.0
+float(True) 1.0
+float(2**53 + 1) 9007199254740992.0
+float(10**400) OverflowError int too large to convert to float
+float(None) TypeError float() argument must be a string or a real number, not 'NoneType'
+float([1]) TypeError float() argument must be a string or a real number, not 'list'
+float(1j) TypeError float() argument must be a string or a real number, not 'complex'
+float(x='1') TypeError float() takes no keyword arguments
+float('1', '2') TypeError float expected at most 1 argument, got 2
+float.fromhex('0x1p-1') 0.5
+type(float('1')) 'float'
+float('0.1') == 0.1 True
+float('1e23') == 1e23 True
+float('1e16') repr '1e+16'
+float(str(1/3)) == 1/3 True
+float('-0').hex() '-0x0.0p+0'
+long digit string 1e-301
+long mantissa 1.0

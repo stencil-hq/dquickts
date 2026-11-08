@@ -1,0 +1,59 @@
+sorted default ['Banana', 'Fig', 'apple', 'kiwi', 'pear']
+sorted key lower ['apple', 'Banana', 'Fig', 'kiwi', 'pear']
+sorted key len stable ['Fig', 'pear', 'kiwi', 'apple', 'Banana']
+sorted reverse stable ['Banana', 'apple', 'pear', 'kiwi', 'Fig']
+sorted tuple key ['Fig', 'kiwi', 'pear', 'apple', 'Banana']
+sorted returns list 'list'
+sorted string ['e', 'h', 'l', 'l', 'o']
+sorted dict ['a', 'b']
+sorted dict items by value [('b', 1), ('a', 2)]
+sorted empty []
+sorted mixed -> TypeError: '<' not supported between instances of 'str' and 'int'
+sorted key None [1, 3]
+sorted positional key -> TypeError: sorted expected 1 argument, got 2
+sorted bools ints [0, False, True, 1, 2]
+sorted floats nan-free [-1, 0.0, -0.0, 1e-09, 2.5]
+min 2
+max args 8
+min key 'Fig'
+max key ties first 'aa'
+min ties first (1, 'x')
+min empty -> ValueError: min() iterable argument is empty
+max empty -> ValueError: max() iterable argument is empty
+min default 'none'
+max default unused 1
+max default with args -> TypeError: Cannot specify a default for max() with multiple positional arguments
+max single non-iterable -> TypeError: 'int' object is not iterable
+max no args -> TypeError: max expected at least 1 argument, got 0
+min strings 'e'
+max key raises -> ZeroDivisionError: division by zero
+min key kw only -> TypeError: '<' not supported between instances of 'function' and 'list'
+any empty False
+all empty True
+any values False
+all values True
+any returns bool True
+all with falsy False
+any non-iterable -> TypeError: 'int' object is not iterable
+len list 2
+len str unicode 6
+len dict 1
+len range big 142858
+len range huge -> OverflowError: Python int too large to convert to C ssize_t
+len int -> TypeError: object of type 'int' has no len()
+len none -> TypeError: object of type 'NoneType' has no len()
+len generator -> TypeError: object of type 'generator' has no len()
+chr ('A', '😀', '\x00', True)
+chr negative -> ValueError: chr() arg not in range(0x110000)
+chr too big -> ValueError: chr() arg not in range(0x110000)
+chr float -> TypeError: 'float' object cannot be interpreted as an integer
+ord (65, 8364, 10, 97, 122)
+ord empty -> TypeError: ord() expected a character, but string of length 0 found
+ord long -> TypeError: ord() expected a character, but string of length 2 found
+ord int -> TypeError: ord() expected string of length 1, but int found
+roundtrip 'IBM'
+list from iterables (['a', 'b'], [1, 2], ['k'], [0, 1, 2])
+tuple dict set ((1,), {'a': 1}, ['a', 'b'])
+reversed sorted [3, 2, 1]
+enumerate zip combo [(0, 'ac'), (1, 'bd')]
+slice object ([1, 2], (1, 5, 2))

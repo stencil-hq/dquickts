@@ -1,0 +1,25 @@
+genexp type generator log empty []
+first 0 ['produce 0']
+rest [10, 20]
+second pass empty []
+outermost iterable evaluated eagerly True
+outermost evaluated at creation TypeError 'int' object is not iterable
+inner evaluated lazily TypeError 'int' object is not iterable
+outermost bound at creation [1, 2, 3]
+free vars resolved late [0, 10, 20]
+sum genexp 285
+any short-circuits True 4
+all short-circuits False 2
+max with genexp (3, 'bbb')
+dict from genexp {'0': 0, '1': 1, '2': 2}
+sorted genexp [2, 2, 1, 1, 0, 0, 0]
+nested genexp [[0, 0, 0], [0, 1, 2], [0, 2, 4]]
+conditional genexp [3, 6, 9]
+pipeline ['1: alpha', '2: beta', '3: gamma', '4: delta']
+infinite pipeline [0, 4, 16, 36, 64]
+batched [(0, 1, 2), (3, 4, 5), (6,)]
+coroutine-style generator [10.0, 15.0, 30.0]
+interleave ['a', 1, 'X', 'b', 2, 'Y', 'c', 'Z', 'W']
+genexp as sole argument ['h', 'i']
+tuple from genexp ('A', 'B', 'C')
+join genexp 0-1-2-3

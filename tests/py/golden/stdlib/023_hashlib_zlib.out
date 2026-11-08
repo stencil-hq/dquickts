@@ -1,0 +1,50 @@
+md5 md5 16 64 9e107d9d372bb6826bd81d3542a419d6
+sha1 sha1 20 64 2fd4e1c67a2d28fced849ee1bb76e7391b93eb12
+sha224 sha224 28 64 730e109bd7a8a32b1cb9d9a09aa2325d2430587ddbc0c38bad911525
+sha256 sha256 32 64 d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592
+sha384 sha384 48 128 ca737f1014a48f4c0b6dd43cb177b0afd9e5169367544c494011e3317dbf9a509cb1e5dc1e85a941bbee3d7f2afbc9b1
+sha512 sha512 64 128 07e547d9586f6a73f73fbac0435ed76951218fb7d0c8d788a309d785436bbb642e93a252a954f23912547d1e8a3b5ed6e1bfd7097821233fa0538f3db854fee6
+sha3_256 sha3_256 32 136 69070dda01975c8c120c3aada1b282394e7f032fa9cf32f4cb2259a0897dfc04
+blake2b blake2b 64 128 a8add4bdddfd93e4877d2746e62817b116364a1fa7bc148d95090bc7333b3673f82401cf7aa2e4cb1ecd90296e3f14cb5413f8ed77be73045b13914cdcd6a918
+blake2s blake2s 32 64 606beeec743ccbeff6cbcdf5d5302aa855c256c29b88c8ed331ea1a6bf3c8812
+sha256 empty e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+sha256 b'' e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+md5 abc 900150983cd24fb0d6963f7d28e17f72
+sha1 abc a9993e364706816aba3e25717850c26c9cd0d89d
+blake2b 16 cf4ab791c62b8d2b2109c90275287816
+blake2b key 0c3d973f5f44547f37c0c0c34ae8cd9015c324ef
+blake2b person 5945bc3fa5d27aff
+shake_128 5881092dd818bf5cf8a3
+incremental equal True
+copy diverges True True
+digest bytes b'\xd4\x1d\x8c\xd9\x8f\x00\xb2\x04\xe9\x80\t\x98\xec\xf8B~'
+usedforsecurity 9dd4e461268c8034f5c8564e155c67a6
+memoryview input 8f3a07543988e4673dcae5e59c35323c5791f370
+str input TypeError Strings must be encoded before hashing
+unknown algo ValueError unsupported hash algorithm nope
+guaranteed has sha256 True
+pbkdf2 632c2812e46d4604102ba7618e9d6d7d2f8128f6266b4a03264d2a0460b7dcb3
+hmac f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8
+hmac digest be199e98ea123abd6d50b67091a4e2b5
+compare_digest True False
+compress smaller True
+roundtrip True
+level 0 True
+level 1 True
+level 6 True
+level 9 True
+level -1 True
+level 0 bigger True
+empty b''
+crc32 222957957 0 222957957
+adler32 436929629 1 300286872
+crc32 == binascii True
+raw deflate True
+gzip header b'\x1f\x8b' True
+streaming True True b''
+unused_data True b'TRAILER'
+max_length 10 True
+bad data error Error -3 while decompressing data: incorrect header check
+truncated error Error -5 while decompressing data: incomplete or truncated stream
+bad level error Bad compression level
+constants 15 8 9 -1

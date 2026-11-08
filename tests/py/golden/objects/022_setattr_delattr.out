@@ -1,0 +1,27 @@
+log ['set a=1', 'set b=[2]', 'set a=11', "set c='three'", 'del b', 'del c']
+dict ['a', 'log']
+AttributeError 'Logged' object has no attribute 'zzz'
+frozen read 5
+AttributeError Frozen is immutable: x
+AttributeError cannot delete x
+bypass 7
+TypeError age must be int, got str
+validated 3
+setattr weird name 2 ['dynamic', 'with space']
+hasattr after delattr False
+TypeError attribute name must be string, not 'int'
+TypeError attribute name must be string, not 'NoneType'
+TypeError getattr expected at least 2 arguments, got 1
+AttributeError 'int' object has no attribute 'x' and no __dict__ for setting new attributes
+AttributeError 'str' object has no attribute 'x' and no __dict__ for setting new attributes
+AttributeError 'NoneType' object has no attribute 'x' and no __dict__ for setting new attributes
+AttributeError 'list' object has no attribute 'x' and no __dict__ for setting new attributes
+AttributeError 'object' object has no attribute 'x' and no __dict__ for setting new attributes
+TypeError cannot set 'new_attr' attribute of immutable type 'int'
+AttributeError type object 'Plain' has no attribute 'missing'
+class setattr on class
+class delattr False
+setattr through __dict__ 42
+count sets 3 2 3
+dict assignment ['replaced'] 4
+TypeError __dict__ must be set to a dictionary, not a 'int'

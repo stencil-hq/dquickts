@@ -1,0 +1,54 @@
+bytes b'abc' b'ABC' b'single' b'triple'
+bytes escapes b'\x00\x7f\x80\xff' b'\n\t\r\\' b'A\x00'
+bytes raw b'\\x00' b'\\n' 4
+bytes concat b'abcd' b'xy' b'---'
+bytes printable repr b' ~' b'\x1f' b'\x7f' b' '
+bytes index 65 [104, 105] b'hi' b'\x00\x00\x00' b'ABCDE'
+bytes str mix False b'abc' abc b'\xc3\xa9'
+bytearray bytearray(b'xy') bytearray(b'') bytearray(b'\xc3\xa9')
+bytes hex dead b'\xde\xad\xbe\xef' 61:62:63
+bytes + str TypeError can't concat str to bytes
+bytes 256 ValueError bytes must be in range(0, 256)
+bytes from str no encoding TypeError string argument without an encoding
+bad hex ValueError non-hexadecimal number found in fromhex() arg at position 0
+repr 'plain' ascii 'plain'
+repr "it's" ascii "it's"
+repr 'say "hi"' ascii 'say "hi"'
+repr 'both \' and "' ascii 'both \' and "'
+repr '' ascii ''
+repr "'" ascii "'"
+repr '"' ascii '"'
+repr '\'"' ascii '\'"'
+repr 'back\\slash' ascii 'back\\slash'
+repr 'new\nline' ascii 'new\nline'
+repr 'tab\t' ascii 'tab\t'
+repr 'nul\x00' ascii 'nul\x00'
+repr 'bell\x07' ascii 'bell\x07'
+repr 'del\x7f' ascii 'del\x7f'
+repr 'latin é ñ' ascii 'latin \xe9 \xf1'
+repr 'greek αβγ' ascii 'greek \u03b1\u03b2\u03b3'
+repr 'emoji 😀' ascii 'emoji \U0001f600'
+repr 'zero width \u200b' ascii 'zero width \u200b'
+repr 'line sep \u2028' ascii 'line sep \u2028'
+repr 'nbsp \xa0' ascii 'nbsp \xa0'
+repr 'soft hyphen \xad' ascii 'soft hyphen \xad'
+repr 'private \ue000' ascii 'private \ue000'
+repr 'combining é' ascii 'combining e\u0301'
+repr 'replacement �' ascii 'replacement \ufffd'
+bytes repr b'plain'
+bytes repr b"it's"
+bytes repr b'say "hi"'
+bytes repr b'both \' and "'
+bytes repr b''
+bytes repr b"'"
+bytes repr b'"'
+bytes repr b'\\'
+bytes repr b'\x00\xff'
+containers ["it's", 'q"'] ('a',) {"k'": 'v"'} {'x\n'}
+round-trip all True
+subclass repr "it's" x str
+custom repr R<'v'> [R<'w'>] R<'z'> R<'q'>
+str of bytes b"q'" bytearray(b'\x01')
+bytes methods b'HELLO' [b'a', b'b'] b'x' b'zb'
+bytes find 2 2 True
+bytes slices b'el' b'olleh' b'o'

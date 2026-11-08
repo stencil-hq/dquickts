@@ -1,0 +1,69 @@
+(1).to_bytes() b'\x01'
+(255).to_bytes() b'\xff'
+(0).to_bytes(0) b''
+(256).to_bytes() OverflowError int too big to convert
+(1024).to_bytes(2, 'big') b'\x04\x00'
+(1024).to_bytes(2, 'little') b'\x00\x04'
+(1024).to_bytes(4) b'\x00\x00\x04\x00'
+(1024).to_bytes(4, byteorder='little') b'\x00\x04\x00\x00'
+(1024).to_bytes(1) OverflowError int too big to convert
+(-1).to_bytes(2) OverflowError can't convert negative int to unsigned
+(-1).to_bytes(2, signed=True) b'\xff\xff'
+(-128).to_bytes(1, signed=True) b'\x80'
+(-129).to_bytes(1, signed=True) OverflowError int too big to convert
+(128).to_bytes(1, signed=True) OverflowError int too big to convert
+(127).to_bytes(1, signed=True) b'\x7f'
+(-256).to_bytes(4, 'little', signed=True) b'\x00\xff\xff\xff'
+(2**64-1).to_bytes(8) b'\xff\xff\xff\xff\xff\xff\xff\xff'
+(2**64).to_bytes(8) OverflowError int too big to convert
+(2**100).to_bytes(13, 'little') b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x10'
+(-2**100).to_bytes(13, signed=True) b'\xf0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+(1).to_bytes(-1) ValueError length cannot be negative
+(1).to_bytes(1, 'middle') ValueError byteorder must be either 'little' or 'big'
+(1).to_bytes(1, 1) TypeError to_bytes() argument 'byteorder' must be str, not int
+True.to_bytes(2) b'\x00\x01'
+type of to_bytes 'bytes'
+from_bytes(b'\x04\x00') 1024
+from_bytes(b'\x04\x00', 'little') 4
+from_bytes(b'') 0
+from_bytes(b'', signed=True) 0
+from_bytes(b'\xff') 255
+from_bytes(b'\xff', signed=True) -1
+from_bytes(b'\x80\x00', signed=True) -32768
+from_bytes(b'\x00\x80', 'little', signed=True) -32768
+from_bytes(b'\xff'*9, signed=True) -1
+from_bytes(b'\xff'*9) 4722366482869645213695
+from_bytes(b'\x01' + b'\x00'*16) 340282366920938463463374607431768211456
+from_bytes([1, 2, 3]) 66051
+from_bytes((255, 0), 'little') 255
+from_bytes(bytearray(b'\x01\x02')) 258
+from_bytes(memoryview(b'\x01\x02')) 258
+from_bytes([256]) ValueError bytes must be in range(0, 256)
+from_bytes('ab') TypeError cannot convert 'str' object to bytes
+from_bytes(5) TypeError cannot convert 'int' object to bytes
+from_bytes(b'\x01', 'mid') ValueError byteorder must be either 'little' or 'big'
+bool.from_bytes(b'\x01') True
+bool.from_bytes(b'\x00') False
+type(bool.from_bytes(b'\x05')) 'bool'
+roundtrip 0 big 00 True
+roundtrip 0 little 00 True
+roundtrip 1 big 01 True
+roundtrip 1 little 01 True
+roundtrip -1 big ff True
+roundtrip -1 little ff True
+roundtrip 127 big 7f True
+roundtrip 127 little 7f True
+roundtrip -128 big ff80 True
+roundtrip -128 little 80ff True
+roundtrip 255 big 00ff True
+roundtrip 255 little ff00 True
+roundtrip -32768 big ff8000 True
+roundtrip -32768 little 0080ff True
+roundtrip 9223372036854775807 big 7fffffffffffffff True
+roundtrip 9223372036854775807 little ffffffffffffff7f True
+roundtrip -9223372036854775808 big ff8000000000000000 True
+roundtrip -9223372036854775808 little 0000000000000080ff True
+roundtrip 12345678901234567890 big 00ab54a98ceb1f0ad2 True
+roundtrip 12345678901234567890 little d20a1feb8ca954ab00 True
+roundtrip -98765432109876543210 big faa55ab2c71ad98116 True
+roundtrip -98765432109876543210 little 1681d91ac7b25aa5fa True

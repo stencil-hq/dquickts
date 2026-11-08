@@ -1,0 +1,36 @@
+empty displays [] () {} set() frozenset()  b''
+singleton tuple (1,) ('a',) ((),) (None,)
+nested [1, [2, [3, [4]]]] (1, (2, (3,))) {'a': {'b': {'c': None}}}
+mixed types [1, 2.0, '3', b'4', None, True, 1j, Ellipsis, (5,), [6], {7: 8}]
+float reprs in containers [0.1, 1e+100, -0.0, inf, nan]
+str quotes in containers ["a'b", 'a"b', 'a\'"b', '\n', '\t', 'é', '\x00']
+dict reprs {1: 'one', 'two': 2, (3,): [3], None: None, 4.5: True}
+dict str vs repr equal True
+set of ints sorted [1, 3, 5, 9] frozenset({2})
+range repr range(0, 5) range(1, 5) range(1, 10, 2) range(0, -5, -1)
+slice repr slice(1, 2, None) slice(None, None, None) slice(1, None, -1)
+bool/None [True, False, None]
+bytearray in list [bytearray(b'x')]
+type objects [<class 'int'>, <class 'str'>, <class 'list'>, <class 'NoneType'>]
+recursive list [1, 2, [...]]
+recursive dict {'k': 1, 'self': {...}}
+recursive via tuple ([(...)],)
+indirect recursion [[[...]]]
+custom repr [R1, R2] {R3: R4} (R5,)
+containers use repr [REPR] [REPR] STR
+bad repr in list ValueError repr failed
+non-str repr TypeError NonStrRepr.__repr__() must return a str, not int
+subclass reprs [1] {'a': 1} (1, 2)
+deep nesting length 102
+long list repr length 4890
+dict views dict_keys(['a']) dict_values([1]) dict_items([('a', 1)])
+empty views dict_keys([]) dict_values([]) dict_items([])
+str/repr quote's "quote's" ["quote's"] ["quote's"]
+round trip True [1, 'a', (2.5, None)]
+round trip True {'k': [1, {2}]}
+round trip True (1,)
+round trip True {1: {2: {3: ()}}}
+round trip True [b'x', True, -0.0]
+trailing commas [1, 2] (1, 2) {1: 2} {3}
+parenthesized expr is not tuple 1 int tuple
+bare tuple tuple

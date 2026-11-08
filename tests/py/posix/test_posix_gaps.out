@@ -1,0 +1,157 @@
+eintr select Alarm True
+eintr select fds Alarm True
+eintr poll Alarm True
+eintr poll again Alarm True
+eintr sleep Alarm True
+eintr read Alarm True
+eintr waitpid Alarm True
+retry select ([], [], []) True
+retry poll [] True
+handler ran True
+system 3 0
+system bytes 4
+spawnv 6
+spawnlp 7
+spawnvpe nowait 8
+posix_spawn 5
+posix_spawnp 9
+posix_spawn env 11
+posix_spawn env None 12
+file_actions 0
+file_actions output ['out', 'err', 'closed']
+setpgroup 0
+setsid 0
+no setsid 1
+setsigmask 13
+setsigdef True
+resetids 15
+spawn missing -> FileNotFoundError 2
+spawnp missing -> FileNotFoundError 2
+argv type -> TypeError posix_spawn: argv must be a tuple or list
+argv empty -> ValueError posix_spawn: argv must not be empty
+argv first empty -> ValueError posix_spawnp: argv first element cannot be empty
+argv item -> TypeError expected str, bytes or os.PathLike object, not int
+env type -> TypeError posix_spawn: environment must be a mapping object or None
+env list -> AttributeError 'list' object has no attribute 'keys'
+env key -> ValueError illegal environment variable name
+scheduler type -> TypeError posix_spawn: scheduler must be a tuple or None
+file_actions type -> TypeError file_actions must be a sequence or None
+file_actions item -> TypeError Each file_actions element must be a non-empty tuple
+file_actions empty -> TypeError Each file_actions element must be a non-empty tuple
+file_actions tag -> TypeError Unknown file_actions identifier
+file_actions open -> TypeError A open file_action tuple must have 5 elements
+file_actions close -> TypeError A close file_action tuple must have 2 elements
+file_actions dup2 -> TypeError A dup2 file_action tuple must have 3 elements
+setsigmask bad -> ValueError signal number 0 out of range [1; 31]
+kw only -> TypeError posix_spawn() takes exactly 3 positional arguments (4 given)
+posonly -> TypeError posix_spawn() takes exactly 3 positional arguments (0 given)
+spawn constants 0 1 2
+wait4 True 7 struct_rusage float int
+wait3 True 3 16
+wait3 nochild -> ChildProcessError 10
+wait4 nochild -> ChildProcessError 10
+waitid waitid_result True 21 True True 5
+waitid WNOHANG None
+waitid nochild -> ChildProcessError 10
+waitid_result posix 5
+idtypes 1 2 0
+CLD 1 2 3 4 5 6
+getsid True
+getpgid True
+child setpgrp (None, True)
+child setsid (None, True)
+child setpgrp+setsid PermissionError 1
+child setpgid (None, True)
+getpriority int True
+setpriority None
+setpriority bad -> PermissionError 13
+PRIO 0 1 2
+sched int True None
+sched_get_priority_max type -> TypeError 'str' object cannot be interpreted as an integer
+loadavg ['float', 'float', 'float']
+setuid None None None None None None
+setuid type -> TypeError uid should be integer, not str
+setuid range -> OverflowError uid is less than minimum
+chown uid 4294967295 -> FileNotFoundError 2
+chown uid 4294967296 -> OverflowError uid is less than minimum
+chown uid 9223372036854775808 -> OverflowError uid is greater than maximum
+chown uid 18446744073709551616 -> OverflowError uid is greater than maximum
+chown uid -2 -> OverflowError uid is less than minimum
+setgroups -> PermissionError 1
+chroot -> PermissionError 1
+setgroups type -> TypeError setgroups argument must be a sequence
+setgroups item -> TypeError groups must be integers
+setgroups many -> ValueError too many groups
+openpty True True False False
+ttyname True True
+terminal_size (0, 0)
+ttyname pipe -> OSError 25
+get_terminal_size pipe -> OSError 25
+tcgetpgrp nottty -> OSError 25
+posix_openpt False None None True
+grantpt bad -> OSError 9
+ptsname type -> TypeError argument must be an int, or have a fileno() method.
+ctermid /dev/tty
+forkpty False
+forkpty child b'in child 1 1 1 1\n'
+login_tty child b'tty 1 1\n'
+truncate 5
+ftruncate 3
+lockf None None None None
+lockf bad -> OSError 9
+F_ 0 1 2 3
+pwritev 6
+preadv 7 [bytearray(b'eab'), bytearray(b'cdef\x00\x00\x00\x00\x00\x00')]
+preadv type -> TypeError preadv2() arg 2 must be a sequence
+preadv ro -> BufferError Object is not writable.
+pwritev type -> TypeError pwritev() arg 2 must be a sequence
+statvfs statvfs_result True
+sync None
+mkfifo True 0o600
+mkfifo exists -> FileExistsError 17
+mkfifo dir_fd True
+mknod dir_fd True
+mknod True
+mknod exists -> FileExistsError 17
+supports_dir_fd True True
+makedev 8 17 0 int
+makedev neg -> OverflowError can't convert negative int to unsigned
+makedev big -> OverflowError Python int too large to convert to C dev_t
+major type -> TypeError 'float' object cannot be interpreted as an integer
+st_dev True
+sendfile 5 b'23456'
+sendfile kw 3 b'012'
+sendfile neg -> ValueError count cannot be negative
+sendfile bad fd -> OSError 9
+pipe2 False False
+pipe False False True
+normpath '' '.' '.' ('', '', '')
+normpath '.' '.' '.' ('', '', '.')
+normpath '/' '/' '/' ('', '/', '')
+normpath '//' '//' '//' ('', '//', '')
+normpath '///' '/' '/' ('', '/', '//')
+normpath 'a//b/./c/..' 'a/b' 'a/b' ('', '', 'a//b/./c/..')
+normpath '/../x' '/x' '/x' ('', '/', '../x')
+normpath '../../a/./b' '../../a/b' '../../a/b' ('', '', '../../a/./b')
+normpath './' '.' '.' ('', '', './')
+normpath '//a/b/../..' '//' '//' ('', '//', 'a/b/../..')
+normpath 'a/b/' 'a/b' 'a/b' ('', '', 'a/b/')
+normpath '\udc80/./x' '\udc80/x' '\udc80/x' ('', '', '\udc80/./x')
+normpath 'a\x00b/../c' 'c' 'c' ('', '', 'a\x00b/../c')
+normpath 'é/../ü//' 'ü' 'ü' ('', '', 'é/../ü//')
+normpath bytes b'//b' (b'', b'/', b'//x')
+splitroot pathlike ('', '//', 'x/y')
+normpath type -> TypeError _path_normpath: path should be string, bytes or os.PathLike, not int
+splitroot type -> TypeError _path_splitroot_ex: path should be string, bytes or os.PathLike, not NoneType
+environ before False
+environ after yes
+_create_environ dict b'yes'
+inputhook False 0
+EX 0 64 70 75 78
+RTLD 1 True True True
+SCHED 1 4 2
+missing []
+getgrouplist True 12345
+getgrouplist type -> TypeError getgrouplist() argument 1 must be str, not bytes
+initgroups -> PermissionError 1
+done

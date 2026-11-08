@@ -1,0 +1,25 @@
+list subclass repr [1, 2, 3] [1, 2, 3] MyList
+slice returns base list list list
+isinstance list True True
+subclass has __dict__ has dict
+missing {'a': [1, 2], 'b': []} DefaultDict
+get does not call missing None False
+counter {'h': 1, 'e': 1, 'l': 2, 'o': 1} 0 4
+KeyError 'k'
+dict methods bypass __setitem__ {'a': 1, 'b': 20, 'c': 3}
+str subclass hi 'hi' HI! str str
+str subclass eq hash True True 1
+str __new__ text T 4
+int subclass Celsius(21) Celsius(21) 22 int Celsius(21)
+int subclass f-string Celsius(21) 021 21
+int __new__ 4
+ValueError odd: 3
+tuple subclass (1, 2) 1 Pair True
+TypeError type 'bool' is not an acceptable base type
+TypeError type 'NoneType' is not an acceptable base type
+TypeError type 'range' is not an acceptable base type
+TypeError type 'memoryview' is not an acceptable base type
+TypeError type 'slice' is not an acceptable base type
+float subclass 1.5 3.0 float 2.5
+set subclass [1, 3] set MySet()
+empty subclass reprs [] {}  Celsius(0) (0, 0)

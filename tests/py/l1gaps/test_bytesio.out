@@ -1,0 +1,22 @@
+closed I/O operation on closed file.
+export Existing exports of data: object cannot be re-sized
+b'abc'
+BufferError Existing exports of data: object cannot be re-sized
+BufferError Existing exports of data: object cannot be re-sized
+BufferError Existing exports of data: object cannot be re-sized
+BufferError Existing exports of data: object cannot be re-sized
+BufferError Existing exports of data: object cannot be re-sized
+BufferError Existing exports of data: object cannot be re-sized
+0 b'abcd' b'abcd'
+b'Xbcd'
+10 b'abcdef' 2 b'ab' 0
+x TypeError 'str' object cannot be interpreted as an integer
+1.5 TypeError 'float' object cannot be interpreted as an integer
+-1 ValueError negative size value -1
+1180591620717411303424 OverflowError Python int too large to convert to C long
+None 0
+I/O operation on closed file.
+Truncate the file to at most size bytes.
+
+Size defaults to the current file position, as returned by tell().
+The current file position is unchanged.  Returns the new size.

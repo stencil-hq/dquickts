@@ -1,0 +1,43 @@
+writerow returns 15
+writerow returns 15
+writerow returns 32
+writerow returns 17
+writerow returns 11
+written 'name,qty,note\r\napple,3,plain\r\n"banana, ripe",12,"say ""hi"""\r\n"multi\nline",0,\r\nnone,,1.5\r\n'
+read back [['name', 'qty', 'note'], ['apple', '3', 'plain'], ['banana, ripe', '12', 'say "hi"'], ['multi\nline', '0', ''], ['none', '', '1.5']]
+all strings True
+quoting ALL '"a","1","2.5","",""\n'
+quoting MINIMAL 'a,1,2.5,,\n'
+quoting NONNUMERIC '"a",1,2.5,"",""\n'
+quoting STRINGS '"a",1,2.5,,""\n'
+quoting NOTNULL '"a","1","2.5",,""\n'
+QUOTE_NONE escape 'a\\,b,q\\"\n'
+QUOTE_NONE no escape Error need to escape, but no escapechar set
+nonnumeric read [['a', 1.0, 2.5]]
+delimiter [['a', 'b', 'c'], ['1', '', '3']]
+tab dialect [['x', 'y']]
+skipinitialspace [['a', 'b, c', 'd']]
+no skip [['a', ' "b', ' c"']]
+doublequote [['he said "yo"']]
+empty lines [[], ['a'], []]
+quotechar [['a,b', 'c']]
+strict Error unexpected end of data
+strict bad quote Error ',' expected after '"'
+lenient [['ab', 'c']]
+line_num ['h1', 'h2'] 1 ['1', '2'] 2
+DictWriter 'id,name,score\n1,ann,9.5\n2,bob,\n3,"c, d",7\n'
+extra key ValueError dict contains fields not in fieldnames: 'extra'
+extrasaction ignore '1'
+fieldnames ['id', 'name', 'score']
+DictReader {'id': '1', 'name': 'ann', 'score': '9.5'}
+DictReader {'id': '2', 'name': 'bob', 'score': ''}
+DictReader {'id': '3', 'name': 'c, d', 'score': '7'}
+DictReader {'id': '1', 'name': None, 'score': None}
+restval/restkey [{'a': '1', 'b': '2', 'c': '?'}, {'a': '1', 'b': '2', 'c': '3', 'more': ['4']}]
+explicit fieldnames [{'x': '1', 'y': '2'}, {'x': '3', 'y': '4'}]
+custom dialect '"p"|"q"\n' True
+dialect attrs '|' True '"'
+unregistered Error unknown dialect
+bad delimiter TypeError "delimiter" must be a unicode character, not a string of length 2
+sniffer ';' True
+field_size_limit 131072

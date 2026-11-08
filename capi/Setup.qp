@@ -1,0 +1,162 @@
+# CPython 3.15.2 C modules built into the Python runtime (plan D5, Tier S).
+#
+# Read by capi/setup.awk (Makefile: $(CAPI_OBJDIR)/Setup.mk,
+# capi_core_inittab.c and capi_ext_inittab.c), by rquickjs/sys/build.rs
+# (the same model, for the `python` feature of rquickjs) and by
+# tools/capi_sync.py (the sources to vendor from cpython/Modules into
+# capi/modules/).
+#
+# Line format (whitespace separated, `#` starts a comment):
+#
+#     name  [@cond ...]  source.c ...  [-flag ...]
+#     +     [@cond ...]  source.c ...  [-flag ...]
+#     NAME = flag ...
+#     *external* cond ...
+#
+# - `name` registers the module `name` (inittab entry {"name", PyInit_name});
+#   `+` adds objects to the module of the previous `name` line.  A module
+#   may have several `name` lines with mutually exclusive conditions.
+# - Sources are paths under capi/modules/ (the layout of cpython/Modules).
+#   An object shared by several modules is compiled once, with the flags
+#   of its first line.
+# - Flags apply to the sources of their line; $(VARS) are expanded by make:
+#   the `NAME = ...` variables below (paths relative to the source root)
+#   and the Makefile's CAPI_<COND>_CFLAGS of the pkg-config dependencies.
+# - `@cond` keeps the line only when the condition is enabled by the
+#   Makefile (CAPI_CONDS).  On a `name` line it disables the whole module.
+#   Conditions: zlib bz2 lzma sqlite3 ssl (OpenSSL >= 1.1.1) zstd ffi
+#   readline libuuid (pkg-config or the system library), expat (bundled
+#   capi/modules/expat, the default) and system_expat
+#   (CONFIG_PYTHON_CAPI_SYSTEM_EXPAT=y), x86_64 (SIMD HACL*), darwin
+#   (macOS) and scproxy (macOS: SystemConfiguration and CoreFoundation
+#   frameworks).
+#
+# Core and launcher modules: a module is "core" unless one of its enabled
+# lines carries an *external* condition (one that links a system library).
+# Core modules are compiled into libquickjs and registered by the runtime
+# itself (qp_state_init: JS_InitPython, qpy, snapshots), so every embedder
+# (qpy, qjs, rquickjs, libquickjs.a users) has them.  The external ones form
+# libqpcapi.a, which a launcher links with its libraries and registers with
+# PyImport_ExtendInittab(_PyQp_ExtInittab) (capi/qpcapi.h): qpy and qjs link
+# them all; rquickjs has one cargo feature per library.
+#
+# Not built from CPython: _contextvars (our own module, the C API bridges
+# PyContext_* to it) and the modules implemented natively in python/
+# (sys.builtin_module_names).  _interpreters, _interpchannels and
+# _interpqueues are not provided: the runtime has a single interpreter per
+# context and no PEP 684 subinterpreters.  Test-only modules (_testcapi,
+# xxlimited, ...) are not built into qpy; `make capi-testmods` builds
+# _testlimitedcapi as an extension for the L3 tests (Makefile).
+
+*external* zlib bz2 lzma sqlite3 ssl zstd ffi readline libuuid system_expat scproxy
+
+# CPython's LIBHACL_FLAG_I / LIBHACL_FLAG_D
+CAPI_HACL_CFLAGS = -Icapi/modules/_hacl -Icapi/modules/_hacl/include -D_BSD_SOURCE -D_DEFAULT_SOURCE
+# libmpdec (_decimal): CPython's LIBMPDEC_CFLAGS of the "uint128" machine
+# (64-bit hosts, any architecture)
+CAPI_MPDEC_CFLAGS = -Icapi/modules/_decimal/libmpdec -DCONFIG_64=1 -DANSI=1 -DHAVE_UINT128_T=1
+# the bundled expat (CPython's LIBEXPAT_CFLAGS)
+CAPI_EXPAT_CFLAGS = -Icapi/modules/expat
+
+_sre            _sre/sre.c
+itertools       itertoolsmodule.c
+_collections    _collectionsmodule.c
+_functools      _functoolsmodule.c
+_struct         _struct.c
+math            mathmodule.c
+_math_integer   mathintegermodule.c
+cmath           cmathmodule.c
+_json           _json.c
+_datetime       _datetimemodule.c
+binascii        binascii.c
+_bisect         _bisectmodule.c
+_heapq          _heapqmodule.c
+_random         _randommodule.c
+unicodedata     unicodedata.c
+array           arraymodule.c
+_socket         socketmodule.c
+_csv            _csv.c
+_operator       _operator.c
+_pickle         _pickle.c
+_opcode         _opcode.c
+_statistics     _statisticsmodule.c
+_asyncio        _asynciomodule.c
+_queue          _queuemodule.c
+resource        resource.c
+# mmap: imported by the bundled pip (cachecontrol), M5
+mmap            mmapmodule.c
+
+# _decimal with the bundled libmpdec (CPython's LIBMPDEC_OBJS; mpsignal.c is
+# not used by _decimal)
+_decimal        _decimal/_decimal.c $(CAPI_MPDEC_CFLAGS)
++               _decimal/libmpdec/basearith.c _decimal/libmpdec/constants.c _decimal/libmpdec/context.c $(CAPI_MPDEC_CFLAGS)
++               _decimal/libmpdec/convolute.c _decimal/libmpdec/crt.c _decimal/libmpdec/difradix2.c $(CAPI_MPDEC_CFLAGS)
++               _decimal/libmpdec/fnt.c _decimal/libmpdec/fourstep.c _decimal/libmpdec/io.c $(CAPI_MPDEC_CFLAGS)
++               _decimal/libmpdec/mpalloc.c _decimal/libmpdec/mpdecimal.c _decimal/libmpdec/numbertheory.c $(CAPI_MPDEC_CFLAGS)
++               _decimal/libmpdec/sixstep.c _decimal/libmpdec/transpose.c $(CAPI_MPDEC_CFLAGS)
+
+# HACL*-based hashes (Modules/_hacl, compiled with CPython's LIBHACL flags)
+_md5            md5module.c $(CAPI_HACL_CFLAGS)
++               _hacl/Hacl_Hash_MD5.c $(CAPI_HACL_CFLAGS)
+_sha1           sha1module.c $(CAPI_HACL_CFLAGS)
++               _hacl/Hacl_Hash_SHA1.c $(CAPI_HACL_CFLAGS)
+_sha2           sha2module.c $(CAPI_HACL_CFLAGS)
++               _hacl/Hacl_Hash_SHA2.c $(CAPI_HACL_CFLAGS)
+_sha3           sha3module.c $(CAPI_HACL_CFLAGS)
++               _hacl/Hacl_Hash_SHA3.c $(CAPI_HACL_CFLAGS)
+_blake2         blake2module.c $(CAPI_HACL_CFLAGS)
++               _hacl/Hacl_Hash_Blake2s.c _hacl/Hacl_Hash_Blake2b.c _hacl/Lib_Memzero0.c $(CAPI_HACL_CFLAGS)
++ @x86_64       _hacl/Hacl_Hash_Blake2s_Simd128.c $(CAPI_HACL_CFLAGS) -msse -msse2 -msse3 -msse4.1 -msse4.2 -DHACL_CAN_COMPILE_VEC128
++ @x86_64       _hacl/Hacl_Hash_Blake2b_Simd256.c $(CAPI_HACL_CFLAGS) -mavx2 -DHACL_CAN_COMPILE_VEC256
+
+# CJK codecs (encodings.gb2312, shift_jis, iso2022_jp, big5, ...)
+_multibytecodec cjkcodecs/multibytecodec.c
+_codecs_cn      cjkcodecs/_codecs_cn.c
+_codecs_hk      cjkcodecs/_codecs_hk.c
+_codecs_iso2022 cjkcodecs/_codecs_iso2022.c
+_codecs_jp      cjkcodecs/_codecs_jp.c
+_codecs_kr      cjkcodecs/_codecs_kr.c
+_codecs_tw      cjkcodecs/_codecs_tw.c
+
+_lsprof         _lsprof.c rotatingtree.c
+# _tracemalloc: over python/capi_tracemalloc.c (the traces of the
+# runtime's allocations, capi/compat/pycore_tracemalloc.h)
+_tracemalloc    _tracemalloc.c
+_zoneinfo       _zoneinfo.c
+fcntl           fcntlmodule.c
+termios         termios.c
+grp             grpmodule.c
+pwd             pwdmodule.c
+syslog          syslogmodule.c
+_posixshmem     _multiprocessing/posixshmem.c
+_multiprocessing _multiprocessing/multiprocessing.c _multiprocessing/semaphore.c
+# _uuid: libSystem on macOS, libuuid elsewhere
+_uuid @darwin   _uuidmodule.c
+_uuid @libuuid  _uuidmodule.c $(CAPI_LIBUUID_CFLAGS)
+# _dbm: the ndbm of libSystem on macOS
+_dbm @darwin    _dbmmodule.c -DUSE_NDBM
+# _hmac: HACL* HMAC over the hash implementations of the modules above
+_hmac           hmacmodule.c $(CAPI_HACL_CFLAGS)
++               _hacl/Hacl_HMAC.c _hacl/Hacl_Streaming_HMAC.c $(CAPI_HACL_CFLAGS)
+
+# pyexpat: the bundled expat (Modules/expat) unless system_expat
+pyexpat @expat  pyexpat.c $(CAPI_EXPAT_CFLAGS)
++               expat/xcs.c expat/xmlparse.c expat/xmlrole.c expat/xmltok.c $(CAPI_EXPAT_CFLAGS)
+pyexpat @system_expat pyexpat.c $(CAPI_SYSTEM_EXPAT_CFLAGS)
+# _elementtree: expat through pyexpat's capsule (expat.h for the types)
+_elementtree @expat _elementtree.c $(CAPI_EXPAT_CFLAGS)
+_elementtree @system_expat _elementtree.c $(CAPI_SYSTEM_EXPAT_CFLAGS)
+
+# system libraries (pkg-config; optional, see the Makefile switches)
+zlib            @zlib    zlibmodule.c $(CAPI_ZLIB_CFLAGS)
+_bz2            @bz2     _bz2module.c $(CAPI_BZ2_CFLAGS)
+_lzma           @lzma    _lzmamodule.c $(CAPI_LZMA_CFLAGS)
+_sqlite3        @sqlite3 _sqlite/blob.c _sqlite/connection.c _sqlite/cursor.c _sqlite/microprotocols.c _sqlite/module.c _sqlite/prepare_protocol.c _sqlite/row.c _sqlite/statement.c _sqlite/util.c $(CAPI_SQLITE3_CFLAGS)
+_ssl            @ssl     _ssl.c $(CAPI_SSL_CFLAGS)
+_hashlib        @ssl     _hashopenssl.c $(CAPI_SSL_CFLAGS)
+_zstd           @zstd    _zstd/_zstdmodule.c _zstd/zstddict.c _zstd/compressor.c _zstd/decompressor.c $(CAPI_ZSTD_CFLAGS)
+readline        @readline readline.c $(CAPI_READLINE_CFLAGS)
+_ctypes         @ffi     _ctypes/_ctypes.c _ctypes/callbacks.c _ctypes/callproc.c _ctypes/stgdict.c _ctypes/cfield.c $(CAPI_FFI_CFLAGS)
+
+# macOS proxy settings, imported by urllib.request on darwin (pip, M5)
+_scproxy        @scproxy _scproxy.c

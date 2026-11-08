@@ -1,0 +1,23 @@
+listdir empty []
+makedirs ['a/', 'a/b/', 'a/b/c/']
+makedirs exists FileExistsError EEXIST
+mkdir missing parent FileNotFoundError ENOENT
+listdir ['a', 'd', 'top.txt']
+listdir a ['b', 'x.py']
+walk ['a/', 'a/b/', 'a/b/c/', 'a/b/c/z.dat', 'a/b/y.py', 'a/x.py', 'd/', 'top.txt']
+walk bottom-up sorted [('.', ['a', 'd'], ['top.txt']), ('a', ['b'], ['x.py']), ('a/b', ['c'], ['y.py']), ('a/b/c', [], ['z.dat']), ('d', [], [])]
+walk pruned ['.', 'a', 'd']
+scandir [('a', True, False), ('d', True, False), ('top.txt', False, True)]
+exists True True False
+getsize 3 3
+after rename ['a/', 'a/b/', 'a/b/c/', 'a/b/c/z.dat', 'a/b/y.py', 'a/x.py', 'd/', 'd/moved.txt']
+rename missing FileNotFoundError ENOENT
+replace content 'x = 1\n'
+after remove ['a/', 'a/b/', 'a/b/c/', 'a/b/c/z.dat', 'a/b/y.py', 'd/']
+remove missing FileNotFoundError ENOENT
+rmdir non-empty OSError ENOTEMPTY
+after rmdir ['a/', 'a/b/', 'a/b/y.py']
+os.write 6
+os.read b'abc' 3 b'def' b''
+double close OSError EBADF
+final ['a/', 'a/b/', 'a/b/y.py', 'raw.bin']

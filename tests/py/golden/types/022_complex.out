@@ -1,0 +1,102 @@
+1j 1j
+1j * 1j (-1+0j)
+(1+2j) (1+2j)
+(1-2j) (1-2j)
+-1j (-0-1j)
+0j 0j
+-0j (-0-0j)
+-(0j) (-0-0j)
+complex(-0.0, -0.0) (-0-0j)
+complex(0.0, -0.0) -0j
+(1.5+0.5j) (1.5+0.5j)
+1e16j 1e+16j
+(1e-5+1e22j) (1e-05+1e+22j)
+str(2+3j) '(2+3j)'
+complex(1, 2) (1+2j)
+complex(1) (1+0j)
+complex() 0j
+complex(1.5) (1.5+0j)
+complex(True, False) (1+0j)
+complex(inf, nan) (inf+nanj)
+complex(-inf, -inf) (-inf-infj)
+abs(3+4j) 5.0
+abs(-5j) 5.0
+abs(1+1j) 1.4142135623730951
+(3+4j).real 3.0
+(3+4j).imag 4.0
+type((3+4j).real) 'float'
+(3+4j).conjugate() (3-4j)
+(1+2j) + (3-4j) (4-2j)
+(1+2j) - (1+2j) 0j
+(1+2j) * (3-4j) (11+2j)
+(1+2j) / (3-4j) (-0.2+0.4j)
+(4+2j) / 2 (2+1j)
+1 / 1j -1j
+1j ** 2 (-1+0j)
+(1+1j) ** 2 2j
+(1+1j) ** 0 (1+0j)
+0j ** 0 (1+0j)
+0j ** -1 ZeroDivisionError zero to a negative or complex power
+2 + 1j (2+1j)
+2.5 * 2j 5j
+True + 1j (1+1j)
+-(1+2j) (-1-2j)
++(1+2j) (1+2j)
+(1+2j) == (1+2j) True
+1+0j == 1 True
+1j == 1 False
+1j < 2j TypeError '<' not supported between instances of 'complex' and 'complex'
+1j > 0 TypeError '>' not supported between instances of 'complex' and 'int'
+1j // 1 TypeError unsupported operand type(s) for //: 'complex' and 'int'
+1j % 1 TypeError unsupported operand type(s) for %: 'complex' and 'int'
+divmod(1j, 1) TypeError unsupported operand type(s) for divmod(): 'complex' and 'int'
+int(1j) TypeError int() argument must be a string, a bytes-like object or a real number, not 'complex'
+float(1+0j) TypeError float() argument must be a string or a real number, not 'complex'
+round(1j) TypeError type complex doesn't define __round__ method
+pow(1j, 2, 3) ValueError complex modulo
+bool(0j) False
+bool(-0j) False
+bool(1e-300j) True
+complex('1+2j') (1+2j)
+complex('1-2j') (1-2j)
+complex(' (1+2j) ') (1+2j)
+complex('2j') 2j
+complex('-2j') -2j
+complex('j') 1j
+complex('-j') -1j
+complex('1') (1+0j)
+complex('1.5e3+2.5e-3j') (1500+0.0025j)
+complex('inf+nanj') (inf+nanj)
+complex('-infj') -infj
+complex('1_0+2_0j') (10+20j)
+complex('1e3j') 1000j
+complex('+1J') 1j
+complex('(3)') (3+0j)
+complex('1+2j ') (1+2j)
+complex('1 + 2j') ValueError complex() arg is a malformed string
+complex('1+2') ValueError complex() arg is a malformed string
+complex('j1') ValueError complex() arg is a malformed string
+complex('') ValueError complex() arg is a malformed string
+complex('(1+2j') ValueError complex() arg is a malformed string
+complex('1+2jj') ValueError complex() arg is a malformed string
+complex('1++2j') ValueError complex() arg is a malformed string
+complex('nanj') nanj
+complex('0x1j') ValueError complex() arg is a malformed string
+complex('1', 2) TypeError complex() argument 'real' must be a real number, not str
+complex(1, '2') TypeError complex() argument 'imag' must be a real number, not str
+complex(None) TypeError complex() argument must be a string or a number, not NoneType
+complex(1j, 1j) (-1+1j)
+complex(real=1, imag=2) (1+2j)
+complex(10**400) OverflowError int too large to convert to float
+complex.from_number(5) (5+0j)
+complex.from_number('5') TypeError must be real number, not str
+format(1+2j, '.2f') '1.00+2.00j'
+format(1+2j, '') '(1+2j)'
+format(1+2j, '>12') '      (1+2j)'
+format(1.5+2j, 'g') '1.5+2j'
+format(1+2j, '=10') ValueError '=' alignment flag is not allowed in complex format specifier
+format(1+2j, '010') ValueError Zero padding is not allowed in complex format specifier
+hash(1+0j) == hash(1) True
+{1+0j: 'a', 1: 'b'} {(1+0j): 'b'}
+type(1j).__name__ 'complex'
+sum complex (5.5+1j)

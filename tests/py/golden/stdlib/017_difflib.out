@@ -1,0 +1,95 @@
+unified:
+--- a.txt
++++ b.txt
+@@ -1,6 +1,7 @@
++zero
+ one
+-two
+ three
+-four
++FOUR
+ five
+ six
++seven
+unified n=0:
+--- old
++++ new
+@@ -0,0 +1 @@
++zero
+@@ -2 +2,0 @@
+-two
+@@ -4 +4 @@
+-four
++FOUR
+@@ -6,0 +7 @@
++seven
+unified lineterm:
+  '--- l'
+  '+++ r'
+  '@@ -1,2 +1,2 @@'
+  ' x'
+  '-y'
+  '+z'
+unified identical []
+context:
+*** a
+--- b
+***************
+*** 1,3 ****
+  one
+- two
+  three
+--- 1,3 ----
++ zero
+  one
+  three
+ndiff:
+  apple
+- banana
++ bandana
+?    +
+- cherry
++ cherry pie
+?       ++++
+ndiff list ['- abc\n', '?   ^\n', '+ abd\n', '?   ^\n']
+restore 1 abc
+restore 2 abd
+ratio 0.8
+quick_ratio 0.8 0.933333
+opcodes [('equal', 0, 2, 0, 2), ('replace', 2, 3, 2, 3), ('equal', 3, 7, 3, 7), ('insert', 7, 7, 7, 8)]
+matching blocks [Match(a=0, b=0, size=2), Match(a=3, b=3, size=4), Match(a=7, b=8, size=0)]
+longest match Match(a=3, b=3, size=4)
+longest match defaults Match(a=3, b=3, size=4)
+  equal   a[0:2]='ab'     b[0:2]='ab'
+  replace a[2:3]='c'      b[2:3]='x'
+  equal   a[3:7]='defg'   b[3:7]='defg'
+  insert  a[7:7]=''       b[7:8]='h'
+grouped [[('equal', 8, 10, 8, 10), ('replace', 10, 11, 10, 11)]]
+ratio identical 1.0
+ratio disjoint 0.0
+ratio empty 1.0
+ratio lists 0.75
+isjunk 0.909091 [('equal', 0, 2, 0, 2), ('insert', 2, 2, 2, 3), ('equal', 2, 5, 3, 6)]
+set_seqs 0.615385 [('replace', 0, 1, 0, 1), ('equal', 1, 4, 1, 4), ('replace', 4, 5, 4, 5), ('equal', 5, 6, 5, 6), ('insert', 6, 6, 6, 7)]
+set_seq2 0.714286
+close ['apply', 'apple', 'ape']
+close n=1 ['apply']
+close cutoff ['apply', 'apple', 'ape', 'applet', 'maple']
+close none []
+close keywords ['where', 'while', 'whale']
+close n=0 ValueError n must be > 0: 0
+close cutoff ValueError cutoff must be in [0.0, 1.0]: 2
+Differ:
+  one
+- two
++ tree
++ emu
+IS_CHARACTER_JUNK True False
+IS_LINE_JUNK True False
+diff_bytes:
+  b'--- x\n'
+  b'+++ y\n'
+  b'@@ -1,2 +1,2 @@\n'
+  b' a\n'
+  b'-b\n'
+  b'+c\n'

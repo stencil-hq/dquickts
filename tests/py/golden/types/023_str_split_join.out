@@ -1,0 +1,77 @@
+split() 'a b c' ['a', 'b', 'c']
+rsplit() 'a b c' ['a', 'b', 'c']
+split(',') 'a b c' ['a b c']
+split() '  a  b  ' ['a', 'b']
+rsplit() '  a  b  ' ['a', 'b']
+split(',') '  a  b  ' ['  a  b  ']
+split() '' []
+rsplit() '' []
+split(',') '' ['']
+split() '   ' []
+rsplit() '   ' []
+split(',') '   ' ['   ']
+split() 'a,b,,c,' ['a,b,,c,']
+rsplit() 'a,b,,c,' ['a,b,,c,']
+split(',') 'a,b,,c,' ['a', 'b', '', 'c', '']
+split() ',a,' [',a,']
+rsplit() ',a,' [',a,']
+split(',') ',a,' ['', 'a', '']
+split() 'a\tb\nc\r\nd\x0be\x0cf' ['a', 'b', 'c', 'd', 'e', 'f']
+rsplit() 'a\tb\nc\r\nd\x0be\x0cf' ['a', 'b', 'c', 'd', 'e', 'f']
+split(',') 'a\tb\nc\r\nd\x0be\x0cf' ['a\tb\nc\r\nd\x0be\x0cf']
+split() 'one' ['one']
+rsplit() 'one' ['one']
+split(',') 'one' ['one']
+split() 'a\u3000b\xa0c\u2003d' ['a', 'b', 'c', 'd']
+rsplit() 'a\u3000b\xa0c\u2003d' ['a', 'b', 'c', 'd']
+split(',') 'a\u3000b\xa0c\u2003d' ['a\u3000b\xa0c\u2003d']
+split() 'a\x1cb\x1dc\x1ed\x1ff' ['a', 'b', 'c', 'd', 'f']
+rsplit() 'a\x1cb\x1dc\x1ed\x1ff' ['a', 'b', 'c', 'd', 'f']
+split(',') 'a\x1cb\x1dc\x1ed\x1ff' ['a\x1cb\x1dc\x1ed\x1ff']
+split() '\u200ba\u200bb' ['\u200ba\u200bb']
+rsplit() '\u200ba\u200bb' ['\u200ba\u200bb']
+split(',') '\u200ba\u200bb' ['\u200ba\u200bb']
+'a  b'.split(' ') ['a', '', 'b']
+' a b '.split(' ') ['', 'a', 'b', '']
+''.split(',') ['']
+''.split() []
+'abc'.split('abc') ['', '']
+'aXbXXc'.split('XX') ['aXb', 'c']
+'aaa'.split('aa') ['', 'a']
+'aaa'.rsplit('aa') ['a', '']
+'a b c d'.split(maxsplit=1) ['a', 'b c d']
+'a b c d'.rsplit(maxsplit=1) ['a b c', 'd']
+'  a b c  '.split(None, 1) ['a', 'b c  ']
+'  a b c  '.rsplit(None, 1) ['  a b', 'c']
+'a,b,c,d'.split(',', 2) ['a', 'b', 'c,d']
+'a,b,c,d'.rsplit(',', 2) ['a,b', 'c', 'd']
+'a,b,c'.split(',', 0) ['a,b,c']
+'a b c'.split(None, 0) ['a b c']
+'  a b c'.split(None, 0) ['a b c']
+'a,b,c'.split(',', -1) ['a', 'b', 'c']
+'a,b'.split(sep=',', maxsplit=5) ['a', 'b']
+'abc'.split('') ValueError empty separator
+'abc'.rsplit('') ValueError empty separator
+'abc'.split(1) TypeError must be str or None, not int
+'abc'.split(',', 1.5) TypeError 'float' object cannot be interpreted as an integer
+'a😀b😀c'.split('😀') ['a', 'b', 'c']
+'ab'.split(b'a') TypeError must be str or None, not bytes
+','.join(['a','b','c']) 'a,b,c'
+''.join([]) ''
+'-'.join('abc') 'a-b-c'
+'-'.join(['x']) 'x'
+', '.join(gen) '0, 1, 2, 3, 4'
+'ab'.join(['1','2','3']) '1ab2ab3'
+''.join(('a', '', 'b')) 'ab'
+'x'.join({'k': 1}) 'kxj'
+','.join([1, 2]) TypeError sequence item 0: expected str instance, int found
+','.join(['a', None]) TypeError sequence item 1: expected str instance, NoneType found
+','.join(['a', b'b']) TypeError sequence item 1: expected str instance, bytes found
+','.join(5) TypeError can only join an iterable
+','.join() TypeError str.join() takes exactly one argument (0 given)
+'😀'.join('ab') 'a😀b'
+split/join roundtrip True
+join many 2000
+words 'fox brown quick the'
+type split result 'list'
+split preserves str ['str', 'str']

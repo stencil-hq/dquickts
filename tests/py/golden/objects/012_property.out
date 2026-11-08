@@ -1,0 +1,22 @@
+get 3 6
+set 5 10
+ValueError radius must be >= 0
+unchanged 5
+AttributeError property 'diameter' of 'Circle' object has no setter
+AttributeError property 'diameter' of 'Circle' object has no deleter
+deleting radius
+AttributeError 'Circle' object has no attribute '_radius'
+instance dict {}
+doc The radius.
+property type property
+fget name radius None None
+property() call 40 legacy doc
+override property 4 24
+property recomputes 42 42 2
+data descriptor wins property
+extended property base x base
+AttributeError property 'name' of 'Base' object has no setter
+property AttributeError fallback fallback missing
+KeyError 'inner'
+class access returns property True
+getter copy distinct True

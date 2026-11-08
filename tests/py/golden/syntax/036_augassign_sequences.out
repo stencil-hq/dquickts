@@ -1,0 +1,31 @@
+str += abcd ab False
+str *= abcdabcd
+list += in place [1, 2, 3] [1, 2, 3] True
+list += tuple [1, 2, 3, 4, 5]
+list += str [1, 2, 3, 4, 5, 'x', 'y']
+list += range [1, 2, 3, 4, 5, 'x', 'y', 0, 1]
+list *= in place 18 True
+list = list + rebinds [1, 2, 3] [1, 2] False
+list + tuple TypeError can only concatenate list (not "tuple") to list
+tuple += rebinds (1, 2, 3) (1, 2) False
+tuple *= (1, 2, 3, 1, 2, 3)
+tuple += list TypeError can only concatenate tuple (not "list") to tuple
+set ops in place [4, 9] True
+frozenset rebinds [1, 2] [1] False
+dict |= in place {'a': 1, 'b': 2, 'c': 3} True
+dict |= int TypeError 'int' object is not iterable
+bytes += rebinds b'abc' b'ab' False
+bytearray in place bytearray(b'abcabc') True
+tuple item += TypeError 'tuple' object does not support item assignment
+but list was extended ([1, 2],)
+list *= 0 [] []
+shared default [1, 2] [1, 2]
+  __add__ called
+fallback to __add__ 6 False
+  __iadd__ called
+uses __iadd__ 6 True
+  __iadd__ NotImplemented
+  __add__ called
+iadd NotImplemented falls back 11 OnlyAdd
+iadd return value is bound 'replaced'
+radd fallback radd(5)

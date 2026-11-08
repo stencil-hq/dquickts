@@ -1,0 +1,17 @@
+diamond mro ['D', 'B', 'C', 'A', 'object']
+mro() ['D', 'B', 'C', 'A', 'object']
+cooperative ['D', 'B', 'C', 'A']
+object last True
+reversed bases ['E', 'C', 'B', 'A', 'object']
+TypeError Cannot create a consistent method resolution order (MRO) for bases B, C
+TypeError Cannot create a consistent method resolution order (MRO) for bases A, B
+TypeError duplicate base class A
+cooperative init ['Base', 'Right=2', 'Left=1', 'Both']
+leftover False
+leftover kw {'extra': 3}
+wikipedia-style mro ['K3', 'K1', 'X', 'K2', 'Y', 'Z', 'object']
+attr resolution 1 2
+bases ['Attr1', 'Attr2']
+isinstance multi True True True
+super skip ['C', 'A']
+TypeError multiple bases have instance lay-out conflict

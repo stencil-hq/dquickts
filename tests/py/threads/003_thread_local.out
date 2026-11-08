@@ -1,0 +1,5 @@
+[('after', 0, ['x']), ('after', 1, ['x']), ('after', 2, ['x']), ('before', False), ('before', False), ('before', False)]
+main {'x': 'main'}
+[(5, True)] True
+released at thread exit: True False
+TypeError: Initialization arguments are not supported

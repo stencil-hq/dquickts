@@ -1,0 +1,48 @@
+empty {}
+nested {'a': {'b': {'c': []}}, 1: (2,), None: {1, 2}}
+str keys quoting {"it's": 'x\n', 'q"': b'\x00'}
+recursive {'name': 'root', 'self': {...}}
+recursive str "{'name': 'root', 'self': {...}}"
+recursive via list {'list': [{...}]}
+recursive eq self True
+eq True
+eq numeric values True
+ne different keys True
+eq vs items list False
+lt unsupported TypeError '<' not supported between instances of 'dict' and 'dict'
+dict + dict TypeError unsupported operand type(s) for +: 'dict' and 'dict'
+dict | list TypeError unsupported operand type(s) for |: 'dict' and 'list'
+bool (False, True)
+-1 and -2 distinct keys {-1: 'm1', -2: 'm2'}
+1/1.0/True merge {1: 'c'}
+0/-0.0/False merge {0: 'c'}
+str vs bytes keys {'a': 1, b'a': 2}
+tuple keys {(): 0, (1,): 1, ((),): 2}
+frozenset key 'fs'
+list key TypeError cannot use 'list' as a dict key (unhashable type: 'list')
+set key TypeError cannot use 'set' as a dict key (unhashable type: 'set')
+dict key TypeError cannot use 'dict' as a dict key (unhashable type: 'dict')
+nan keys 2
+colliding hashes {Key('a'): 1, Key('b'): 2}
+colliding lookup 2
+eq was called True
+colliding missing KeyError Key('c')
+__missing__ (1, 0)
+__missing__ not stored {'a': 1}
+__missing__ not used by get None
+subclass repr {'x': 1}
+subclass eq dict True
+subclass | type 'dict'
+kwargs keys must be str TypeError keywords must be strings
+dict(**{'a': 1}) {'a': 1}
+dict unpack merge {'a': 1, 'b': 3, 'c': 4}
+len after overwrite 1
+literal dup key last wins {'a': 2}
+format "{'k': 1}"
+str of dict "{1: '1'}"
+in checks keys (True, False)
+iter gives keys ['x', 'y']
+del missing KeyError 'k'
+keys order big ints [18446744073709551616, -1, 0]
+max dict 'b'
+sorted by value ['b', 'c', 'a']

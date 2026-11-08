@@ -1,0 +1,85 @@
+True + True 2
+True - True 0
+True * 10 10
+False * 10 0
+True / 2 0.5
+True // 2 0
+-True -1
++True 1
+~True -2
+abs(True) 1
+True ** 10 1
+True + 0.5 1.5
+True + 1j (1+1j)
+type(True + True) 'int'
+type(True & True) 'bool'
+type(True | False) 'bool'
+type(True ^ True) 'bool'
+type(-True) 'int'
+sum of bools 3
+sum gen bools 7
+True == 1 True
+False == 0 True
+True == 1.0 True
+True is 1 True
+True > False True
+True < 2 True
+max(True, 1) True
+max(1, True) 1
+sorted bools [False, 0, True, 1, True]
+list index by bool 'b'
+str * bool 'ab'
+divmod(True, True) (1, 0)
+True % 2 1
+True << 4 16
+int(True) 1
+float(True) 1.0
+complex(False) 0j
+str(True) 'True'
+repr(False) 'False'
+f'{True}' 'True'
+f'{True:d}' '1'
+f'{True:5}' '    1'
+f'{True:>6}' '     1'
+f'{True:.2f}' '1.00'
+f'{False:x}' '0'
+format(True, '') 'True'
+format(True, 'b') '1'
+'%d' % True '1'
+'%s' % True 'True'
+'%r' % False 'False'
+hex(True) '0x1'
+True.real 1
+True.imag 0
+True.numerator 1
+True.denominator 1
+True.bit_length() 1
+True.conjugate() 1
+bool(2) True
+bool(-1) True
+bool(0.0) False
+bool(-0.0) False
+bool(float('nan')) True
+bool(0j) False
+bool('') False
+bool(' ') True
+bool('False') True
+bool([]) False
+bool([0]) True
+bool({}) False
+bool(range(0)) False
+bool(None) False
+bool() False
+bool(1, 2) TypeError bool expected at most 1 argument, got 2
+bool(x=1) TypeError bool() takes no keyword arguments
+not 0 True
+not [] True
+1 and 2 2
+0 and 2 0
+0 or '' ''
+'' or 'x' 'x'
+isinstance(True, int) True
+issubclass(bool, int) True
+bool.__mro__ ['bool', 'int', 'object']
+{True: 'a', 1: 'b'} {True: 'b'}
+{0, False, 0.0} {0}

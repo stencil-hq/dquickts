@@ -1,0 +1,56 @@
+set() set()
+frozenset() frozenset()
+{1} {1}
+frozenset({5}) frozenset({5})
+set('a') {'a'}
+set('aaa') {'a'}
+sorted set('hello') ['e', 'h', 'l', 'o']
+set(range(3)) {0, 1, 2}
+set(5) TypeError 'int' object is not iterable
+set([[1]]) TypeError cannot use 'list' as a set element (unhashable type: 'list')
+{[]} TypeError cannot use 'list' as a set element (unhashable type: 'list')
+set of dict ['a', 'b']
+bool (False, True)
+add dedup (2, True)
+add returns None
+add unhashable TypeError cannot use 'list' as a set element (unhashable type: 'list')
+discard present None
+discard missing None
+discard unhashable TypeError cannot use 'list' as a set element (unhashable type: 'list')
+discard set (frozen lookup) None
+remove present None
+remove missing str KeyError 'x'
+remove missing int KeyError 5
+remove missing tuple KeyError (1, 2)
+remove unhashable TypeError cannot use 'dict' as a set element (unhashable type: 'dict')
+remove KeyError args ('k',) "'k'"
+pop single 42
+pop single str 'only'
+pop empty KeyError 'pop from an empty set'
+pop drains ([7, 8], set())
+update multi [1, 2, 3, 4, 5, 6]
+update none [1, 2, 3, 4, 5, 6]
+intersection_update [1, 3]
+difference_update [3]
+symmetric_difference_update [4]
+update returns None None
+update non-iterable TypeError 'int' object is not iterable
+update str 4
+copy independent ([1, 2], [1, 2, 3])
+clear (set(), set())
+frozenset hashable True
+frozenset dict key 'val'
+set lookup by set TypeError cannot use 'set' as a dict key (unhashable type: 'set')
+set in set of frozensets True
+frozenset in set [[], [1], [1, 2, 3]]
+frozenset no add AttributeError 'frozenset' object has no attribute 'add'
+frozenset copy identity True
+frozenset(frozenset) identity True
+set hash TypeError unhashable type: 'set'
+set as key TypeError cannot use 'set' as a dict key (unhashable type: 'set')
+nested frozenset repr frozenset({frozenset()})
+frozenset eq set True
+frozenset methods [1, 2, 3, 4]
+set of mixed numeric 2
+isinstance (True, False)
+type names ('set', 'frozenset')

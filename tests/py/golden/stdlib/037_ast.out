@@ -1,0 +1,84 @@
+dump expr Expression(body=BinOp(left=Constant(value=1), op=Add(), right=BinOp(left=Constant(value=2), op=Mult(), right=Name(id='x'))))
+dump stmt Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=List(elts=[Name(id='a'), Name(id='b')]))])
+dump attrs Module(body=[Assign(targets=[Name(id='y', ctx=Store(), lineno=1, col_offset=0, end_lineno=1, end_col_offset=1)], value=Call(func=Name(id='f', lineno=1, col_offset=4, end_lineno=1, end_col_offset=5), args=[Constant(value=1, lineno=1, col_offset=6, end_lineno=1, end_col_offset=7)], lineno=1, col_offset=4, end_lineno=1, end_col_offset=8), lineno=1, col_offset=0, end_lineno=1, end_col_offset=8)])
+dump indent
+Module(
+  body=[
+    If(
+      test=Name(id='a'),
+      body=[
+        Pass()],
+      orelse=[
+        Expr(
+          value=Call(
+            func=Name(id='b')))])])
+dump unannotated Delete([Name('x', Del())])
+dump show_empty FunctionDef(name='f', args=arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]), body=[Pass()], decorator_list=[], type_params=[])
+dump func AsyncFunctionDef(name='g', args=arguments(posonlyargs=[arg(arg='a')], args=[arg(arg='b')], vararg=arg(arg='c'), kwonlyargs=[arg(arg='d')], kw_defaults=[None], kwarg=arg(arg='e'), defaults=[Constant(value=1)]), body=[Return(value=Name(id='a'))], returns=Name(id='int'))
+dump fstring JoinedStr(values=[FormattedValue(value=Name(id='x'), conversion=114, format_spec=JoinedStr(values=[Constant(value='>'), FormattedValue(value=Name(id='w'), conversion=-1)]))])
+dump comprehension ListComp(elt=Name(id='i'), generators=[comprehension(target=Name(id='i', ctx=Store()), iter=Call(func=Name(id='range'), args=[Constant(value=3)]), ifs=[Name(id='i')], is_async=0)])
+dump lambda Lambda(args=arguments(args=[arg(arg='x')], kwonlyargs=[arg(arg='y')], kw_defaults=[Constant(value=2)]), body=Name(id='x'))
+dump match Match(subject=Name(id='p'), cases=[match_case(pattern=MatchSequence(patterns=[MatchValue(value=Constant(value=1)), MatchStar(name='rest')]), guard=Name(id='rest'), body=[Pass()])])
+dump class ClassDef(name='C', bases=[Name(id='B')], keywords=[keyword(arg='metaclass', value=Name(id='M'))], body=[AnnAssign(target=Name(id='x', ctx=Store()), annotation=Name(id='int'), value=Constant(value=1), simple=1)], decorator_list=[Name(id='dec')])
+node types Module FunctionDef BinOp
+positions 1 0 2 16
+fields ('name', 'args', 'body', 'decorator_list', 'returns', 'type_comment', 'type_params')
+get_docstring Doc  string.
+
+More.
+source segment 1 + foo(2)
+unparse 'x = (1 +\n 2)' -> 'x = 1 + 2'
+unparse 'lambda: (yield)' -> 'lambda: (yield)'
+unparse "print ( 'hi' , end = '' )" -> "print('hi', end='')"
+unparse 'a if b else c' -> 'a if b else c'
+unparse 'x[1:2, ::3]' -> 'x[1:2, ::3]'
+unparse 'def f(*, a): ...' -> 'def f(*, a):\n    ...'
+unparse 'class A[T]: pass' -> 'class A[T]:\n    pass'
+unparse '(a := 1)' -> '(a := 1)'
+unparse 'with (a as b, c): pass' -> 'with a as b, c:\n    pass'
+unparse "f(*[2], **{'k': 1})" -> "f(*[2], **{'k': 1})"
+unparse '-(-1) ** 2' -> '-(-1) ** 2'
+unparse 'not a or b and c' -> 'not a or (b and c)'
+unparse "x = 'it\\'s'" -> 'x = "it\'s"'
+unparse 'type X = int' -> 'type X = int'
+unparse 'try:\n pass\nexcept* E:\n pass' -> 'try:\n    pass\nexcept* E:\n    pass'
+literal_eval 42 -> 42
+literal_eval -3.5 -> -3.5
+literal_eval 's' -> 's'
+literal_eval b'by' -> b'by'
+literal_eval [1, (2, 3), {'a': None}] -> [1, (2, 3), {'a': None}]
+literal_eval {1, 2} -> {1, 2}
+literal_eval True -> True
+literal_eval 1+2j -> (1+2j)
+literal_eval set() -> set()
+literal_eval () -> ()
+literal_eval {'k': [1, -2]} -> {'k': [1, -2]}
+literal_eval ... -> Ellipsis
+literal_eval 0x1f -> 31
+literal_eval 1_000 -> 1000
+literal_eval bad 'x' ValueError malformed node or string on line 1
+literal_eval bad '1 + x' ValueError malformed node or string on line 1
+literal_eval bad 'f()' ValueError malformed node or string on line 1
+literal_eval bad '[i for i in x]' ValueError malformed node or string on line 1
+literal_eval bad 'a.b' ValueError malformed node or string on line 1
+literal_eval bad '{**d}' ValueError malformed node or string
+literal_eval bad '2 ** 3' ValueError malformed node or string on line 1
+literal_eval syntax SyntaxError invalid syntax
+parse error 'def f(:' SyntaxError invalid syntax 1 7
+parse error 'x = = 1' SyntaxError invalid syntax 1 5
+parse error 'if x\n  pass' SyntaxError expected ':' 1 5
+parsed ok 'return 5'
+parse error '  x = 1' IndentationError unexpected indent 1 2
+parse error 'f(**a, *b)' SyntaxError iterable argument unpacking follows keyword argument unpacking 1 6
+visitor names ['x', 'x', 'y', 'x']
+transformed renamed = renamed + y * renamed
+walk ['Add', 'Assign', 'BinOp', 'Load', 'Module', 'Mult', 'Name', 'Store']
+iter_fields ['targets', 'value', 'type_comment']
+iter_child_nodes ['Name', 'BinOp']
+exec transformed 9
+built 42 6 * 7
+increment_lineno 6
+type_comments Assign(targets=[Name(id='x', ctx=Store())], value=Constant(value=1), type_comment='int')
+feature_version Module(body=[Assign(targets=[Name(id='a', ctx=Store())], value=Constant(value=1))])
+compare True False
+ast repr Expression(body=Constant(value=1, kind=None))

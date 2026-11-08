@@ -1,0 +1,48 @@
+auto 1 + 2 = 3
+manual b a b
+keyword Bo is 7
+mixed p kw q
+repeat ababab
+unused args ok 1 1
+escaped braces {} {v} }{
+empty  no fields
+index list one two
+index dict str key value
+index digit key is int int-one
+keyword index value zero
+nested index b
+attribute (3, -4)
+keyword attribute 3|-4
+attribute then index 20
+method attr str 3.0 4.0
+conversions café 'café' 'caf\xe9'
+conversion with spec [       'x']
+spec [     r] [l     ] [  c   ] [003.14] [1,000,000] [0xff]
+nested spec [     2.718]
+nested spec named [x    ]
+nested spec numbered [***y***]
+format_map A <b>
+format_map dict 1
+index out of range IndexError Replacement index 2 out of range for positional args tuple
+auto too few IndexError Replacement index 1 out of range for positional args tuple
+missing keyword KeyError 'name'
+mix auto manual ValueError cannot switch from automatic field numbering to manual field specification
+mix manual auto ValueError cannot switch from manual field specification to automatic field numbering
+single open brace ValueError Single '{' encountered in format string
+single close brace ValueError Single '}' encountered in format string
+unclosed field ValueError expected '}' before end of string
+bad conversion ValueError Unknown conversion specifier x
+bad spec ValueError Unknown format code 'q' for object of type 'int'
+missing attr AttributeError 'Point' object has no attribute 'nope'
+missing key KeyError 'nokey'
+list str index TypeError list indices must be integers or slices, not str
+index out of list IndexError list index out of range
+empty attribute ValueError Empty attribute in format string
+too deep nesting ValueError Max string recursion exceeded
+format int with s ValueError Unknown format code 's' for object of type 'int'
+keyword not identifier ok 'dash'
+space in name 'spaced'
+negative index is a key 'minus'
+custom __format__    $123.45|$0.05
+bytes format AttributeError 'bytes' object has no attribute 'format'
+template intact {}-{} 1-2

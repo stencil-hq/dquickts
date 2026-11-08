@@ -30,7 +30,8 @@ endif
 ENGINE := quickjs dtoa libregexp libunicode cutils
 ENGINE_OBJS := $(addprefix $(OBJDIR)/,$(addsuffix .o,$(ENGINE)))
 
-HOSTS := $(patsubst %.c,%,$(wildcard test_*.c))
+# test_python_* hosts need the engine built with the Python runtime
+HOSTS := $(patsubst %.c,%,$(filter-out test_python_%.c,$(wildcard test_*.c)))
 HOST_BINS := $(addprefix $(OBJDIR)/,$(HOSTS))
 
 SCRIPTS := $(wildcard js/*.js)
@@ -39,6 +40,23 @@ UPSTREAM_TESTS := $(addprefix $(Q)/tests/,test_closure.js test_loop.js \
                     test_language.js test_bigint.js test_builtin.js)
 
 all: $(HOST_BINS) $(OBJDIR)/hibernate
+
+# Python snapshot host: quickjs.c with CONFIG_PYTHON (python/*.c are
+# #included by it) in a separate object
+PY_ENGINE_OBJS := $(OBJDIR)/quickjs-py.o $(addprefix $(OBJDIR)/,$(addsuffix .o,dtoa libregexp libunicode cutils))
+
+$(OBJDIR)/quickjs-py.o: $(Q)/quickjs.c $(wildcard $(Q)/python/*.c $(Q)/python/*.h) | $(OBJDIR)
+	$(CC) $(CFLAGS) -DCONFIG_PYTHON -c -o $@ $<
+
+$(OBJDIR)/test_python_snapshot: $(OBJDIR)/test_python_snapshot.o $(PY_ENGINE_OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS) -ldl
+
+python-check: $(OBJDIR)/test_python_snapshot
+	QPYHOME=$(abspath $(Q)) ./$(OBJDIR)/test_python_snapshot
+
+# C-extension state: needs the top-level build (libqpcapi.a)
+python-capi-check:
+	$(MAKE) -C $(Q) test-snapshot-capi
 
 $(OBJDIR):
 	mkdir -p $@
@@ -78,7 +96,7 @@ stress:
 clean:
 	rm -rf build build-asan build-stress build-asan-stress
 
-.PHONY: all check stress clean
+.PHONY: all check python-check python-capi-check stress clean
 .SECONDARY:
 
 -include $(wildcard $(OBJDIR)/*.d)

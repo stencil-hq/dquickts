@@ -1,0 +1,80 @@
+plain 1.0 1.0 0.5 0.0 -0.0 10.25
+exponent 1000.0 1000.0 0.001 150.0 0.00025 0.0 1.0
+underscores 1000.5 10.01 10000000000.0 1e-06
+large 1e+308 inf -inf 1.7976931348623157e+308
+small 1e-320 5e-324 0.0 2.2250738585072014e-308
+repr 0.1 1e+16 1e-05 123.0 1e+22 1e+21
+integral True 1000000000000000.0 1e+16 1000000000000000.0 1e+16
+leading zeros ok 0.5 7.25 0.0 9.0
+type float float float
+imag 1j 2j 0j 1.5j 1000j 10j (-0-1j)
+complex sum (1+2j) (1.5-0.5j) (-1-1j) (-2+1j)
+complex parts 3.0 4.0 (3-4j) 5.0
+complex repr (1+0j) 1j (-0-0j) -0j (-0+0j)
+complex type complex float
+complex eq True True (-1+0j)
+complex special (inf+0j) (nan+nanj) (inf-infj)
+float '1.5' 1.5
+float ' -2.5e3 ' -2500.0
+float '+.5' 0.5
+float '1_000.25' 1000.25
+float 'inf' inf
+float '-Infinity' -inf
+float 'nan' nan
+float 'NaN' nan
+float '-nan' nan
+float '1e500' inf
+float '-1e500' -inf
+float '1e-500' 0.0
+float '0x10' ValueError could not convert string to float: '0x10'
+float '1.5.2' ValueError could not convert string to float: '1.5.2'
+float '' ValueError could not convert string to float: ''
+float '1__0' ValueError could not convert string to float: '1__0'
+float '1_' ValueError could not convert string to float: '1_'
+float 'infinity' inf
+float ' iNF ' inf
+float '1e' ValueError could not convert string to float: '1e'
+float 'e5' ValueError could not convert string to float: 'e5'
+float '.' ValueError could not convert string to float: '.'
+float '١.٢' 1.2
+float '١٢٣' 123.0
+float() 1 1.0
+float() -1 -1.0
+float() 100000000000000000000 1e+20
+float() True 1.0
+float() None TypeError float() argument must be a string or a real number, not 'NoneType'
+float() 'x' ValueError could not convert string to float: 'x'
+float() b'3.5' 3.5
+float() [1] TypeError float() argument must be a string or a real number, not 'list'
+float big int OverflowError int too large to convert to float
+complex '1+2j' (1+2j)
+complex '1-2J' (1-2j)
+complex 'j' 1j
+complex '-j' -1j
+complex '2.5j' 2.5j
+complex ' (1+1j) ' (1+1j)
+complex '1+j' (1+1j)
+complex '1 + 2j' ValueError complex() arg is a malformed string
+complex '' ValueError complex() arg is a malformed string
+complex '1+2' ValueError complex() arg is a malformed string
+complex 'inf+nanj' (inf+nanj)
+complex 'j1' ValueError complex() arg is a malformed string
+complex ctor (1+2j) 0j (2+0j) 1j (3+4j)
+is_integer True False
+as_integer_ratio (3, 4) (3602879701896397, 36028797018963968)
+hex 0x1.0000000000000p+0 -0x1.999999999999ap-4 0x0.0p+0 3.0 -0.25
+float int conversion 2 -2 2 4 -2 2.67
+round ndigits 1200.0 1234.6 0 int
+syntax '1.e' invalid decimal literal
+syntax '1e+' invalid decimal literal
+syntax '1_.5' invalid decimal literal
+syntax '1._5' invalid decimal literal
+syntax '1e_5' invalid decimal literal
+syntax '1.5_' invalid decimal literal
+syntax '0x1.5' invalid syntax
+syntax '1__0.5' invalid decimal literal
+syntax '1.5jj' invalid imaginary literal
+literal attr 1.0 1 0 0x1.8000000000000p+0 0.0 True
+inf arith inf nan nan inf 0.0
+nan arith nan nan False True True
+special repr inf -inf nan nan

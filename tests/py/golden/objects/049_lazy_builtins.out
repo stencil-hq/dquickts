@@ -1,0 +1,41 @@
+map lazy map []
+map first 2 ['m:1']
+map rest [4, 6] exhausted []
+filter lazy []
+filter first 2 ['f:1', 'f:2']
+zip [(1, 'x'), (2, 'y')]
+zip pull order ['a:1', "b:'x'", 'a:2', "b:'y'", 'a:3']
+zip shorter first [(1, 'x'), (2, 'y')] ['a:1', "b:'x'", 'a:2', "b:'y'"]
+zip empty [] [] []
+zip three [('a', 1, True), ('b', 2, False)]
+ValueError zip() argument 2 is shorter than argument 1
+ValueError zip() argument 2 is longer than argument 1
+zip strict ok [('a', 'c'), ('b', 'd')]
+unzip [(1, 2), ('a', 'b')]
+enumerate lazy []
+enumerate [(10, 'a'), (11, 'b')] []
+enumerate negative start [(-1, 'x'), (0, 'y')]
+reversed type list_reverseiterator [3, 2, 1] []
+reversed range [7, 4, 1]
+reversed str olleh
+reversed dict ['b', 'a']
+reversed after shrink []
+range reusable [0, 1, 2] [0, 1, 2] 3 2
+range iterator single use [0, 1, 2] []
+range slicing range(2, 8, 2) [9, 6, 3, 0]
+range contains True False True
+range repr range(0, 5) range(1, 5) range(1, 5, 2)
+range empty [] False True
+shared iterator zip [(1, 2), (3, 4), (5, 6)]
+map over shared [1, 5]
+filter None [3, 'x', [1]]
+map multiple stops shortest [32, 9]
+any consumes until true True 4
+in consumes until found True 5
+sum then empty 14 0
+map consumed by tuple ('A', 'B') ()
+TypeError object of type 'map' has no len()
+TypeError 'map' object is not subscriptable
+TypeError 'generator' object is not reversible
+TypeError 'int' object is not callable
+TypeError 'int' object is not iterable

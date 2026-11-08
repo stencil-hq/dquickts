@@ -102,6 +102,31 @@ bytes = ["rquickjs-core/bytes"]
 # Enable interop between Rust futures and JS Promises
 futures = ["rquickjs-core/futures"]
 
+# Embed the Python 3.15 runtime of the engine (Ctx::init_python, Ctx::eval_python,
+# Ctx::python_import)
+python = ["rquickjs-core/python"]
+
+# CPython C modules that link a system library (found with pkg-config, else
+# linked by name; the self-contained C modules come with `python`)
+# zlib (zlib)
+python-zlib = ["python", "rquickjs-core/python-zlib"]
+# _bz2 (bzip2)
+python-bz2 = ["python", "rquickjs-core/python-bz2"]
+# _lzma (liblzma)
+python-lzma = ["python", "rquickjs-core/python-lzma"]
+# _sqlite3 (sqlite3)
+python-sqlite3 = ["python", "rquickjs-core/python-sqlite3"]
+# _ssl and _hashlib (OpenSSL)
+python-ssl = ["python", "rquickjs-core/python-ssl"]
+# _zstd (libzstd)
+python-zstd = ["python", "rquickjs-core/python-zstd"]
+# _ctypes (libffi)
+python-ctypes = ["python", "rquickjs-core/python-ctypes"]
+# readline (GNU readline or libedit)
+python-readline = ["python", "rquickjs-core/python-readline"]
+# _uuid (libuuid; built without it on macOS)
+python-uuid = ["python", "rquickjs-core/python-uuid"]
+
 # Enable QuickJS dumps for debug
 dump-bytecode = ["rquickjs-core/dump-bytecode"]
 dump-gc = ["rquickjs-core/dump-gc"]

@@ -1,0 +1,51 @@
+(5).__index__() 5
+True.__index__() 1
+(2**100).__index__() 1267650600228229401496703205376
+list[Idx(1)] 20
+list[Idx(-1)] 50
+list[Idx(1):Idx(3)] [20, 30]
+list[::Idx(2)] [10, 30, 50]
+'abc'[Idx(2)] 'c'
+b'abc'[Idx(0)] 97
+(1, 2)[Idx(0)] 1
+range(Idx(3)) range(0, 3)
+list(range(Idx(1), Idx(7), Idx(2))) [1, 3, 5]
+range(10)[Idx(4)] 4
+hex(Idx(255)) '0xff'
+bin(Idx(5)) '0b101'
+oct(Idx(8)) '0o10'
+'ab' * Idx(3) 'ababab'
+[0] * Idx(2) [0, 0]
+bytes(Idx(3)) b'\x00\x00\x00'
+int(Idx(7)) 7
+float(Idx(7)) 7.0
+complex(Idx(7)) (7+0j)
+operator-free index 20
+list.insert(Idx) ['x', 1, 2]
+chr(Idx(65)) 'A'
+round(1.23456, Idx(2)) 1.23
+pow(2, Idx(5)) TypeError unsupported operand type(s) for ** or pow(): 'int' and 'Idx'
+slice(Idx(1), Idx(4)).indices(3) (1, 3, 1)
+int.from_bytes chosen length b'\x01,'
+list[1.0] TypeError list indices must be integers or slices, not float
+list[OnlyInt()] TypeError list indices must be integers or slices, not OnlyInt
+int(OnlyInt()) 3
+range(OnlyInt()) TypeError 'OnlyInt' object cannot be interpreted as an integer
+range(1.0) TypeError 'float' object cannot be interpreted as an integer
+hex(OnlyInt()) TypeError 'OnlyInt' object cannot be interpreted as an integer
+'ab' * 2.0 TypeError can't multiply sequence by non-int of type 'float'
+list['1'] TypeError list indices must be integers or slices, not str
+list[None] TypeError list indices must be integers or slices, not NoneType
+list[BadIndex()] TypeError BadIndex.__index__() must return an int, not float
+hex(BadIndex()) TypeError BadIndex.__index__() must return an int, not float
+'abc'[half] TypeError string indices must be integers, not 'float'
+(1,)[None:None] (1,)
+data['a':] TypeError slice indices must be integers or have an __index__ method
+data[1.0:] TypeError slice indices must be integers or have an __index__ method
+data[10**30] IndexError cannot fit 'int' into an index-sized integer
+data[-10**30] IndexError cannot fit 'int' into an index-sized integer
+data[10**30:] []
+data[-10**30:2] [10, 20]
+data[::10**30] [10]
+data[::0] ValueError slice step cannot be zero
+isinstance index result 'int'

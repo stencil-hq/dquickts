@@ -1,0 +1,78 @@
+split() [b'a', b'b', b'c']
+split ws ascii only [b'a\xa0b\x85c']
+split sep [b'a', b'b', b'', b'c']
+split maxsplit [b'a', b'b,c']
+rsplit maxsplit [b'a,b', b'c']
+split empty sep ValueError empty separator
+split str sep TypeError a bytes-like object is required, not 'str'
+split int sep TypeError a bytes-like object is required, not 'int'
+split bytearray sep [b'a', b'b']
+strip b'ab'
+strip high ws b'\xa0ab\xa0'
+strip chars b'ab'
+lstrip b'ab '
+rstrip chars b'ab'
+strip str chars TypeError a bytes-like object is required, not 'str'
+replace b'a+b+c'
+replace count b'ab-c'
+replace empty b'.a.b.'
+replace str TypeError a bytes-like object is required, not 'str'
+startswith True
+startswith tuple True
+endswith range True
+startswith str TypeError startswith first arg must be bytes or a tuple of bytes, not str
+find 2
+find int 2
+rfind int 3
+find int range -1
+find bad int ValueError byte must be in range(0, 256)
+find str TypeError argument should be integer or bytes-like object, not 'str'
+index missing ValueError subsection not found
+rindex int missing ValueError subsection not found
+count 2
+count int 3
+count empty 4
+hex '00abff'
+hex sep '01:02:03:04'
+hex sep bytes_per_sep '01-0203-0405'
+hex sep negative '0102-0304-05'
+hex empty ''
+hex bad sep ValueError sep must be length 1.
+fromhex b'\x00\xab\xff'
+fromhex empty b''
+fromhex whitespace b'\n\x0b'
+fromhex odd ValueError fromhex() arg must contain an even number of hexadecimal digits
+fromhex bad ValueError non-hexadecimal number found in fromhex() arg at position 0
+fromhex split byte ValueError non-hexadecimal number found in fromhex() arg at position 1
+fromhex bytes arg b'\xab'
+decode 'café'
+decode errors replace 'caf�'
+decode latin-1 'café'
+decode strict UnicodeDecodeError 'utf-8' codec can't decode byte 0xe9 in position 3: unexpected end of data
+join b'a, b, c'
+join type 'bytes'
+join str TypeError sequence item 1: expected a bytes-like object, str found
+join int TypeError sequence item 0: expected a bytes-like object, int found
+upper b'ABC\xe9XYZ'
+lower b'abc\xc9'
+title b'Hello World'
+capitalize b'Hello'
+swapcase b'AbC'
+partition (b'k', b'=', b'v=w')
+rpartition (b'k=v', b'=', b'w')
+center b'**ab**'
+ljust b'ab  '
+rjust fill str TypeError rjust() argument 2 must be a byte string of length 1, not str
+zfill b'-005'
+expandtabs b'a   b'
+removeprefix b'x'
+removesuffix b'x'
+isdigit (True, False, False)
+isalpha (True, False)
+isspace (True, False)
+isascii (True, False, True)
+isupper/islower (True, True, False)
+istitle (True, False)
+isalnum (True, False)
+bytes has no encode AttributeError 'bytes' object has no attribute 'encode'
+bytes has no format AttributeError 'bytes' object has no attribute 'format'

@@ -39,6 +39,28 @@ import * as os from "os";
        each command. It keeps the values: it returns their rendering
        and answers the completion queries with JSON copies. */
     var durable = options.durable;
+    /* Python (qjs built with it, except in a JavaScript durable session):
+       it runs the Python inputs in the durable session or, in the plain
+       REPL, in this runtime (initialized by the first Python input).
+       Python decides when the lines form a complete input
+       (pyrt.complete()), gives the prompts (sys.ps1, sys.ps2) and the
+       completions, and writes the results and the tracebacks itself. */
+    var pyrt = options.python;
+    /* the language selected by \py and \js: true for Python (a Python
+       durable session starts in Python, or in the language it was left
+       in) */
+    var lang_py = !!(durable && pyrt && durable.language !== "js");
+    /* the language of the current input: '\py CODE' and '\js CODE' run
+       one input in the other language */
+    var python = lang_py;
+    /* stdin is not a terminal: the lines are read without editing or
+       echo, and wait in 'plain_lines' while an input runs */
+    var plain = false;
+    var plain_line = "";
+    var plain_lines = [];
+    var plain_busy = false; /* an input runs (until readline_start()) */
+    var plain_loop = false; /* plain_next() runs the lines */
+    var plain_eof = false; /* the end of stdin was read */
 
     /* close global objects */
     var Object = g.Object;
@@ -137,6 +159,11 @@ import * as os from "os";
                 /* set the TTY to raw mode */
                 os.ttySetRaw(term_fd);
             }
+        } else {
+            plain = true;
+            show_colors = false;
+            for (var k in colors)
+                colors[k] = "";
         }
 
         /* install a Ctrl-C signal handler */
@@ -155,6 +182,10 @@ import * as os from "os";
     function term_read_handler() {
         var l, i;
         l = os.read(term_fd, term_read_buf.buffer, 0, term_read_buf.length);
+        if (l <= 0) {
+            input_eof();
+            return;
+        }
         for(i = 0; i < l; i++)
             handle_byte(term_read_buf[i]);
     }
@@ -279,7 +310,8 @@ import * as os from "os";
         /* cursor_pos is the position in 16 bit characters inside the
            UTF-16 string 'cmd' */
         if (cmd != last_cmd) {
-            if (!show_colors && last_cmd.substring(0, last_cursor_pos) == cmd.substring(0, last_cursor_pos)) {
+            if (!show_colors &&
+                last_cmd.substring(0, last_cursor_pos) == cmd.substring(0, last_cursor_pos)) {
                 /* optimize common case */
                 std.puts(cmd.substring(last_cursor_pos));
             } else {
@@ -288,8 +320,7 @@ import * as os from "os";
                 if (show_colors) {
                     var str = mexpr ? mexpr + '\n' + cmd : cmd;
                     var start = str.length - cmd.length;
-                    var colorstate = colorize_js(str);
-                    print_color_text(str, start, colorstate[2]);
+                    print_color_text(str, start, colorize_input(str));
                 } else {
                     std.puts(cmd);
                 }
@@ -550,6 +581,13 @@ import * as os from "os";
     }
 
     function control_c() {
+        if (python) {
+            /* like Python: the input is dropped */
+            std.puts("\nKeyboardInterrupt\n");
+            mexpr = "";
+            readline_start("", readline_cb);
+            return;
+        }
         if (last_fun === control_c) {
             std.puts("\n");
             std.exit(0);
@@ -657,7 +695,8 @@ import * as os from "os";
         /* add non-numeric regular properties with s as prefix */
         for (j = 0; j < props.length; j++) {
             var prop = props[j];
-            if (""+(+prop) != prop && prop.startsWith(s))
+            /* (not the hidden names of the Python sessions, "\x01...") */
+            if (""+(+prop) != prop && prop.startsWith(s) && prop[0] >= " ")
                 r.push(prop);
         }
         if (r.length > 1) {
@@ -687,9 +726,28 @@ import * as os from "os";
         return { tab: r, pos: s.length, expr: expr };
     }
 
+    /* the Python names completing the word before 'pos' (an attribute
+       after a dotted name, like rlcompleter) */
+    function get_py_completions(line, pos) {
+        var s, m, expr = "", names;
+        s = get_context_word(line, pos);
+        m = /([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\.$/.exec(line.substring(0, pos - s.length));
+        if (m)
+            expr = m[1];
+        else if (pos - s.length > 0 && line[pos - s.length - 1] === ".")
+            return { tab: [], pos: s.length };
+        names = pyrt.names(expr, s);
+        return { tab: names ? names.split("\n") : [], pos: s.length };
+    }
+
     function completion() {
         var tab, res, s, i, j, len, t, max_width, col, n_cols, row, n_rows;
-        res = get_completions(cmd, cursor_pos);
+        if (python && /^\s*$/.test(cmd.substring(0, cursor_pos))) {
+            /* indentation */
+            insert("    ");
+            return;
+        }
+        res = python ? get_py_completions(cmd, cursor_pos) : get_completions(cmd, cursor_pos);
         tab = res.tab;
         if (tab.length === 0)
             return;
@@ -708,7 +766,7 @@ import * as os from "os";
         for(i = res.pos; i < len; i++) {
             insert(s[i]);
         }
-        if (last_fun === completion && tab.length == 1) {
+        if (last_fun === completion && tab.length == 1 && !python) {
             /* append parentheses to function names */
             insert(query_suffix(res.expr, tab[0]));
         }
@@ -810,14 +868,20 @@ import * as os from "os";
     }
 
     function readline_start(defstr, cb) {
-        cmd = defstr || "";
+        /* the plain lines are not edited */
+        cmd = plain ? "" : defstr || "";
         cursor_pos = cmd.length;
         history_index = history.length;
         readline_cb = cb;
+        /* a new input is in the selected language */
+        if (!mexpr)
+            python = lang_py;
 
         prompt = pstate;
 
-        if (mexpr) {
+        if (python) {
+            prompt = pyrt.prompt(!!mexpr);
+        } else if (mexpr) {
             prompt += dupstr(" ", plen - prompt.length);
             prompt += ps2;
         } else {
@@ -831,10 +895,45 @@ import * as os from "os";
         readline_print_prompt();
         update();
         readline_state = 0;
+        if (plain) {
+            /* the next line can run (after the jobs of an input whose
+               evaluation is asynchronous) */
+            plain_busy = false;
+            if (!plain_loop)
+                os.setTimeout(plain_next, 0);
+        }
+    }
+
+    /* run the lines read from a plain stdin, one input at a time, then
+       end the REPL after the last one */
+    function plain_next() {
+        plain_loop = true;
+        while (!plain_busy && plain_lines.length > 0) {
+            plain_busy = true;
+            readline_cb(plain_lines.shift());
+        }
+        plain_loop = false;
+        if (!plain_busy && plain_eof) {
+            plain_eof = false;
+            input_end("");
+        }
     }
 
     function handle_char(c1) {
         var c;
+        if (plain) {
+            /* one line, without echo */
+            if (c1 == 10) {
+                plain_lines.push(plain_line);
+                plain_line = "";
+                plain_next();
+            } else if (c1 == 3) {
+                control_c(); /* from sigint_handler() */
+            } else if (c1 != 13) {
+                plain_line += String.fromCodePoint(c1);
+            }
+            return;
+        }
         c = String.fromCodePoint(c1);
         switch(readline_state) {
         case 0:
@@ -972,6 +1071,8 @@ import * as os from "os";
             return n ? "*": " ";
         }
         std.puts("\\h          this help\n" +
+                 "\\js [code] " + sel(!lang_py) + "JavaScript inputs, or run 'code' as one\n" +
+                 "\\py [code] " + sel(lang_py) + "Python inputs, or run 'code' as one\n" +
                  "\\x         " + sel(hex_mode) + "hexadecimal number display\n" +
                  "\\d         " + sel(!hex_mode) + "decimal number display\n" +
                  "\\t         " + sel(show_time) + "toggle timing display\n" +
@@ -980,7 +1081,10 @@ import * as os from "os";
     }
 
     function cmd_start() {
-        std.puts('QuickJS - Type "\\h" for help\n');
+        if (python)
+            std.puts(pyrt.banner);
+        else
+            std.puts('QuickJS - Type "\\h" for help\n');
         if (durable) {
             std.puts((durable.restored ? "Restored" : "Created") +
                      " the durable session " + durable.path + "\n");
@@ -999,19 +1103,109 @@ import * as os from "os";
         }
     }
 
-    /* return true if async termination */
-    function handle_cmd(expr) {
-        var colorstate, cmd;
-
-        if (expr === null) {
-            expr = "";
+    /* a Python line: run the input when it is complete (return true) */
+    function handle_py_cmd(line) {
+        var src;
+        if (line === null)
+            return false;
+        if (!mexpr && /^[ \t\f\r]*(#.*)?$/.test(line))
+            return false; /* blank line or comment */
+        src = mexpr ? mexpr + "\n" + line : line;
+        if (!pyrt.complete(src)) {
+            mexpr = src;
             return false;
         }
-        if (expr === "?") {
+        mexpr = "";
+        eval_and_print_start(src);
+        return true;
+    }
+
+    /* the end of stdin: the remaining lines run (in a plain stdin), then
+       the REPL ends */
+    function input_eof() {
+        os.setReadHandler(term_fd, null);
+        if (plain) {
+            if (plain_line) {
+                plain_lines.push(plain_line);
+                plain_line = "";
+            }
+            plain_eof = true;
+            plain_next();
+        } else {
+            input_end(cmd);
+        }
+    }
+
+    /* end the REPL after the last line 'line' (not run): a pending Python
+       input runs, as Python does */
+    function input_end(line) {
+        var src = mexpr;
+        if (line)
+            src = src ? src + "\n" + line : line;
+        mexpr = cmd = "";
+        std.puts("\n");
+        if (python && src && !/^[ \t\f\r]*(#.*)?$/.test(src))
+            python_eval(src);
+        os.signal(os.SIGINT, null);
+    }
+
+    /* run the complete Python input 'src' (Python prints the results);
+       SystemExit ends qjs */
+    function python_eval(src) {
+        var result = pyrt.eval(src);
+        if (result.exit !== undefined)
+            std.exit(result.exit);
+    }
+
+    /* \py and \js: 'py' selects Python for the next inputs, or JavaScript
+       if false; with 'code', only 'code' is an input in that language
+       (its continuation lines too). Return true if async termination. */
+    function select_language(py, code) {
+        if (py) {
+            if (!pyrt) {
+                std.puts(durable ?
+                         "\\py: this session has no Python: start it with qjs --drepl FILE --python\n" :
+                         "\\py: this qjs has no Python\n");
+                return false;
+            }
+            try {
+                pyrt.init();
+            } catch (e) {
+                std.puts("\\py: " + e.message + "\n");
+                return false;
+            }
+        }
+        code = code.replace(/^[ \t]+/, "");
+        if (code === "") {
+            if (lang_py != py && durable && durable.setLanguage)
+                durable.setLanguage(py ? "python" : "js");
+            lang_py = python = py;
+            return false;
+        }
+        python = py;
+        return py ? handle_py_cmd(code) : handle_js_cmd(code);
+    }
+
+    /* return true if async termination */
+    function handle_cmd(expr) {
+        var cmd;
+
+        if (expr === null)
+            return false;
+        /* in Python, the directives start an input */
+        if (python && mexpr)
+            return handle_py_cmd(expr);
+        if (expr === "?" && !python) {
             help();
             return false;
         }
         cmd = extract_directive(expr);
+        if (cmd === "py" || cmd === "js") {
+            /* they start an input */
+            if (mexpr)
+                return handle_js_cmd(expr);
+            return select_language(cmd === "py", expr.substring(cmd.length + 1));
+        }
         if (cmd === "load" && durable) {
             /* the file is a command of the durable runtime */
             var filename = directive_filename(cmd, expr);
@@ -1020,6 +1214,7 @@ import * as os from "os";
                 std.puts("Cannot load " + filename + "\n");
                 return false;
             }
+            python = false;
             eval_and_print_start(expr);
             return true;
         }
@@ -1029,9 +1224,16 @@ import * as os from "os";
             }
             expr = expr.substring(cmd.length + 1);
         }
+        return python ? handle_py_cmd(expr) : handle_js_cmd(expr);
+    }
+
+    /* a JavaScript line: run the command when it is complete (return true
+       if async termination) */
+    function handle_js_cmd(expr) {
+        var colorstate;
+
         if (expr === "")
             return false;
-
         if (mexpr)
             expr = mexpr + '\n' + expr;
         colorstate = colorize_js(expr);
@@ -1052,6 +1254,11 @@ import * as os from "os";
         var result;
 
         eval_start_time = os.now();
+        if (python) {
+            python_eval(expr);
+            handle_cmd_end();
+            return;
+        }
         if (durable) {
             /* synchronous: the durable runtime also runs the jobs of
                the command */
@@ -1370,6 +1577,186 @@ import * as os from "os";
         }
         set_style(n, n);
         return [ state, level, r ];
+    }
+
+    /* the styles of the input 'str' in the current language; a \py or \js
+       directive starting a new input colors the rest in its language */
+    function colorize_input(str) {
+        var m = !mexpr && /^\\(py|js)(\s|$)/.exec(str);
+        var r, i, len;
+        if (!m)
+            return (python ? colorize_py(str) : colorize_js(str))[2];
+        len = 1 + m[1].length;
+        str = str.substring(len);
+        r = (m[1] == "py" ? colorize_py(str) : colorize_js(str))[2];
+        for (i = 0; i < len; i++)
+            r.unshift('keyword');
+        return r;
+    }
+
+    var py_keywords = "|False|None|True|and|as|assert|async|await|break|" +
+        "class|continue|def|del|elif|else|except|finally|for|from|global|" +
+        "if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|" +
+        "while|with|yield|";
+    /* keywords only at the start of a statement */
+    var py_soft_keywords = "|match|case|type|";
+    var py_types = "|bool|bytearray|bytes|complex|dict|float|frozenset|int|" +
+        "list|memoryview|object|range|set|slice|str|tuple|";
+    var py_string_prefixes = "|r|u|b|br|rb|f|fr|rf|t|tr|rt|";
+
+    /* the style of each UTF-16 unit of the Python source 'str', with the
+       styles of colorize_js(): a name after def or a decorator is a
+       'function', after class a 'type' */
+    function colorize_py(str) {
+        var i, c, start, style, n = str.length;
+        var r = [], level = 0, stmt_start = true, def_name = null;
+
+        function set_style(from, to) {
+            while (r.length < from)
+                r.push('default');
+            while (r.length < to)
+                r.push(style);
+        }
+
+        function next_char(j) {
+            while (j < n && (str[j] == ' ' || str[j] == '\t'))
+                j++;
+            return j < n ? str[j] : "";
+        }
+
+        /* from the opening quote at i; a single-quoted string ends at the
+           end of the line */
+        function parse_string(q) {
+            var triple = str.substring(i, i + 3) == q + q + q;
+            style = 'string';
+            i += triple ? 3 : 1;
+            while (i < n) {
+                c = str[i++];
+                if (c == '\\') {
+                    i++;
+                } else if (c == '\n' && !triple) {
+                    i--;
+                    break;
+                } else if (c == q && (!triple || str.substring(i, i + 2) == q + q)) {
+                    if (triple)
+                        i += 2;
+                    break;
+                }
+            }
+        }
+
+        function parse_number() {
+            style = 'number';
+            while (i < n) {
+                c = str[i];
+                if (is_word(c) || c == '.' ||
+                    ((c == '+' || c == '-') && (str[i - 1] == 'e' || str[i - 1] == 'E') &&
+                     !/^0[xX]/.test(str.substring(start, i)))) {
+                    i++;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        function parse_identifier() {
+            var w, next;
+            while (i < n && is_word(str[i]))
+                i++;
+            w = '|' + str.substring(start, i) + '|';
+            if ((str[i] == '"' || str[i] == '\'') &&
+                py_string_prefixes.indexOf(w.toLowerCase()) >= 0) {
+                parse_string(str[i]);
+                return;
+            }
+            next = next_char(i);
+            if (def_name) {
+                style = def_name;
+            } else if (py_keywords.indexOf(w) >= 0) {
+                style = 'keyword';
+            } else if (stmt_start && py_soft_keywords.indexOf(w) >= 0 &&
+                       (str[i] == ' ' || str[i] == '\t') && "=.,:;)]}".indexOf(next) < 0) {
+                style = 'keyword';
+            } else if (next == '(') {
+                style = 'function';
+            } else if (py_types.indexOf(w) >= 0) {
+                style = 'type';
+            } else {
+                style = 'identifier';
+            }
+            def_name = w == '|def|' ? 'function' : w == '|class|' ? 'type' : null;
+        }
+
+        for (i = 0; i < n;) {
+            var at_start = stmt_start;
+            style = null;
+            start = i;
+            stmt_start = false;
+            switch (c = str[i++]) {
+            case '\n':
+                stmt_start = level == 0 && str[i - 2] != '\\';
+                def_name = null;
+                continue;
+            case ' ':
+            case '\t':
+            case '\r':
+            case '\f':
+                stmt_start = at_start;
+                continue;
+            case ';':
+                stmt_start = level == 0;
+                continue;
+            case '#':
+                style = 'comment';
+                while (i < n && str[i] != '\n')
+                    i++;
+                stmt_start = at_start;
+                break;
+            case '@':
+                if (at_start && i < n && is_word(str[i])) {
+                    style = 'function';
+                    while (i < n && (is_word(str[i]) || str[i] == '.'))
+                        i++;
+                    break;
+                }
+                continue;
+            case '\'':
+            case '\"':
+                i--;
+                parse_string(c);
+                break;
+            case '(':
+            case '[':
+            case '{':
+                level++;
+                continue;
+            case ')':
+            case ']':
+            case '}':
+                if (level > 0)
+                    level--;
+                continue;
+            case '.':
+                if (!is_digit(str[i]))
+                    continue;
+                parse_number();
+                break;
+            default:
+                if (is_digit(c)) {
+                    parse_number();
+                    break;
+                }
+                if (is_word(c)) {
+                    parse_identifier();
+                    break;
+                }
+                continue;
+            }
+            if (style)
+                set_style(start, i);
+        }
+        set_style(n, n);
+        return [ "", level, r ];
     }
 
     termInit();

@@ -1,0 +1,17 @@
+start
+validated 3 -> 6
+validated 2 -> 4
+validated 1 -> 2
+validated 0 -> 0
+first failure handled: ValueError boom
+pipeline ok [2, 4, 6]
+results so far [6, 4, 2, 0]
+total 12
+about to fail
+countdown 3
+countdown 2
+countdown 1
+enter outer
+finally in level2 runs before exit
+exit outer ValueError
+[exit 1] ValueError: boom

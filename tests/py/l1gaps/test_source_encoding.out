@@ -1,0 +1,48 @@
+cp1252 import 'caf\xe9 \u20ac'
+cp1252 compile 'caf\xe9 \u20ac'
+cp1252 exec 'caf\xe9 \u20ac'
+latin9 import '\u20ac'
+latin9 compile '\u20ac'
+latin9 exec '\u20ac'
+koi8_r import '\u043f\u0440\u0438'
+koi8_r compile '\u043f\u0440\u0438'
+koi8_r exec '\u043f\u0440\u0438'
+shift_jis import '\u65e5\u672c \u8868'
+shift_jis compile '\u65e5\u672c \u8868'
+shift_jis exec '\u65e5\u672c \u8868'
+euc_jp import '\u65e5'
+euc_jp compile '\u65e5'
+euc_jp exec '\u65e5'
+line2 import '\u041f\u0440'
+line2 compile '\u041f\u0440'
+line2 exec '\u041f\u0440'
+line3 import SyntaxError "Non-UTF-8 code starting with '\\xd0' on line 4, but no encoding declared; see https://peps.python.org/pep-0263/ for details" l1enc_line3.py 4 6 'x = "\ufffd\ufffd"' 4 6
+line3 compile SyntaxError "Non-UTF-8 code starting with '\\xd0' on line 4, but no encoding declared; see https://peps.python.org/pep-0263/ for details" l1enc_line3.py 4 6 'x = "\ufffd\ufffd"' 4 6
+line3 exec SyntaxError "Non-UTF-8 code starting with '\\xd0' on line 4, but no encoding declared; see https://peps.python.org/pep-0263/ for details" <string> 4 6 'x = "\ufffd\ufffd"' 4 6
+utf8sig import '\xe9'
+utf8sig compile '\xe9'
+utf8sig exec '\xe9'
+bom_utf8 import '\xe9'
+bom_utf8 compile '\xe9'
+bom_utf8 exec '\xe9'
+bom_cookie import SyntaxError 'encoding problem: cp1252 with BOM' l1enc_bom_cookie.py 1 0 '# coding: cp1252' 1 16
+bom_cookie compile SyntaxError 'encoding problem: cp1252 with BOM' l1enc_bom_cookie.py 1 0 '# coding: cp1252' 1 16
+bom_cookie exec SyntaxError 'encoding problem: cp1252 with BOM' <string> 1 0 '# coding: cp1252' 1 16
+bogus import SyntaxError 'unknown encoding: bogus-enc' l1enc_bogus.py 0 -1 None None None
+bogus compile SyntaxError 'unknown encoding: bogus-enc' l1enc_bogus.py 0 -1 None None None
+bogus exec SyntaxError 'unknown encoding: bogus-enc' <string> 0 -1 None None None
+utf16 import SyntaxError "'utf-16-le' codec can't decode byte 0x0a in position 22: truncated data" l1enc_utf16.py 0 -1 None None None
+utf16 compile SyntaxError "'utf-16-le' codec can't decode byte 0x0a in position 22: truncated data" l1enc_utf16.py 0 -1 None None None
+utf16 exec SyntaxError "'utf-16-le' codec can't decode byte 0x0a in position 22: truncated data" <string> 0 -1 None None None
+undefined import SyntaxError "'charmap' codec can't decode byte 0x81 in position 30: character maps to <undefined>" l1enc_undefined.py 0 -1 None None None
+undefined compile SyntaxError "'charmap' codec can't decode byte 0x81 in position 30: character maps to <undefined>" l1enc_undefined.py 0 -1 None None None
+undefined exec SyntaxError "'charmap' codec can't decode byte 0x81 in position 30: character maps to <undefined>" <string> 0 -1 None None None
+ascii import SyntaxError "'ascii' codec can't decode byte 0xe9 in position 27: ordinal not in range(128)" l1enc_ascii.py 0 -1 None None None
+ascii compile SyntaxError "'ascii' codec can't decode byte 0xe9 in position 27: ordinal not in range(128)" l1enc_ascii.py 0 -1 None None None
+ascii exec SyntaxError "'ascii' codec can't decode byte 0xe9 in position 27: ordinal not in range(128)" <string> 0 -1 None None None
+nocookie import SyntaxError "Non-UTF-8 code starting with '\\xe9' on line 2, but no encoding declared; see https://peps.python.org/pep-0263/ for details" l1enc_nocookie.py 2 6 'y = "\ufffd"' 2 6
+nocookie compile SyntaxError "Non-UTF-8 code starting with '\\xe9' on line 2, but no encoding declared; see https://peps.python.org/pep-0263/ for details" l1enc_nocookie.py 2 6 'y = "\ufffd"' 2 6
+nocookie exec SyntaxError "Non-UTF-8 code starting with '\\xe9' on line 2, but no encoding declared; see https://peps.python.org/pep-0263/ for details" <string> 2 6 'y = "\ufffd"' 2 6
+latin1 import '\xe9'
+latin1 compile '\xe9'
+latin1 exec '\xe9'

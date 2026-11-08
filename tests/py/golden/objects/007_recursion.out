@@ -1,0 +1,19 @@
+fact 0 1
+fact 10 3628800
+fact 30 265252859812191058636308480000000
+fib 0..15 [0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610]
+mutual True True False
+hanoi 3 ['AC', 'AB', 'CB', 'AC', 'BA', 'BC', 'AC']
+flatten [1, 2, 3, 4, 5, 6]
+perms ['abc', 'acb', 'bac', 'bca', 'cab', 'cba']
+ackermann 2 3 9
+depth 500 125250
+unbounded RecursionError
+RecursionError base RuntimeError
+tree total 21
+tree depth 4
+repr recursion RecursionError
+self-referencing list [1, [...]]
+self-referencing dict {'k': 1, 'self': {...}}
+recovered recovered
+still works 120

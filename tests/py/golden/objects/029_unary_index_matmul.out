@@ -1,0 +1,27 @@
+unary Num(-5) Num(5) Num(3) Num(-6)
+conversions 5 5.0 (5+1j)
+round rounded None rounded 2
+neg str TypeError bad operand type for unary -: 'str'
+invert float TypeError bad operand type for unary ~: 'float'
+abs list TypeError bad operand type for abs(): 'list'
+index subscript 3 9
+index slice [2, 3, 4] bdf
+index builtins 0b101 0xff 0o10
+index range [0, 1, 2] xxx
+index int() 7 [0, 0]
+operator-free index 5 1
+TypeError list indices must be integers or slices, not float
+TypeError list indices must be integers or slices, not Num
+TypeError BadIndex.__index__() must return an int, not str
+TypeError BadInt.__int__() must return an int, not float
+matmul Matrix([[7, 10], [15, 22]]) Matrix([[1, 2], [3, 4]])
+rmatmul rmatmul with list
+imatmul Matrix([[7, 10], [15, 22]])
+TypeError unsupported operand type(s) for @: 'int' and 'int'
+not uses bool True False
+builtin unary 5 1 -1 0 -0.0 0.0 -18446744073709551616
+int of float edge -2 2 100000000000000000000
+OverflowError cannot convert float infinity to integer
+ValueError cannot convert float NaN to integer
+complex parts 2.0 1.0
+float of Idx 4.0

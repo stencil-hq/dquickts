@@ -1,0 +1,35 @@
+vars {'x': 1, 'y': 2}
+__dict__ same object True
+write through __dict__ 3
+dir instance ['base_attr', 'base_method', 'cls_attr', 'method', 'prop', 'x', 'y', 'z']
+dir class ['base_attr', 'base_method', 'cls_attr', 'method', 'prop']
+class __dict__ keys ['cls_attr', 'method', 'prop']
+class __dict__ type mappingproxy
+TypeError 'mappingproxy' object does not support item assignment
+dir builtin ['as_integer_ratio', 'bit_count', 'bit_length', 'conjugate', 'denominator', 'from_bytes']
+dir list ['append', 'clear', 'copy', 'count', 'extend', 'index', 'insert', 'pop', 'remove', 'reverse', 'sort']
+dir sorted True
+custom __dir__ ['a', 'a', 'b', 'c']
+TypeError 'int' object is not iterable
+getattr 1 dflt p
+getattr default None None
+AttributeError 'Thing' object has no attribute 'missing'
+setattr 100
+hasattr True True True False
+delattr False {'y': 2, 'z': 3}
+AttributeError 'Thing' object has no attribute 'cls_attr'
+AttributeError property 'prop' of 'Thing' object has no deleter
+lookup y in instance dict: True hasattr: True
+lookup cls_attr in instance dict: False hasattr: True
+lookup base_attr in instance dict: False hasattr: True
+lookup method in instance dict: False hasattr: True
+TypeError vars() argument must have __dict__ attribute
+TypeError vars expected at most 1 argument, got 2
+vars of function {'attr': 1}
+vars of class has methods True False
+getattr on class c absent
+dynamic names {'attr0': 0, 'attr1': 1, 'attr2': 4} [0, 1, 4]
+cleared {} False
+dir of module-level names ['Base', 'Thing', 'o', 'public']
+getattr dunder Thing Thing
+hasattr dunders True False True

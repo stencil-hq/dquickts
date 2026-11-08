@@ -1,0 +1,99 @@
+'' '' 0
+'abc' 'abc' 3
+"it's" "it's" 4
+'say "hi"' 'say "hi"' 8
+'both \' and "' 'both \' and "' 12
+'back\\slash' 'back\\slash' 10
+'tab\tnl\ncr\r' 'tab\tnl\ncr\r' 10
+'\x00\x01\x1f' '\x00\x01\x1f' 3
+'\x7f' '\x7f' 1
+'\x80' '\x80' 1
+'\x9f' '\x9f' 1
+'\xa0' '\xa0' 1
+'\xad' '\xad' 1
+'é' '\xe9' 1
+'€' '\u20ac' 1
+'😀' '\U0001f600' 1
+'\u200b' '\u200b' 1
+'\u200e' '\u200e' 1
+'\u2028' '\u2028' 1
+'\u2029' '\u2029' 1
+'\ufeff' '\ufeff' 1
+'�' '\ufffd' 1
+'\uffff' '\uffff' 1
+'\ue000' '\ue000' 1
+'\U000e0001' '\U000e0001' 1
+'\U0010ffff' '\U0010ffff' 1
+'😀' '\U0001f600' 1
+'\ud800' '\ud800' 1
+'\udfff' '\udfff' 1
+'\ud83d\ude00' '\ud83d\ude00' 2
+'a\ud800b' 'a\ud800b' 3
+'\x0b\x0c' '\x0b\x0c' 2
+'\x1b[0m' '\x1b[0m' 4
+'̀' '\u0300' 1
+'é' 'e\u0301' 2
+'\u3000' '\u3000' 1
+'日本語' '\u65e5\u672c\u8a9e' 3
+'\u0378' '\u0378' 1
+"'" "'" 1
+'"' '"' 1
+'\'"' '\'"' 2
+'\\' '\\' 1
+'\\n' '\\n' 2
+'\xa0x' '\xa0x' 2
+repr of repr '"a\'b"'
+nested in list ["it's", 'x\ny', 'é']
+nested in tuple ('\t',)
+nested in dict {"k'": 'v"'}
+str vs repr True True
+%r "x'y"
+!r 'tab\there'
+format !r with width     'ab'
+!a '\xe9\U0001f600'
+repr type str
+repr len escapes 6 8 12
+isprintable vs repr [False, False, False, True]
+long 'xxxxx\nyyyyy'
+all controls '\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f'
+C1 controls '\x7f\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8a\x8b\x8c\x8d\x8e\x8f\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9a\x9b\x9c\x9d\x9e\x9f\xa0'
+printable latin1 '¡¢£¤¥¦§¨©ª«¬\xad®¯'
+str of str subclass 'x'
+eval-free roundtrip check True
+cp 0x20 ' '
+cp 0x85 '\x85'
+cp 0xa0 '\xa0'
+cp 0x1680 '\u1680'
+cp 0x2000 '\u2000'
+cp 0x200a '\u200a'
+cp 0x200c '\u200c'
+cp 0x200d '\u200d'
+cp 0x202f '\u202f'
+cp 0x205f '\u205f'
+cp 0x2060 '\u2060'
+cp 0x2066 '\u2066'
+cp 0x3000 '\u3000'
+cp 0xfff9 '\ufff9'
+cp 0xfffc '￼'
+cp 0xd7ff '\ud7ff'
+cp 0xe000 '\ue000'
+cp 0xf8ff '\uf8ff'
+cp 0xfdd0 '\ufdd0'
+cp 0x10000 '𐀀'
+cp 0x1d173 '\U0001d173'
+cp 0xe0100 '󠄀'
+cp 0xf0000 '\U000f0000'
+cp 0x1f1e6 '🇦'
+cp 0x2603 '☃'
+cp 0x915 'क'
+cp 0x93f 'ि'
+cp 0x600 '\u0600'
+cp 0x61c '\u061c'
+cp 0x110bd '\U000110bd'
+quote choice "'" '"' '\'"' "a'b'c" 'a"b"c'
+backslash before quote "\\'" '\\"'
+escape forms '\x07\x08\x0c\x0b' '\x00' '\x7f'
+repr list of quotes ["'", '"', '\'"']
+repr bytes vs str 'aÿb' b'a\xffb'
+repr concat 'a''b'
+str() of escapes len 1 4

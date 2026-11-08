@@ -1,0 +1,89 @@
+round(0.5) 0
+round(1.5) 2
+round(2.5) 2
+round(3.5) 4
+round(-0.5) 0
+round(-1.5) -2
+round(-2.5) -2
+round(0.4999999999999999) 0
+round(0.5000000000000001) 1
+round(2.4) 2
+round(2.6) 3
+round(-2.6) -3
+round(1.0000000000000002e+16) 10000000000000002
+round(1e+300) 1000000000000000052504760255204420248704468581108159154915854115511802457988908195786371375080447864043704443832883878176942523235360430575644792184786706982848387200926575803737830233794788090059368953234970799945081119038967640880074652742780142494579258788820056842838115669472196386865459400540160
+round(0.0) 0
+round(-0.0) 0
+type(round(2.5)) 'int'
+type(round(2.5, 0)) 'float'
+type(round(2.5, None)) 'int'
+round(2.5, 0) 2.0
+round(3.5, 0) 4.0
+round(-0.5, 0) -0.0
+round(-0.4) 0
+round(-0.4, 0) -0.0
+round(2.675, 2) 2.67
+round(1.005, 2) 1.0
+round(0.125, 2) 0.12
+round(0.375, 2) 0.38
+round(2.5, 1) 2.5
+round(0.05, 1) 0.1
+round(0.15, 1) 0.1
+round(0.25, 1) 0.2
+round(0.35, 1) 0.3
+round(1.23456789, 4) 1.2346
+round(-1.23456789, 4) -1.2346
+round(123.456, -1) 120.0
+round(125.0, -1) 120.0
+round(135.0, -1) 140.0
+round(155.0, -1) 160.0
+round(1234.5, -2) 1200.0
+round(1e+300, -300) 1e+300
+round(1.5e+300, -300) 2e+300
+round(5e-324, 323) 0.0
+round(5e-324, 400) 5e-324
+round(1.25, 1000) 1.25
+round(1e+308, -308) 1e+308
+round(12.34, -5) 0.0
+round(15, -1) 20
+round(25, -1) 20
+round(35, -1) 40
+round(-25, -1) -20
+round(-35, -1) -40
+round(1234, -2) 1200
+round(1250, -2) 1200
+round(1350, -2) 1400
+round(5, -1) 0
+round(-5, -1) 0
+round(4, -1) 0
+round(6, -1) 10
+round(12345, 0) 12345
+round(12345, 3) 12345
+round(1267650600228229401496703205376, -10) 1267650600228229401500000000000
+round(1000000000000000000005000000000, -10) 1000000000000000000000000000000
+round(1000000000000000000015000000000, -10) 1000000000000000000020000000000
+round(999, -3) 1000
+round(500, -3) 0
+round(1500, -3) 2000
+round(7, -100) 0
+type(round(25, -1)) 'int'
+type(round(True)) 'int'
+round(True, 2) 1
+round(float('inf')) OverflowError cannot convert float infinity to integer
+round(float('nan')) ValueError cannot convert float NaN to integer
+round(float('inf'), 2) inf
+round(float('nan'), 2) nan
+round(1.5, 1.0) TypeError 'float' object cannot be interpreted as an integer
+round('1.5') TypeError type str doesn't define __round__ method
+round(1j) TypeError type complex doesn't define __round__ method
+round() TypeError round() missing required argument 'number' (pos 1)
+round(2.5, ndigits=None) 2
+round(number=2.567, ndigits=1) 2.6
+round(1.7976931348623157e308, -308) OverflowError rounded value too large to represent
+round(0.1 + 0.2, 15) 0.3
+round(0.1 + 0.2, 16) 0.3
+round(0.1 + 0.2, 17) 0.30000000000000004
+round(-0.0, 1) -0.0
+round(-0.04, 1) -0.0
+round(2**1023 * 1.0, -300) > 0 True
+round(10**400, -399) True

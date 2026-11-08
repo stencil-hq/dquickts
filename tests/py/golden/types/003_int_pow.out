@@ -1,0 +1,61 @@
+2**10 1024
+2**0 1
+0**0 1
+0**5 0
+(-1)**1001 -1
+(-1)**1000 1
+-1**2 -1
+2**3**2 512
+(2**3)**2 64
+2**-1 0.5
+2**-2 0.25
+10**-1 0.1
+10**-3 0.001
+(-2)**-3 -0.125
+1**-100 1.0
+2**-1 type 'float'
+0**-1 ZeroDivisionError zero to a negative power
+0**-2 ZeroDivisionError zero to a negative power
+2**0.5 1.4142135623730951
+4**0.5 2.0
+2**-1074 5e-324
+2**-1080 0.0
+2**1023 type 'int'
+10**30 1000000000000000000000000000000
+7**77 118181386580595879976868414312001964434038548836769923458287039207
+(-3)**33 -5559060566555523
+True**2 1
+2**True 2
+pow(2, 10) 1024
+pow(2, -1) 0.5
+pow(3, 4, 5) 1
+pow(-3, 3, 5) 3
+pow(3, 3, -5) -3
+pow(-3, 3, -5) -2
+pow(3, 0, 1) 0
+pow(3, 0, 7) 1
+pow(0, 0, 7) 1
+pow(3, -1, 7) 5
+pow(3, -2, 7) 4
+pow(-3, -1, 7) 2
+pow(3, -1, -7) -2
+pow(38, -1, 97) 23
+inverse check 1
+pow(2, -1, 4) ValueError base is not invertible for the given modulus
+pow(0, -1, 5) ValueError base is not invertible for the given modulus
+pow(3, 2, 0) ValueError pow() 3rd argument cannot be 0
+pow(3, -1, 1) 0
+pow(2, 100, 10**9+7) 976371285
+pow(2**100, 2**100, 10**9+7) 639253612
+pow(12345, 10**18, 2**61-1) 1934975192358098224
+pow(7, 2**64 + 3, 2**127 - 1) 151579521014419195864879774573118940501
+pow(2, 0.5, 3) TypeError pow() 3rd argument not allowed unless all arguments are integers
+pow(2.0, 2, 3) TypeError pow() 3rd argument not allowed unless all arguments are integers
+pow(2, 2, 3.0) TypeError pow() 3rd argument not allowed unless all arguments are integers
+pow('2', 2) TypeError unsupported operand type(s) for ** or pow(): 'str' and 'int'
+pow(base=2, exp=5) 32
+pow(base=2, exp=5, mod=3) 2
+pow(2, 3, None) 8
+2 ** None TypeError unsupported operand type(s) for ** or pow(): 'int' and 'NoneType'
+**=  81
+**= neg 0.25

@@ -1,0 +1,20 @@
+run result slept
+gather results ['a done', 'b done', 'c done']
+interleaving ['a0', 'b0', 'c0', 'a1', 'b1', 'a2']
+return_exceptions ['str:x done', 'ValueError:bad']
+gather raises ValueError first
+task created, not started [] task-t False
+after one yield ['t0']
+await task t done True t done
+cancelled True True
+wait_for timeout TimeoutError True
+wait_for ok w done
+timeout cm expired
+queue order ['put0', 'put1', 'got0', 'got1', 'put2', 'put3', 'got2', 'got3', 'put4', 'got4']
+queue empty True 0 2
+get_nowait QueueEmpty
+put_nowait QueueFull
+priority ['a', 'b', 'c']
+asyncio.run main done
+iscoroutinefunction True True
+second run r done r0

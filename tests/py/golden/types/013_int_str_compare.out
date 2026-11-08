@@ -1,0 +1,57 @@
+str(10**50) '100000000000000000000000000000000000000000000000000'
+str(-10**50 + 1) '-99999999999999999999999999999999999999999999999999'
+repr(2**127 - 1) '170141183460469231731687303715884105727'
+str(-(2**63)) '-9223372036854775808'
+len(str(2**10000)) 3011
+str(2**10000)[:20] '19950631168807583848'
+str(2**10000)[-20:] '81774304792596709376'
+str(10**4299) len 4300
+str(10**4300) ValueError Exceeds the limit (4300 digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit
+hex(10**5000) len 4155
+f'{10**30}' '1000000000000000000000000000000'
+'%d' % 10**25 '10000000000000000000000000'
+str roundtrip True
+2**53 == 2.0**53 True
+2**53+1 == 2.0**53 False
+2**53+1 > 2.0**53 True
+2.0**53 < 2**53+1 True
+2**53+1 == float(2**53+1) False
+float(2**53+1) 9007199254740992.0
+float(2**53+3) 9007199254740996.0
+2**1024 > 1e308 True
+2**1024 < inf True
+-2**1024 > -inf True
+10**400 == inf False
+10**400 > 1.7976931348623157e308 True
+1 == nan False
+1 < nan False
+1 != nan True
+10**400 < nan False
+0 == -0.0 True
+1 < 1.5 < 2 True
+-1 > -1.5 True
+10**16 == 1e16 True
+10**23 == 1e23 False
+10**22 == 1e22 True
+int(1e23) 99999999999999991611392
+10**23 > 1e23 True
+2**63 == 9.223372036854776e18 True
+2**63-1 < 9.223372036854776e18 True
+2**63-1 == float(2**63-1) False
+max(2**53+1, 2.0**53) 9007199254740993
+min(2**53, 2.0**53) 9007199254740992.0
+sorted mixed [-1e+20, -1, 0, -0.0, True, 2.5, 3, 1e+19, 100000000000000000000]
+float(10**308) 1e+308
+float(10**309) OverflowError int too large to convert to float
+float(2**1024) OverflowError int too large to convert to float
+float(2**1024 - 2**970) OverflowError int too large to convert to float
+float(2**1024 - 2**971) 1.7976931348623157e+308
+10**400 + 0.5 OverflowError int too large to convert to float
+10**400 * 1.0 OverflowError int too large to convert to float
+10**400 / 10**390 10000000000.0
+int == float hash True
+1 == 1.0000000000000002 False
+int < str TypeError '<' not supported between instances of 'int' and 'str'
+int == str False
+int == None False
+int < None TypeError '<' not supported between instances of 'int' and 'NoneType'

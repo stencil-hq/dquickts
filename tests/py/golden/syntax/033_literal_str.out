@@ -1,0 +1,56 @@
+single abc double abc True
+quotes inside it's say "hi" both ' and " esc ' quote
+triple tri "double" ple tri 'single' ple
+triple multiline 'line1\nline2\n    indented'
+backslash continuation 'first second'
+simple escapes '\n\t\r\\\'"\x07\x08\x0c\x0b'
+octal '\x00' 'A' '\x081' '\x07' '\x7f'
+hex 'A' '\x7f' 'é' 'ÿ'
+unicode 16 'A' 'é' '☃' '\u200b'
+unicode 32 '😀' 'A' 1
+named '•' 'é' '☃'
+named alias '\xa0' '—'
+escapes printed tab[	] bullet[•] snowman[☃]
+lengths 1 2 1 1 1 2
+ord/chr 10 8226 • 😀 0
+raw \n\t C:\path\to \x41 \N{BULLET} 2
+raw quote a\"b \' upper R
+raw triple raw\ntriple
+implicit concat abcdefghi
+concat with raw a
+b\n
+paren concat part one, part two, part three
+concat with f x=2 done
+unicode identifier coffee
+non-BMP 𝔘𝔫𝔦 3
+combining é False
+case SS i̇ 2 ǅ
+u prefix unicode upper str
+rb/br bytes b'\\n' b'\\x' b'a'
+syntax "\x4" (unicode error) 'unicodeescape' codec can't decode bytes in position 0-2: truncated \xXX escape
+syntax "\u12" (unicode error) 'unicodeescape' codec can't decode bytes in position 0-3: truncated \uXXXX escape
+syntax "\U1234" (unicode error) 'unicodeescape' codec can't decode bytes in position 0-5: truncated \UXXXXXXXX escape
+syntax "\N{NOT A REAL NAME}" (unicode error) 'unicodeescape' codec can't decode bytes in position 0-18: unknown Unicode character name
+syntax "\N" (unicode error) 'unicodeescape' codec can't decode bytes in position 0-1: malformed \N character escape
+syntax "unterminated unterminated string literal (detected at line 1)
+syntax """unterminated unterminated triple-quoted string literal (detected at line 1)
+syntax 'a' 'b unterminated string literal (detected at line 1)
+compiles b"\u0041" b'\\u0041'
+syntax b"é" bytes can only contain ASCII literal characters
+compiles "\777" 'ǿ'
+compiles "\8" '\\8'
+repr '' '' 0
+repr ' ' ' ' 1
+repr '\x00' '\x00' 1
+repr '\x7f' '\x7f' 1
+repr '\x80' '\x80' 1
+repr '\xa0' '\xa0' 1
+repr '\u2028' '\u2028' 1
+repr '\ud800' '\ud800' 1
+repr '\U0010ffff' '\U0010ffff' 1
+repr '\x1b[0m' '\x1b[0m' 4
+mul ababab   --- ''
+concat ab a1
+str + int TypeError can only concatenate str (not "int") to str
+str * float TypeError can't multiply sequence by non-int of type 'float'
+docstring 'Doc line.\n\nMore text.'

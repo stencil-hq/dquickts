@@ -1,0 +1,21 @@
+chflags True
+chflags clear 0
+lchflags True 0
+chflags nofollow True
+chflags missing -> FileNotFoundError 2
+chflags type -> TypeError chflags() argument 'flags' must be int, not str
+chflags float -> TypeError chflags() argument 'flags' must be int, not float
+supports_follow_symlinks True
+_fcopyfile None
+copied b'0123456789'
+_fcopyfile bad -> OSError 9
+COPYFILE 8 2 1 4
+shutil.copyfile b'0123456789' True
+sendfile hdtr 11 b'<h>0123</t>'
+sendfile to eof 3 b'789'
+sendfile headers type -> TypeError sendfile() headers must be a sequence
+sendfile trailers type -> TypeError sendfile() trailers must be a sequence
+sendfile headers item -> TypeError a bytes-like object is required, not 'int'
+PRIO_DARWIN 3 4 4096 4097
+NODEV -1 255 16777215
+pipe2 True

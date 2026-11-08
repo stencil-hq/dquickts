@@ -1,0 +1,50 @@
+seq [] empty
+seq () empty
+seq [1] one 1
+seq (1,) one 1
+seq [1, 2] two (1, 2)
+seq (1, 2, 3) three (1, 2, 3)
+seq [0, 1, 2, 3, 4, 5] many first=0 rest=[1, 2, 3, 4, 5]
+seq 'ab' not a sequence
+seq b'ab' not a sequence
+seq {1, 2} not a sequence
+seq {'a': 1} not a sequence
+seq range(0, 2) two (0, 1)
+seq 5 not a sequence
+seq None not a sequence
+star ['end'] ends with end
+star ['x', 'end'] ends with end
+star ['start', 'end'] ends with end
+star ['start', 1, 2, 3] start middle=[1, 2] last=3
+star ['start', 9] start middle=[] last=9
+star [5, 4, 0] init before 0 [5, 4]
+star [0] init before 0 []
+star [1, 2] at least two
+star [1] other
+starred type list [2, 3]
+nested nested (1, 2, 3, [4, 5]) deep 7 literal nest no
+cmd 'go north' go north
+cmd 'go up' unknown: go up
+cmd 'pick up lamp' take lamp
+cmd 'take key' take key
+cmd 'drop a b c' drop a,b,c
+cmd 'drop' unknown: drop
+cmd 'exit' bye
+cmd '' unknown: 
+mapping {'type': 'point', 'x': 1, 'y': 2, 'z': 3} point (1, 2)
+mapping {'type': 'circle', 'r': 5, 'color': 'red'} circle r=5 rest={'color': 'red'}
+mapping {'type': 'circle', 'r': 1} circle r=1 rest={}
+mapping {'type': 'square'} typed 'square'
+mapping {'x': 1} any mapping
+mapping {} any mapping
+mapping [] not a mapping
+mapping 'type' not a mapping
+literal/value keys one N nil
+dict subclass 1
+syntax "match x:\n case {'a': 1, 'a': 2}: pass" mapping pattern checks duplicate key ('a')
+syntax 'match x:\n case [*a, *b]: pass' multiple starred names in sequence pattern
+syntax 'match x:\n case a | b: pass' name capture 'a' makes remaining patterns unreachable
+syntax 'match x:\n case {**_}: pass' invalid syntax
+syntax 'match x:\n case x:\n  pass\n case 1: pass' name capture 'x' makes remaining patterns unreachable
+syntax 'match x:\n case [a, a]: pass' multiple assignments to name 'a' in pattern
+syntax 'match x:\n case 1 + 1: pass' imaginary number required in complex literal

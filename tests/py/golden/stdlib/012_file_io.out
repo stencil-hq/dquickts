@@ -1,0 +1,44 @@
+write returns 9 19
+mode/closed w False True False
+closed after with True
+write closed ValueError I/O operation on closed file.
+read all 'line one\nline two\nline three'
+read at eof ''
+readline 'line one\n' 'line two\n'
+readline rest 'line three' ''
+readlines ['line one\n', 'line two\n', 'line three']
+iterate ['line one', 'line two', 'line three']
+read(4) 'line' ' on'
+after append ['line one', 'line two', 'line three', 'appended']
+r+ overwrite 'LINE one\n'
+x existing FileExistsError EEXIST
+x new ok 5
+missing FileNotFoundError ENOENT
+bad mode 'rw' ValueError must have exactly one of create/read/write/append mode
+bad mode 'z' ValueError invalid mode: 'z'
+bad mode 'rbt' ValueError can't have text and binary mode at once
+bad mode 'U' ValueError invalid mode: 'U'
+utf-8 bytes b'na\xc3\xafve caf\xc3\xa9 \xe2\x82\xac' 16
+as latin-1 'naÃ¯ve cafÃ© â\x82¬'
+ascii strict UnicodeDecodeError ordinal not in range(128) 2 3
+errors=replace 'na��ve caf�� ���'
+errors=ignore 'nave caf '
+errors=surrogateescape 'na\udcc3\udcafve caf\udcc3\udca9 \udce2\udc82\udcac'
+xmlcharrefreplace b'&#252;&#8364;'
+utf-16-be b'\x00h\x00i \xac'
+universal 'a\nb\nc\nd' ('\r', '\n', '\r\n')
+newline='' ['a\n', 'b\r\n', 'c\r', 'd']
+newline=crlf ['a\nb\r\n', 'c\rd']
+write crlf b'x\r\ny\r\n'
+tell after write 16
+read 4 b'\x00\x01\x02\x03' 4
+seek set 10 b'\n\x0b'
+seek cur 8 b'\x08'
+seek end 14 b'\x0e\x0f'
+read eof b'' 16
+readinto 5 bytearray(b'\x00\x01\x02\x03\x04')
+read1 b'\x05\x06\x07'
+mode rb BufferedReader
+r+b truncate b'\x00\x01\xff\xfe\x04\x05'
+unbuffered FileIO b'\x00\x01\xff'
+text relative seek UnsupportedOperation can't do nonzero cur-relative seeks

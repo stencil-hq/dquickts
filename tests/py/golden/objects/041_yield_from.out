@@ -1,0 +1,14 @@
+first inner-1
+  inner got 'x'
+send x inner-2
+  inner got 'y'
+  outer got result 'inner result'
+send y outer-after
+outer return outer result
+yield from iterables [1, 2]
+chain ['a', 'b', 1, 2, 0, 1, 2, 0, 1, 4]
+recursive delegation ['root', 'a', 'a1', 'a2', 'b', 'b1', 'b1x']
+delegated yields [1, 2, 3]
+sum of sub-returns 60
+yield from custom iterable [3, 2, 1]
+empty delegation returns None None

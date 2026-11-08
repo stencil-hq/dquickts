@@ -1,4 +1,7 @@
 #![allow(clippy::uninlined_format_args)]
+#[path = "build_capi.rs"]
+mod capi;
+
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -115,11 +118,14 @@ fn main() {
 
     for feature in dump_features
         .iter()
-        .chain(&["bindgen", "update-bindings", "disable-assertions"])
+        .chain(&["bindgen", "update-bindings", "disable-assertions", "python"])
+        .copied()
+        .chain(capi::features())
     {
         println!("cargo:rerun-if-env-changed={}", feature_to_cargo(feature));
     }
     println!("cargo:rerun-if-env-changed=CARGO_CFG_SANITIZE");
+    println!("cargo:rerun-if-env-changed=RQUICKJS_PYLIB_DIR");
 
     // The engine is the QuickJS tree this crate is vendored in.
     let src_dir = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("../..");
@@ -160,10 +166,14 @@ fn main() {
         println!("cargo:rerun-if-changed={}", src_dir.join(file).display());
     }
     println!("cargo:rerun-if-changed=quickjs.bind.h");
+    // quickjs.c includes python/ (python/opcode.h always, the whole runtime
+    // with CONFIG_PYTHON)
+    println!("cargo:rerun-if-changed={}", src_dir.join("python").display());
 
     let version = fs::read_to_string(src_dir.join("VERSION")).expect("Unable to read VERSION");
     let version = format!("\"{}\"", version.trim());
 
+    let pylib_define;
     let mut defines: Vec<(String, Option<&str>)> = vec![
         ("_GNU_SOURCE".into(), None),
         ("CONFIG_VERSION".into(), Some(version.as_str())),
@@ -179,6 +189,21 @@ fn main() {
     #[cfg(feature = "disable-assertions")]
     defines.push(("NDEBUG".into(), None));
 
+    // The Python runtime: python/*.c are #included by quickjs.c (as in the
+    // engine Makefile, CONFIG_PYTHON=y). The stdlib directory is compiled in
+    // (QP_PYLIB_DIR): the launcher default <executable dir>/pylib means
+    // nothing for an embedder. RQUICKJS_PYLIB_DIR overrides the vendored
+    // `pylib` of the source tree; QPYHOME still overrides both at run time.
+    if env::var("CARGO_FEATURE_PYTHON").is_ok() {
+        let pylib = env::var_os("RQUICKJS_PYLIB_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| src_dir.join("pylib"));
+        let pylib = pylib.canonicalize().unwrap_or(pylib);
+        pylib_define = c_string_literal(&pylib.to_string_lossy());
+        defines.push(("CONFIG_PYTHON".into(), None));
+        defines.push(("QP_PYLIB_DIR".into(), Some(pylib_define.as_str())));
+    }
+
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap();
 
@@ -193,28 +218,21 @@ fn main() {
         .flag_if_supported("-Wno-unused-parameter")
         .flag_if_supported("-Wno-sign-compare");
 
-    match env::var("CARGO_CFG_SANITIZE").as_deref() {
-        Ok("address") => {
-            builder
-                .flag("-fsanitize=address")
-                .flag("-fno-sanitize-recover=all")
-                .flag("-fno-omit-frame-pointer");
+    // sanitizers: the engine and the C modules of the Python C API
+    let sanitize = env::var("CARGO_CFG_SANITIZE").ok();
+    if let Some(x) = sanitize.as_deref() {
+        if !matches!(x, "address" | "memory" | "thread") {
+            println!("cargo:warning=Unsupported sanitize_option: '{x}'");
         }
-        Ok("memory") => {
-            builder
-                .flag("-fsanitize=memory")
-                .flag("-fno-sanitize-recover=all")
-                .flag("-fno-omit-frame-pointer");
-        }
-        Ok("thread") => {
-            builder
-                .flag("-fsanitize=thread")
-                .flag("-fno-sanitize-recover=all")
-                .flag("-fno-omit-frame-pointer");
-        }
-        Ok(x) => println!("cargo:warning=Unsupported sanitize_option: '{x}'"),
-        _ => {}
     }
+    let configure_sanitizer = |b: &mut cc::Build| {
+        if let Some(x @ ("address" | "memory" | "thread")) = sanitize.as_deref() {
+            b.flag(format!("-fsanitize={x}"))
+                .flag("-fno-sanitize-recover=all")
+                .flag("-fno-omit-frame-pointer");
+        }
+    };
+    configure_sanitizer(&mut builder);
 
     let mut bindgen_cflags = vec![format!("-I{}", src_dir.display())];
 
@@ -256,6 +274,18 @@ fn main() {
         bindgen_cflags.push(sysroot);
     }
 
+    // The Python C API (python/capi_*.c in quickjs.c) and the CPython C
+    // modules of capi/Setup.qp: see build_capi.rs
+    if env::var("CARGO_FEATURE_PYTHON").is_ok() && capi::supported() {
+        capi::build(
+            &src_dir,
+            out_dir,
+            &mut builder,
+            &mut defines,
+            &configure_sanitizer,
+        );
+    }
+
     // generating bindings
     bindgen(
         out_dir,
@@ -273,6 +303,19 @@ fn main() {
     }
 
     builder.compile("libquickjs.a");
+}
+
+fn c_string_literal(s: &str) -> String {
+    let mut lit = String::with_capacity(s.len() + 2);
+    lit.push('"');
+    for c in s.chars() {
+        if c == '"' || c == '\\' {
+            lit.push('\\');
+        }
+        lit.push(c);
+    }
+    lit.push('"');
+    lit
 }
 
 fn feature_to_cargo(name: impl AsRef<str>) -> String {

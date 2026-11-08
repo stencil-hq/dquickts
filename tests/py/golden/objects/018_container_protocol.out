@@ -1,0 +1,26 @@
+len 4
+getitem 1 4
+slice Bag(2, 3) Bag(1, 3) Bag(4, 3, 2, 1)
+slice with None Bag(1, 2)
+after set del Bag(10, 3, 4)
+contains True False True
+iter [10, 3, 4] [20, 6, 8]
+reversed [4, 3, 10]
+log ['get 0', 'get -1', 'get slice(1, 3, None)', 'get slice(None, None, 2)', 'get slice(None, None, -1)', 'get slice(None, 2, None)', 'set 0', 'del 1', 'contains 3', 'contains 99', 'contains 99']
+IndexError list index out of range
+bool from len False True
+unpack a b
+star unpack 1 [2, 3]
+sorted bag [1, 2, 3] 6 9
+bool beats len True False yes
+not False fallback both
+TypeError BadBool.__bool__() must return a bool, not int
+ValueError __len__() should return >= 0
+TypeError 'float' object cannot be interpreted as an integer
+default truthy True
+TypeError object of type 'NoLen' has no len()
+TypeError 'NoLen' object is not subscriptable
+TypeError 'NoLen' object does not support item assignment
+TypeError 'NoLen' object doesn't support item deletion
+TypeError 'NoLen' object is not reversible
+tuple key key=(1, 2) key=(slice(1, 2, None), slice(None, None, 3)) key=Ellipsis key=()

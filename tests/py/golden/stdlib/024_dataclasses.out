@@ -1,0 +1,21 @@
+repr Point(x=1, y=2) Point(x=5, y=0)
+eq True False False
+no order TypeError '<' not supported between instances of 'Point' and 'Point'
+hash none True
+fields [('x', 'int', None), ('y', 'int', 0)]
+asdict {'x': 1, 'y': 2} astuple (1, 2)
+replace Point(x=1, y=9) Point(x=1, y=2)
+is_dataclass True True False
+missing arg TypeError Point.__init__() missing 1 required positional argument: 'x'
+replace unknown TypeError Point.__init__() got an unexpected keyword argument 'z'
+order True True True
+sorted [Version(major=0, minor=9, label=''), Version(major=1, minor=0, label=''), Version(major=1, minor=5, label='')]
+default_factory Inventory(items=['apple']) Inventory(items=[]) True
+mutable default ValueError mutable default <class 'list'> for field items is not allowed: use default_factory
+frozen FrozenInstanceError cannot assign to field 'name'
+frozen del FrozenInstanceError cannot delete field 'name'
+frozen hashable True
+frozen replace Frozen(name='g', tags=('t',)) Frozen(name='f', tags=('t',))
+FrozenInstanceError base AttributeError
+post_init Rect(w=2.0, h=3.0, area=6.0) Rect(w=4, h=6, area=24)
+InitVar not field ['w', 'h', 'area']

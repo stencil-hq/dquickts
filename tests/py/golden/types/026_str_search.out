@@ -1,0 +1,59 @@
+startswith True
+startswith tuple True
+startswith empty tuple False
+startswith start True
+startswith start end False
+startswith start end exact True
+startswith neg start True
+startswith empty True
+startswith empty past end False
+startswith empty at len True
+''.startswith('') True
+endswith True
+endswith tuple True
+endswith end True
+endswith neg end False
+startswith list TypeError startswith first arg must be str or a tuple of str, not list
+startswith tuple with int True
+endswith None start True
+find 0
+rfind 13
+find missing -1
+find start 13
+find start end -1
+find neg start 15
+find empty 0
+rfind empty 18
+find empty start 5
+find empty past end -1
+find empty at len 18
+find char 11
+rfind char end 7
+index 6
+rindex 16
+index missing ValueError substring not found
+rindex missing ValueError substring not found
+index range missing ValueError substring not found
+find int TypeError find() argument 1 must be str, not int
+find bytes TypeError find() argument 1 must be str, not bytes
+find non-BMP 2
+rfind non-BMP 3
+count 2
+count char 5
+count non-overlapping 2
+count overlapping text 2
+count empty 4
+count empty in empty 1
+count empty range 3
+count start end 2
+count neg 2
+count missing 0
+count bad end 1
+count start > end 0
+in True
+not in True
+empty in True
+empty in empty True
+in int TypeError 'in <string>' requires string as left operand, not int
+in case-sensitive False
+in non-BMP True

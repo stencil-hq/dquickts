@@ -1,0 +1,21 @@
+type 3-arg Dyn 2 True
+type subclass 10 ['Sub', 'Dyn', 'object']
+type of class True True True
+TypeError type.__new__() argument 2 must be tuple, not int
+TypeError type.__new__() argument 3 must be dict or frozendict, not int
+TypeError type.__new__() argument 1 must be str, not int
+TypeError type() takes 1 or 3 arguments
+meta log ["new Model ['a']", "init Model {'flavor': 'x'}", 'call Model']
+injected by meta True 7
+meta method class Model
+meta method not on instance False
+type of class Meta True
+inherited metaclass Meta ["new Child ['b']", 'init Child {}']
+singleton True 1
+prepare from prepare prepare Prepared
+TypeError metaclass conflict: the metaclass of a derived class must be a (non-strict) subclass of the metaclasses of all its bases
+most derived metaclass MetaASub
+callable metaclass not a class: Weird
+__class__ chain Model Meta type
+metaclass attr lookup Model True
+issubclass meta True True True

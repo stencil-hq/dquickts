@@ -1,0 +1,22 @@
+no error -> 'done' ['try', 'else', 'finally']
+with error -> 'done' ['try', 'except bad', 'finally']
+unhandled raised KeyError 'k' ['try', 'finally']
+return in try -> 'from try' ['try', 'finally']
+return in except -> 'from except' ['except', 'finally']
+else skipped by return -> 'early' ['finally']
+error in else raised RuntimeError from else ['try', 'else', 'finally']
+error in finally raised TypeError from finally ['finally']
+which lookup-ish KeyError
+which lookup-ish IndexError
+which arith ZeroDivisionError
+which arith OverflowError
+which generic ValueError
+which generic LookupError
+unparenthesized tuple except
+inside temp
+except target cleared NameError name 'err' is not defined
+  bare except caught
+reraised ValueError again
+finally on iteration 0
+finally on iteration 1
+finally on iteration 2

@@ -1,0 +1,6 @@
+2 waiter <module>
+KeyError('in thread') None
+ValueError('main') [None]
+default main
+2
+RecursionError 500

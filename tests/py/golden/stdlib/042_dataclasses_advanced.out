@@ -1,0 +1,17 @@
+kw_only Opts(verbose=False, level=3)
+kw_only positional TypeError Opts.__init__() takes 1 positional argument but 3 were given
+KW_ONLY sentinel Mixed(a=0, b=1, c=5) [False, True, True]
+field kw_only PerField(a=1, b=3)
+slots Slotted(x=1, y=2) ('x', 'y') False
+slots no new attr AttributeError
+asdict nested {'p': {'x': 1, 'y': 2}, 'ps': [{'x': 3, 'y': 4}], 'm': {'k': {'x': 5, 'y': 6}}}
+astuple nested ((1, 2), [(3, 4)], {'k': (5, 6)})
+asdict copies True
+asdict factory [('y', 2), ('x', 1)]
+asdict class TypeError asdict() should be called on dataclass instances
+eq=False False True
+unsafe_hash True True
+make_dataclass Dyn(a=1, b='z') Dyn
+inheritance Child(x=1, y=2, z=3) ['x', 'y', 'z']
+MISSING True 0
+default before non-default TypeError non-default argument 'b' follows default argument 'a'

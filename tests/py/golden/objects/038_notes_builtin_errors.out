@@ -1,0 +1,62 @@
+no notes attr False
+notes ['first note', 'second note'] list
+str unaffected base
+TypeError add_note() argument must be str, not int
+notes list mutable ['first note', 'second note', 'appended directly']
+note survives re-raise invalid literal for int() with base 10: 'bad' ['while parsing config']
+int division -> ZeroDivisionError: division by zero
+int floordiv -> ZeroDivisionError: division by zero
+int modulo -> ZeroDivisionError: division by zero
+float division -> ZeroDivisionError: division by zero
+float modulo -> ZeroDivisionError: division by zero
+divmod -> ZeroDivisionError: division by zero
+pow zero negative -> ZeroDivisionError: zero to a negative power
+float pow zero negative -> ZeroDivisionError: zero to a negative power
+dict key -> KeyError: 'b'
+dict int key -> KeyError: 0
+dict tuple key -> KeyError: (1, 2)
+list index -> IndexError: list index out of range
+list assignment index -> IndexError: list assignment index out of range
+tuple index -> IndexError: tuple index out of range
+str index -> IndexError: string index out of range
+range index -> IndexError: range object index out of range
+pop empty list -> IndexError: pop from empty list
+pop empty dict -> KeyError: 'popitem(): dictionary is empty'
+list remove -> ValueError: list.remove(x): x not in list
+list index method -> ValueError: list.index(x): x not in list
+str index method -> ValueError: substring not found
+int attribute -> AttributeError: 'int' object has no attribute 'x'
+str attribute -> AttributeError: 'str' object has no attribute 'foo'
+none call -> TypeError: 'NoneType' object is not callable
+int call -> TypeError: 'int' object is not callable
+add int str -> TypeError: unsupported operand type(s) for +: 'int' and 'str'
+add str int -> TypeError: can only concatenate str (not "int") to str
+sub str -> TypeError: unsupported operand type(s) for -: 'str' and 'str'
+mul list list -> TypeError: can't multiply sequence by non-int of type 'list'
+neg list -> TypeError: bad operand type for unary -: 'list'
+compare -> TypeError: '<' not supported between instances of 'list' and 'int'
+name -> NameError: name 'undefined_global' is not defined
+int literal -> ValueError: invalid literal for int() with base 10: 'x'
+int literal base -> ValueError: invalid literal for int() with base 8: '9'
+int empty -> ValueError: invalid literal for int() with base 10: ''
+float literal -> ValueError: could not convert string to float: 'abc'
+int none -> TypeError: int() argument must be a string, a bytes-like object or a real number, not 'NoneType'
+iter int -> TypeError: 'int' object is not iterable
+next list -> TypeError: 'list' object is not an iterator
+len int -> TypeError: object of type 'int' has no len()
+unpack too many -> ValueError: too many values to unpack (expected 2, got 3)
+unpack too few -> ValueError: not enough values to unpack (expected 3, got 2)
+unpack non-iterable -> TypeError: cannot unpack non-iterable int object
+hash list -> TypeError: unhashable type: 'list'
+set of dicts -> TypeError: cannot use 'dict' as a set element (unhashable type: 'dict')
+str join ints -> TypeError: sequence item 0: expected str instance, int found
+chr range -> ValueError: chr() arg not in range(0x110000)
+tuple assign -> AttributeError: 'tuple' object has no attribute '__setitem__'
+str assign -> AttributeError: 'str' object has no attribute '__setitem__'
+missing method -> AttributeError: 'list' object has no attribute 'push'
+bad kwarg -> TypeError: sort() got an unexpected keyword argument 'reversed'. Did you mean 'reverse'?
+int overflow float -> OverflowError: int too large to convert to float
+str mul negative -> no error ''
+range step zero -> ValueError: range() arg 3 must not be zero
+slice step zero -> ValueError: slice step cannot be zero
+unbound local -> UnboundLocalError: cannot access local variable 'x' where it is not associated with a value

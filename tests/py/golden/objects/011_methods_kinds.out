@@ -1,0 +1,27 @@
+instance method 21C
+via class 21C
+classmethod ctor 100.0C
+classmethod via instance Temperature
+staticmethod True False
+static no args static no args static no args
+created 2
+classmethod subclass Kelvin 0.0K Kelvin
+bound self True
+bound func True
+bound call 21C
+bound equal True False
+bound type method
+classmethod bound to class True
+staticmethod plain function function
+raw dict entries classmethod staticmethod
+staticmethod object callable False
+classmethod __func__ kind
+TypeError Temperature.describe() missing 1 required positional argument: 'self'
+chaining [1, 2, 3]
+stored bound ('Callable', 1, 2)
+unbound vs bound ('Callable', 9) ('Callable', 9)
+self is convention this works SelfNaming
+bound reads current 2
+getattr method 2
+function becomes method plain 2
+added descriptors added static added class Getter added class Getter

@@ -264,6 +264,9 @@ DEF(    dispose_end, 1, 1, 0, none) /* error -> (throws the error if any) */
 /* decorators */
 DEF(apply_decorators, 2, 5, 1, u8) /* target key value decorators state -> result */
 DEF(decorator_helper, 2, 3, 1, u8) /* a b c -> result */
+/* Python prefix opcode: OP_py <u8 subop> <operands>, see python/opcode.h.
+   Walkers take size/n_pop/n_push/fmt from qp_subop_info[subop]. */
+DEF(             py, 2, 0, 0, u8)
 /* must be the last non short and non temporary opcode */
 DEF(            nop, 1, 0, 0, none)
 

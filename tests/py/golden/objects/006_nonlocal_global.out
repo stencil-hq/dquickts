@@ -1,0 +1,15 @@
+counter 1 1 2 7
+counter 2 101 102
+independent 8 103
+UnboundLocalError cannot access local variable 'n' where it is not associated with a value
+UnboundLocalError is NameError True
+read then assign UnboundLocalError cannot access local variable 'g_value' where it is not associated with a value
+local result 2 global still 1
+global set 50
+deleted local UnboundLocalError: cannot access local variable 'v' where it is not associated with a value
+nonlocal chain ('inner', 'inner')
+mixed scopes enclosing g
+loop counter 7
+conditional ok set
+UnboundLocalError cannot access local variable 'z' where it is not associated with a value
+NameError name 'undefined_name_xyz' is not defined

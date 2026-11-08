@@ -1,0 +1,9 @@
+scheduler ([('zero', 'zero slept 0'), ('fast', 'fast slept 1'), ('slow', 'slow slept 3')], 4)
+interleaving ['slow', 'fast', 'slow', 'slow']
+mixed ([('b', 'ValueError: b failed'), ('c', 'c total 0'), ('a', 'a total 3')], 5)
+trace ['a', 'b', 'c', 'a', 'a']
+  forever cleaned up on close
+cancel ([('short', 'cancelled'), ('loop', 'cancelled')], 5)
+nested awaits ([('parent', ['child1 slept 1', 'child2 slept 2'])], 3)
+parent steps 3
+producer/consumer ([('producer', 'producer done'), ('consumer', [0, 1, 2])], 13)

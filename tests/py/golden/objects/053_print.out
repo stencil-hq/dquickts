@@ -1,0 +1,51 @@
+
+plain
+a b c
+abc
+a, b, c
+a
+b
+no newline <- continued
+custom end |END|
+multi-args!
+sep None x
+end None
+flush
+flush false
+
+[]
+empty string arg 
+1 2.5 None True [1, 'a'] (1,) {'k': 'v'} b'bytes'
+nested str inside containers uses repr ["it's", 'say "hi"']
+unicode héllo 世界 emoji 👍 é
+escapes tab	here quote"s back\slash
+multi-line
+string
+0 1 2 3 4
+0,1,2,3,4
+a|b|c.
+
+star empty above
+Shown.__str__ [Shown.__repr__]
+TypeError sep must be None or a string, not int
+TypeError end must be None or a string, not int
+TypeError sep must be None or a string, not bytes
+TypeError print() got an unexpected keyword argument 'bogus'
+before ValueError str failed
+file None goes to stdout
+print returns None
+0 1 2
+one
+two
+three
+x=5 y=6 z=7
+width [   ab] [ab   ] [  ab  ] [00042]
+big int 1267650600228229401496703205376
+float formats 0.1 1e+16 1e-07 123456789.0 1.5e+300 -0.0 inf nan
+complex 1j (1+2j) (-0-1.5j) -0j
+sep with unicode → a → b
+long xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+😀 • b'\x00'
+bool sep-a-b
+end empty then print()
+done

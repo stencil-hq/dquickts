@@ -1,0 +1,181 @@
+(<class '_io.StringIO'>, <class '_io._TextIOBase'>, <class '_io._IOBase'>, <class 'object'>)
+False True
+'__default__' None 'x\ry\r\nz\n€\r\nq' 11 None
+  lines ['x\ry\r\n', 'z\n', '€\r\n', 'q', '', '', '', ''] 11
+  read 'x\ry\r\n' 5 'z\n€\r\nq' 11
+  list ['a\rb\r\n', 'c'] ['a\rb\r\n', 'c\r']
+  state ('x\ry\r\nz\n€\r\nq', '\n', 11, None)
+'__default__' 'a\rb\r\nc\nd' 'a\rb\r\nc\ndx\ry\r\nz\n€\r\nq' 19 None
+  lines ['a\rb\r\n', 'c\n', 'dx\ry\r\n', 'z\n', '€\r\n', 'q', '', ''] 19
+  read 'a\rb\r\n' 5 'c\ndx\ry\r\nz\n€\r\nq' 19
+  list ['a\rb\r\n', 'c'] ['a\rb\r\n', 'c\r']
+  state ('a\rb\r\nc\ndx\ry\r\nz\n€\r\nq', '\n', 19, None)
+None None 'x\ny\nz\n€\n\nq' 10 ('\r', '\n', '\r\n')
+  lines ['x\n', 'y\n', 'z\n', '€\n', '\n', 'q', '', ''] 10
+  read 'x\ny\nz' 5 '\n€\n\nq' 10
+  list ['a\n', 'b\n', 'c'] ['a\n', 'b\n', 'c\n']
+  state ('x\ny\nz\n€\n\nq', None, 10, None)
+None 'a\rb\r\nc\nd' 'a\nb\nc\ndx\ny\nz\n€\n\nq' 17 ('\r', '\n', '\r\n')
+  lines ['a\n', 'b\n', 'c\n', 'dx\n', 'y\n', 'z\n', '€\n', '\n'] 16
+  read 'a\nb\nc' 5 '\ndx\ny\nz\n€\n\nq' 17
+  list ['a\n', 'b\n', 'c'] ['a\n', 'b\n', 'c\n']
+  state ('a\nb\nc\ndx\ny\nz\n€\n\nq', None, 17, None)
+'' None 'x\ry\r\nz\n€\r\nq' 11 ('\r', '\n', '\r\n')
+  lines ['x\r', 'y\r\n', 'z\n', '€\r\n', 'q', '', '', ''] 11
+  read 'x\ry\r\n' 5 'z\n€\r\nq' 11
+  list ['a\r', 'b\r\n', 'c'] ['a\r', 'b\r\n', 'c\r']
+  state ('x\ry\r\nz\n€\r\nq', '', 11, None)
+'' 'a\rb\r\nc\nd' 'a\rb\r\nc\ndx\ry\r\nz\n€\r\nq' 19 ('\r', '\n', '\r\n')
+  lines ['a\r', 'b\r\n', 'c\n', 'dx\r', 'y\r\n', 'z\n', '€\r\n', 'q'] 19
+  read 'a\rb\r\n' 5 'c\ndx\ry\r\nz\n€\r\nq' 19
+  list ['a\r', 'b\r\n', 'c'] ['a\r', 'b\r\n', 'c\r']
+  state ('a\rb\r\nc\ndx\ry\r\nz\n€\r\nq', '', 19, None)
+'\n' None 'x\ry\r\nz\n€\r\nq' 11 None
+  lines ['x\ry\r\n', 'z\n', '€\r\n', 'q', '', '', '', ''] 11
+  read 'x\ry\r\n' 5 'z\n€\r\nq' 11
+  list ['a\rb\r\n', 'c'] ['a\rb\r\n', 'c\r']
+  state ('x\ry\r\nz\n€\r\nq', '\n', 11, None)
+'\n' 'a\rb\r\nc\nd' 'a\rb\r\nc\ndx\ry\r\nz\n€\r\nq' 19 None
+  lines ['a\rb\r\n', 'c\n', 'dx\ry\r\n', 'z\n', '€\r\n', 'q', '', ''] 19
+  read 'a\rb\r\n' 5 'c\ndx\ry\r\nz\n€\r\nq' 19
+  list ['a\rb\r\n', 'c'] ['a\rb\r\n', 'c\r']
+  state ('a\rb\r\nc\ndx\ry\r\nz\n€\r\nq', '\n', 19, None)
+'\r' None 'x\ry\r\rz\r€\r\rq' 11 None
+  lines ['x\r', 'y\r', '\r', 'z\r', '€\r', '\r', 'q', ''] 11
+  read 'x\ry\r\r' 5 'z\r€\r\rq' 11
+  list ['a\r', 'b\r', '\r', 'c'] ['a\r', 'b\r', '\r', 'c\r']
+  state ('x\ry\r\rz\r€\r\rq', '\r', 11, None)
+'\r' 'a\rb\r\nc\nd' 'a\rb\r\rc\rdx\ry\r\rz\r€\r\rq' 19 None
+  lines ['a\r', 'b\r', '\r', 'c\r', 'dx\r', 'y\r', '\r', 'z\r'] 15
+  read 'a\rb\r\r' 5 'c\rdx\ry\r\rz\r€\r\rq' 19
+  list ['a\r', 'b\r', '\r', 'c'] ['a\r', 'b\r', '\r', 'c\r']
+  state ('a\rb\r\rc\rdx\ry\r\rz\r€\r\rq', '\r', 19, None)
+'\r\n' None 'x\ry\r\r\nz\r\n€\r\r\nq' 14 None
+  lines ['x\ry\r\r\n', 'z\r\n', '€\r\r\n', 'q', '', '', '', ''] 14
+  read 'x\ry\r\r' 5 '\nz\r\n€\r\r\nq' 14
+  list ['a\rb\r\r\n', 'c'] ['a\rb\r\r\n', 'c\r']
+  state ('x\ry\r\r\nz\r\n€\r\r\nq', '\r\n', 14, None)
+'\r\n' 'a\rb\r\nc\nd' 'a\rb\r\r\nc\r\ndx\ry\r\r\nz\r\n€\r\r\nq' 24 None
+  lines ['a\rb\r\r\n', 'c\r\n', 'dx\ry\r\r\n', 'z\r\n', '€\r\r\n', 'q', '', ''] 24
+  read 'a\rb\r\r' 5 '\nc\r\ndx\ry\r\r\nz\r\n€\r\r\nq' 24
+  list ['a\rb\r\r\n', 'c'] ['a\rb\r\r\n', 'c\r']
+  state ('a\rb\r\r\nc\r\ndx\ry\r\r\nz\r\n€\r\r\nq', '\r\n', 24, None)
+'\n\x00x' None 'x\ry\r\nz\n€\r\nq' 11 None
+  lines ['x\ry\r\n', 'z\n', '€\r\n', 'q', '', '', '', ''] 11
+  read 'x\ry\r\n' 5 'z\n€\r\nq' 11
+  list ['a\rb\r\n', 'c'] ['a\rb\r\n', 'c\r']
+  state ('x\ry\r\nz\n€\r\nq', '\n', 11, None)
+'\n\x00x' 'a\rb\r\nc\nd' 'a\rb\r\nc\ndx\ry\r\nz\n€\r\nq' 19 None
+  lines ['a\rb\r\n', 'c\n', 'dx\ry\r\n', 'z\n', '€\r\n', 'q', '', ''] 19
+  read 'a\rb\r\n' 5 'c\ndx\ry\r\nz\n€\r\nq' 19
+  list ['a\rb\r\n', 'c'] ['a\rb\r\n', 'c\r']
+  state ('a\rb\r\nc\ndx\ry\r\nz\n€\r\nq', '\n', 19, None)
+h€l 3 lo😀  7 2 llo😀 wörld 12
+'h€llo😀 wörld\x00\x00\x00\x00\x00\x00\x00\x00Z' 21
+😀 1 2
+'\x00\x00\x00q'
+2 0 ab 10 ab
+'a' 1
+1 aZc c
+'' 10 'abc' ''
+ab c
+ def
+ ''
+['a\n', 'b\n'] ['a\n', 'b\n']
+'\r\n'
+('\r', '\r\n')
+<class 'str'> hey
+1 b 1
+read (1, 2) TypeError read expected at most 1 argument, got 2
+read ('x',) TypeError argument should be integer or None, not 'str'
+readline (1, 2) TypeError readline expected at most 1 argument, got 2
+readline (1.5,) TypeError argument should be integer or None, not 'float'
+write () TypeError StringIO.write() takes exactly one argument (0 given)
+write (1, 2) TypeError StringIO.write() takes exactly one argument (2 given)
+write (b'x',) TypeError string argument expected, got 'bytes'
+seek () TypeError seek expected at least 1 argument, got 0
+seek (1, 2, 3) TypeError seek expected at most 2 arguments, got 3
+seek (1.5,) TypeError 'float' object cannot be interpreted as an integer
+seek (0, 1.5) TypeError 'float' object cannot be interpreted as an integer
+seek (-1,) ValueError Negative seek position -1
+seek (1, 1) OSError Can't do nonzero cur-relative seeks
+seek (0, 3) ValueError Invalid whence (3, should be 0, 1 or 2)
+seek (1180591620717411303424,) OverflowError Python int too large to convert to C ssize_t
+seek (0, 1099511627776) OverflowError Python int too large to convert to C int
+read (1180591620717411303424,) OverflowError cannot fit 'int' into an index-sized integer
+truncate (1, 2) TypeError truncate expected at most 1 argument, got 2
+truncate ('x',) TypeError 'str' object cannot be interpreted as an integer
+truncate (-1,) ValueError negative pos value -1
+truncate (1180591620717411303424,) OverflowError Python int too large to convert to C long
+tell (1,) TypeError StringIO.tell() takes no arguments (1 given)
+getvalue (1,) TypeError StringIO.getvalue() takes no arguments (1 given)
+close (1,) TypeError StringIO.close() takes no arguments (1 given)
+readable (1,) TypeError StringIO.readable() takes no arguments (1 given)
+__getstate__ (1,) TypeError StringIO.__getstate__() takes no arguments (1 given)
+__setstate__ () TypeError StringIO.__setstate__() takes exactly one argument (0 given)
+__setstate__ (1, 2) TypeError StringIO.__setstate__() takes exactly one argument (2 given)
+StringIO.read() takes no keyword arguments
+StringIO.write() takes no keyword arguments
+StringIO.seek() takes no keyword arguments
+StringIO.tell() takes no keyword arguments
+() {'x': 1} TypeError StringIO() got an unexpected keyword argument 'x'
+() {'initial_value': 'a', 'x': 1} TypeError StringIO() got an unexpected keyword argument 'x'
+() {'newline': None, 'x': 1, 'y': 2} TypeError StringIO() takes at most 2 keyword arguments (3 given)
+('a', '\n', 3) {} TypeError StringIO() takes at most 2 arguments (3 given)
+('a',) {'initial_value': 'b'} TypeError argument for StringIO() given by name ('initial_value') and position (1)
+() {'newline': 'x'} ValueError illegal newline value: 'x'
+() {'newline': 5} TypeError newline must be str or None, not int
+(5,) {} TypeError initial_value must be str or None, not int
+(b'a',) {} TypeError initial_value must be str or None, not bytes
+() {'newline': '\n\n'} ValueError illegal newline value: '\n\n'
+flush ok None
+readlines ValueError I/O operation on closed file.
+__iter__ ValueError I/O operation on closed file.
+__enter__ ValueError I/O operation on closed file.
+isatty ValueError I/O operation on closed file.
+fileno UnsupportedOperation fileno
+detach UnsupportedOperation detach
+closed ok True
+line_buffering ValueError I/O operation on closed file
+newlines ValueError I/O operation on closed file
+encoding ok None
+errors ok None
+__getstate__ ValueError I/O operation on closed file
+readable ValueError I/O operation on closed file
+truncate ValueError I/O operation on closed file
+readline ValueError I/O operation on closed file
+__next__ ValueError I/O operation on closed file
+read ValueError I/O operation on closed file
+getvalue ValueError I/O operation on closed file
+tell ValueError I/O operation on closed file
+write I/O operation on closed file
+False re
+u read ValueError I/O operation on uninitialized object
+u write ValueError I/O operation on uninitialized object
+u closed ValueError I/O operation on uninitialized object
+u getvalue ValueError I/O operation on uninitialized object
+u __getstate__ ValueError I/O operation on uninitialized object
+u newlines ValueError I/O operation on uninitialized object
+u line_buffering ValueError I/O operation on uninitialized object
+close ok None
+None b
+readline() should have returned a str object, not 'bytes'
+I/O operation on uninitialized object
+('hello', '\r', 2, {'x': 1})
+hello 2 1 None
+'a\nb' 
+
+('x', '\n', 0, None)
+('x', '\n', 0, {})
+TypeError _io.StringIO.__setstate__ argument should be 4-tuple, got tuple
+TypeError _io.StringIO.__setstate__ argument should be 4-tuple, got list
+TypeError newline must be str or None, not int
+TypeError initial_value must be str or None, not int
+TypeError third item of state must be an integer, got str
+ValueError position value cannot be negative
+OverflowError Python int too large to convert to C ssize_t
+TypeError fourth item of state should be a dict, got a int
+ValueError illegal newline value: 'x'
+I/O operation on closed file
+True
+0 1

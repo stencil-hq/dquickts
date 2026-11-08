@@ -1,0 +1,43 @@
+sorted by age (stable) [('eve', 22), ('bob', 25), ('carol', 25), ('frank', 25), ('alice', 30), ('dave', 30)]
+sorted by age reverse (stable) [('alice', 30), ('dave', 30), ('bob', 25), ('carol', 25), ('frank', 25), ('eve', 22)]
+reversed(sorted) differs [('dave', 30), ('alice', 30), ('frank', 25), ('carol', 25), ('bob', 25), ('eve', 22)]
+sorted tuple key [('alice', 30), ('dave', 30), ('bob', 25), ('carol', 25), ('frank', 25), ('eve', 22)]
+sorted default tuples [('alice', 30), ('bob', 25), ('carol', 25), ('dave', 30), ('eve', 22), ('frank', 25)]
+sorted by len then alpha ['a', 'b', 'aa', 'bb', 'ccc']
+two-pass stable sort [('eve', 22), ('bob', 25), ('carol', 25), ('frank', 25), ('alice', 30), ('dave', 30)]
+sorted [-2, -2, 0, 1, 3, 7, 10]
+sorted reverse [10, 7, 3, 1, 0, -2, -2]
+sorted abs [0, 1, -2, -2, 3, 7, 10]
+sorted abs reverse [10, 7, 3, -2, -2, 1, 0]
+original untouched [3, 1, -2, 10, 0, -2, 7]
+sort returns None None
+after sort [-2, -2, 0, 1, 3, 7, 10]
+sort by mod 3 stable [0, 3, -2, -2, 1, 7, 10]
+sort reverse [10, 7, 3, 1, 0, -2, -2]
+key once per element ([9, 8, 7, 6, 5, 4, 3, 2, 1, 0], 10)
+sorted str ['a', 'a', 'a', 'b', 'n', 'n']
+sorted dict ['a', 'b']
+sorted dict items by value [('c', 0), ('b', 1), ('a', 2)]
+sorted empty []
+sorted floats [-1e+300, -0.0, 0.0, 1, True, 2.5]
+sorted mixed int str TypeError '<' not supported between instances of 'str' and 'int'
+sorted None TypeError '<' not supported between instances of 'int' and 'NoneType'
+sorted lists [[], [1], [1, 5], [2]]
+sorted list vs tuple TypeError '<' not supported between instances of 'tuple' and 'list'
+sorted complex TypeError '<' not supported between instances of 'complex' and 'complex'
+sorted key=None [1, 3]
+sorted positional key TypeError sorted expected 1 argument, got 2
+sort positional key TypeError sort() takes no positional arguments
+sorted bad key TypeError 'int' object is not callable
+sorted key raises ZeroDivisionError division by zero
+sorted reverse int [3, 2, 1]
+sorted reverse str [3, 2, 1]
+sorted generator [0, 1, 1, 4, 4, 9, 9]
+sorted by str [1, 10, 100, 9]
+sorted case-insensitive ['A', 'a', 'b', 'B']
+sorted bytes [b'A', b'a', b'b']
+sorted with nan stays 3
+sorted bool [False, True, True]
+sorted big ints [-18446744073709551616, 0, 9223372036854775808, 18446744073709551616]
+mutation during sort ValueError list modified during sort
+list after mutation error [1, 4, 5]

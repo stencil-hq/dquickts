@@ -1,0 +1,34 @@
+isinstance basic True True False
+isinstance tuple True False
+nested tuple True
+empty tuple False
+union True False True
+issubclass tuple True False
+issubclass self True True
+type is True False True
+__class__ True Dog
+builtins True True False
+object True True True
+type of type <class 'type'> <class 'type'> <class 'NoneType'>
+NoneType name NoneType ellipsis NotImplementedType
+tuple short-circuits True
+TypeError isinstance() arg 2 must be a type, a tuple of types, or a union
+TypeError isinstance() arg 2 must be a type, a tuple of types, or a union
+TypeError isinstance() arg 2 must be a type, a tuple of types, or a union
+TypeError issubclass() arg 1 must be a class
+TypeError issubclass() arg 2 must be a class, a tuple of classes, or a union
+instancecheck hook True False False
+subclasscheck hook True False
+hook in tuple True
+class assignment Other other False
+TypeError __class__ assignment only supported for mutable types or ModuleType subclasses
+TypeError __class__ assignment only supported for mutable types or ModuleType subclasses
+fake __class__ True True Dog
+type names ['int', 'float', 'complex', 'str', 'bytes', 'list', 'tuple', 'dict', 'set', 'NoneType', 'range']
+bool subclass of int False True
+filter ints [1, 4]
+exact type check [1, 4]
+callable checks True True False True
+type is instance of itself True True
+issubclass union True False
+union repr int | str int | None True

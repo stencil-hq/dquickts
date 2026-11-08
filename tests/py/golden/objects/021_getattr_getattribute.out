@@ -1,0 +1,22 @@
+normal lookup class attr instance attr
+fallback dynamic x dynamic y
+hasattr True False
+AttributeError no attribute 'other'
+getattr default default
+explicit dunder lookup uses getattr False
+implicit dunder skips getattr TypeError object of type 'Fallback' has no len()
+intercept intercepted 1 1
+logged ['secret', 'real', 'method', 'real']
+AttributeError 'Everything' object has no attribute 'missing'
+getattr after AttributeError getattr saw boom getattr saw missing
+proxy red HI
+AttributeError 'Target' object has no attribute 'nothing'
+chained getattr resolved
+non-AttributeError propagates KeyError 'x'
+hasattr propagates KeyError 'x'
+getattr default only for AttributeError None
+patched getattr patched foo
+int no attribute AttributeError 'int' object has no attribute 'x'
+AttributeError 'NoneType' object has no attribute 'foo'
+AttributeError type object 'int' has no attribute 'foo'
+AttributeError name obj nope s

@@ -1,0 +1,51 @@
+search <re.Match object; span=(6, 8), match='66'>
+search none None
+match none None
+match <re.Match object; span=(0, 5), match='Order'>
+fullmatch <re.Match object; span=(0, 6), match='abc123'>
+fullmatch none None
+match prefix only ab
+findall 0 groups ['66', '12', '7', '300']
+findall 1 group ['12', '7', '300']
+findall 2 groups [('12', 'apples'), ('7', 'pears'), ('300', 'plums')]
+findall opt group [('a', 'b'), ('', 'b')]
+findall empty ['', 'x', '', '']
+findall none []
+finditer 'apples' (13, 19) 13 19
+finditer 'pears' (23, 28) 23 28
+finditer 'plums' (34, 39) 34 39
+finditer empty [(0, 0), (1, 1), (2, 2)]
+group0 '12 apples' '12 apples'
+group1 12 apples
+group multi ('12', 'apples')
+groups ('12', 'apples', None)
+groups default ('12', 'apples', '-')
+groupdict {'qty': '12', 'fruit': 'apples', 'suffix': None}
+groupdict default {'qty': '12', 'fruit': 'apples', 'suffix': '?'}
+span (0, 9) (0, 2) (3, 9) (-1, -1)
+start/end 3 9 -1
+lastindex 2 lastgroup fruit
+string/pos '12 ap' 0 30
+re attr (?P<qty>\d+) (?P<fruit>\w+)(?P<suffix>z)?
+expand apples=12 [12]
+bad group IndexError no such group
+bad name IndexError no such group
+unmatched group ('a', None) (-1, -1) 1
+bool True False
+pattern repr re.compile('\\d')
+pattern attrs \d 0 {}
+pos endpos <re.Match object; span=(3, 4), match='2'> ['2']
+match at pos <re.Match object; span=(2, 3), match='3'>
+groupindex {'a': 1, 'b': 2} 2
+greedy ['<b>bold</b><i>it</i>']
+lazy ['<b>', '</b>', '<i>', '</i>']
+lazy plus a
+lazy brace aa aaaa
+possessive aaab None
+atomic <re.Match object; span=(0, 3), match='aab'> None
+dollar before nl <re.Match object; span=(4, 7), match='end'>
+Z before nl None
+Z <re.Match object; span=(4, 7), match='end'>
+A ['a'] ['a', 'c']
+word boundary ['cat', 'cat']
+non boundary ['cat', 'cat']

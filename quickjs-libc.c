@@ -177,10 +177,24 @@ typedef struct JSThreadState {
     struct pollfd *poll_fds;
     int poll_fds_size;
 #endif    
+    /* js_std_set_wait_hooks() */
+    void *(*wait_enter)(JSRuntime *rt);
+    void (*wait_leave)(JSRuntime *rt, void *state);
+    /* between 'wait_enter' and 'wait_leave' in js_os_poll_internal():
+       the other threads of the runtime may run */
+    BOOL waiting;
+#ifdef USE_WORKER
+    /* signaled (once per wait) by js_os_wake() */
+    BOOL wait_woken;
+    BOOL has_wait_waker;
+    JSWaker wait_waker;
+#endif
 } JSThreadState;
 
 static uint64_t os_pending_signals;
 static int (*os_poll_func)(JSContext *ctx);
+
+static void js_os_wake(JSThreadState *ts);
 
 static void js_std_dbuf_init(JSContext *ctx, DynBuf *s)
 {
@@ -2461,12 +2475,14 @@ static JSValue js_os_setReadHandler(JSContext *ctx, JSValueConst this_val,
             if (!rh)
                 return JS_EXCEPTION;
             rh->fd = fd;
+            rh->poll_fd_index = -1;
             rh->rw_func[0] = JS_NULL;
             rh->rw_func[1] = JS_NULL;
             list_add_tail(&rh->link, &ts->os_rw_handlers);
         }
         JS_FreeValue(ctx, rh->rw_func[magic]);
         rh->rw_func[magic] = JS_DupValue(ctx, func);
+        js_os_wake(ts);
     }
     return JS_UNDEFINED;
 }
@@ -2605,7 +2621,17 @@ static void free_timer(JSRuntime *rt, JSOSTimer *th)
     js_free_rt(rt, th);
 }
 
-/* setTimeout(func, delay) and setInterval(func, delay) if is_interval */
+/* the global timers of js_std_add_helpers() may exist without
+   js_std_init_handlers() */
+static JSValue js_os_throw_no_handlers(JSContext *ctx)
+{
+    return JS_ThrowTypeError(ctx, "no event loop (js_std_init_handlers() was not called)");
+}
+
+/* setTimeout(func, delay) and setInterval(func, delay) if is_interval,
+   also the globals of js_std_add_helpers(): return the timer id (a
+   number). func is called without arguments (the extra arguments are
+   ignored, as in quickjs-ng). */
 static JSValue js_os_setTimeout(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv, int is_interval)
 {
@@ -2615,6 +2641,8 @@ static JSValue js_os_setTimeout(JSContext *ctx, JSValueConst this_val,
     JSValueConst func;
     JSOSTimer *th;
 
+    if (!ts)
+        return js_os_throw_no_handlers(ctx);
     func = argv[0];
     if (!JS_IsFunction(ctx, func))
         return JS_ThrowTypeError(ctx, "not a function");
@@ -2637,6 +2665,7 @@ static JSValue js_os_setTimeout(JSContext *ctx, JSValueConst this_val,
         th->interval = delay;
     th->func = JS_DupValue(ctx, func);
     list_add_tail(&th->link, &ts->os_timers);
+    js_os_wake(ts);
     return JS_NewInt32(ctx, th->timer_id);
 }
 
@@ -2661,6 +2690,8 @@ static JSValue js_os_clearTimeout(JSContext *ctx, JSValueConst this_val,
     JSOSTimer *th;
     int timer_id;
 
+    if (!ts)
+        return js_os_throw_no_handlers(ctx);
     if (JS_ToInt32(ctx, &timer_id, argv[0]))
         return JS_EXCEPTION;
     th = find_timer_by_id(ts, timer_id);
@@ -2697,6 +2728,7 @@ static JSValue js_os_sleepAsync(JSContext *ctx, JSValueConst this_val,
     th->timeout = get_time_ms() + delay;
     th->func = JS_DupValue(ctx, resolving_funcs[0]);
     list_add_tail(&th->link, &ts->os_timers);
+    js_os_wake(ts);
     JS_FreeValue(ctx, resolving_funcs[0]);
     JS_FreeValue(ctx, resolving_funcs[1]);
     return promise;
@@ -2717,10 +2749,12 @@ static int call_handler(JSContext *ctx, JSValueConst func)
     return 0;
 }
 
-/* call the handler of the first expired timer. Return 1 if a handler
-   was called, -1 if it threw (the exception is pending). Otherwise
-   return 0 and set '*pmin_delay' to the delay in ms until the next
-   timer expires or to -1 if there is no timer. */
+/* call the handler of the expired timer which expired first (the first
+   one created on ties), so that the timers run in the order of their
+   expiration even when the loop is late. Return 1 if a handler was
+   called, -1 if it threw (the exception is pending). Otherwise return 0
+   and set '*pmin_delay' to the delay in ms until the next timer expires
+   or to -1 if there is no timer. */
 static int js_os_run_timers(JSContext *ctx, JSThreadState *ts,
                             int *pmin_delay)
 {
@@ -2728,7 +2762,7 @@ static int js_os_run_timers(JSContext *ctx, JSThreadState *ts,
     int64_t cur_time, delay;
     int min_delay, ret;
     struct list_head *el;
-    JSOSTimer *th;
+    JSOSTimer *th, *expired;
     JSValue func;
 
     if (list_empty(&ts->os_timers)) {
@@ -2737,33 +2771,38 @@ static int js_os_run_timers(JSContext *ctx, JSThreadState *ts,
     }
     cur_time = get_time_ms();
     min_delay = 10000;
+    expired = NULL;
     list_for_each(el, &ts->os_timers) {
         th = list_entry(el, JSOSTimer, link);
         delay = th->timeout - cur_time;
         if (delay <= 0) {
-            /* the timer expired */
-            if (th->interval > 0) {
-                /* rearm it before the call so that the handler can
-                   clear it. Moving it to the end of the list lets the
-                   other expired timers run first. */
-                func = JS_DupValue(ctx, th->func);
-                th->timeout = cur_time + th->interval;
-                list_del(&th->link);
-                list_add_tail(&th->link, &ts->os_timers);
-            } else {
-                func = th->func;
-                th->func = JS_UNDEFINED;
-                free_timer(rt, th);
-            }
-            ret = call_handler(ctx, func);
-            JS_FreeValue(ctx, func);
-            return ret < 0 ? -1 : 1;
+            if (!expired || th->timeout < expired->timeout)
+                expired = th;
         } else if (delay < min_delay) {
             min_delay = delay;
         }
     }
-    *pmin_delay = min_delay;
-    return 0;
+    if (!expired) {
+        *pmin_delay = min_delay;
+        return 0;
+    }
+    th = expired;
+    if (th->interval > 0) {
+        /* rearm it before the call so that the handler can clear it.
+           Moving it to the end of the list lets the other timers which
+           expire at the same time run first. */
+        func = JS_DupValue(ctx, th->func);
+        th->timeout = cur_time + th->interval;
+        list_del(&th->link);
+        list_add_tail(&th->link, &ts->os_timers);
+    } else {
+        func = th->func;
+        th->func = JS_UNDEFINED;
+        free_timer(rt, th);
+    }
+    ret = call_handler(ctx, func);
+    JS_FreeValue(ctx, func);
+    return ret < 0 ? -1 : 1;
 }
 
 #ifdef USE_WORKER
@@ -2913,6 +2952,62 @@ static int handle_posted_message(JSRuntime *rt, JSContext *ctx,
 }
 #endif /* !USE_WORKER */
 
+/* a timer or a handler was added: end the wait of the event loop if
+   another thread waits in it (see js_std_set_wait_hooks()) */
+static void js_os_wake(JSThreadState *ts)
+{
+#ifdef USE_WORKER
+    if (ts->waiting && ts->has_wait_waker && !ts->wait_woken) {
+        ts->wait_woken = TRUE;
+        js_waker_signal(&ts->wait_waker);
+    }
+#endif
+}
+
+/* with the wait hooks, the waker of js_os_wake(), created by the first
+   wait (not inherited by the child processes): FALSE if there is none */
+static BOOL js_os_has_wait_waker(JSThreadState *ts)
+{
+#ifdef USE_WORKER
+    if (ts->wait_enter && !ts->has_wait_waker &&
+        js_waker_init(&ts->wait_waker) == 0) {
+#if !defined(_WIN32)
+        fcntl(ts->wait_waker.read_fd, F_SETFD, FD_CLOEXEC);
+        fcntl(ts->wait_waker.write_fd, F_SETFD, FD_CLOEXEC);
+#endif
+        ts->has_wait_waker = TRUE;
+    }
+    return ts->wait_enter && ts->has_wait_waker;
+#else
+    return FALSE;
+#endif
+}
+
+/* around the wait of js_os_poll_internal(): the wait hooks let the other
+   threads of the runtime run. 'state' is the value of 'wait_enter'. */
+static void *js_os_wait_enter(JSRuntime *rt, JSThreadState *ts)
+{
+    if (!ts->wait_enter)
+        return NULL;
+    ts->waiting = TRUE;
+#ifdef USE_WORKER
+    ts->wait_woken = FALSE;
+#endif
+    return ts->wait_enter(rt);
+}
+
+static void js_os_wait_leave(JSRuntime *rt, JSThreadState *ts, void *state)
+{
+    int err;
+
+    if (!ts->wait_enter)
+        return;
+    err = errno;
+    ts->wait_leave(rt, state);
+    ts->waiting = FALSE;
+    errno = err;
+}
+
 /* js_os_poll_internal() flag: run the timers and return -1 when there
    is no event source left. Without it, the I/O is waited for at most
    'timeout_ms'. */
@@ -2929,10 +3024,11 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
 {
     JSRuntime *rt = JS_GetRuntime(ctx);
     JSThreadState *ts = JS_GetRuntimeOpaque(rt);
-    int min_delay, count, ret;
+    int min_delay, count, ret, waker_index;
     JSOSRWHandler *rh;
     struct list_head *el;
     HANDLE handles[MAXIMUM_WAIT_OBJECTS]; // 64
+    void *state;
 
     /* XXX: handle signals if useful */
 
@@ -2966,14 +3062,29 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
             break;
     }
 
+    /* the waker of js_os_wake(), unless there is nothing to wait for */
+    waker_index = -1;
+    if ((count > 0 || min_delay > 0) && count < (int)countof(handles) &&
+        js_os_has_wait_waker(ts)) {
+        waker_index = count;
+        handles[count++] = ts->wait_waker.handle;
+    }
+
     ret = 0;
     if (count > 0) {
         DWORD wret, timeout = INFINITE;
         if (min_delay != -1)
             timeout = min_delay;
+        state = js_os_wait_enter(rt, ts);
         wret = WaitForMultipleObjects(count, handles, FALSE, timeout);
+        js_os_wait_leave(rt, ts, state);
 
-        if (wret < (DWORD)count) {
+        if (waker_index >= 0 && wret == (DWORD)waker_index) {
+#ifdef USE_WORKER
+            /* a new timer or handler: the caller polls again */
+            js_waker_clear(&ts->wait_waker);
+#endif
+        } else if (wret < (DWORD)count) {
             list_for_each(el, &ts->os_rw_handlers) {
                 rh = list_entry(el, JSOSRWHandler, link);
                 if (rh->fd == 0 && !JS_IsNull(rh->rw_func[0])) {
@@ -2999,7 +3110,9 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
             }
         }
     } else if (min_delay > 0) {
+        state = js_os_wait_enter(rt, ts);
         Sleep(min_delay);
+        js_os_wait_leave(rt, ts, state);
     }
  done:
     return ret;
@@ -3041,9 +3154,10 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
 {
     JSRuntime *rt = JS_GetRuntime(ctx);
     JSThreadState *ts = JS_GetRuntimeOpaque(rt);
-    int min_delay, nfds, ret;
+    int min_delay, nfds, ret, waker_index;
     JSOSRWHandler *rh;
     struct list_head *el;
+    void *state;
 
     /* only check signals in the main thread */
     if (!ts->recv_pipe &&
@@ -3071,11 +3185,14 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
             return ret < 0 ? -2 : 0;
     }
 
+    /* the handlers added during the wait (by the other threads of
+       js_std_set_wait_hooks()) keep the index -1 */
     nfds = 0;
     list_for_each(el, &ts->os_rw_handlers) {
         int events;
 
         rh = list_entry(el, JSOSRWHandler, link);
+        rh->poll_fd_index = -1;
         events = 0;
         if (!JS_IsNull(rh->rw_func[0]))
             events |= POLLIN;
@@ -3090,6 +3207,7 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
 
     list_for_each(el, &ts->port_list) {
         JSWorkerMessageHandler *port = list_entry(el, JSWorkerMessageHandler, link);
+        port->poll_fd_index = -1;
         if (!JS_IsNull(port->on_message_func)) {
             JSWorkerMessagePipe *ps = port->recv_pipe;
             port->poll_fd_index = nfds;
@@ -3102,15 +3220,34 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
     if (nfds == 0 && min_delay < 0 && !(flags & JS_OS_POLL_RUN_TIMERS))
         return 0;
 
+    /* the waker of js_os_wake() */
+    waker_index = -1;
+    if (js_os_has_wait_waker(ts)) {
+        waker_index = nfds;
+        if (js_poll_add_poll_fd(ts, &nfds, ts->wait_waker.read_fd, POLLIN))
+            return -1;
+    }
+
     ret = 0;
+    state = js_os_wait_enter(rt, ts);
     nfds = poll(ts->poll_fds, nfds, min_delay);
+    js_os_wait_leave(rt, ts, state);
     if (nfds < 0) {
         /* a signal handler is run by the next call */
         if (errno != EINTR)
             ret = -1;
     } else if (nfds > 0) {
+#ifdef USE_WORKER
+        /* a new timer or handler: the caller polls again */
+        if (waker_index >= 0 && ts->poll_fds[waker_index].revents != 0) {
+            js_waker_clear(&ts->wait_waker);
+            goto done;
+        }
+#endif
         list_for_each(el, &ts->os_rw_handlers) {
             rh = list_entry(el, JSOSRWHandler, link);
+            if (rh->poll_fd_index < 0)
+                continue;
             if (!JS_IsNull(rh->rw_func[0]) &&
                 (ts->poll_fds[rh->poll_fd_index].revents & (POLLERR | POLLHUP | POLLNVAL | POLLIN))) {
                 if (call_handler(ctx, rh->rw_func[0]) < 0)
@@ -3129,7 +3266,7 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
 
         list_for_each(el, &ts->port_list) {
             JSWorkerMessageHandler *port = list_entry(el, JSWorkerMessageHandler, link);
-            if (!JS_IsNull(port->on_message_func)) {
+            if (!JS_IsNull(port->on_message_func) && port->poll_fd_index >= 0) {
                 if (ts->poll_fds[port->poll_fd_index].revents != 0) {
                     int r = handle_posted_message(rt, ctx, port);
                     if (r < 0)
@@ -3160,6 +3297,11 @@ static int js_os_poll(JSContext *ctx)
 int js_std_poll_io(JSContext *ctx, int timeout_ms)
 {
     return js_os_poll_internal(ctx, timeout_ms, 0);
+}
+
+int js_std_poll(JSContext *ctx)
+{
+    return js_os_poll_internal(ctx, -1, JS_OS_POLL_RUN_TIMERS);
 }
 
 static JSValue make_obj_error(JSContext *ctx,
@@ -4513,11 +4655,13 @@ static JSValue js_worker_set_onmessage(JSContext *ctx, JSValueConst this_val,
                 return JS_EXCEPTION;
             port->recv_pipe = js_dup_message_pipe(worker->recv_pipe);
             port->on_message_func = JS_NULL;
+            port->poll_fd_index = -1;
             list_add_tail(&port->link, &ts->port_list);
             worker->msg_handler = port;
         }
         JS_FreeValue(ctx, port->on_message_func);
         port->on_message_func = JS_DupValue(ctx, func);
+        js_os_wake(ts);
     }
     return JS_UNDEFINED;
 }
@@ -4838,6 +4982,15 @@ JSValue js_std_console_log(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
+/* globalThis[name] = func; func is freed */
+static int js_std_set_global_func(JSContext *ctx, JSValueConst global_obj,
+                                  const char *name, JSValue func)
+{
+    if (JS_IsException(func))
+        return -1;
+    return JS_SetPropertyStr(ctx, global_obj, name, func);
+}
+
 /* in case of error, the exception is left pending */
 void js_std_add_helpers(JSContext *ctx, int argc, char **argv)
 {
@@ -4884,6 +5037,21 @@ void js_std_add_helpers(JSContext *ctx, int argc, char **argv)
     if (JS_IsException(val))
         goto done;
     JS_SetPropertyStr(ctx, global_obj, "__loadScript", val);
+
+    /* the timers of the 'os' module (same functions, shared ids) */
+    if (js_std_set_global_func(ctx, global_obj, "setTimeout",
+                               JS_NewCFunctionMagic(ctx, js_os_setTimeout, "setTimeout", 2,
+                                                    JS_CFUNC_generic_magic, 0)) < 0 ||
+        js_std_set_global_func(ctx, global_obj, "clearTimeout",
+                               JS_NewCFunction(ctx, js_os_clearTimeout, "clearTimeout", 1)) < 0 ||
+        js_std_set_global_func(ctx, global_obj, "setInterval",
+                               JS_NewCFunctionMagic(ctx, js_os_setTimeout, "setInterval", 2,
+                                                    JS_CFUNC_generic_magic, 1)) < 0 ||
+        js_std_set_global_func(ctx, global_obj, "clearInterval",
+                               JS_NewCFunction(ctx, js_os_clearTimeout, "clearInterval", 1)) < 0)
+        goto done;
+    /* js_std_loop() runs them without the 'os' module */
+    os_poll_func = js_os_poll;
  done:
     JS_FreeValue(ctx, global_obj);
 }
@@ -4918,6 +5086,15 @@ void js_std_init_handlers(JSRuntime *rt)
         JS_SetSharedArrayBufferFunctions(rt, &sf);
     }
 #endif
+}
+
+void js_std_set_wait_hooks(JSRuntime *rt, void *(*enter)(JSRuntime *rt),
+                           void (*leave)(JSRuntime *rt, void *state))
+{
+    JSThreadState *ts = JS_GetRuntimeOpaque(rt);
+
+    ts->wait_enter = enter;
+    ts->wait_leave = leave;
 }
 
 void js_std_free_handlers(JSRuntime *rt)
@@ -4961,6 +5138,10 @@ void js_std_free_handlers(JSRuntime *rt)
 
 #if !defined(_WIN32)
     free(ts->poll_fds);
+#endif
+#ifdef USE_WORKER
+    if (ts->has_wait_waker)
+        js_waker_close(&ts->wait_waker);
 #endif
 
     free(ts);

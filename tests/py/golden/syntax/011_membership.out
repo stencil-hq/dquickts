@@ -1,0 +1,42 @@
+substr True True True True
+substr miss False False False
+not in str True False
+list in True False True
+list eq based True True True
+tuple in True True True
+dict keys True False True
+dict values True True
+set in True True False
+frozenset in True
+range in True False True False
+range neg True False
+range float True False
+range big True False
+bytes in True True False True
+bytearray in True True
+nan same object True False
+int in str TypeError 'in <string>' requires string as left operand, not int
+list in set TypeError cannot use 'list' as a set element (unhashable type: 'list')
+in int TypeError argument of type 'int' is not a container or iterable
+in None TypeError argument of type 'NoneType' is not a container or iterable
+dict key unhashable TypeError cannot use 'list' as a dict key (unhashable type: 'list')
+bytes in str TypeError 'in <string>' requires string as left operand, not bytes
+str in bytes TypeError a bytes-like object is required, not 'str'
+256 in bytes ValueError byte must be in range(0, 256)
+float in bytes TypeError a bytes-like object is required, not 'float'
+  __contains__ 4
+  __contains__ 3
+  __contains__ 3
+contains True False True
+contains non-bool coerced True
+  __iter__ called
+  __iter__ called
+iter fallback True False
+getitem fallback True False
+iterator in True [3, 4]
+generator in True 16
+in chain True False
+not in vs not True True
+multi-char False True
+case sensitive False
+unicode True False

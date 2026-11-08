@@ -1,0 +1,24 @@
+compose 11 12 7
+partial 81 1024 27
+map [2, 3, 4]
+map two seqs [8, 9]
+filter [1, 3, 5, 7, 9]
+filter None [1, 'a', [0]]
+sorted key ['a', 'bb', 'ccc']
+max key ccc
+reduce sum 10
+reduce concat cba
+memo fib 40 102334155
+memo calls 41
+memo cache size 41
+memo hit 102334155 41
+TypeError cannot use 'tuple' as a dict key (unhashable type: 'list')
+curry 6 6 6
+pipeline ['hello', 'world']
+unbound method as func ['A', 'B']
+builtin as func [0, 2, 3]
+type as func [1, 22] ['1', '2']
+apply_n 1024
+dispatch table [11, 20, 11]
+immediately invoked ((1,), {'z': 2})
+lambda conditional neg

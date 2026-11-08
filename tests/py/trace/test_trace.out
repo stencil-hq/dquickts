@@ -1,0 +1,531 @@
+== calls -> 9
+   call      calls         62 
+   line      calls         63 
+   call      add           57 
+   line      add           58 
+   line      add           59 
+   return    add           59 3
+   line      calls         64 
+   line      calls         65 
+   line      calls         64 
+   call      add           57 
+   line      add           58 
+   line      add           59 
+   return    add           59 6
+   line      calls         66 
+   call      add           57 
+   line      add           58 
+   line      add           59 
+   return    add           59 9
+   return    calls         66 9
+== one-liner -> 84
+   call      uses_one_liner  75 
+   line      uses_one_liner  76 
+   call      one_liner     72 
+   line      one_liner     72 
+   return    one_liner     72 42
+   call      one_liner     72 
+   line      one_liner     72 
+   return    one_liner     72 42
+   return    uses_one_liner  76 84
+== recursion -> 3
+   call      recurse       82 
+   line      recurse       83 
+   line      recurse       85 
+   call      recurse       82 
+   line      recurse       83 
+   line      recurse       85 
+   call      recurse       82 
+   line      recurse       83 
+   line      recurse       84 
+   return    recurse       84 0
+   return    recurse       85 1
+   return    recurse       85 3
+== loops -> 102
+   call      loops         93 
+   line      loops         94 
+   line      loops         95 
+   line      loops         96 
+   line      loops         98 
+   line      loops         95 
+   line      loops         96 
+   line      loops         97 
+   line      loops         95 
+   line      loops         96 
+   line      loops         98 
+   line      loops         95 
+   line      loops         99 
+   line      loops        100 
+   line      loops        101 
+   line      loops        100 
+   line      loops        101 
+   line      loops        100 
+   line      loops        102 
+   line      loops        102 
+   line      loops        102 
+   line      loops        103 
+   line      loops        104 
+   line      loops        103 
+   line      loops        104 
+   line      loops        103 
+   line      loops        104 
+   line      loops        105 
+   line      loops        108 
+   line      loops        111 
+   line      loops        112 
+   return    loops        112 102
+== nested loops -> 1
+   call      nested_loops 118 
+   line      nested_loops 119 
+   line      nested_loops 120 
+   line      nested_loops 121 
+   line      nested_loops 122 
+   line      nested_loops 121 
+   line      nested_loops 122 
+   line      nested_loops 121 
+   line      nested_loops 120 
+   line      nested_loops 121 
+   line      nested_loops 122 
+   line      nested_loops 121 
+   line      nested_loops 122 
+   line      nested_loops 121 
+   line      nested_loops 120 
+   line      nested_loops 123 
+   return    nested_loops 123 1
+== comprehensions -> ([0, 1, 4], {'a': 0, 'b': 1}, 5)
+   call      comprehensions 129 
+   line      comprehensions 130 
+   line      comprehensions 130 
+   line      comprehensions 130 
+   line      comprehensions 130 
+   line      comprehensions 131 
+   line      comprehensions 131 
+   line      comprehensions 131 
+   line      comprehensions 132 
+   call      <genexpr>    132 
+   line      <genexpr>    132 
+   return    <genexpr>    132 0
+   call      <genexpr>    132 
+   line      <genexpr>    132 
+   return    <genexpr>    132 1
+   call      <genexpr>    132 
+   line      <genexpr>    132 
+   return    <genexpr>    132 4
+   call      <genexpr>    132 
+   line      <genexpr>    132 
+   return    <genexpr>    132 None
+   line      comprehensions 133 
+   return    comprehensions 133 ([0, 1, 4], {'a': 0, 'b': 1}, 5)
+== generator for -> [0, 1]
+   call      use_gen      147 
+   line      use_gen      148 
+   line      use_gen      149 
+   call      gen          141 
+   line      gen          142 
+   line      gen          143 
+   return    gen          143 0
+   line      use_gen      150 
+   line      use_gen      149 
+   call      gen          143 
+   line      gen          142 
+   line      gen          143 
+   return    gen          143 1
+   line      use_gen      150 
+   line      use_gen      149 
+   call      gen          143 
+   line      gen          142 
+   line      gen          144 
+   return    gen          144 'done'
+   exception use_gen      149 StopIteration(done)
+   line      use_gen      151 
+   return    use_gen      151 [0, 1]
+== generator send -> 12
+   call      use_send     167 
+   line      use_send     168 
+   line      use_send     169 
+   call      counter      157 
+   line      counter      158 
+   line      counter      159 
+   line      counter      160 
+   return    counter      160 0
+   line      use_send     170 
+   call      counter      160 
+   line      counter      161 
+   line      counter      163 
+   line      counter      159 
+   line      counter      160 
+   return    counter      160 5
+   line      use_send     171 
+   call      counter      160 
+   line      counter      161 
+   line      counter      163 
+   line      counter      159 
+   line      counter      160 
+   return    counter      160 12
+   line      use_send     172 
+   line      use_send     173 
+   call      counter      160 
+   line      counter      161 
+   line      counter      162 
+   line      counter      164 
+   return    counter      164 12
+   exception use_send     173 StopIteration(12)
+   line      use_send     174 
+   line      use_send     175 
+   return    use_send     175 12
+closing finally
+== generator close -> closed
+   call      use_close    189 
+   line      use_close    190 
+   line      use_close    191 
+   call      closing      181 
+   line      closing      182 
+   line      closing      183 
+   return    closing      183 1
+   line      use_close    192 
+   call      closing      183 
+   exception closing      183 GeneratorExit()
+   line      closing      186 
+   return    closing      186 None
+   line      use_close    193 
+   return    use_close    193 'closed'
+== generator throw -> caught boom
+   call      use_throw    206 
+   line      use_throw    207 
+   line      use_throw    208 
+   call      thrower      199 
+   line      thrower      200 
+   line      thrower      201 
+   return    thrower      201 1
+   line      use_throw    209 
+   call      thrower      201 
+   exception thrower      201 ValueError(boom)
+   line      thrower      202 
+   line      thrower      203 
+   return    thrower      203 'caught boom'
+   line      use_throw    210 
+   call      thrower      203 
+   exception thrower      203 GeneratorExit()
+   return    thrower      203 None
+   line      use_throw    211 
+   return    use_throw    211 'caught boom'
+== yield from -> [0, 1]
+   call      use_delegate 222 
+   line      use_delegate 223 
+   call      delegate     217 
+   line      delegate     218 
+   call      gen          141 
+   line      gen          142 
+   line      gen          143 
+   return    gen          143 0
+   return    delegate     218 0
+   call      delegate     218 
+   call      gen          143 
+   line      gen          142 
+   line      gen          143 
+   return    gen          143 1
+   return    delegate     218 1
+   call      delegate     218 
+   call      gen          143 
+   line      gen          142 
+   line      gen          144 
+   return    gen          144 'done'
+   exception delegate     218 StopIteration(done)
+   line      delegate     219 
+   return    delegate     219 'done'
+   return    use_delegate 223 [0, 1]
+== exceptions -> 'k'!?
+   call      exceptions   237 
+   line      exceptions   238 
+   line      exceptions   239 
+   exception exceptions   239 ZeroDivisionError(division by zero)
+   line      exceptions   240 
+   line      exceptions   241 
+   line      exceptions   242 
+   line      exceptions   243 
+   call      fails        231 
+   line      fails        232 
+   line      fails        233 
+   exception fails        233 KeyError('k')
+   return    fails        233 None
+   exception exceptions   243 KeyError('k')
+   line      exceptions   244 
+   line      exceptions   245 
+   line      exceptions   246 
+   line      exceptions   247 
+   line      exceptions   248 
+   call      fails        231 
+   line      fails        232 
+   line      fails        233 
+   exception fails        233 KeyError('inner')
+   return    fails        233 None
+   exception exceptions   248 KeyError('inner')
+   line      exceptions   250 
+   line      exceptions   251 
+   line      exceptions   252 
+   line      exceptions   253 
+   return    exceptions   253 "'k'!?"
+== uncaught -> raised KeyError('out')
+   call      uncaught     259 
+   line      uncaught     260 
+   call      fails        231 
+   line      fails        232 
+   line      fails        233 
+   exception fails        233 KeyError('out')
+   return    fails        233 None
+   exception uncaught     260 KeyError('out')
+   return    uncaught     260 None
+== reraise -> raised KeyError('again')
+   call      reraise      266 
+   line      reraise      267 
+   line      reraise      268 
+   call      fails        231 
+   line      fails        232 
+   line      fails        233 
+   exception fails        233 KeyError('again')
+   return    fails        233 None
+   exception reraise      268 KeyError('again')
+   line      reraise      269 
+   line      reraise      270 
+   return    reraise      270 None
+== with -> cm!
+   call      with_stmt    276 
+   line      with_stmt    277 
+   call      CM           277 
+   line      CM           277 
+   line      CM           278 
+   line      CM           281 
+   return    CM           281 None
+   line      with_stmt    284 
+   call      __enter__    278 
+   line      __enter__    279 
+   return    __enter__    279 'cm'
+   line      with_stmt    285 
+   line      with_stmt    284 
+   call      __exit__     281 
+   line      __exit__     282 
+   return    __exit__     282 False
+   line      with_stmt    286 
+   return    with_stmt    286 'cm!'
+== local tracers -> 2
+   call      local_main   308 
+   line      local_main   309 
+   call      add           57 
+   L:line    add           58 
+   L:line    add           59 
+   L:return  add           59 
+   line      local_main   310 
+   line      local_main   311 
+   call      fails        231 
+   exception local_main   311 KeyError(1)
+   line      local_main   312 
+   line      local_main   313 
+   line      local_main   314 
+   return    local_main   314 2
+== local returns None -> 9
+   call      calls         62 
+   line      calls         63 
+   call      add           57 
+   line      add           58 
+   line      add           59 
+   return    add           59 3
+   line      calls         64 
+   line      calls         65 
+   line      calls         64 
+   call      add           57 
+   line      add           58 
+   line      add           59 
+   return    add           59 6
+   line      calls         66 
+   call      add           57 
+   line      add           58 
+   line      add           59 
+   return    add           59 9
+   return    calls         66 9
+== f_trace_lines=False -> 9
+   call      calls         62 
+   line      calls         63 
+   call      add           57 
+   return    add           59 3
+   line      calls         64 
+   line      calls         65 
+   line      calls         64 
+   call      add           57 
+   return    add           59 6
+   line      calls         66 
+   call      add           57 
+   return    add           59 9
+   return    calls         66 9
+== frame.f_trace assignment -> 9
+   call      calls         62 
+   line      calls         63 
+   call      add           57 
+   line      add           58 
+   line      add           59 
+   return    add           59 3
+   line      calls         64 
+   line      calls         65 
+   line      calls         64 
+   call      add           57 
+   line      add           58 
+   line      add           59 
+   return    add           59 6
+   line      calls         66 
+   call      add           57 
+   line      add           58 
+   line      add           59 
+   return    add           59 9
+   return    calls         66 9
+== frame attributes -> 9
+   add called from calls line 63, locals [('a', 1), ('b', 2)], back is back True
+   add returns with locals [('a', 1), ('b', 2), ('c', 3)]
+   add called from calls line 64, locals [('a', 3), ('b', 3)], back is back True
+   add returns with locals [('a', 3), ('b', 3), ('c', 6)]
+   add called from calls line 66, locals [('a', 3), ('b', 6)], back is back True
+   add returns with locals [('a', 3), ('b', 6), ('c', 9)]
+== tracer raises -> raised RuntimeError(tracer failed)
+   call      after_error  373 
+   line      after_error  374 
+   call      calls         62 
+   line      calls         63 
+   call      add           57 
+   line      add           58 
+gettrace after error: None
+== f_lineno jump -> 1
+   call      jump_target  399 
+   call: can't jump from the 'call' trace event of a new frame
+   line      jump_target  400 
+   line      jump_target  401 
+   jumped to 403
+   return    jump_target  403 1
+   return: can only jump from a 'line' trace event
+outside a tracer: f_lineno can only be set in a trace function
+== f_trace_opcodes -> 9
+   call      calls         62 
+   line      calls         63 
+   call      add           57 
+   line      add           58 
+   line      add           59 
+   return    add           59 3
+   line      calls         64 
+   line      calls         65 
+   line      calls         64 
+   call      add           57 
+   line      add           58 
+   line      add           59 
+   return    add           59 6
+   line      calls         66 
+   call      add           57 
+   line      add           58 
+   line      add           59 
+   return    add           59 9
+   return    calls         66 9
+opcode events seen: True True
+== class body, decorator, lambda -> 2
+   call      classes      441 
+   line      classes      442 
+   call      K            442 
+   line      K            442 
+   line      K            443 
+   line      K            445 
+   line      K            446 
+   line      K            445 
+   call      deco         437 
+   line      deco         438 
+   return    deco         438 <classes.<locals>.K.method>
+   line      K            446 
+   return    K            446 None
+   line      classes      449 
+   line      classes      450 
+   call      method       445 
+   line      method       447 
+   return    method       447 1
+   call      <lambda>     449 
+   line      <lambda>     449 
+   return    <lambda>     449 2
+   return    classes      450 2
+== setprofile builtins -> ([3, 3, 2, 1], True, 9)
+   call      builtins_use 462 
+   c_call    builtins_use 464 len
+   c_return  builtins_use 464 len
+   c_call    builtins_use 464 list.append
+   c_return  builtins_use 464 list.append
+   c_call    builtins_use 465 sorted
+   call      <lambda>     465 
+   return    <lambda>     465 -3
+   call      <lambda>     465 
+   return    <lambda>     465 -1
+   call      <lambda>     465 
+   return    <lambda>     465 -2
+   call      <lambda>     465 
+   return    <lambda>     465 -3
+   c_return  builtins_use 465 sorted
+   c_call    builtins_use 470 list.append
+   c_return  builtins_use 470 list.append
+   c_call    builtins_use 472 isinstance
+   c_return  builtins_use 472 isinstance
+   c_call    builtins_use 472 max
+   c_return  builtins_use 472 max
+   return    builtins_use 472 ([3, 3, 2, 1], True, 9)
+== setprofile generators -> [1, 2, 1]
+   call      profile_gen_use 483 
+   call      profiled_gen 478 
+   return    profiled_gen 479 1
+   call      profiled_gen 479 
+   return    profiled_gen 480 2
+   call      profiled_gen 480 
+   return    profiled_gen 480 None
+   c_call    profile_gen_use 485 next
+   call      profiled_gen 478 
+   return    profiled_gen 479 1
+   c_return  profile_gen_use 485 next
+   c_call    profile_gen_use 486 generator.close
+   call      profiled_gen 479 
+   return    profiled_gen 479 None
+   c_return  profile_gen_use 486 generator.close
+   return    profile_gen_use 487 [1, 2, 1]
+== setprofile exception -> raised KeyError(5)
+   call      profile_exc  493 
+   call      fails        231 
+   return    fails        233 None
+   return    profile_exc  494 None
+== setprofile + settrace -> 3
+   call      both         500 
+   c_call    both         501 settrace
+   c_return  both         501 settrace
+   c_call    both         502 len
+   c_return  both         502 len
+   call      add           57 
+   call      add           57 
+   line      add           58 
+   line      add           59 
+   return    add           59 3
+   return    add           59 3
+   c_call    both         503 settrace
+   c_return  both         503 settrace
+   return    both         504 3
+gettrace: True getprofile: True after reset: None None
+== call_tracing from a tracer -> 9
+   call      calls         62 
+   call      add           57 
+   call      add           57 
+   call      add           57 
+   call      add           57 
+== settrace inside a running frame -> 4
+   call      add           57 
+   line      add           58 
+   line      add           59 
+   return    add           59 3
+   line      late_start   538 
+   line      late_start   539 
+   return    late_start   539 4
+monitoring ids: 0 1 2 5
+events: 1 32 16 0 262144 131072
+tool: mytool 0
+ValueError: tool 3 is already in use
+callback: None True
+freed: None
+ValueError: invalid tool 9 (must be between 0 and 5)
+ValueError: invalid tool -1 (must be between 0 and 5)
+ValueError: tool 4 is not in use
+ValueError: The callback can only be set for one event at a time

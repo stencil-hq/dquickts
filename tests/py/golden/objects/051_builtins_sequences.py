@@ -1,0 +1,75 @@
+# Sequence-oriented builtins: sorted/min/max with key and default, any/all, len, sum edge cases.
+
+
+def check(label, func):
+    try:
+        print(label, repr(func()))
+    except Exception as e:
+        print(label, "->", type(e).__name__ + ":", e)
+
+
+words = ["pear", "Fig", "apple", "kiwi", "Banana"]
+check("sorted default", lambda: sorted(words))
+check("sorted key lower", lambda: sorted(words, key=str.lower))
+check("sorted key len stable", lambda: sorted(words, key=len))
+check("sorted reverse stable", lambda: sorted(words, key=len, reverse=True))
+check("sorted tuple key", lambda: sorted(words, key=lambda w: (len(w), w)))
+check("sorted returns list", lambda: type(sorted("cba")).__name__)
+check("sorted string", lambda: sorted("hello"))
+check("sorted dict", lambda: sorted({"b": 1, "a": 2}))
+check("sorted dict items by value", lambda: sorted({"b": 1, "a": 2}.items(), key=lambda kv: kv[1]))
+check("sorted empty", lambda: sorted([]))
+check("sorted mixed", lambda: sorted([1, "a"]))
+check("sorted key None", lambda: sorted([3, 1], key=None))
+check("sorted positional key", lambda: sorted([3, 1], len))
+check("sorted bools ints", lambda: sorted([True, 0, 2, False, 1]))
+check("sorted floats nan-free", lambda: sorted([2.5, -1, 0.0, -0.0, 1e-9]))
+
+check("min", lambda: min([4, 2, 8]))
+check("max args", lambda: max(4, 2, 8))
+check("min key", lambda: min(words, key=len))
+check("max key ties first", lambda: max(["aa", "bb", "c"], key=len))
+check("min ties first", lambda: min([(1, "x"), (1, "a")], key=lambda t: t[0]))
+check("min empty", lambda: min([]))
+check("max empty", lambda: max(()))
+check("min default", lambda: min([], default="none"))
+check("max default unused", lambda: max([1], default=0))
+check("max default with args", lambda: max(1, 2, default=0))
+check("max single non-iterable", lambda: max(5))
+check("max no args", lambda: max())
+check("min strings", lambda: min("hello"))
+check("max key raises", lambda: max([1, 2], key=lambda x: 1 / 0))
+check("min key kw only", lambda: min([1, 2], lambda x: x))
+
+check("any empty", lambda: any([]))
+check("all empty", lambda: all([]))
+check("any values", lambda: any([0, "", None, 0.0]))
+check("all values", lambda: all([1, "a", [0]]))
+check("any returns bool", lambda: any([0, 5]))
+check("all with falsy", lambda: all([1, 0, 1]))
+check("any non-iterable", lambda: any(5))
+
+check("len list", lambda: len([1, 2]))
+check("len str unicode", lambda: len("héllo👍"))
+check("len dict", lambda: len({"a": 1}))
+check("len range big", lambda: len(range(0, 10**6, 7)))
+check("len range huge", lambda: len(range(10**20)))
+check("len int", lambda: len(5))
+check("len none", lambda: len(None))
+check("len generator", lambda: len(x for x in []))
+
+check("chr", lambda: (chr(65), chr(0x1F600), chr(0), chr(0x10FFFF) == "\U0010ffff"))
+check("chr negative", lambda: chr(-1))
+check("chr too big", lambda: chr(0x110000))
+check("chr float", lambda: chr(65.0))
+check("ord", lambda: (ord("A"), ord("€"), ord("\n"), ord(b"a"), ord(bytearray(b"z"))))
+check("ord empty", lambda: ord(""))
+check("ord long", lambda: ord("ab"))
+check("ord int", lambda: ord(1))
+check("roundtrip", lambda: "".join(chr(ord(c) + 1) for c in "HAL"))
+
+check("list from iterables", lambda: (list("ab"), list((1, 2)), list({"k": 1}), list(range(3))))
+check("tuple dict set", lambda: (tuple([1]), dict([("a", 1)]), sorted(set("aba"))))
+check("reversed sorted", lambda: list(reversed(sorted([3, 1, 2]))))
+check("enumerate zip combo", lambda: [(i, a + b) for i, (a, b) in enumerate(zip("ab", "cd"))])
+check("slice object", lambda: ([0, 1, 2, 3][slice(1, 3)], slice(1, 10, 2).indices(5)))

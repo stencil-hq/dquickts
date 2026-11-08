@@ -1,0 +1,68 @@
+str None | repr None | ascii None
+str True | repr True | ascii True
+str False | repr False | ascii False
+str 0 | repr 0 | ascii 0
+str -5 | repr -5 | ascii -5
+str 1180591620717411303424 | repr 1180591620717411303424 | ascii 1180591620717411303424
+str 0.5 | repr 0.5 | ascii 0.5
+str -0.0 | repr -0.0 | ascii -0.0
+str 1e+16 | repr 1e+16 | ascii 1e+16
+str inf | repr inf | ascii inf
+str nan | repr nan | ascii nan
+str 1j | repr 1j | ascii 1j
+str (-1.5+2j) | repr (-1.5+2j) | ascii (-1.5+2j)
+str  | repr '' | ascii ''
+str é | repr 'é' | ascii '\xe9'
+str 😀 | repr '😀' | ascii '\U0001f600'
+str a
+b | repr 'a\nb' | ascii 'a\nb'
+str b'' | repr b'' | ascii b''
+str b'\xff' | repr b'\xff' | ascii b'\xff'
+str bytearray(b'x') | repr bytearray(b'x') | ascii bytearray(b'x')
+str [] | repr [] | ascii []
+str [1, 'a'] | repr [1, 'a'] | ascii [1, 'a']
+str () | repr () | ascii ()
+str (1,) | repr (1,) | ascii (1,)
+str (1, 2) | repr (1, 2) | ascii (1, 2)
+str {} | repr {} | ascii {}
+str {'k': [1]} | repr {'k': [1]} | ascii {'k': [1]}
+str set() | repr set() | ascii set()
+str frozenset() | repr frozenset() | ascii frozenset()
+str {1} | repr {1} | ascii {1}
+str frozenset({2}) | repr frozenset({2}) | ascii frozenset({2})
+str range(0, 3) | repr range(0, 3) | ascii range(0, 3)
+str range(1, 10, 2) | repr range(1, 10, 2) | ascii range(1, 10, 2)
+str slice(1, 2, None) | repr slice(1, 2, None) | ascii slice(1, 2, None)
+str slice(None, None, None) | repr slice(None, None, None) | ascii slice(None, None, None)
+str Ellipsis | repr Ellipsis | ascii Ellipsis
+str NotImplemented | repr NotImplemented | ascii NotImplemented
+str OnlyRepr(é) | repr OnlyRepr(é) | ascii OnlyRepr(\xe9)
+str both-str | repr Both() | ascii Both()
+str [Both()] | repr [Both()] | ascii [Both()]
+str <class 'int'> | repr <class 'int'> | ascii <class 'int'>
+str <class 'str'> | repr <class 'str'> | ascii <class 'str'>
+str <class 'type'> | repr <class 'type'> | ascii <class 'type'>
+str <class 'object'> | repr <class 'object'> | ascii <class 'object'>
+str <built-in function len> | repr <built-in function len> | ascii <built-in function len>
+str s | repr 's' | ascii 's'
+str(BadStr()) TypeError BadStr.__str__() must return a str, not int
+ascii('é😀\x00') "'\\xe9\\U0001f600\\x00'"
+ascii(['ü']) "['\\xfc']"
+ascii(OnlyRepr()) 'OnlyRepr(\\xe9)'
+ascii type 'str'
+str(StrSub) type 'str'
+format(Both()) 'both-str'
+f'{Both()}' 'both-str'
+f'{Both()!r}' 'Both()'
+f'{Both()!s}' 'both-str'
+'%s %r %a' % (...) "both-str Both() '\\xe9'"
+str(b'x', 'ascii') 'x'
+str(1, 'ascii') TypeError decoding to str: need a bytes-like object, int found
+str(b'x', errors='strict') 'x'
+str.__str__('x') 'x'
+object.__str__(Both()) 'Both()'
+repr(str) "<class 'str'>"
+repr(len) '<built-in function len>'
+repr(int.bit_length) "<method 'bit_length' of 'int' objects>"
+repr(str.join) "<method 'join' of 'str' objects>"
+repr(None.__class__) "<class 'NoneType'>"

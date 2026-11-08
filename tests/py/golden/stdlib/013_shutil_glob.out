@@ -1,0 +1,35 @@
+initial ['src/', 'src/a.txt', 'src/b.log', 'src/pkg/', 'src/pkg/__init__.py', 'src/pkg/mod.py', 'src/pkg/sub/', 'src/pkg/sub/deep.txt']
+copy returns copy.txt alpha
+copy into dir out/b.log
+copyfile/copy2 ['b.log', 'c2.txt', 'cf.txt']
+same file SameFileError
+copy missing FileNotFoundError
+copytree tree ['a.txt', 'b.log', 'pkg/', 'pkg/__init__.py', 'pkg/mod.py', 'pkg/sub/', 'pkg/sub/deep.txt']
+copytree exists FileExistsError
+dirs_exist_ok ok
+ignore_patterns ['a.txt', 'pkg/', 'pkg/__init__.py', 'pkg/mod.py']
+move into dir out/copy.txt
+move dir renamed False
+rmtree False
+rmtree missing FileNotFoundError
+after ops ['out/', 'out/b.log', 'out/c2.txt', 'out/cf.txt', 'out/copy.txt', 'renamed/', 'renamed/a.txt', 'renamed/pkg/', 'renamed/pkg/__init__.py', 'renamed/pkg/mod.py', 'src/', 'src/a.txt', 'src/b.log', 'src/pkg/', 'src/pkg/__init__.py', 'src/pkg/mod.py', 'src/pkg/sub/', 'src/pkg/sub/deep.txt']
+glob * ['a.txt', 'b.log', 'pkg']
+glob *.txt ['a.txt']
+glob recursive ['pkg/__init__.py', 'pkg/mod.py']
+glob all recursive ['a.txt', 'b.log', 'pkg', 'pkg/__init__.py', 'pkg/mod.py', 'pkg/sub', 'pkg/sub/deep.txt']
+glob charclass ['a.txt', 'b.log']
+glob question ['b.log']
+glob absolute ['pkg/__init__.py', 'pkg/mod.py', 'pkg/sub']
+glob none []
+glob temp root ['out', 'renamed', 'src']
+glob escape a[[]b][*][?].txt
+iglob ['pkg/__init__.py', 'pkg/mod.py', 'pkg/sub']
+named read 'named temp\n'
+named prefix/suffix True True
+named exists True
+named deleted False
+TemporaryFile b'anon'
+Spooled b'spool'
+mkdtemp is dir True True
+mkstemp True True
+cleaned up False

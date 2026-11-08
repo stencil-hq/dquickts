@@ -15,6 +15,12 @@ Temporal and `quickjs-libc`. The bundled bindings of `src/bindings` are generate
 feature compiles the engine debug dumps in (`ENABLE_DUMPS`); they are selected per runtime by
 `JS_SetDumpFlags()`.
 
+The `python` feature compiles the Python 3.15 runtime in (`CONFIG_PYTHON`: `python/*.c`, included
+by `quickjs.c`) with `QP_PYLIB_DIR` set to the standard library directory: the `pylib` of the
+QuickJS tree, or `RQUICKJS_PYLIB_DIR` at build time (`QPYHOME` or `JSPythonConfig.home` override
+it at run time). The declarations of `JS_InitPython`, `JS_EvalPython` and `JS_PythonImport` are
+always bound; they only link with the feature.
+
 ## Environment Variables
 
 The following environment variables can be used to control which WASI SDK is using during the build:

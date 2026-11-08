@@ -1,0 +1,582 @@
+# capi/modules patches against cpython v3.15.2 (tools/capi_sync.py --record).
+#
+# Unified diffs applied by tools/capi_sync.py to the vendored Modules/ files
+# (capi-design.md §8).  Edit the files under capi/modules, then run
+# `tools/capi_sync.py --record`; the `#` notes before each diff are kept.
+#
+# Modules built unmodified, with what makes them work:
+#   _collections  defaultdict: DICT + NATIVE; OrderedDict is the runtime's
+#                 (PyODict_Type: python/odictobject.c).
+#   _pickle       _Py_Mangle/_Py_IsPrivateName exported by D (P1).
+#   _datetime     PyObject_Malloc + _PyObject_Init (= PyObject_Init, A);
+#                 patched below to ready its static types.
+#   _opcode       compat shims + capi/compat/qp_internals.c (F):
+#                 ENABLE_SPECIALIZATION 0, no executors, no Py_STATS.
+#   _asyncio      pycore_qp_tstate.h (_PyThreadStateImpl, struct _is),
+#                 freelists disabled (pycore_freelist.h).
+#   hashes        Modules/_hacl with CPython's LIBHACL flags; SIMD objects
+#                 on x86_64 only (capi/Setup.qp @x86_64).
+#   pyexpat       bundled Modules/expat (or CONFIG_PYTHON_CAPI_SYSTEM_EXPAT).
+#   _elementtree  _PyDict_CopyAsDict (E1); expat through pyexpat's capsule.
+#   cjkcodecs     _multibytecodec and the _codecs_* modules, unmodified.
+#   _tracemalloc  capi/compat/pycore_tracemalloc.h over
+#                 python/capi_tracemalloc.c (traces of the runtime).
+#   _zoneinfo     static C types are immutable (PyType_Ready, B).
+#   grp, pwd      _PyLong_FromUid/Gid, _Py_Uid/Gid_Converter (E2, over the
+#                 native posix module's converters).
+#   readline      PyOS_Readline / PyOS_ReadlineFunctionPointer (E2), used by
+#                 input() and the basic REPL once the module is loaded.
+#   _dbm          macOS ndbm (-DUSE_NDBM); "s#" accepts bytes (E2).
+#   _hmac         Modules/_hacl HMAC over the hash objects of the hash modules.
+#   fcntl, termios, syslog, _posixshmem, _multiprocessing, _uuid: unmodified
+#                 (pyconfig.h entries; capi/compat/pycore_signal.h).
+#   _ctypes       libffi through pkg-config (capi/Setup.qp @ffi); the libffi
+#                 and loader HAVE_* of configure in capi/include/pyconfig.h;
+#                 PEP 697 type data of the metaclasses (StgInfo) on Python
+#                 classes: python/capi_mirror.c sizes their type mirrors.
+#   all           Py_BUILD_CORE_MODULE: clinic KWTUPLE is NULL.
+
+# _heapq: list items live in the JS array, not in a C array: the sift loops
+# read with PyList_GET_ITEM and swap with PyList_SetItem (heap_swap), and
+# the four `list->ob_item[0] = x` sites take a reference to the old top
+# item and replace it with PyList_SetItem (CPython moved the slot's
+# reference to the returned item; here the list drops its own).
+
+# _datetime: CPython readies the static datetime types at interpreter init
+# (pylifecycle.c pycore_init_types -> _PyDateTime_InitTypes); here the first
+# module exec does it.
+
+# _ctypes: CPython's configure defines USING_APPLE_OS_LIBFFI when it links
+# the macOS SDK's libffi (no ffi_prep_closure there on arm64, runtime
+# availability checks); pkg-config picks the libffi here, so ctypes.h
+# detects the SDK header by its FFI_AVAILABLE_APPLE macro.
+--- a/_ctypes/ctypes.h
++++ b/_ctypes/ctypes.h
+@@ -20,6 +20,14 @@
+ #include "pycore_typeobject.h"    // _PyType_GetModuleState()
+ #include "pycore_critical_section.h"
+ #include "pycore_pyatomic_ft_wrappers.h"
++
++/* dquickts: CPython's configure defines USING_APPLE_OS_LIBFFI when it builds
++   against the SDK's libffi; here pkg-config picks the libffi, so detect the
++   SDK header (it defines FFI_AVAILABLE_APPLE; every file includes <ffi.h>
++   before this header). */
++#if defined(__APPLE__) && defined(FFI_AVAILABLE_APPLE) && !defined(USING_APPLE_OS_LIBFFI)
++#   define USING_APPLE_OS_LIBFFI 1
++#endif
+ 
+ // Do we support C99 complex types in ffi?
+ // For Apple's libffi, this must be determined at runtime (see gh-128156).
+
+--- a/_datetimemodule.c
++++ b/_datetimemodule.c
+@@ -7629,6 +7629,18 @@
+     }
+     /* We actually set the "current" module right before a successful return. */
+ 
++    /* dquickts: no interpreter init readies the static types
++       (pylifecycle.c pycore_init_types); the first exec does */
++    if (!PyType_HasFeature(&PyDateTime_DateType, Py_TPFLAGS_READY)) {
++        PyStatus status = _PyDateTime_InitTypes(interp);
++        if (_PyStatus_EXCEPTION(status)) {
++            if (!PyErr_Occurred()) {
++                PyErr_SetString(PyExc_SystemError, status.err_msg);
++            }
++            goto error;
++        }
++    }
++
+     for (size_t i = 0; i < Py_ARRAY_LENGTH(capi_types); i++) {
+         PyTypeObject *type = capi_types[i];
+         const char *name = _PyType_Name(type);
+
+# _decimal: signaldict_richcompare read the flags pointer of the other
+# operand even when it is a dict (CPython reads the dict's ma_used there,
+# nonzero for a full signal dict); PyDictObject.ma_used is not maintained
+# here, so only a SignalDict operand is checked.
+--- a/_decimal/_decimal.c
++++ b/_decimal/_decimal.c
+@@ -795,7 +795,8 @@
+     decimal_state *state = get_module_state_by_def(Py_TYPE(v));
+     assert(PyDecSignalDict_Check(state, v));
+ 
+-    if ((SdFlagAddr(v) == NULL) || (SdFlagAddr(w) == NULL)) {
++    if ((SdFlagAddr(v) == NULL) ||
++        (PyDecSignalDict_Check(state, w) && SdFlagAddr(w) == NULL)) {
+         return value_error_ptr(INVALID_SIGNALDICT_ERROR_MSG);
+     }
+ 
+--- a/_heapqmodule.c
++++ b/_heapqmodule.c
+@@ -22,10 +22,22 @@
+ [clinic start generated code]*/
+ /*[clinic end generated code: output=da39a3ee5e6b4b0d input=d7cca0a2e4c0ceb3]*/
+ 
++/* dquickts: list items live in the JS array, not in a C array: the sift
++   loops read with PyList_GET_ITEM and swap or replace items through
++   PyList_SetItem (capi/modules/PATCHES). */
++static void
++heap_swap(PyListObject *heap, Py_ssize_t i, Py_ssize_t j)
++{
++    PyObject *a = Py_NewRef(PyList_GET_ITEM(heap, i));
++    PyObject *b = Py_NewRef(PyList_GET_ITEM(heap, j));
++    (void)PyList_SetItem((PyObject *)heap, i, b);
++    (void)PyList_SetItem((PyObject *)heap, j, a);
++}
++
+ static int
+ siftdown(PyListObject *heap, Py_ssize_t startpos, Py_ssize_t pos)
+ {
+-    PyObject *newitem, *parent, **arr;
++    PyObject *newitem, *parent;
+     Py_ssize_t parentpos, size;
+     int cmp;
+ 
+@@ -38,11 +50,10 @@
+ 
+     /* Follow the path to the root, moving parents down until finding
+        a place newitem fits. */
+-    arr = _PyList_ITEMS(heap);
+-    newitem = arr[pos];
++    newitem = PyList_GET_ITEM(heap, pos);
+     while (pos > startpos) {
+         parentpos = (pos - 1) >> 1;
+-        parent = arr[parentpos];
++        parent = PyList_GET_ITEM(heap, parentpos);
+         Py_INCREF(newitem);
+         Py_INCREF(parent);
+         cmp = PyObject_RichCompareBool(newitem, parent, Py_LT);
+@@ -57,12 +68,9 @@
+         }
+         if (cmp == 0)
+             break;
+-        arr = _PyList_ITEMS(heap);
+-        parent = arr[parentpos];
+-        newitem = arr[pos];
+-        FT_ATOMIC_STORE_PTR_RELAXED(arr[parentpos], newitem);
+-        FT_ATOMIC_STORE_PTR_RELAXED(arr[pos], parent);
++        heap_swap(heap, parentpos, pos);
+         pos = parentpos;
++        newitem = PyList_GET_ITEM(heap, pos);
+     }
+     return 0;
+ }
+@@ -71,7 +79,6 @@
+ siftup(PyListObject *heap, Py_ssize_t pos)
+ {
+     Py_ssize_t startpos, endpos, childpos, limit;
+-    PyObject *tmp1, *tmp2, **arr;
+     int cmp;
+ 
+     assert(PyList_Check(heap));
+@@ -83,14 +90,13 @@
+     }
+ 
+     /* Bubble up the smaller child until hitting a leaf. */
+-    arr = _PyList_ITEMS(heap);
+     limit = endpos >> 1;         /* smallest pos that has no child */
+     while (pos < limit) {
+         /* Set childpos to index of smaller child.   */
+         childpos = 2*pos + 1;    /* leftmost child position  */
+         if (childpos + 1 < endpos) {
+-            PyObject* a = arr[childpos];
+-            PyObject* b = arr[childpos + 1];
++            PyObject* a = PyList_GET_ITEM(heap, childpos);
++            PyObject* b = PyList_GET_ITEM(heap, childpos + 1);
+             Py_INCREF(a);
+             Py_INCREF(b);
+             cmp = PyObject_RichCompareBool(a, b, Py_LT);
+@@ -99,7 +105,6 @@
+             if (cmp < 0)
+                 return -1;
+             childpos += ((unsigned)cmp ^ 1);   /* increment when cmp==0 */
+-            arr = _PyList_ITEMS(heap);         /* arr may have changed */
+             if (endpos != PyList_GET_SIZE(heap)) {
+                 PyErr_SetString(PyExc_RuntimeError,
+                                 "list changed size during iteration");
+@@ -107,10 +112,7 @@
+             }
+         }
+         /* Move the smaller child up. */
+-        tmp1 = arr[childpos];
+-        tmp2 = arr[pos];
+-        FT_ATOMIC_STORE_PTR_RELAXED(arr[childpos], tmp2);
+-        FT_ATOMIC_STORE_PTR_RELAXED(arr[pos], tmp1);
++        heap_swap(heap, childpos, pos);
+         pos = childpos;
+     }
+     /* Bubble it up to its final resting place (by sifting its parents down). */
+@@ -172,9 +174,9 @@
+ 
+     if (!n)
+         return lastelt;
+-    returnitem = PyList_GET_ITEM(heap, 0);
++    returnitem = Py_NewRef(PyList_GET_ITEM(heap, 0));
+     PyListObject *list = _PyList_CAST(heap);
+-    FT_ATOMIC_STORE_PTR_RELAXED(list->ob_item[0], lastelt);
++    (void)PyList_SetItem(heap, 0, lastelt);
+     if (siftup_func(list, 0)) {
+         Py_DECREF(returnitem);
+         return NULL;
+@@ -209,9 +211,9 @@
+         return NULL;
+     }
+ 
+-    returnitem = PyList_GET_ITEM(heap, 0);
++    returnitem = Py_NewRef(PyList_GET_ITEM(heap, 0));
+     PyListObject *list = _PyList_CAST(heap);
+-    FT_ATOMIC_STORE_PTR_RELAXED(list->ob_item[0], Py_NewRef(item));
++    (void)PyList_SetItem(heap, 0, Py_NewRef(item));
+     if (siftup_func(list, 0)) {
+         Py_DECREF(returnitem);
+         return NULL;
+@@ -287,9 +289,9 @@
+         return NULL;
+     }
+ 
+-    returnitem = PyList_GET_ITEM(heap, 0);
++    returnitem = Py_NewRef(PyList_GET_ITEM(heap, 0));
+     PyListObject *list = _PyList_CAST(heap);
+-    FT_ATOMIC_STORE_PTR_RELAXED(list->ob_item[0], Py_NewRef(item));
++    (void)PyList_SetItem(heap, 0, Py_NewRef(item));
+     if (siftup(list, 0)) {
+         Py_DECREF(returnitem);
+         return NULL;
+@@ -408,7 +410,7 @@
+ static int
+ siftdown_max(PyListObject *heap, Py_ssize_t startpos, Py_ssize_t pos)
+ {
+-    PyObject *newitem, *parent, **arr;
++    PyObject *newitem, *parent;
+     Py_ssize_t parentpos, size;
+     int cmp;
+ 
+@@ -421,11 +423,10 @@
+ 
+     /* Follow the path to the root, moving parents down until finding
+        a place newitem fits. */
+-    arr = _PyList_ITEMS(heap);
+-    newitem = arr[pos];
++    newitem = PyList_GET_ITEM(heap, pos);
+     while (pos > startpos) {
+         parentpos = (pos - 1) >> 1;
+-        parent = Py_NewRef(arr[parentpos]);
++        parent = Py_NewRef(PyList_GET_ITEM(heap, parentpos));
+         Py_INCREF(newitem);
+         cmp = PyObject_RichCompareBool(parent, newitem, Py_LT);
+         Py_DECREF(parent);
+@@ -439,12 +440,9 @@
+         }
+         if (cmp == 0)
+             break;
+-        arr = _PyList_ITEMS(heap);
+-        parent = arr[parentpos];
+-        newitem = arr[pos];
+-        FT_ATOMIC_STORE_PTR_RELAXED(arr[parentpos], newitem);
+-        FT_ATOMIC_STORE_PTR_RELAXED(arr[pos], parent);
++        heap_swap(heap, parentpos, pos);
+         pos = parentpos;
++        newitem = PyList_GET_ITEM(heap, pos);
+     }
+     return 0;
+ }
+@@ -453,7 +451,6 @@
+ siftup_max(PyListObject *heap, Py_ssize_t pos)
+ {
+     Py_ssize_t startpos, endpos, childpos, limit;
+-    PyObject *tmp1, *tmp2, **arr;
+     int cmp;
+ 
+     assert(PyList_Check(heap));
+@@ -465,14 +462,13 @@
+     }
+ 
+     /* Bubble up the larger child until hitting a leaf. */
+-    arr = _PyList_ITEMS(heap);
+     limit = endpos >> 1;         /* smallest pos that has no child */
+     while (pos < limit) {
+         /* Set childpos to index of larger child.   */
+         childpos = 2*pos + 1;    /* leftmost child position  */
+         if (childpos + 1 < endpos) {
+-            PyObject* a = arr[childpos + 1];
+-            PyObject* b = arr[childpos];
++            PyObject* a = PyList_GET_ITEM(heap, childpos + 1);
++            PyObject* b = PyList_GET_ITEM(heap, childpos);
+             Py_INCREF(a);
+             Py_INCREF(b);
+             cmp = PyObject_RichCompareBool(a, b, Py_LT);
+@@ -481,7 +477,6 @@
+             if (cmp < 0)
+                 return -1;
+             childpos += ((unsigned)cmp ^ 1);   /* increment when cmp==0 */
+-            arr = _PyList_ITEMS(heap);         /* arr may have changed */
+             if (endpos != PyList_GET_SIZE(heap)) {
+                 PyErr_SetString(PyExc_RuntimeError,
+                                 "list changed size during iteration");
+@@ -489,10 +484,7 @@
+             }
+         }
+         /* Move the larger child up. */
+-        tmp1 = arr[childpos];
+-        tmp2 = arr[pos];
+-        FT_ATOMIC_STORE_PTR_RELAXED(arr[childpos], tmp2);
+-        FT_ATOMIC_STORE_PTR_RELAXED(arr[pos], tmp1);
++        heap_swap(heap, childpos, pos);
+         pos = childpos;
+     }
+     /* Bubble it up to its final resting place (by sifting its parents down). */
+@@ -625,9 +617,9 @@
+         return NULL;
+     }
+ 
+-    returnitem = PyList_GET_ITEM(heap, 0);
++    returnitem = Py_NewRef(PyList_GET_ITEM(heap, 0));
+     PyListObject *list = _PyList_CAST(heap);
+-    FT_ATOMIC_STORE_PTR_RELAXED(list->ob_item[0], Py_NewRef(item));
++    (void)PyList_SetItem(heap, 0, Py_NewRef(item));
+     if (siftup_max(list, 0) < 0) {
+         Py_DECREF(returnitem);
+         return NULL;
+
+# _sre: expand_template filled the storage of a fresh list through
+# &PyList_GET_ITEM(list, 0); it now collects into a PyMem array and builds
+# the list from it.
+--- a/_sre/sre.c
++++ b/_sre/sre.c
+@@ -3032,14 +3032,18 @@
+     PyObject *buffer[10];
+     PyObject **out = buffer;
+     PyObject *list = NULL;
++    /* dquickts: list items are not a C array; collect into a heap array
++       and build the list from it (capi/modules/PATCHES). */
++    PyObject **heap = NULL;
+     if (self->chunks > (int)Py_ARRAY_LENGTH(buffer) ||
+         !PyUnicode_Check(self->literal))
+     {
+-        list = PyList_New(self->chunks);
+-        if (!list) {
++        heap = PyMem_New(PyObject *, self->chunks);
++        if (!heap) {
++            PyErr_NoMemory();
+             return NULL;
+         }
+-        out = &PyList_GET_ITEM(list, 0);
++        out = heap;
+     }
+ 
+     out[count++] = Py_NewRef(self->literal);
+@@ -3068,19 +3072,23 @@
+         result = _PyUnicode_JoinArray(&_Py_STR(empty), out, count);
+     }
+     else {
+-        Py_SET_SIZE(list, count);
++        list = PyList_New(count);
++        if (!list) {
++            goto cleanup;
++        }
++        for (Py_ssize_t i = 0; i < count; i++) {
++            PyList_SET_ITEM(list, i, out[i]);
++        }
++        count = 0;  /* the list owns the items */
+         result = PyBytes_Join((PyObject *)&_Py_SINGLETON(bytes_empty), list);
+     }
+ 
+ cleanup:
+-    if (list) {
+-        Py_DECREF(list);
+-    }
+-    else {
+-        for (Py_ssize_t i = 0; i < count; i++) {
+-            Py_DECREF(out[i]);
+-        }
+-    }
++    Py_XDECREF(list);
++    for (Py_ssize_t i = 0; i < count; i++) {
++        Py_DECREF(out[i]);
++    }
++    PyMem_Free(heap);
+     return result;
+ }
+ 
+# _ssl: SSLError_str read the PyOSErrorObject fields (strerror, args), which
+# live on the JS exception object: use the attribute protocol and
+# PyException_GetArgs().
+--- a/_ssl.c
++++ b/_ssl.c
+@@ -485,12 +485,28 @@
+ static PyObject *
+ SSLError_str(PyObject *op)
+ {
+-    PyOSErrorObject *self = (PyOSErrorObject*)op;
+-    if (self->strerror != NULL && PyUnicode_Check(self->strerror)) {
+-        return Py_NewRef(self->strerror);
+-    }
+-    else
+-        return PyObject_Str(self->args);
++    /* dquickts: the PyOSErrorObject fields live on the JS exception object
++       (capi/modules/PATCHES): read them through the attribute protocol. */
++    PyObject *strerror = PyObject_GetAttrString(op, "strerror");
++    if (strerror == NULL) {
++        if (!PyErr_ExceptionMatches(PyExc_AttributeError)) {
++            return NULL;
++        }
++        PyErr_Clear();
++    }
++    else if (PyUnicode_Check(strerror)) {
++        return strerror;
++    }
++    else {
++        Py_DECREF(strerror);
++    }
++    PyObject *args = PyException_GetArgs(op);
++    if (args == NULL) {
++        return NULL;
++    }
++    PyObject *res = PyObject_Str(args);
++    Py_DECREF(args);
++    return res;
+ }
+ 
+ static PyType_Slot sslerror_type_slots[] = {
+
+# _testcapi (test-only, make capi-testmods): immortal.c takes
+# _PyLong_IsSmallInt from the capi/compat shim (no Include/internal/).
+--- a/_testcapi/immortal.c
++++ b/_testcapi/immortal.c
+@@ -1,7 +1,7 @@
+ #include "parts.h"
+ 
+ #define Py_BUILD_CORE
+-#include "internal/pycore_long.h"   // IMMORTALITY_BIT_MASK
++#include "pycore_long.h"            // dquickts: capi/compat shim
+ 
+ int verify_immortality(PyObject *object)
+ {
+
+# _testcapi monitoring.c: only the public cpython/monitoring.h API is used;
+# the pycore_instruments.h include is dropped.
+--- a/_testcapi/monitoring.c
++++ b/_testcapi/monitoring.c
+@@ -1,8 +1,8 @@
+ #include "parts.h"
+ #include "util.h"
+ 
+-#define Py_BUILD_CORE
+-#include "internal/pycore_instruments.h"
++/* dquickts: the public cpython/monitoring.h API only (no
++   pycore_instruments.h). */
+ 
+ typedef struct {
+     PyObject_HEAD
+
+# _testcapi watchers.c: PyContext's struct is internal (not our layout):
+# clear_context_stack clears the _contextvars context stack through
+# _PyQp_ClearContextStack.
+--- a/_testcapi/watchers.c
++++ b/_testcapi/watchers.c
+@@ -736,16 +736,17 @@
+ static PyObject *
+ clear_context_stack(PyObject *Py_UNUSED(self), PyObject *Py_UNUSED(args))
+ {
+-    PyThreadState *tstate = PyThreadState_Get();
+-    if (tstate->context == NULL) {
+-        Py_RETURN_NONE;
++    /* dquickts: the context stack is the _contextvars state, not
++       tstate->context (PyContext is not CPython's struct) */
++    int r = _PyQp_ClearContextStack();
++    if (r < 0) {
++        return NULL;
+     }
+-    if (((PyContext *)tstate->context)->ctx_prev != NULL) {
++    if (r > 0) {
+         PyErr_SetString(PyExc_RuntimeError,
+                         "must first exit all non-base contexts");
+         return NULL;
+     }
+-    Py_CLEAR(tstate->context);
+     Py_RETURN_NONE;
+ }
+ 
+
+# _testcapimodule.c: the test_* functions that create subinterpreters
+# (Py_NewInterpreter / Py_NewInterpreterFromConfig fail: one interpreter
+# per C-API process) are left out of the method table, so Test_testcapi
+# does not run them.
+--- a/_testcapimodule.c
++++ b/_testcapimodule.c
+@@ -3067,7 +3067,9 @@
+      METH_NOARGS},
+     {"buffer_fill_info",        buffer_fill_info,                METH_VARARGS},
+     {"crash_no_current_thread", crash_no_current_thread,         METH_NOARGS},
++#if 0  /* dquickts: needs a subinterpreter (Py_NewInterpreter fails here) */
+     {"test_current_tstate_matches", test_current_tstate_matches, METH_NOARGS},
++#endif
+     {"run_in_subinterp",        run_in_subinterp,                METH_VARARGS},
+     {"create_cfunction",        create_cfunction,                METH_NOARGS},
+     {"call_in_temporary_c_thread", call_in_temporary_c_thread, METH_VARARGS,
+@@ -3117,17 +3119,27 @@
+     {"function_set_warning", function_set_warning, METH_NOARGS},
+     {"test_critical_sections", test_critical_sections, METH_NOARGS},
+     {"finalize_thread_hang", finalize_thread_hang, METH_O, NULL},
++#if 0  /* dquickts: needs a subinterpreter (Py_NewInterpreter fails here) */
+     {"test_atexit", test_atexit, METH_NOARGS},
++#endif
+     {"code_offset_to_line", _PyCFunction_CAST(code_offset_to_line), METH_FASTCALL},
+     {"toggle_reftrace_printer", toggle_reftrace_printer, METH_O},
+     {"create_managed_weakref_nogc_type",
+         create_managed_weakref_nogc_type, METH_NOARGS},
+     {"test_soft_deprecated_macros", test_soft_deprecated_macros, METH_NOARGS},
++#if 0  /* dquickts: needs a subinterpreter (Py_NewInterpreter fails here) */
+     {"test_interpreter_guards", test_interpreter_guards, METH_NOARGS},
++#endif
+     {"test_thread_state_ensure_nested", test_thread_state_ensure_nested, METH_NOARGS},
++#if 0  /* dquickts: needs a subinterpreter (Py_NewInterpreter fails here) */
+     {"test_thread_state_ensure_crossinterp", test_thread_state_ensure_crossinterp, METH_NOARGS},
++#endif
++#if 0  /* dquickts: needs a subinterpreter (Py_NewInterpreter fails here) */
+     {"test_interp_view_after_shutdown", test_interp_view_after_shutdown, METH_NOARGS},
++#endif
++#if 0  /* dquickts: needs a subinterpreter (Py_NewInterpreter fails here) */
+     {"test_thread_state_ensure_view", test_thread_state_ensure_view, METH_NOARGS},
++#endif
+     {"test_thread_state_ensure_detachment", test_thread_state_ensure_detachment, METH_NOARGS},
+     {"test_thread_state_ensure_detached_gilstate", test_thread_state_ensure_detached_gilstate, METH_NOARGS},
+     {"test_thread_state_release_with_destructor", test_thread_state_release_with_destructor, METH_NOARGS},
+
+# _zstd: "internal/pycore_lock.h" is capi/compat/pycore_lock.h (no
+# internal/ directory: the compat headers are flat).
+--- a/_zstd/compressor.c
++++ b/_zstd/compressor.c
+@@ -16,7 +16,7 @@
+ 
+ #include "_zstdmodule.h"
+ #include "buffer.h"
+-#include "internal/pycore_lock.h" // PyMutex_IsLocked
++#include "pycore_lock.h"   // PyMutex_IsLocked (dquickts: capi/compat)
+ 
+ #include <stddef.h>               // offsetof()
+ #include <zstd.h>                 // ZSTD_*()
+
+--- a/_zstd/decompressor.c
++++ b/_zstd/decompressor.c
+@@ -16,7 +16,7 @@
+ 
+ #include "_zstdmodule.h"
+ #include "buffer.h"
+-#include "internal/pycore_lock.h" // PyMutex_IsLocked
++#include "pycore_lock.h"   // PyMutex_IsLocked (dquickts: capi/compat)
+ 
+ #include <stdbool.h>              // bool
+ #include <stddef.h>               // offsetof()
+
+--- a/_zstd/zstddict.c
++++ b/_zstd/zstddict.c
+@@ -16,7 +16,7 @@
+ 
+ #include "_zstdmodule.h"
+ #include "clinic/zstddict.c.h"
+-#include "internal/pycore_lock.h" // PyMutex_IsLocked
++#include "pycore_lock.h"   // PyMutex_IsLocked (dquickts: capi/compat)
+ 
+ #include <zstd.h>                 // ZSTD_freeDDict(), ZSTD_getDictID_fromDict()
+ 

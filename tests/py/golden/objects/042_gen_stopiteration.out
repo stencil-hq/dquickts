@@ -1,0 +1,21 @@
+first 1
+RuntimeError generator raised StopIteration
+cause StopIteration leaked
+after RuntimeError exhausted exhausted
+next() inside generator RuntimeError generator raised StopIteration
+next with default inside ['default']
+StopAsyncIteration not converted in sync gen StopAsyncIteration
+genexp StopIteration RuntimeError generator raised StopIteration
+list comprehension lets it through StopIteration
+return dict value {'answer': 42} ({'answer': 42},)
+exhausted again value None
+exhausted again value None
+tuple return (1, 2) ((1, 2),)
+return exception object StopIteration('x')
+manual StopIteration fine [1, 2]
+manual iter can be resumed x 4
+StopIteration multiple args 1 (1, 2)
+StopIteration default None
+for ignores return value [0, 1, 2]
+map stops cleanly [0, 2, 4]
+zip shortest stops [(0, 'a'), (1, 'b'), (2, 'c')]

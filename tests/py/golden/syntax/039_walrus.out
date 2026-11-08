@@ -1,0 +1,37 @@
+if walrus 5
+walrus visible after if 5
+falsy walrus 0
+while walrus ['alpha', 'beta'] ''
+pop until 2 [4, 3] [1] 2
+elif walrus div3 big q=3 r=1 small r=1
+in call 3 3
+in arithmetic 20
+nested 3 3 2
+in list display [1, 2, 3]
+in tuple ('x', 'xx')
+in subscript 12 1
+in fstring 10 20
+ternary walrus yes 5
+compute once [0, 4, 16] [0, 1, 2, 3, 4]
+lambda walrus 16
+lambda local not leaked NameError name 'w' is not defined
+function local 42
+no global z NameError name 'z' is not defined
+syntax 'x := 1' invalid syntax
+syntax '(x.y := 1)' cannot use assignment expressions with attribute
+syntax '(x[0] := 1)' cannot use assignment expressions with subscript
+compiles '(a, b := 1, 2)'
+syntax 'def f(x := 1): pass' invalid syntax
+compiles 'f(x := 1)'
+compiles 'f(a=(x := 1))'
+syntax 'f(a=x := 1)' invalid syntax
+syntax '[(x := 1) for x in y]' assignment expression cannot rebind comprehension iteration variable 'x'
+syntax 'y = x := 1' invalid syntax
+syntax '(lambda: x := 1)' cannot use assignment expressions with lambda
+compiles '(lambda: (x := 1))'
+compiles 'with (x := open) as y: pass'
+walrus in tuple binds first only (1, 2) 1
+statement walrus ok
+counter 5
+assert/return walrus (6, True, 6)
+assert walrus fail AssertionError not positive
