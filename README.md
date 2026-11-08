@@ -1027,6 +1027,7 @@ was removed (QuickJS-NG-only APIs) and the supported targets.
 ```sh
 make qbun
 ./qbun app.ts --flag          # also: qbun run app.ts, qbun -e 'console.log(Bun.version)'
+./qbun --preload ./setup.ts app.ts   # load modules first, like bun --preload
 ```
 
 - **Modules.** Bun's resolution: `node_modules`, `package.json` `exports`/`imports`/`main`,
