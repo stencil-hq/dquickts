@@ -371,6 +371,10 @@ unreleased:
   uses memset
 - JS_GetTypedArrayBuffer() returns the current length of length-tracking
   views
+- faster module star exports: a name exported by a single module of
+  the star closure of a namespace is not resolved again, and the export
+  and resolution lookups are O(1) (a namespace of 4000 'export *' took
+  6.4 s, now 0.12 s; importing names through them is 6x faster)
 
 2026-06-04:
 

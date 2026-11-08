@@ -555,6 +555,21 @@ typedef struct {
     JSWeakRefHeaderTypeEnum weakref_type;
 } JSWeakRefHeader;
 
+/* index of the entries of an array by an integer key (open addressing,
+   see index_hash_find()). It only speeds up lookups: when it cannot be
+   allocated, the array is searched linearly. */
+typedef struct {
+    uint64_t key;
+    int val; /* -1 if the slot is empty */
+} JSIndexHashEntry;
+
+typedef struct {
+    JSIndexHashEntry *tab; /* NULL if not allocated */
+    uint32_t mask;
+    uint32_t count;
+    int indexed; /* number of array entries in the table */
+} JSIndexHash;
+
 typedef struct JSVarRef {
     JSGCObjectHeader header; /* must come first */
     uint8_t is_detached;
@@ -1126,6 +1141,11 @@ struct JSModuleDef {
     JSExportEntry *export_entries;
     int export_entries_count;
     int export_entries_size;
+    /* export_name -> index of its first export entry (open addressing,
+       -1 if the slot is empty), see find_export_entry() */
+    int *export_hash;
+    uint32_t export_hash_mask;
+    int export_hash_indexed; /* number of export entries in the table */
 
     JSStarExportEntry *star_export_entries;
     int star_export_entries_count;
@@ -1145,6 +1165,12 @@ struct JSModuleDef {
     /* temp use during js_module_link() & js_module_evaluate() */
     int dfs_index, dfs_ancestor_index;
     JSModuleDef *stack_prev;
+    /* temp use during js_build_module_ns(): 1 + index in the star
+       closure of the namespace module, 0 if not in it */
+    int ns_index;
+    /* temp use during js_resolve_export(): 1 + module number in the
+       resolve set, 0 if not in it */
+    int resolve_index;
     /* temp use during js_module_evaluate() */
     JSModuleDef **async_parent_modules;
     int async_parent_modules_count;
@@ -6420,6 +6446,79 @@ static JSValue JS_ConcatString(JSContext *ctx, JSValue op1, JSValue op2)
         }
     }
     return js_new_string_rope(ctx, op1, op2);
+}
+
+/* Index hash tables. The keys are exact (atoms, indexes or pointers), so
+   a collision only costs a probe. */
+
+static inline uint32_t index_hash_key(uint64_t key)
+{
+    key ^= key >> 33;
+    key *= 0xff51afd7ed558ccdULL;
+    key ^= key >> 33;
+    return (uint32_t)key;
+}
+
+/* return the entry of 'key' or NULL */
+static JSIndexHashEntry *index_hash_find(const JSIndexHash *h, uint64_t key)
+{
+    uint32_t i;
+    if (!h->tab)
+        return NULL;
+    for(i = index_hash_key(key) & h->mask; h->tab[i].val >= 0;
+        i = (i + 1) & h->mask) {
+        if (h->tab[i].key == key)
+            return &h->tab[i];
+    }
+    return NULL;
+}
+
+/* return the entry of 'key', with val = -1 if it was not present (the
+   caller must set it), or NULL if out of memory */
+static JSIndexHashEntry *index_hash_add(JSRuntime *rt, JSIndexHash *h,
+                                        uint64_t key)
+{
+    JSIndexHashEntry *tab, *e;
+    uint32_t i, j, size;
+
+    size = h->tab ? h->mask + 1 : 0;
+    if ((h->count + 1) * 2 > size) {
+        uint32_t new_size = size ? size * 2 : 64;
+        tab = js_malloc_rt(rt, sizeof(tab[0]) * new_size);
+        if (!tab)
+            return NULL;
+        for(i = 0; i < new_size; i++)
+            tab[i].val = -1;
+        for(i = 0; i < size; i++) {
+            if (h->tab[i].val >= 0) {
+                for(j = index_hash_key(h->tab[i].key) & (new_size - 1);
+                    tab[j].val >= 0; j = (j + 1) & (new_size - 1))
+                    continue;
+                tab[j] = h->tab[i];
+            }
+        }
+        js_free_rt(rt, h->tab);
+        h->tab = tab;
+        h->mask = new_size - 1;
+    }
+    for(i = index_hash_key(key) & h->mask; h->tab[i].val >= 0;
+        i = (i + 1) & h->mask) {
+        if (h->tab[i].key == key)
+            return &h->tab[i];
+    }
+    e = &h->tab[i];
+    e->key = key;
+    h->count++;
+    return e;
+}
+
+static void index_hash_free(JSRuntime *rt, JSIndexHash *h)
+{
+    js_free_rt(rt, h->tab);
+    h->tab = NULL;
+    h->mask = 0;
+    h->count = 0;
+    h->indexed = 0;
 }
 
 /* Shape support */
@@ -40257,6 +40356,7 @@ static void js_free_module_def(JSRuntime *rt, JSModuleDef *m)
         JS_FreeAtomRT(rt, me->local_name);
     }
     js_free_rt(rt, m->export_entries);
+    js_free_rt(rt, m->export_hash);
 
     js_free_rt(rt, m->star_export_entries);
 
@@ -40306,11 +40406,63 @@ static int add_req_module_entry(JSContext *ctx, JSModuleDef *m,
     return m->req_module_entries_count - 1;
 }
 
+/* below this number of entries, the module tables are searched
+   linearly */
+#define JS_MODULE_HASH_MIN 16
+
+/* index the export entries added since the last call. Return FALSE if
+   out of memory. */
+static BOOL export_hash_update(JSRuntime *rt, JSModuleDef *m)
+{
+    uint32_t size, new_size, j;
+    JSAtom name;
+    int i, *tab = m->export_hash;
+
+    size = tab ? m->export_hash_mask + 1 : 0;
+    if ((uint32_t)m->export_entries_count * 2 > size) {
+        new_size = size ? size * 2 : 64;
+        while ((uint32_t)m->export_entries_count * 2 > new_size)
+            new_size *= 2;
+        tab = js_malloc_rt(rt, sizeof(tab[0]) * new_size);
+        if (!tab)
+            return FALSE;
+        memset(tab, 0xff, sizeof(tab[0]) * new_size);
+        js_free_rt(rt, m->export_hash);
+        m->export_hash = tab;
+        m->export_hash_mask = new_size - 1;
+        m->export_hash_indexed = 0;
+    }
+    for(i = m->export_hash_indexed; i < m->export_entries_count; i++) {
+        name = m->export_entries[i].export_name;
+        for(j = index_hash_key(name) & m->export_hash_mask; tab[j] >= 0;
+            j = (j + 1) & m->export_hash_mask) {
+            if (m->export_entries[tab[j]].export_name == name)
+                break;
+        }
+        if (tab[j] < 0)
+            tab[j] = i;
+    }
+    m->export_hash_indexed = m->export_entries_count;
+    return TRUE;
+}
+
 static JSExportEntry *find_export_entry(JSContext *ctx, JSModuleDef *m,
                                         JSAtom export_name)
 {
     JSExportEntry *me;
+    uint32_t j;
     int i;
+
+    if (m->export_entries_count >= JS_MODULE_HASH_MIN &&
+        (m->export_hash_indexed == m->export_entries_count ||
+         export_hash_update(ctx->rt, m))) {
+        for(j = index_hash_key(export_name) & m->export_hash_mask;
+            (i = m->export_hash[j]) >= 0; j = (j + 1) & m->export_hash_mask) {
+            if (m->export_entries[i].export_name == export_name)
+                return &m->export_entries[i];
+        }
+        return NULL;
+    }
     for(i = 0; i < m->export_entries_count; i++) {
         me = &m->export_entries[i];
         if (me->export_name == export_name)
@@ -40736,24 +40888,31 @@ typedef struct JSResolveState {
     JSResolveEntry *array;
     int size;
     int count;
+    int module_count; /* number of modules with a resolve_index */
+    JSIndexHash entries; /* (resolve_index, name) -> index in 'array' */
 } JSResolveState;
+
+static inline uint64_t resolve_entry_key(JSModuleDef *m, JSAtom name)
+{
+    return ((uint64_t)m->resolve_index << 32) | name;
+}
 
 static int find_resolve_entry(JSResolveState *s,
                               JSModuleDef *m, JSAtom name)
 {
-    int i;
-    for(i = 0; i < s->count; i++) {
-        JSResolveEntry *re = &s->array[i];
-        if (re->module == m && re->name == name)
-            return i;
-    }
-    return -1;
+    JSIndexHashEntry *e;
+
+    if (!m->resolve_index)
+        return -1;
+    e = index_hash_find(&s->entries, resolve_entry_key(m, name));
+    return e ? e->val : -1;
 }
 
 static int add_resolve_entry(JSContext *ctx, JSResolveState *s,
                              JSModuleDef *m, JSAtom name)
 {
     JSResolveEntry *re;
+    JSIndexHashEntry *e;
 
     if (js_resize_array(ctx, (void **)&s->array,
                         sizeof(JSResolveEntry),
@@ -40762,6 +40921,14 @@ static int add_resolve_entry(JSContext *ctx, JSResolveState *s,
     re = &s->array[s->count++];
     re->module = m;
     re->name = JS_DupAtom(ctx, name);
+    if (!m->resolve_index)
+        m->resolve_index = ++s->module_count;
+    e = index_hash_add(ctx->rt, &s->entries, resolve_entry_key(m, name));
+    if (!e) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+    e->val = s->count - 1;
     return 0;
 }
 
@@ -40868,15 +41035,16 @@ static JSResolveResultEnum js_resolve_export(JSContext *ctx,
     int i;
     JSResolveResultEnum ret;
 
-    s->array = NULL;
-    s->size = 0;
-    s->count = 0;
+    memset(s, 0, sizeof(*s));
 
     ret = js_resolve_export1(ctx, pmodule, pme, m, export_name, s);
 
-    for(i = 0; i < s->count; i++)
+    for(i = 0; i < s->count; i++) {
+        s->array[i].module->resolve_index = 0;
         JS_FreeAtom(ctx, s->array[i].name);
+    }
     js_free(ctx, s->array);
+    index_hash_free(ctx->rt, &s->entries);
 
     return ret;
 }
@@ -40923,9 +41091,11 @@ typedef struct ExportedNameEntry {
         JSExportEntry *me; /* using when the list is built */
         JSVarRef *var_ref; /* EXPORTED_NAME_NORMAL */
     } u;
+    JSModuleDef *module; /* module of 'u.me' when the list is built */
 } ExportedNameEntry;
 
 typedef struct GetExportNamesState {
+    /* star closure of the module, their ns_index is set */
     JSModuleDef **modules;
     int modules_size;
     int modules_count;
@@ -40933,16 +41103,24 @@ typedef struct GetExportNamesState {
     ExportedNameEntry *exported_names;
     int exported_names_size;
     int exported_names_count;
+    JSIndexHash name_hash; /* export_name -> index in 'exported_names' */
 } GetExportNamesState;
+
+static void get_exported_names_free(JSContext *ctx, GetExportNamesState *s)
+{
+    int i;
+    for(i = 0; i < s->modules_count; i++)
+        s->modules[i]->ns_index = 0;
+    s->modules_count = 0;
+    js_free(ctx, s->modules);
+    s->modules = NULL;
+    index_hash_free(ctx->rt, &s->name_hash);
+}
 
 static int find_exported_name(GetExportNamesState *s, JSAtom name)
 {
-    int i;
-    for(i = 0; i < s->exported_names_count; i++) {
-        if (s->exported_names[i].export_name == name)
-            return i;
-    }
-    return -1;
+    JSIndexHashEntry *e = index_hash_find(&s->name_hash, name);
+    return e ? e->val : -1;
 }
 
 static __exception int get_exported_names(JSContext *ctx,
@@ -40950,17 +41128,17 @@ static __exception int get_exported_names(JSContext *ctx,
                                           JSModuleDef *m, BOOL from_star)
 {
     ExportedNameEntry *en;
+    JSIndexHashEntry *e;
     int i, j;
 
     /* check circular reference */
-    for(i = 0; i < s->modules_count; i++) {
-        if (s->modules[i] == m)
-            return 0;
-    }
+    if (m->ns_index)
+        return 0;
     if (js_resize_array(ctx, (void **)&s->modules, sizeof(s->modules[0]),
                         &s->modules_size, s->modules_count + 1))
         return -1;
     s->modules[s->modules_count++] = m;
+    m->ns_index = s->modules_count;
 
     for(i = 0; i < m->export_entries_count; i++) {
         JSExportEntry *me = &m->export_entries[i];
@@ -40972,13 +41150,23 @@ static __exception int get_exported_names(JSContext *ctx,
                                 &s->exported_names_size,
                                 s->exported_names_count + 1))
                 return -1;
+            e = index_hash_add(ctx->rt, &s->name_hash, me->export_name);
+            if (!e) {
+                JS_ThrowOutOfMemory(ctx);
+                return -1;
+            }
+            e->val = s->exported_names_count;
             en = &s->exported_names[s->exported_names_count++];
             en->export_name = me->export_name;
-            /* avoid a second lookup for simple module exports */
-            if (from_star || me->export_type != JS_EXPORT_TYPE_LOCAL)
+            /* avoid a lookup for the local export of a name exported
+               by a single module of the star closure: the resolution
+               can only find it */
+            if (me->export_type != JS_EXPORT_TYPE_LOCAL) {
                 en->u.me = NULL;
-            else
+            } else {
                 en->u.me = me;
+                en->module = m;
+            }
         } else {
             en = &s->exported_names[j];
             en->u.me = NULL;
@@ -41071,7 +41259,7 @@ static JSValue js_build_module_ns(JSContext *ctx, JSModuleDef *m)
 
     memset(s, 0, sizeof(*s));
     ret = get_exported_names(ctx, s, m, FALSE);
-    js_free(ctx, s->modules);
+    get_exported_names_free(ctx, s);
     if (ret)
         goto fail;
 
@@ -41084,7 +41272,7 @@ static JSValue js_build_module_ns(JSContext *ctx, JSModuleDef *m)
 
         if (en->u.me) {
             res_me = en->u.me; /* fast case: no resolution needed */
-            res_m = m;
+            res_m = en->module;
             res = JS_RESOLVE_RES_FOUND;
         } else {
             res = js_resolve_export(ctx, &res_m, &res_me, m,
@@ -48602,6 +48790,9 @@ static int add_global_variables(JSContext *ctx, JSFunctionDef *fd)
                         memmove(me, me + 1, (m->export_entries_count - i - 1) *
                                 sizeof(*me));
                         m->export_entries_count--;
+                        js_free(ctx, m->export_hash);
+                        m->export_hash = NULL;
+                        m->export_hash_indexed = 0;
                         i--;
                         continue;
                     }

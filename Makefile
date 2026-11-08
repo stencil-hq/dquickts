@@ -841,6 +841,7 @@ test: qjs$(EXE) tests/test_std_api$(EXE) tests/test_api$(EXE) $(QJSC_TESTS)
 	$(WINE) ./qjs$(EXE) tests/test_bigint.js
 	$(WINE) ./qjs$(EXE) tests/test_cyclic_import.js
 	$(WINE) ./qjs$(EXE) tests/test_destructured_export.js
+	$(WINE) ./qjs$(EXE) tests/test_star_exports.js
 	$(WINE) ./qjs$(EXE) tests/test_typescript.ts
 	$(WINE) ./qjs$(EXE) --typescript -e 'let x: number = 1; if (x !== 1) throw Error("--typescript")'
 	$(WINE) ./qjs$(EXE) tests/test_decorators.js
