@@ -382,6 +382,10 @@ unreleased:
 - Array.prototype.shift() of a fast array is O(1) instead of moving all
   the elements: the freed slots before the elements are reused when the
   array grows (queues using push() and shift() were O(n^2))
+- faster compilation of functions with many variables: the variables
+  and global variables of a function are indexed by a hash table, and a
+  scope chain lookup skips each scope at once (16k 'let' declarations
+  in a block compiled in 2 s, now 16 ms); the bytecode is unchanged
 
 2026-06-04:
 
