@@ -2614,13 +2614,16 @@ static int qp_co_synth_name(JSContext *ctx, DynBuf *db, JSValueConst names, int 
 {
     const char *s;
     size_t len;
+    int r;
 
     if (!real)
         return dbuf_printf(db, "%c%d", prefix, i);
     s = qp_str_utf8(ctx, QP_TUPLE_ITEMS(names)[i], &len);
     if (!s)
         return -1;
-    return dbuf_put(db, (const uint8_t *)s, len);
+    r = dbuf_put(db, (const uint8_t *)s, len);
+    JS_FreeCString(ctx, s);
+    return r;
 }
 
 /* The bytecode of an explicit code object: a function with the
@@ -2651,11 +2654,14 @@ static JSFunctionBytecode *qp_co_synth(JSContext *ctx, const int *iv, JSValueCon
             JSValueConst n = i < total ? QP_TUPLE_ITEMS(varnames)[i]
                                        : QP_TUPLE_ITEMS(freevars)[i - total];
             const char *s = qp_str_utf8(ctx, n, NULL);
+            BOOL shadows;
             if (!s) {
                 JS_FreeValue(ctx, JS_GetException(ctx));
                 return NULL;
             }
-            if (!strcmp(s, "SystemError"))
+            shadows = !strcmp(s, "SystemError");
+            JS_FreeCString(ctx, s);
+            if (shadows)
                 return NULL;
         }
     }

@@ -359,7 +359,9 @@ static JSValue qp_ss_replace(JSContext *ctx, JSValueConst self, JSValueConst *ar
         JSValue v = QP_NULL;
         for (k = 0; k < nkw; k++) {
             const char *kn = qp_str_utf8(ctx, QP_TUPLE_ITEMS(kwnames)[k], NULL);
-            if (kn && !strcmp(kn, d->fields[i])) {
+            BOOL match = kn && !strcmp(kn, d->fields[i]);
+            JS_FreeCString(ctx, kn);
+            if (match) {
                 v = JS_DupValue(ctx, args[nargs + k]);
                 used[k] = 1;
                 break;
