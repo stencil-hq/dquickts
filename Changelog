@@ -375,6 +375,10 @@ unreleased:
   the star closure of a namespace is not resolved again, and the export
   and resolution lookups are O(1) (a namespace of 4000 'export *' took
   6.4 s, now 0.12 s; importing names through them is 6x faster)
+- linear time substring search: String.prototype.indexOf(),
+  lastIndexOf(), includes(), split(), replace() and replaceAll() use the
+  Two-Way algorithm for long needles (no allocation), instead of a naive
+  search in O(n * m) (a 16k character needle in 1 MB took 12 s)
 
 2026-06-04:
 

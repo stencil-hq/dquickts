@@ -60690,20 +60690,170 @@ static int string_indexof_char(JSString *p, int c, int from)
     return -1;
 }
 
+/* Substring search (Crochemore-Perrin Two-Way algorithm with glibc's bad
+   character shift): O(n + m) time in the worst case, O(1) space and no
+   allocation. Like the naive search, it compares UTF-16 code units and
+   returns the first match in the search direction. The strings are read
+   through a view so that the same code searches forward (indexOf) and on
+   the reversed strings (lastIndexOf). */
+typedef struct {
+    const JSString *p;
+    int base;
+    int dir; /* 1 or -1 */
+} JSStringView;
+
+static inline int sv_get(const JSStringView *v, int i)
+{
+    return string_get(v->p, v->base + v->dir * i);
+}
+
+/* Return the start - 1 of the maximal suffix of the needle for the code
+   unit order or the reverse order, and its period in '*pperiod' */
+static int two_way_max_suffix(const JSStringView *nd, int m, BOOL rev,
+                              int *pperiod)
+{
+    int ms = -1, j = 0, k = 1, p = 1, a, b;
+
+    while (j + k < m) {
+        a = sv_get(nd, j + k);
+        b = sv_get(nd, ms + k);
+        if (rev ? b < a : a < b) {
+            j += k;
+            k = 1;
+            p = j - ms;
+        } else if (a == b) {
+            if (k != p) {
+                k++;
+            } else {
+                j += p;
+                k = 1;
+            }
+        } else {
+            ms = j++;
+            k = p = 1;
+        }
+    }
+    *pperiod = p;
+    return ms;
+}
+
+/* Search p2 in the n code units of p1 starting at 'start' (forward) or
+   ending at 'start' (reverse). Return the match offset in the search
+   direction or -1. */
+static int two_way_search(JSString *p1, int start, int n, JSString *p2,
+                          BOOL reverse)
+{
+    int m = p2->len, dir = reverse ? -1 : 1;
+    JSStringView h = { p1, start, dir }, nd = { p2, reverse ? m - 1 : 0, dir };
+    int suffix, period, period_rev, i, j, shift, memory;
+    BOOL periodic;
+    /* bad character shift of the last needle character, indexed by the
+       low 8 bits of the code unit (a shared entry keeps the smallest
+       shift, so it is always safe), capped to 255 */
+    uint8_t shift_tab[256];
+
+    /* critical factorization */
+    suffix = two_way_max_suffix(&nd, m, FALSE, &period);
+    i = two_way_max_suffix(&nd, m, TRUE, &period_rev);
+    if (i >= suffix) {
+        suffix = i;
+        period = period_rev;
+    }
+    suffix++;
+    for (i = 0; i < suffix; i++) {
+        if (sv_get(&nd, i) != sv_get(&nd, i + period))
+            break;
+    }
+    periodic = (i == suffix);
+    if (!periodic)
+        period = max_int(suffix, m - suffix) + 1;
+    memset(shift_tab, min_int(m, 255), sizeof(shift_tab));
+    for (i = 0; i < m; i++)
+        shift_tab[sv_get(&nd, i) & 0xff] = min_int(m - 1 - i, 255);
+
+    /* 'memory' (periodic needles only): length of the needle prefix
+       known to match at 'j' */
+    memory = 0;
+    j = 0;
+    while (j <= n - m) {
+        /* the shift only skips positions where the last needle character
+           cannot match, so the last character is compared again */
+        shift = shift_tab[sv_get(&h, j + m - 1) & 0xff];
+        if (shift > 0) {
+            if (memory && shift < period)
+                shift = m - period;
+            memory = 0;
+            j += shift;
+            continue;
+        }
+        i = max_int(suffix, memory);
+        while (i < m && sv_get(&nd, i) == sv_get(&h, i + j))
+            i++;
+        if (i >= m) {
+            i = suffix - 1;
+            while (i >= memory && sv_get(&nd, i) == sv_get(&h, i + j))
+                i--;
+            if (i < memory)
+                return j;
+            j += period;
+            if (periodic)
+                memory = m - period;
+        } else {
+            j += i - suffix + 1;
+            memory = 0;
+        }
+    }
+    return -1;
+}
+
+/* Short needles or haystacks use the first character scan: it is faster
+   than Two-Way there and its O(n * m) worst case is bounded. */
+#define TWO_WAY_MIN_NEEDLE 16
+#define TWO_WAY_MIN_HAYSTACK 64
+
+/* first occurrence of p2 in p1 at or after 'from', or -1 */
 static int string_indexof(JSString *p1, JSString *p2, int from)
 {
     /* assuming 0 <= from <= p1->len */
-    int c, i, j, len1 = p1->len, len2 = p2->len;
+    int c, j, ret, len1 = p1->len, len2 = p2->len, n = len1 - from;
+
     if (len2 == 0)
         return from;
-    for (i = from, c = string_get(p2, 0); i + len2 <= len1; i = j + 1) {
-        j = string_indexof_char(p1, c, i);
-        if (j < 0 || j + len2 > len1)
-            break;
-        if (!string_cmp(p1, p2, j + 1, 1, len2 - 1))
-            return j;
+    if (len2 > n)
+        return -1;
+    if (len2 < TWO_WAY_MIN_NEEDLE || n < TWO_WAY_MIN_HAYSTACK) {
+        /* first character scan */
+        for (c = string_get(p2, 0); from + len2 <= len1; from = j + 1) {
+            j = string_indexof_char(p1, c, from);
+            if (j < 0 || j + len2 > len1)
+                break;
+            if (!string_cmp(p1, p2, j + 1, 1, len2 - 1))
+                return j;
+        }
+        return -1;
     }
-    return -1;
+    ret = two_way_search(p1, from, n, p2, FALSE);
+    return ret < 0 ? -1 : from + ret;
+}
+
+/* last occurrence of p2 in p1 starting at or before 'pos', or -1 */
+static int string_lastindexof(JSString *p1, JSString *p2, int pos)
+{
+    /* assuming 0 <= pos <= p1->len - p2->len */
+    int i, ret, len2 = p2->len;
+
+    if (len2 == 0)
+        return pos;
+    if (len2 < TWO_WAY_MIN_NEEDLE || pos + len2 < TWO_WAY_MIN_HAYSTACK) {
+        for (i = pos; i >= 0; i--) {
+            if (!string_cmp(p1, p2, i, 0, len2))
+                return i;
+        }
+        return -1;
+    }
+    /* search the reversed prefix p1[0 .. pos + len2) for the reversed p2 */
+    ret = two_way_search(p1, pos + len2 - 1, pos + len2, p2, TRUE);
+    return ret < 0 ? -1 : pos - ret;
 }
 
 static int64_t string_advance_index(JSString *p, int64_t index, BOOL unicode)
@@ -60796,7 +60946,7 @@ static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv, int lastIndexOf)
 {
     JSValue str, v;
-    int i, len, v_len, pos, start, stop, ret, inc;
+    int len, v_len, pos, start, stop, ret, inc;
     JSString *p;
     JSString *p1;
 
@@ -60838,14 +60988,10 @@ static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val,
     }
     ret = -1;
     if (len >= v_len && inc * (stop - start) >= 0) {
-        for (i = start;; i += inc) {
-            if (!string_cmp(p, p1, i, 0, v_len)) {
-                ret = i;
-                break;
-            }
-            if (i == stop)
-                break;
-        }
+        if (lastIndexOf)
+            ret = string_lastindexof(p, p1, start);
+        else
+            ret = string_indexof(p, p1, start);
     }
     JS_FreeValue(ctx, str);
     JS_FreeValue(ctx, v);
@@ -60864,7 +61010,7 @@ static JSValue js_string_includes(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv, int magic)
 {
     JSValue str, v = JS_UNDEFINED;
-    int i, len, v_len, pos, start, stop, ret;
+    int len, v_len, pos, start, stop, ret;
     JSString *p;
     JSString *p1;
 
@@ -60904,14 +61050,10 @@ static JSValue js_string_includes(JSContext *ctx, JSValueConst this_val,
         start = stop = pos;
     }
     if (start >= 0 && start <= stop) {
-        for (i = start;; i++) {
-            if (!string_cmp(p, p1, i, 0, v_len)) {
-                ret = 1;
-                break;
-            }
-            if (i == stop)
-                break;
-        }
+        if (magic == 0)
+            ret = string_indexof(p, p1, start) >= 0;
+        else
+            ret = !string_cmp(p, p1, start, 0, v_len);
     }
  done:
     JS_FreeValue(ctx, str);
