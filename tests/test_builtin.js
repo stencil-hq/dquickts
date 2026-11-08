@@ -977,6 +977,38 @@ function test_symbol()
     assert(b.toString(), "Symbol(aaa)");
 }
 
+/* the strings of one Latin-1 character are shared: appending to one
+   must not change the others */
+function test_char_strings()
+{
+    var s, a, c, i, w;
+    s = "hello";
+    a = s.split("");
+    assert(a.join("|"), "h|e|l|l|o");
+    assert([...s].join("|"), "h|e|l|l|o");
+    c = s[0];
+    for (i = 0; i < 20; i++)
+        c += "x";
+    assert(c, "h" + "x".repeat(20));
+    assert(s[0], "h");
+    assert(s.charAt(0), "h");
+    assert(String.fromCharCode(104), "h");
+    c = String.fromCharCode(0xff);
+    c += "y";
+    assert(c, "\xffy");
+    assert(String.fromCharCode(0xff), "\xff");
+    /* one Latin-1 character of a 16 bit string */
+    w = "\u4e00\xe9";
+    assert(w[1], "\xe9");
+    assert(w.slice(1), "\xe9");
+    assert(w.slice(1) + "a", "\xe9a");
+    assert(w[1], "\xe9");
+    /* 16 bit characters are not shared */
+    assert(w[0] + w[0], "\u4e00\u4e00");
+    assert("abc".at(-1), "c");
+    assert("abc".replace("abc", "z"), "z");
+}
+
 function test_map1(key_type, n)
 {
     var a, i, tab, o, v;
@@ -1437,6 +1469,7 @@ test_json();
 test_date();
 test_regexp();
 test_symbol();
+test_char_strings();
 test_map();
 test_weak_map();
 test_weak_map_cycles();

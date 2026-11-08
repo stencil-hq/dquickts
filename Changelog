@@ -292,6 +292,9 @@ unreleased:
   found in the executable instead of being loaded at run time (added
   JS_SetModuleAttributes(); js_std_eval_binary_json_module() takes the
   module type)
+- the strings of one Latin-1 character are shared by the runtime instead
+  of being allocated for each s[i], charAt(), String.fromCharCode(),
+  split("") or for-of step (24 bytes each)
 - fixed a double free in JSON.parse() with a reviver when out of memory
 - Temporal and Intl load the time zones missing from the embedded data
   from the system zoneinfo, so the default time zone is no longer

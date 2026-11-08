@@ -447,6 +447,9 @@ struct JSRuntime {
     /* last JSShape.py_uid given */
     uint64_t py_shape_uid;
 #endif
+    /* shared strings of one Latin-1 character (char_strings[c]), NULL
+       until the first one is created (see js_new_string8_len()) */
+    JSString **char_strings;
 };
 
 typedef struct JSRuntimeFinalizerState {
@@ -3163,6 +3166,13 @@ void JS_FreeRuntime(JSRuntime *rt)
         }
     }
     js_free_rt(rt, rt->class_array);
+    if (rt->char_strings) {
+        for(i = 0; i < 256; i++) {
+            if (rt->char_strings[i])
+                JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, rt->char_strings[i]));
+        }
+        js_free_rt(rt, rt->char_strings);
+    }
 
 #ifdef ENABLE_DUMPS // JS_DUMP_ATOM_LEAKS
     /* only the atoms defined in JS_InitAtoms() should be left */
@@ -5011,12 +5021,38 @@ int JS_NewClass(JSRuntime *rt, JSClassID class_id, const JSClassDef *class_def)
     return ret;
 }
 
+/* create the shared string of the Latin-1 character 'c' */
+static no_inline JSValue js_new_char_string(JSContext *ctx, uint8_t c)
+{
+    JSRuntime *rt = ctx->rt;
+    JSString *str;
+    if (!rt->char_strings) {
+        rt->char_strings = js_mallocz(ctx, sizeof(rt->char_strings[0]) * 256);
+        if (!rt->char_strings)
+            return JS_EXCEPTION;
+    }
+    str = js_alloc_string(ctx, 1, 0);
+    if (!str)
+        return JS_EXCEPTION;
+    str->u.str8[0] = c;
+    str->u.str8[1] = '\0';
+    rt->char_strings[c] = str;
+    return JS_DupValue(ctx, JS_MKPTR(JS_TAG_STRING, str));
+}
+
 static JSValue js_new_string8_len(JSContext *ctx, const char *buf, int len)
 {
     JSString *str;
 
-    if (len <= 0) {
-        return JS_AtomToString(ctx, JS_ATOM_empty_string);
+    if (len <= 1) {
+        if (len <= 0)
+            return JS_AtomToString(ctx, JS_ATOM_empty_string);
+        /* one character: shared by the runtime. A string with more than
+           one reference is never modified in place */
+        if (unlikely(!ctx->rt->char_strings ||
+                     !(str = ctx->rt->char_strings[(uint8_t)buf[0]])))
+            return js_new_char_string(ctx, buf[0]);
+        return JS_DupValue(ctx, JS_MKPTR(JS_TAG_STRING, str));
     }
     str = js_alloc_string(ctx, len, 0);
     if (!str)
@@ -5075,6 +5111,10 @@ static JSValue js_sub_string(JSContext *ctx, JSString *p, int start, int end)
         }
         if (c > 0xFF)
             return js_new_string16_len(ctx, p->u.str16 + start, len);
+        if (len == 1) {
+            char ch = c;
+            return js_new_string8_len(ctx, &ch, 1);
+        }
 
         str = js_alloc_string(ctx, len, 0);
         if (!str)
@@ -60167,6 +60207,12 @@ static JSValue js_string_fromCharCode(JSContext *ctx, JSValueConst this_val,
     int i;
     StringBuffer b_s, *b = &b_s;
 
+    if (argc == 1) {
+        int32_t c;
+        if (JS_ToInt32(ctx, &c, argv[0]))
+            return JS_EXCEPTION;
+        return js_new_string_char(ctx, c & 0xffff);
+    }
     string_buffer_init(ctx, b, argc);
 
     for(i = 0; i < argc; i++) {
