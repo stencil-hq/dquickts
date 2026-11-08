@@ -4398,10 +4398,12 @@ static int qp_os_confname(JSContext *ctx, JSValueConst arg, const QPConstDef *ta
             return -1;
         for (i = 0; table[i].name; i++) {
             if (!strcmp(table[i].name, s)) {
+                JS_FreeCString(ctx, s);
                 *out = table[i].value;
                 return 0;
             }
         }
+        JS_FreeCString(ctx, s);
         qp_raise_value_error(ctx, "unrecognized configuration name");
         return -1;
     }

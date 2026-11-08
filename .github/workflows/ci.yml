@@ -38,6 +38,9 @@ jobs:
           make microbench
       - name: Run test262
         run: |
+          # the Temporal tests use the legacy zone names (Asia/Calcutta...)
+          sudo apt-get update
+          sudo apt-get install -y tzdata-legacy
           make test2-bootstrap
           make test2
 
@@ -219,6 +222,9 @@ jobs:
           make CONFIG_COSMO=y test
       - name: Run test262
         run: |
+          # the Temporal tests use the legacy zone names (Asia/Calcutta...)
+          sudo apt-get update
+          sudo apt-get install -y tzdata-legacy
           make test2-bootstrap
           make CONFIG_COSMO=y test2
 

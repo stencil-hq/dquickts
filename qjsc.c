@@ -653,6 +653,10 @@ static int output_executable(const char *out_filename, const char *cfilename,
     *arg++ = "-lm";
     *arg++ = "-ldl";
     *arg++ = "-lpthread";
+#if defined(CONFIG_PYTHON) && (defined(__linux__) || defined(__FreeBSD__))
+    /* os.openpty / os.forkpty / os.login_tty (as LIBS in the Makefile) */
+    *arg++ = "-lutil";
+#endif
     *arg = NULL;
 
     if (verbose) {

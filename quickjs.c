@@ -57240,6 +57240,14 @@ static JSValue js_array_pop(JSContext *ctx, JSValueConst this_val,
                 p->u.array.u1.size--;
                 p->u.array.count--;
                 p->u.array.offset++;
+                if (p->u.array.count == 0) {
+                    /* empty: the elements restart at the start of the
+                       allocation, so that 'values' never points past
+                       its end (LeakSanitizer would see no reference) */
+                    p->u.array.u.values -= p->u.array.offset;
+                    p->u.array.u1.size += p->u.array.offset;
+                    p->u.array.offset = 0;
+                }
             } else {
                 res = arrp[count32 - 1];
                 p->u.array.count--;
