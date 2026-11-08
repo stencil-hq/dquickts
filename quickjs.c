@@ -49157,6 +49157,9 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         if (fd->parent)
             list_del(&fd->link);
         js_free_function_def_ts(ctx, fd);
+        index_hash_free(ctx->rt, &fd->var_hash);
+        js_free(ctx, fd->var_hash_next);
+        index_hash_free(ctx->rt, &fd->global_var_hash);
         js_free(ctx, fd);
         return JS_EXCEPTION;
     }
