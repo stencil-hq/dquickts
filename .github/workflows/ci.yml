@@ -269,6 +269,9 @@ jobs:
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
+          # the MSYS2 of the runner image: the installer download from the
+          # GitHub releases is not reliably reachable
+          release: false
           update: true
           install: git make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-dlfcn
       - name: Build
