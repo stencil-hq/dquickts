@@ -306,6 +306,9 @@ unreleased:
   JS_ExecutePendingJobs(); JSErrorEnum is public; JS_NewObjectFrom()
   creates the object with its final shape (cached per context);
   JS_GetPropertyStr() no longer creates an atom for an absent name
+- template literals keep a string rope substitution as a rope instead of
+  flattening it (a loop doing s = `${s}${x}` was O(n^2): 80k iterations
+  took 1.4 s)
 - faster errors: the default stack trace is formatted on first read,
   error objects reuse a cached shape and the messages are built without
   printf (throw + catch about 4x faster); the JS_Throw*Error() messages
