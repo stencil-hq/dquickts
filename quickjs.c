@@ -12475,6 +12475,37 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
     return 0;
 }
 
+/* make room for 'n' free slots before the elements (unshift()): the
+   block is reallocated with 'n + count / 2' free slots before the
+   elements, so that a sequence of unshift() calls is amortized O(1), and
+   the elements are moved after them. The free slots after the elements
+   are kept. As with the 1.5 growth of push(), up to about half of the
+   element count can stay unused before the elements. Return -1 if
+   exception. */
+static int expand_fast_array_front(JSContext *ctx, JSObject *p, uint32_t n)
+{
+    uint32_t count = p->u.array.count;
+    uint32_t offset = p->u.array.offset;
+    uint64_t front, total;
+    JSValue *base;
+
+    front = (uint64_t)n + count / 2;
+    total = front + p->u.array.u1.size;
+    if (total > UINT32_MAX || total > SIZE_MAX / sizeof(JSValue)) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+    /* a large block is usually grown in place (no copy) */
+    base = js_realloc(ctx, fast_array_base(p), sizeof(JSValue) * total);
+    if (!base)
+        return -1;
+    if (count != 0)
+        memmove(base + front, base + offset, sizeof(JSValue) * count);
+    p->u.array.u.values = base + front;
+    p->u.array.offset = front;
+    return 0;
+}
+
 /* Preconditions: 'p' must be of class JS_CLASS_ARRAY, p->fast_array =
    TRUE and p->extensible = TRUE */
 static inline int add_fast_array_element(JSContext *ctx, JSObject *p,
@@ -56811,7 +56842,7 @@ static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
     int i;
     int64_t len, from, newLen;
 
-    if (likely(JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT && !unshift)) {
+    if (likely(JS_VALUE_GET_TAG(this_val) == JS_TAG_OBJECT)) {
         JSObject *p = JS_VALUE_GET_OBJ(this_val);
         if (likely(p->class_id == JS_CLASS_ARRAY && p->fast_array &&
                    can_extend_fast_array(p) &&
@@ -56822,12 +56853,25 @@ static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
             uint32_t new_len;
             new_len = p->u.array.count + argc;
             if (likely(new_len <= INT32_MAX)) {
-                if (unlikely(new_len > p->u.array.u1.size)) {
-                    if (expand_fast_array(ctx, p, new_len))
-                        return JS_EXCEPTION;
+                if (!unshift) {
+                    if (unlikely(new_len > p->u.array.u1.size)) {
+                        if (expand_fast_array(ctx, p, new_len))
+                            return JS_EXCEPTION;
+                    }
+                    for(i = 0; i < argc; i++)
+                        p->u.array.u.values[p->u.array.count + i] = JS_DupValue(ctx, argv[i]);
+                } else {
+                    /* use the free slots left before the elements */
+                    if (p->u.array.offset < (uint32_t)argc) {
+                        if (expand_fast_array_front(ctx, p, argc))
+                            return JS_EXCEPTION;
+                    }
+                    p->u.array.u.values -= argc;
+                    p->u.array.offset -= argc;
+                    p->u.array.u1.size += argc;
+                    for(i = 0; i < argc; i++)
+                        p->u.array.u.values[i] = JS_DupValue(ctx, argv[i]);
                 }
-                for(i = 0; i < argc; i++)
-                    p->u.array.u.values[p->u.array.count + i] = JS_DupValue(ctx, argv[i]);
                 p->prop[0].u.value = JS_NewInt32(ctx, new_len);
                 p->u.array.count = new_len;
                 return JS_NewInt32(ctx, new_len);
