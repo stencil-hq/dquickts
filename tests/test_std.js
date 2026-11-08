@@ -577,6 +577,63 @@ async function test_interval()
     assert(n > 0);
 }
 
+/* the global timers are the functions of the os module */
+async function test_global_timers()
+{
+    var order = [], n = 0, name, d, id;
+
+    for (name of ["setTimeout", "clearTimeout", "setInterval", "clearInterval"]) {
+        d = Object.getOwnPropertyDescriptor(globalThis, name);
+        assert(typeof d.value, "function", name);
+        assert(d.value.name, name);
+        assert(d.value.length, name.startsWith("set") ? 2 : 1, name);
+        assert(d.writable && d.configurable, true, name);
+    }
+    /* they run in the order of their expiration, whatever the order of
+       their creation, even when they all expired */
+    await new Promise(resolve => {
+        setTimeout(() => { order.push("t30"); resolve(); }, 30);
+        setTimeout(() => order.push("t20"), 20);
+        id = setTimeout(() => order.push("cleared"), 5);
+        os.setTimeout(() => order.push("t1"), 1);
+        clearTimeout(id);
+    });
+    assert(order.join(), "t1,t20,t30");
+    order = [];
+    await new Promise(resolve => {
+        setTimeout(() => order.push("b"), 2);
+        setTimeout(() => order.push("a"), 1);
+        os.sleep(10);
+        setTimeout(resolve, 0);
+    });
+    assert(order.join(), "a,b");
+    /* an interval runs until it is cleared */
+    await new Promise(resolve => {
+        id = setInterval(() => {
+            if (++n == 3) {
+                clearInterval(id);
+                setTimeout(resolve, 10);
+            }
+        }, 1);
+    });
+    assert(n, 3);
+    /* the ids are shared with the os module */
+    n = 0;
+    id = setTimeout(() => n++, 1);
+    os.clearTimeout(id);
+    id = os.setInterval(() => n++, 1);
+    clearInterval(id);
+    id = setInterval(() => n++, 1);
+    clearTimeout(id);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert(n, 0);
+    /* the extra arguments are not passed */
+    await new Promise(resolve => setTimeout((...args) => {
+        assert(args.length, 0);
+        resolve();
+    }, 0, "extra"));
+}
+
 async function test_module_types()
 {
     var ns, ns2, f, read;
@@ -700,5 +757,6 @@ test_async_gc();
 test_async_promise_rejection();
 test_array_loop_interrupt();
 await test_interval();
+await test_global_timers();
 await test_module_types();
 

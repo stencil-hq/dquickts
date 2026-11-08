@@ -429,15 +429,79 @@ typedef struct QPMain {
     char *envwarn;              /* PYTHONWARNINGS copy split in place */
     char *run_filename;         /* cfg.run_filename storage (made absolute) */
     int opt_R;                  /* -R: random hash seed even with PYTHONHASHSEED */
+    int system_exit;            /* a SystemExit ended the code: no event loop */
 } QPMain;
 
 static int qp_main_err_print(JSContext *ctx, QPMain *m)
 {
     int kb = 0;
-    int code = qp_err_print_uncaught(ctx, &kb);
+    int code;
+
+    if (!QP_STATE(ctx)->config.inspect && qp_exc_pending_matches(ctx, QP_EXC(ctx, SystemExit)))
+        m->system_exit = 1;
+    code = qp_err_print_uncaught(ctx, &kb);
     if (kb)
         m->kb = 1;
     return code;
+}
+
+/* qp_set_host() (NULL: none) */
+static const QPHost *qp_main_host;
+
+void qp_set_host(const QPHost *host)
+{
+    qp_main_host = host;
+}
+
+/* The pending exception of a job or a callback of the event loop:
+   SystemExit, KeyboardInterrupt and the uncatchable errors end the loop
+   (1, *exitcode is set), the others are reported like an uncaught
+   exception (0). */
+static int qp_main_loop_exception(JSContext *ctx, QPMain *m, int *exitcode)
+{
+    if (ctx->rt->current_exception_is_uncatchable ||
+        qp_exc_pending_matches(ctx, QP_EXC(ctx, SystemExit)) ||
+        qp_exc_pending_matches(ctx, QP_EXC(ctx, KeyboardInterrupt))) {
+        *exitcode = qp_main_err_print(ctx, m);
+        return 1;
+    }
+    qp_main_err_print(ctx, m);
+    return 0;
+}
+
+/* The event loop of the host after __main__ (and after the -i REPL), as
+   in Node: the JS jobs, timers (js.setTimeout()...) and handlers run
+   until none is left, the main thread letting the other Python threads
+   run while it waits.  A callback that raises is reported like an
+   uncaught exception (sys.excepthook) and the loop goes on, as qjs does
+   for its handlers: the exit status does not change.  SystemExit and
+   KeyboardInterrupt (a SIGINT during the wait included) end it with
+   their exit status.  It does not run after an uncaught exception or a
+   SystemExit. */
+static void qp_main_run_loop(JSContext *ctx, QPMain *m, int *exitcode)
+{
+    JSContext *ctx1;
+    int r;
+
+    if (!qp_main_host || *exitcode != 0 || m->system_exit)
+        return;
+    for (;;) {
+        r = JS_ExecutePendingJob(ctx->rt, &ctx1);
+        if (r > 0)
+            continue;
+        if (r == 0) {
+            /* the Python signal handlers: a signal ends the wait */
+            if (qp_signal_check(ctx) < 0) {
+                r = -2;
+            } else {
+                r = qp_main_host->poll(ctx);
+                if (r == -1)
+                    break;
+            }
+        }
+        if (r < 0 && qp_main_loop_exception(ctx, m, exitcode))
+            break;
+    }
 }
 
 /* stdin_is_interactive */
@@ -1259,6 +1323,7 @@ static void qp_main_repl(JSContext *ctx, QPMain *m, int *exitcode)
     m->cfg.inspect = 0;
     QP_STATE(ctx)->config.inspect = 0;
     *exitcode = qp_main_run_repl(ctx, m);
+    qp_main_run_loop(ctx, m, exitcode);
 }
 
 /* pymain_header */
@@ -3060,7 +3125,7 @@ int qp_main(int argc, char **argv)
     JSRuntime *rt;
     JSContext *ctx;
     JSValue main_module;
-    int exitcode = 0, rc, nthreads, main_importer = 0;
+    int exitcode = 0, rc, nthreads, main_importer = 0, host_ready = 0;
 
     memset(&m, 0, sizeof(m));
     /* _Py_SetLocaleFromEnv(LC_CTYPE) (pymain_init) */
@@ -3118,6 +3183,15 @@ int qp_main(int argc, char **argv)
         }
 #endif
     }
+    /* the environment of the JS side (after the base snapshot, which does
+       not hold host state) */
+    if (qp_main_host) {
+        host_ready = 1;
+        if (qp_main_host->init(ctx, m.cfg.argc, m.cfg.argv) < 0) {
+            exitcode = qp_main_err_print(ctx, &m);
+            goto done;
+        }
+    }
     /* _PyFaulthandler_Init */
     if (m.cfg.faulthandler && qp_faulthandler_init_enable(ctx) < 0) {
         exitcode = qp_main_err_print(ctx, &m);
@@ -3159,6 +3233,7 @@ int qp_main(int argc, char **argv)
         exitcode = qp_main_run_file(ctx, &m);
     else
         exitcode = qp_main_run_stdin(ctx, &m);
+    qp_main_run_loop(ctx, &m, &exitcode);
     qp_main_repl(ctx, &m, &exitcode);
 
  done:
@@ -3173,16 +3248,20 @@ int qp_main(int argc, char **argv)
         return m.kb ? qp_main_exit_sigint() : exitcode;
     /* like qjs: release everything (the state keeps pointers into m.cfg),
        so that leaks and teardown bugs are visible */
+    if (host_ready)
+        qp_main_host->fini(rt);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
     qp_main_free(&m);
     return m.kb ? qp_main_exit_sigint() : exitcode;
 }
 
-/* ---- durable REPL (qjs --drepl FILE --python) ------------------------- */
+/* ---- the REPL of qjs (qjs --drepl FILE --python, qjs's \py inputs) ---- */
 
-/* qjs keeps the line editor in its own runtime and runs the inputs in the
-   session context through these functions.  The session is saved with
+/* qjs keeps the line editor in its own runtime and runs the Python inputs
+   through these functions, in the context of a durable session
+   (qp_drepl_init()) or in the context of its plain REPL
+   (qp_drepl_init_main()).  A durable session is saved with
    JS_WriteSnapshot() as a delta of its base, a new session, which qjs
    rebuilds in each process: the base must be the same bytes in every
    process of the build, so qp_drepl_init() does not depend on the
@@ -3192,6 +3271,35 @@ int qp_main(int argc, char **argv)
    object, so that it survives the restarts like the sources registered
    for the tracebacks */
 #define QP_DREPL_COUNT "\x01qp_drepl_count"
+
+/* The REPL is bilingual: `js` is imported in __main__ and, if 'define_py',
+   the JS global `py` is the __main__ module (qjs defines a getter that
+   initializes Python instead in its plain REPL).  0, or -1 with an
+   exception pending. */
+static int qp_drepl_bilingual(JSContext *ctx, BOOL define_py)
+{
+    JSValue m, js;
+    JSAtom a;
+    int r = -1;
+
+    m = qp_run_main_module(ctx);
+    if (JS_IsException(m))
+        return -1;
+    js = qp_import_module(ctx, "js");
+    if (!JS_IsException(js)) {
+        a = JS_NewAtom(ctx, "js");
+        if (a != JS_ATOM_NULL) {
+            r = qp_setattr(ctx, m, a, js);
+            JS_FreeAtom(ctx, a);
+        }
+        JS_FreeValue(ctx, js);
+    }
+    if (r >= 0 && define_py)
+        r = JS_DefinePropertyValueStr(ctx, ctx->global_obj, "py", JS_DupValue(ctx, m),
+                                      JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE);
+    JS_FreeValue(ctx, m);
+    return r < 0 ? -1 : 0;
+}
 
 /* A new session: Python like the interactive `python`, with options that
    make the state reproducible: the hash seed of the session file,
@@ -3288,6 +3396,8 @@ int qp_drepl_init(JSContext *ctx, const char *argv0, uint32_t hash_seed)
     if (JS_DefinePropertyValueStr(ctx, ctx->global_obj, QP_DREPL_COUNT, JS_NewInt32(ctx, 0),
                                   JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE) < 0)
         goto fail;
+    if (qp_drepl_bilingual(ctx, TRUE) < 0)
+        goto fail;
     /* the finders of sys.path entries: '' is the working directory */
     {
         JSAtom name = JS_NewAtom(ctx, "path_importer_cache");
@@ -3314,6 +3424,63 @@ int qp_drepl_init(JSContext *ctx, const char *argv0, uint32_t hash_seed)
             signal(i, SIG_IGN);
     }
     return ret;
+}
+
+/* Python in ctx, the context of the plain REPL of qjs (qjs without
+   --drepl), initialized by its first Python input: the interactive
+   `python` without arguments (the PYTHON* environment variables apply,
+   sys.argv == ['']) except that the standard streams are unbuffered (the
+   output of Python and of JS interleave) and SystemExit is not inspected.
+   `js` is imported in __main__.  argv0 is the program (sys.executable).
+   Returns 0, or -1 after printing the error. */
+int qp_drepl_init_main(JSContext *ctx, const char *argv0)
+{
+    /* the state keeps pointers into m.cfg: they live as long as the
+       process */
+    static QPMain m;
+    char *argv[2];
+    JSValue mod;
+
+    if (ctx->py)
+        return 0;
+    /* _Py_SetLocaleFromEnv(LC_CTYPE) (pymain_init) */
+    setlocale(LC_CTYPE, "");
+    qp_preconfig_configure_locale = 1;
+    argv[0] = (char *)argv0;
+    argv[1] = NULL;
+    if (qp_main_parse(&m, 1, argv) >= 0)
+        return -1;
+    m.cfg.inspect = 0;
+    m.cfg.unbuffered = 1;
+    if (qp_state_init(ctx, &m.cfg) < 0) {
+        fprintf(stderr, "Fatal Python error: init: Python state initialization failed\n");
+        return -1;
+    }
+#ifdef QP_IMPORTLIB_BOOT
+    if (qp_importlib_boot(ctx) < 0)
+        goto fail;
+#endif
+    mod = qp_run_main_module(ctx);
+    if (JS_IsException(mod))
+        goto fail;
+    JS_FreeValue(ctx, mod);
+    if (m.cfg.sys_path_0 && qp_main_add_path0(ctx, m.cfg.sys_path_0) < 0)
+        goto fail;
+    qp_repl_default_prompt(ctx, QP_ATOM(ctx, ps1), ">>> ");
+    qp_repl_default_prompt(ctx, QP_ATOM(ctx, ps2), "... ");
+    if (qp_drepl_bilingual(ctx, FALSE) < 0)
+        goto fail;
+    return 0;
+ fail:
+    qp_handle_uncaught(ctx);
+    return -1;
+}
+
+/* The __main__ module of the Python of ctx (the JS global `py` of the
+   REPL), or JS_EXCEPTION */
+JSValue qp_drepl_main(JSContext *ctx)
+{
+    return qp_run_main_module(ctx);
 }
 
 /* The session ctx, new (after writing its base) or restored: -1 if it has

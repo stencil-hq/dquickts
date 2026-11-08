@@ -1,22 +1,28 @@
 # dquickts
 
 A fork of [QuickJS](https://bellard.org/quickjs/), Fabrice Bellard's small embeddable JavaScript
-engine, that adds two things:
+engine, that adds three things:
 
 - **Durable execution.** You can pause a running program, even in the middle of a `for` loop,
   serialize its whole heap to bytes, and resume it later in a different process.
 - **Native TypeScript.** `.ts` files run directly. The parser erases the types as it reads them,
   so there is no transpile step.
+- **Python 3.15.** Python is compiled to QuickJS bytecode and runs on the same VM, heap and GC
+  as JS, with objects shared between the two languages. A CPython-compatible C API loads
+  extension modules: pip, abi3 wheels, and source builds of numpy, Pillow and matplotlib.
 
 It also includes Rust bindings (a port of [rquickjs](https://github.com/DelSkayn/rquickjs)) that
-expose both features.
+expose all three.
 
 ```sh
 git clone https://github.com/stencil-hq/dquickts
 cd dquickts
-make                 # builds qjs, qjsc and libquickjs.a
+make                 # builds qjs, qjsc, qpy and libquickjs.a
 ./qjs hello.ts
+./qpy hello.py               # Python, with CPython's command line
+./qjs                        # the REPL: JS, or Python after \py (\js switches back)
 ./qjs --drepl session.snap   # a REPL whose state survives restarts
+./qjs --drepl py.snap --python   # the same for Python and JS together
 make test-snapshot   # builds and runs the suspension and snapshot test hosts
 ```
 
@@ -25,6 +31,7 @@ make test-snapshot   # builds and runs the suspension and snapshot test hosts
 - [What this fork adds](#what-this-fork-adds)
 - [Durable REPL](#durable-repl)
   - [Python sessions](#python-sessions)
+  - [JS and Python in one REPL](#js-and-python-in-one-repl)
 - [Snapshots](#snapshots)
   - [What a snapshot is](#what-a-snapshot-is)
   - [When you can take one](#when-you-can-take-one)
@@ -64,9 +71,11 @@ fork adds:
 | Standard decorators (2023-05), auto-accessors, `Symbol.metadata`; TypeScript legacy decorators and decorator metadata | `JS_EVAL_FLAG_TS_LEGACY_DECORATORS`, `JS_EVAL_FLAG_TS_DECORATOR_METADATA` |
 | Explicit resource management (ES2026) | `using`, `await using`, `DisposableStack`, `AsyncDisposableStack` |
 | Ports from [quickjs-ng](https://github.com/quickjs-ng/quickjs) | `queueMicrotask()`, `atob()`/`btoa()`, `DOMException`, the V8 stack trace API, promise hooks, immutable `ArrayBuffer`s, `performance`, `os.setInterval()`, `std.writeFile()`, the `bjson` module, a re-entrant event loop, C closures, private symbols, runtime dump flags, and bug fixes |
+| Global timers in `qjs`, its workers and the embedders of `js_std_add_helpers()` (the `os` timers, ids shared) | `setTimeout()`, `clearTimeout()`, `setInterval()`, `clearInterval()` |
 | Embedder helpers | `JS_IsEqual()`, `JS_NewProxy()`, `JS_GetProxyTarget()`, `JS_PromiseMarkAsHandled()`, and others |
 | A REPL whose functions and variables survive restarts | `qjs --drepl FILE` |
-| Python 3.15 compiled to QuickJS bytecode, sharing the runtime with JS; CPython-compatible C API (abi3 wheels, source builds of numpy and Pillow) | `qpy`, `JS_InitPython()`, `JS_EvalPython()`, `qjs --drepl FILE --python` |
+| A REPL that switches between JS/TypeScript and Python from one input to the next, in one runtime | `\py`, `\js` in `qjs` and `qjs --drepl FILE --python` |
+| Python 3.15 compiled to QuickJS bytecode, sharing the runtime with JS; CPython-compatible C API (abi3 wheels, source builds of numpy, Pillow and matplotlib) | `qpy`, `JS_InitPython()`, `JS_EvalPython()`, `qjs --drepl FILE --python` |
 | Rust bindings built on this engine | [`rquickjs/`](rquickjs/README.md) |
 
 The full list is under `unreleased` in [`Changelog`](Changelog).
@@ -122,8 +131,8 @@ the standard objects plus `print()` and `console.log()`:
 
 Limits:
 
-- The `std` and `os` modules are not available. Their files, timers and handlers are host state
-  that a snapshot cannot save.
+- The `std` and `os` modules and the global timers (`setTimeout()`...) are not available. Their
+  files, timers and handlers are host state that a snapshot cannot save.
 - `\load file` evaluates a file inside the session.
 - Ctrl-C interrupts a running command. The session is not affected.
 - A session file only loads into the `qjs` build that wrote it.
@@ -173,11 +182,14 @@ Restored the durable session session.snap
 
 The architecture is the one above: `repl.js` edits the lines, the durable runtime holds a Python
 session (`python/pythonrun.c`, the `qp_drepl_*` functions) and runs the inputs, and the runtime
-is saved as a delta after each input (about 6 KB for the transcript above). In detail:
+is saved as a delta after each input (about 34 KB for the transcript above, in a directory with
+a few files: the import system caches the listing of the working directory). In detail:
 
 - The whole heap is saved: globals, functions, classes, instances, closures, generators and
   coroutines suspended in the middle, the imported modules (not imported again on load),
   `sys.path` and the sources that the tracebacks show.
+- The `js` module works in a session: the JS objects that Python holds, the Python objects
+  that JS holds and `Function.prototype.callKw` are saved with the rest.
 - Python decides when the lines form a complete input (`codeop` rules) and writes the results
   and the tracebacks itself.
 - Top-level `await` (`PyCF_ALLOW_TOP_LEVEL_AWAIT`): an input that awaits runs as a coroutine
@@ -188,7 +200,8 @@ is saved as a delta after each input (about 6 KB for the transcript above). In d
   drops the input. Ctrl-D, or the end of a piped input, quits. `SystemExit` (`sys.exit()`) ends
   `qjs` with its exit status, after the session is saved.
 - `FILE` starts with a header that holds the hash seed of the session (the `str` hashes are
-  randomized per session), then the delta. The base is rebuilt with that seed. So that the base
+  randomized per session) and the language of the inputs, then the delta. The base is rebuilt
+  with that seed. So that the base
   is the same in every process, the session ignores the `PYTHON*` environment variables (like
   `python -E`), runs in UTF-8 mode without the user site, has `sys.argv == ['']` and unbuffered,
   non-seekable standard streams that record nothing about their file descriptors, starts with
@@ -200,7 +213,7 @@ is saved as a delta after each input (about 6 KB for the transcript above). In d
   passwords), and a restored session sees the environment of the new process.
 - Tab completes the keywords, the globals and the builtins, and after a dotted name its
   attributes (evaluating the name, like `rlcompleter`). At the start of a line it indents.
-- If stdin is not a terminal, the lines are read without editing or echo.
+- `\js` switches the session to TypeScript (see [below](#js-and-python-in-one-repl)).
 
 Limits:
 
@@ -219,6 +232,76 @@ Sessions may import the CPython C modules (`re`, `json`, `decimal`, `datetime`, 
 `csv`, `threading`, `logging`, `subprocess`...) and keep their objects: the snapshot saves their
 C state. Locks no thread holds and finished threads are saved as values, and the main thread's
 `threading` objects are bound to the main thread of the process that restores the session.
+
+### JS and Python in one REPL
+
+![qjs --drepl --python: Python and TypeScript inputs call each other through py and js, and both survive quitting and restarting the REPL](doc/drepl-python-demo.gif)
+
+The REPL of `qjs` takes JavaScript (TypeScript with `--typescript`) and Python inputs, and
+both languages run in the same runtime and heap. `\py` switches the next inputs to Python and
+`\js` switches back. `\py CODE` and `\js CODE` run a single input in the other language,
+including its continuation lines. The prompt shows the language: `qjs> ` for JavaScript,
+`sys.ps1` and `sys.ps2` (`>>> `, `... `) for Python. `\h` lists the commands.
+
+Neither language needs an import to reach the other:
+
+- In Python, `js` is already imported in `__main__`. `js.name` reads a JavaScript global
+  variable, including the top-level `let`, `const` and `class` declarations of earlier inputs.
+- In JavaScript, `py` is Python's `__main__` module. `py.fib(10)` calls a Python function and
+  `py.x = 1` sets a Python global.
+
+Python inputs behave as in the [Python sessions](#python-sessions): `codeop` decides when an
+input is complete, `sys.displayhook` and `sys.excepthook` print, top-level `await` works and Tab
+completes Python names. JavaScript inputs keep the usual REPL behavior. In a terminal, the input
+is syntax-highlighted in its language, with the colors of the JavaScript REPL; the rest of a
+`\py CODE` or `\js CODE` line is highlighted as that language.
+
+`qjs --drepl FILE --python` sessions start in Python. The JavaScript state is part of the same
+heap snapshot as the Python state, and a restored session comes back in the language it was
+left in:
+
+```text
+$ ./qjs --drepl session.snap --python
+Python 3.15.2 (main) [dquickts 2026-06-04] on darwin
+Type "help", "copyright", "credits" or "license" for more information.
+Created the durable session session.snap
+>>> def fib(n):
+...     return n if n < 2 else fib(n - 1) + fib(n - 2)
+...
+>>> \js
+qjs> let scale: number = 10
+undefined
+qjs> function area(w: number, h: number): number { return w * h * scale }
+undefined
+qjs> py.fib(10)
+55
+qjs> \py [js.area(2, i) for i in range(3)]
+[0, 20, 40]
+qjs> ^D
+$ ./qjs --drepl session.snap --python
+QuickJS - Type "\h" for help
+Restored the durable session session.snap
+qjs> py.fib(scale)
+55
+qjs> \py
+>>> fib(js.area(1, 1))
+55
+```
+
+In those sessions, JavaScript inputs get the same `print()` and `console.log()` as a
+JavaScript session. A JavaScript session (`qjs --drepl FILE` without `--python`) has no Python
+in its base snapshot, so it cannot switch: `\py` prints an error telling you to start the
+session with `--python`.
+
+The plain REPL (`qjs` without `--drepl`) starts in JavaScript. Python is initialized by the
+first Python input, or by the first use of `py`, so a JavaScript-only REPL starts as fast as
+before. It runs like the interactive `python` with no arguments (the `PYTHON*` environment
+variables apply, `sys.argv == ['']`), except that its standard streams are unbuffered so that
+Python and JavaScript output come out in order. `SystemExit` ends `qjs` with its exit status.
+
+If stdin is not a terminal, every REPL reads its lines without editing, echo or colors, and
+runs them one input at a time, waiting for an asynchronous JavaScript result before reading the
+next input. When the input ends, the REPL quits.
 
 ## Snapshots
 
@@ -703,6 +786,8 @@ reports the ones that fail for another reason than a listed C module quickpy doe
   keys and the string keys of mappings are items, `Symbol.iterator` iterates, `toString()` is
   `str()`, `toJSON()` converts dicts to objects and tuples/sets to arrays, coroutines are
   thenables and `instanceof` on a Python type is `isinstance()`.
+- `js.name` is the JS global variable `name`, resolved the way JS resolves a global name: a
+  top-level `let`, `const` or `class` of the scripts, otherwise `globalThis.name`.
 - From Python, a JS object is a `js.JsObject`: attributes are JS properties, it supports
   iteration, `len()`, `in`, `await` on promises, `.new(*args)` for constructors and `.to_py()`.
 - JS has no keyword arguments: call `f.callKw(args, kwargs)`. Python keyword arguments passed to
@@ -711,6 +796,23 @@ reports the ones that fail for another reason than a listed C module quickpy doe
   thrown value is its `js_error` attribute).
 - An ES `import` of a `.py` file loads the Python module: its public globals are the named
   exports and the module object is the default export.
+- In a program started by `qpy`, `qjs file.py` or `qjs --python`, the JS side has the
+  environment of `qjs`: `js.import_module("os")` (and `std`, `bjson`), `js.setTimeout()`,
+  `js.setInterval()` and their `clear` functions (a Python callable is a valid callback),
+  `print()`, `console.log()` and `scriptArgs` (`sys.argv`). After the main module, the event loop
+  runs until no timer or handler is left, as in Node, then the interpreter finalizes (`atexit`,
+  flushed streams). Other Python threads run while it waits. A callback that raises is reported
+  through `sys.excepthook` and the loop goes on, as `qjs` does for its handlers (the exit status
+  does not change). `SystemExit` and `KeyboardInterrupt` (Ctrl-C) end it with their exit status.
+  The loop does not run after an uncaught exception or `sys.exit()` in the main module.
+  `js.run()` only drives the job queue.
+
+```python
+# timer.py: prints "main done", then "fired" 0.3 s later
+import js
+js.setTimeout(lambda: print("fired"), 300)
+print("main done")
+```
 
 ```js
 // main.js
@@ -732,6 +834,10 @@ The API is in [`quickjs.h`](quickjs.h):
   `JS_PY_EVAL_FLAG_ASYNC` top-level `await` is allowed and the result is a promise settled by
   the job queue. A Python exception is the pending JS exception.
 - `JS_PythonImport(ctx, name)` is `importlib.import_module(name)`.
+- `JS_PythonSaveThread(rt)` and `JS_PythonRestoreThread(rt, state)` release and take back the
+  GIL around a blocking wait of the host, like `Py_BEGIN_ALLOW_THREADS`. Passed to
+  `js_std_set_wait_hooks()`, they let the other Python threads run while the quickjs-libc event
+  loop waits.
 - `JS_FreeRuntime()` finalizes Python first, as `Py_FinalizeEx()` does at the exit of `qpy`
   (`threading._shutdown`, `atexit`, flushed streams, finalized modules), then frees the C
   extension state, so nothing leaks.
@@ -766,8 +872,12 @@ Third-party extensions load with `dlopen` (the C API symbols are exported by `qp
 - **Source builds** against `capi/include`, which may use the full non-limited API. `sysconfig`
   reports `EXT_SUFFIX` `.quickpy-315-<plat>.so` (`.quickpy-315-darwin.so`,
   `.quickpy-315-<arch>-linux-gnu.so`), `SOABI` and the include directory, so setuptools and
-  meson-python build for `qpy` unchanged. `tools/build_numpy.sh` and `tools/build_pillow.sh`
-  build numpy and Pillow from their sdists into a `qpy` venv and optionally run their tests.
+  meson-python build for `qpy` unchanged. `tools/build_numpy.sh`, `tools/build_pillow.sh` and
+  `tools/build_matplotlib.sh` build numpy, Pillow and matplotlib (with kiwisolver and the
+  pybind11-based contourpy) from their sdists into a `qpy` venv, running pip, meson and the
+  compilers' build helpers under `qpy`, and optionally run their tests. `tests/py/mpl/run.sh`
+  runs a numpy + matplotlib script under `qpy` and CPython and compares the printed results and
+  the rendered PNGs pixel by pixel (identical).
 - Version-specific CPython binaries (`*.cpython-315-*.so`, `cp315` wheels) raise `ImportError`
   naming their ABI tag (a pure-Python module of the same name still wins). The free-threaded
   build is not a goal.
@@ -775,10 +885,15 @@ Third-party extensions load with `dlopen` (the C API symbols are exported by `qp
 ### Runtime features
 
 - **Threads**: `_thread`/`threading` run real OS threads under a GIL (`sys.getswitchinterval()`,
-  blocking calls and `time.sleep()` release it), with `fork()`, signals delivered to the main
-  thread, `_thread.interrupt_main()` and `sys._current_frames()`.
+  blocking calls, `time.sleep()` and the wait of the event loop for a JS timer release it), with
+  `fork()`, signals delivered to the main thread, `_thread.interrupt_main()` and
+  `sys._current_frames()`.
 - **Tracing**: `sys.settrace()`/`sys.setprofile()` (and `threading.settrace_all_threads()`)
-  produce CPython's event streams, so `pdb`, `bdb`, `trace`, `profile` and `cProfile` work.
+  follow CPython's legacy tracing, including `frame.f_lineno` jumps, so `pdb`, `bdb`, `trace`,
+  `profile` and `cProfile` work (`test_sys_settrace` 448/448, `test_pdb` 235/237).
+  `sys.monitoring` (PEP 669) delivers every event, with local events, `DISABLE` and
+  `co_branches()` laid out like CPython's bytecode (`co_code` is synthesized in CPython's
+  format), so coverage.py's line and branch reports match CPython's.
 - **tracemalloc** traces the runtime's allocations (Python objects, `PyObject_Malloc`,
   `PyMem_*`, `PyTraceMalloc_Track()` domains) with Python tracebacks; `-X tracemalloc[=N]` and
   `PYTHONTRACEMALLOC` start it at startup. It costs one test per allocation while it is off.
@@ -814,8 +929,9 @@ Third-party extensions load with `dlopen` (the C API symbols are exported by `qp
 - The C modules are bound to one runtime at a time (see [Embedding](#embedding-python-in-c));
   subinterpreters, per-interpreter GILs and the free-threaded ABI are not supported.
 - CPython internals that have no equivalent on this VM differ: inline values and the object
-  layout of `__dict__`, frame `f_locals` writes, the `sys.monitoring` events (none are
-  delivered) and `locale`-aware `int`/`float` formatting.
+  layout of `__dict__`, frame `f_locals` writes, exact bytecode offsets in `dis` and
+  `sys.monitoring` (`co_code` is CPython-shaped, not identical) and `locale`-aware
+  `int`/`float` formatting.
 - Code objects carry QuickJS bytecode; `.pyc` files are not interchangeable with CPython's.
 
 ### Testing Python
@@ -838,14 +954,15 @@ testpy-replay`). L2 compares `ast.dump()` from our parser with CPython's on ever
 L3 runs CPython's own `Lib/test` modules with `unittest`: L3a is the language core, L3b the
 stdlib, L3c the remaining modules (`tests/py/cpython.conf` lists the sets). Expected failures are
 listed in `tests/py/l0_errors.txt` and `tests/py/cpython_errors.txt`; a run fails on any other
-failure. Current results: L0 207/211, L2 100% of `Lib/`, L3a 4563/4617, L3b about 9047/9082,
-L3c 14087/14155 tests.
+failure. Current results: L0 207/211, L2 100% of `Lib/`, L3a 4562/4617, L3b 9043/9082,
+L3c 14128/14180 tests.
 
-Other suites: `tests/py/{threads,finalize,interop,posix,l1gaps}/run.sh`,
+Other suites: `tests/py/{threads,finalize,interop,posix,l1gaps,monitoring}/run.sh`,
+`tests/py/mpl/run.sh` (numpy + matplotlib vs CPython),
 `tests/py/trace/test_trace.py` (compared with its `.out`),
 `tests/py/abi3/run.sh` (the abi3 wheels, network access needed), `make test-embed` (the
 embedder API and teardown) and `make test-snapshot-capi` (snapshots of C module state).
-`make bench-py` reports a geometric mean of about 1.48x CPython's time over 16 benchmarks and
+`make bench-py` reports a geometric mean of about 1.5x CPython's time over 16 benchmarks and
 startup at about 1.0x. `tools/build_numpy.sh` (with `NUMPY_TESTS=1`) and
 `tools/build_pillow.sh -t` build and test numpy and Pillow. See
 [`doc/python-plan.md`](doc/python-plan.md) for the design and status.

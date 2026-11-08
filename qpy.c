@@ -5,7 +5,9 @@
  *
  * The CPython command line (Modules/main.c, Python/initconfig.c) is
  * implemented by qp_main() (python/pythonrun.c) so that `qjs file.py` and
- * `qjs --python` share it.  Two extra options are kept for the test
+ * `qjs --python` share it.  qpy gives it the JS environment of
+ * quickjs-libc (qpy_host: the std/os/bjson modules, the global timers and
+ * the event loop after __main__).  Two extra options are kept for the test
  * harness and the build:
  *
  *   qpy --dump-ast-json-batch   serve the JSON-lines AST protocol on
@@ -25,6 +27,7 @@
 #include <string.h>
 
 #include "quickjs.h"
+#include "quickjs-libc.h"
 #include "python/quickpy.h"
 #ifdef CONFIG_PYTHON_CAPI
 #include "capi/qpcapi.h"
@@ -54,6 +57,46 @@ static uint8_t *read_whole_file(const char *path, size_t *psize)
     *psize = (size_t)n;
     return buf;
 }
+
+/* the context of the workers started from the Python program */
+static JSContext *qpy_new_worker_context(JSRuntime *rt)
+{
+    JSContext *ctx = JS_NewContext(rt);
+    if (!ctx)
+        return NULL;
+    if (!js_init_module_std(ctx, "std") || !js_init_module_os(ctx, "os") ||
+        !js_init_module_bjson(ctx, "bjson")) {
+        JS_FreeContext(ctx);
+        return NULL;
+    }
+    return ctx;
+}
+
+/* the JS environment of the Python program (QPHost): the std, os and
+   bjson modules, the globals of js_std_add_helpers() (setTimeout()...)
+   and the module loader of quickjs-libc; the Python threads run while
+   the event loop waits */
+static int qpy_host_init(JSContext *ctx, int argc, char **argv)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+
+    js_std_set_worker_new_context_func(qpy_new_worker_context);
+    js_std_init_handlers(rt);
+    js_std_set_wait_hooks(rt, JS_PythonSaveThread, JS_PythonRestoreThread);
+    JS_SetModuleLoaderFunc2(rt, js_module_normalize, js_module_loader,
+                            js_module_check_attributes, NULL);
+    if (!js_init_module_std(ctx, "std") || !js_init_module_os(ctx, "os") ||
+        !js_init_module_bjson(ctx, "bjson"))
+        return -1;
+    js_std_add_helpers(ctx, argc, argv);
+    return JS_HasException(ctx) ? -1 : 0;
+}
+
+static const QPHost qpy_host = {
+    qpy_host_init,
+    js_std_poll,
+    js_std_free_handlers,
+};
 
 static int dump_ast_json_batch(void)
 {
@@ -112,5 +155,6 @@ int main(int argc, char **argv)
     base = qpy_base_snapshot(&base_size);
     if (base)
         qp_set_base_snapshot(base, base_size);
+    qp_set_host(&qpy_host);
     return qp_main(argc, argv);
 }

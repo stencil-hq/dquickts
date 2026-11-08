@@ -2046,6 +2046,16 @@ JSValue JS_PythonImport(JSContext *ctx, const char *module)
     return qp_import_module(ctx, module);
 }
 
+void *JS_PythonSaveThread(JSRuntime *rt)
+{
+    return qp_gil_release_rt(rt);
+}
+
+void JS_PythonRestoreThread(JSRuntime *rt, void *state)
+{
+    qp_gil_acquire_ts(state);
+}
+
 /* ========================================================================= */
 /* ES modules importing .py files                                             */
 /* ========================================================================= */
@@ -2348,10 +2358,14 @@ static JSModuleDef *qp_jsi_load_py_module(JSContext *ctx, const char *filename)
 /* The `js` builtin module                                                    */
 /* ========================================================================= */
 
-/* js.__getattr__(name) (PEP 562): globalThis[name] */
+/* js.__getattr__(name) (PEP 562): the global variable 'name' of JS, as a
+   global JS name resolves: a top-level let, const or class of the scripts
+   (the global lexical environment), else globalThis[name] */
 static JSValue qp_jsmod_getattr(JSContext *ctx, JSValueConst self, JSValueConst *args, int nargs,
                                 JSValueConst kwnames, int magic)
 {
+    JSShapeProperty *prs;
+    JSProperty *pr;
     JSAtom atom;
     JSValue v;
     int r;
@@ -2361,6 +2375,17 @@ static JSValue qp_jsmod_getattr(JSContext *ctx, JSValueConst self, JSValueConst 
     atom = qp_str_to_atom(ctx, args[0]);
     if (atom == JS_ATOM_NULL)
         return JS_EXCEPTION;
+    prs = find_own_property(&pr, JS_VALUE_GET_OBJ(ctx->global_var_obj), atom);
+    if (prs) {
+        /* a variable reference (JS_GetGlobalVarRef()) */
+        v = *pr->u.var_ref->pvalue;
+        if (JS_IsUninitialized(v))
+            v = JS_ThrowReferenceErrorUninitialized(ctx, atom);
+        else
+            v = JS_DupValue(ctx, v);
+        JS_FreeAtom(ctx, atom);
+        return v;
+    }
     r = JS_HasProperty(ctx, ctx->global_obj, atom);
     if (r == 0)
         v = qp_raise(ctx, QP_EXC(ctx, AttributeError), "module 'js' has no attribute %R", args[0]);
@@ -2545,7 +2570,9 @@ static JSValue qp_jsmod_run(JSContext *ctx, JSValueConst self, JSValueConst *arg
 
 static const QPMethodDef qp_jsmod_methods[] = {
     { "__getattr__", qp_jsmod_getattr, QP_METH_O, 0,
-      "__getattr__($module, name, /)\n--\n\nglobalThis[name]." },
+      "__getattr__($module, name, /)\n--\n\n"
+      "The global JS variable name: a top-level let, const or class, else\n"
+      "globalThis[name]." },
     { "import_module", qp_jsmod_import_module, QP_METH_O, 0,
       "import_module($module, specifier, /)\n--\n\n"
       "Import an ES module and return its namespace (a Promise of it when\n"
@@ -2591,7 +2618,8 @@ static int qp_jsmod_exec(JSContext *ctx, JSValueConst module)
 
 static const QPModuleDef qp_moddef_js = {
     "js",
-    "Access to JavaScript: globalThis names are module attributes\n"
+    "Access to JavaScript: the global variables (globalThis names and the\n"
+    "top-level let, const and class declarations) are module attributes\n"
     "(`from js import console`), JsObject is the type of JavaScript objects,\n"
     "JsError the exception raised for JavaScript throws.",
     qp_jsmod_methods,

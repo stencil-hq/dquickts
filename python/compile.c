@@ -5453,6 +5453,11 @@ codegen_jump_if(compiler *c, location loc,
     if (e->kind == Constant_kind) {
         int truth = qpc_const_truth(e->v.Constant.value);
         if (truth >= 0) {
+            /* codegen's LOAD_CONST added it to u_consts before folding */
+            JSValue v = qpc_const_value(c, e->v.Constant.value);
+            int r = JS_IsException(v) ? ERROR : qpc_consts_add(c, v);
+            JS_FreeValue(c->ctx, v);
+            RETURN_IF_ERROR(r);
             if (truth == !!cond)
                 return qpc_jump(c, LOC(e), OP_goto, next);
             return qpc_op(c, LOC(e), OP_nop);

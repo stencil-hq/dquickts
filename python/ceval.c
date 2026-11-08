@@ -1881,7 +1881,12 @@ static void qp_gil_switch_in(QPThreads *thr, QPThreadState *ts)
    nothing done) while the runtime has a single Python thread. */
 static QPThreadState *qp_gil_release(JSContext *ctx)
 {
-    QPThreads *thr = ctx->rt->py_threads;
+    return qp_gil_release_rt(ctx->rt);
+}
+
+static QPThreadState *qp_gil_release_rt(JSRuntime *rt)
+{
+    QPThreads *thr = rt->py_threads;
     QPThreadState *ts;
 
     if (likely(!thr))
@@ -1897,6 +1902,11 @@ static QPThreadState *qp_gil_release(JSContext *ctx)
 /* PyEval_RestoreThread (ts from qp_gil_release, NULL: no-op); errno is
    preserved. */
 static void qp_gil_acquire(JSContext *ctx, QPThreadState *ts)
+{
+    qp_gil_acquire_ts(ts);
+}
+
+static void qp_gil_acquire_ts(QPThreadState *ts)
 {
     if (!ts)
         return;

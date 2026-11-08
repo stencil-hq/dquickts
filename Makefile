@@ -829,6 +829,7 @@ endif
 ifdef CONFIG_PYTHON
 ifndef CONFIG_WIN32
 	./tests/test_drepl_python.sh ./qjs$(EXE)
+	./tests/test_repl_python.sh ./qjs$(EXE)
 endif
 endif
 

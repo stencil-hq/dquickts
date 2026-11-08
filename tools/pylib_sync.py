@@ -41,6 +41,7 @@ import argparse
 import ast
 import base64
 import csv
+import fnmatch
 import hashlib
 import io
 import os
@@ -63,6 +64,9 @@ USER_DIRS = {"site-packages"}
 # pylib/test: symlink to cpython/Lib/test made by tests/py/run.py l3
 # (gitignored); never listed as stale or removed.
 TEST_LINK = "test"
+# pylib/_test*.so: symlinks to the test-only C extension modules made by
+# tests/py/run.py (gitignored); never listed as stale or removed.
+TEST_MODULE_LINKS = "_test*.so"
 
 # Subdirectories never copied when a package directory is copied.
 EXCLUDED_DIRS = {"test", "tests", "idle_test", "__pycache__"}
@@ -336,7 +340,9 @@ def existing_files():
         if rel == ".":
             dirnames[:] = [d for d in dirnames
                            if d not in USER_DIRS and d != TEST_LINK]
-            filenames = [f for f in filenames if f != TEST_LINK]
+            filenames = [f for f in filenames if f != TEST_LINK
+                         and not (fnmatch.fnmatchcase(f, TEST_MODULE_LINKS)
+                                  and os.path.islink(os.path.join(dirpath, f)))]
         for name in sorted(filenames):
             found.append(name if rel == "." else os.path.join(rel, name)
                          .replace(os.sep, "/"))

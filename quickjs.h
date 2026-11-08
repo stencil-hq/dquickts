@@ -2026,6 +2026,15 @@ JSValue JS_EvalPython(JSContext *ctx, const char *input, size_t input_len,
 /* importlib.import_module(module): the module object (new reference) or
    JS_EXCEPTION. */
 JSValue JS_PythonImport(JSContext *ctx, const char *module);
+/* Py_BEGIN_ALLOW_THREADS / Py_END_ALLOW_THREADS for a blocking wait of
+   the host (e.g. the event loop: js_std_set_wait_hooks()): called by the
+   thread running Python in rt (it holds the GIL), JS_PythonSaveThread()
+   lets the other Python threads of rt run until
+   JS_PythonRestoreThread(rt, state) with its result.  The runtime must
+   not be used in between.  Nothing is done (NULL) while rt has a single
+   Python thread. */
+void *JS_PythonSaveThread(JSRuntime *rt);
+void JS_PythonRestoreThread(JSRuntime *rt, void *state);
 
 #undef js_unlikely
 #undef js_force_inline

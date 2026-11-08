@@ -9,7 +9,7 @@
 | M2 core | Done: L0 207/211 golden scripts (the 4 failures are the UTF-16 surrogate deviation, §8) |
 | M3 stdlib + C API | Done: L3a 4563/4617 test ids; L1 replay parity 99.9% on self-contained cells and 99.9% on sessions; omp `prelude.py` imports and runs (`tests/py/omp_prelude_check.py`) |
 | M4 snapshots, JS interop, rquickjs | Done: interop suite, `--drepl --python` (C module state included, `make test-snapshot-capi`), rquickjs `eval_python` |
-| M5 abi3, threads | Done: 13 abi3 wheels pass their smoke tests (`tests/py/abi3/run.sh`); OS threads under a GIL (`tests/py/threads`, `test_threading` in L3) |
+| M5 abi3, threads | Done: 13 abi3 wheels pass their smoke tests (`tests/py/abi3/run.sh`); OS threads under a GIL (`tests/py/threads`, `test_threading` in L3), released while the event loop waits for a JS timer (`tests/py/interop/test_timers.py`) |
 | M6 tracing, performance | Done: `sys.settrace`/`setprofile` (pdb, trace, cProfile), tracemalloc, frozen modules, base snapshot startup about 1.0x CPython, `make bench-py` geomean about 1.48x CPython |
 | M7 source builds, L3b/L3c | Done: numpy `test_multiarray` 99.99% plus `test_umath`, `test_numeric`, `test_linalg`, `test_random` (`tools/build_numpy.sh`); Pillow 719 passed (`tools/build_pillow.sh -t`); L3b about 9047/9082, L3c 14087/14155 |
 
@@ -436,6 +436,11 @@ Decision: a cpyext-style mirror model, with two compatibility tiers.
 - **Threads.** The GIL is a mutex around the runtime. `Py_BEGIN/END_ALLOW_THREADS` release it,
   and `PyGILState_Ensure` from a foreign thread waits for it. The QJS stack limit is swapped on
   handoff. `threading` arrives with this; the corpus uses `ThreadPoolExecutor` in 0.4% of cells.
+  The event loop that `qpy`, `qjs file.py` and `qjs --python` run after `__main__` (the JS
+  timers and handlers of quickjs-libc, `QPHost` in `python/quickpy.h`) releases the GIL while it
+  waits in `poll()`: the launchers pass `JS_PythonSaveThread()`/`JS_PythonRestoreThread()` to
+  `js_std_set_wait_hooks()`, so quickjs-libc does not depend on Python; a timer or handler added
+  by another thread during the wait ends it.
 
 ## 7. Milestones
 
