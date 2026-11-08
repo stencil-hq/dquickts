@@ -60806,54 +60806,67 @@ static int two_way_search(JSString *p1, int start, int n, JSString *p2,
     return -1;
 }
 
-/* Short needles or haystacks use the first character scan: it is faster
-   than Two-Way there and its O(n * m) worst case is bounded. */
+/* The search starts with a first character scan: it is faster than
+   Two-Way for short needles or haystacks, where its O(n * m) worst case
+   is bounded, and for early matches, where the Two-Way setup dominates.
+   Otherwise it switches to Two-Way after a few failed candidates, which
+   bounds the extra work to O(m). */
 #define TWO_WAY_MIN_NEEDLE 16
 #define TWO_WAY_MIN_HAYSTACK 64
+#define TWO_WAY_NAIVE_CANDIDATES 4
 
 /* first occurrence of p2 in p1 at or after 'from', or -1 */
 static int string_indexof(JSString *p1, JSString *p2, int from)
 {
     /* assuming 0 <= from <= p1->len */
-    int c, j, ret, len1 = p1->len, len2 = p2->len, n = len1 - from;
+    int c, j, ret, budget, len1 = p1->len, len2 = p2->len;
 
     if (len2 == 0)
         return from;
-    if (len2 > n)
-        return -1;
-    if (len2 < TWO_WAY_MIN_NEEDLE || n < TWO_WAY_MIN_HAYSTACK) {
-        /* first character scan */
-        for (c = string_get(p2, 0); from + len2 <= len1; from = j + 1) {
-            j = string_indexof_char(p1, c, from);
-            if (j < 0 || j + len2 > len1)
-                break;
-            if (!string_cmp(p1, p2, j + 1, 1, len2 - 1))
-                return j;
+    if (len2 < TWO_WAY_MIN_NEEDLE || len1 - from < TWO_WAY_MIN_HAYSTACK)
+        budget = INT_MAX;
+    else
+        budget = TWO_WAY_NAIVE_CANDIDATES;
+    for (c = string_get(p2, 0); from + len2 <= len1; from = j + 1) {
+        j = string_indexof_char(p1, c, from);
+        if (j < 0 || j + len2 > len1)
+            break;
+        if (budget-- == 0) {
+            ret = two_way_search(p1, j, len1 - j, p2, FALSE);
+            return ret < 0 ? -1 : j + ret;
         }
-        return -1;
+        if (!string_cmp(p1, p2, j + 1, 1, len2 - 1))
+            return j;
     }
-    ret = two_way_search(p1, from, n, p2, FALSE);
-    return ret < 0 ? -1 : from + ret;
+    return -1;
 }
 
 /* last occurrence of p2 in p1 starting at or before 'pos', or -1 */
 static int string_lastindexof(JSString *p1, JSString *p2, int pos)
 {
     /* assuming 0 <= pos <= p1->len - p2->len */
-    int i, ret, len2 = p2->len;
+    int c, i, ret, budget, len2 = p2->len;
 
     if (len2 == 0)
         return pos;
-    if (len2 < TWO_WAY_MIN_NEEDLE || pos + len2 < TWO_WAY_MIN_HAYSTACK) {
-        for (i = pos; i >= 0; i--) {
-            if (!string_cmp(p1, p2, i, 0, len2))
-                return i;
+    if (len2 < TWO_WAY_MIN_NEEDLE || pos + len2 < TWO_WAY_MIN_HAYSTACK)
+        budget = INT_MAX;
+    else
+        budget = TWO_WAY_NAIVE_CANDIDATES;
+    c = string_get(p2, 0);
+    for (i = pos; i >= 0; i--) {
+        if (string_get(p1, i) != c)
+            continue;
+        if (budget-- == 0) {
+            /* search the reversed prefix p1[0 .. i + len2) for the
+               reversed p2 */
+            ret = two_way_search(p1, i + len2 - 1, i + len2, p2, TRUE);
+            return ret < 0 ? -1 : i - ret;
         }
-        return -1;
+        if (!string_cmp(p1, p2, i, 0, len2))
+            return i;
     }
-    /* search the reversed prefix p1[0 .. pos + len2) for the reversed p2 */
-    ret = two_way_search(p1, pos + len2 - 1, pos + len2, p2, TRUE);
-    return ret < 0 ? -1 : pos - ret;
+    return -1;
 }
 
 static int64_t string_advance_index(JSString *p, int64_t index, BOOL unicode)
