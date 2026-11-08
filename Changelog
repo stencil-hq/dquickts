@@ -114,9 +114,9 @@ unreleased:
   runtime saved to 'file' after each command (as a delta of a new
   session, rebuilt at startup) and restored from it at startup;
   qjs --typescript also applies to the REPL commands
-- added Python 3.15 (CONFIG_PYTHON, python/): Python source is compiled
-  to QuickJS bytecode and runs in the same runtime, heap, GC, job queue
-  and snapshot format as JS:
+- added Python 3.15 (CONFIG_PYTHON, python/, on 64-bit POSIX hosts):
+  Python source is compiled to QuickJS bytecode and runs in the same
+  runtime, heap, GC, job queue and snapshot format as JS:
   - the qpy program with CPython's command line; qjs runs .py files and
     qjs --python takes the qpy options
   - pylib/: CPython v3.15.2's pure-Python Lib/ without the test suite

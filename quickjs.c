@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <string.h>
 #include <assert.h>
 #include <sys/time.h>
@@ -12836,6 +12837,9 @@ JSValue JS_NewObjectFromStr(JSContext *ctx, int count, const char **props,
     JSValue ret;
     int i, n;
 
+    /* as JS_NewObjectFrom(); atoms_s is never passed uninitialized */
+    if (count <= 0)
+        return JS_NewObject(ctx);
     n = 0;
     if (count > (int)countof(atoms_s)) {
         atoms = js_malloc(ctx, count * sizeof(*atoms));
@@ -40835,9 +40839,9 @@ static char *js_default_module_normalize_name(JSContext *ctx,
         return js_strdup(ctx, name);
     }
 
-    p = strrchr(base_name, '/');
-    if (p)
-        len = p - base_name;
+    r = strrchr(base_name, '/');
+    if (r)
+        len = r - base_name;
     else
         len = 0;
 

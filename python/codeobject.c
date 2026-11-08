@@ -1117,7 +1117,9 @@ static void qp_co_emit_py(QPCoEmit *e, const uint8_t *buf, uint32_t pos)
 {
     const uint8_t *p = buf + pos + 2;
     int sub = buf[pos + 1];
-    uint32_t u8 = p[0], u16 = get_u16(p);
+    /* the operands that the instruction has: it may end the buffer */
+    int size = qp_subop_info[sub].size;
+    uint32_t u8 = size >= 3 ? p[0] : 0, u16 = size >= 4 ? get_u16(p) : 0;
 
     switch (sub) {
     case QP_OP_push_null: qp_co_put(e, QP_CPY_PUSH_NULL, 0); break;

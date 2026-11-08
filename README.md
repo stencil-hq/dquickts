@@ -762,7 +762,8 @@ The full reference is the TypeScript section of [`doc/quickjs.texi`](doc/quickjs
 dquickts also runs Python 3.15. Python source is compiled to QuickJS bytecode and runs on the
 same VM as JS: one runtime, one heap, one GC, one job queue and one snapshot format. Python and JS
 values are shared by identity, not copied. The front end lives in `python/` (built with
-`CONFIG_PYTHON`, on by default) and the pure-Python standard library subset in `pylib/`.
+`CONFIG_PYTHON`, on by default on 64-bit POSIX hosts, whose C API provides the C modules that the
+standard library needs) and the pure-Python standard library subset in `pylib/`.
 
 ```sh
 make qpy                   # the Python launcher (CPython's command line: -c, -m, -X, -O, -I...)

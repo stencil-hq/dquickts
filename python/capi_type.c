@@ -6569,12 +6569,12 @@ static PyObject *qp_capi_func_borrow_attr(PyObject *op, int role, JSAtom atom, i
 #define QP_CAPI_FUNC_MAX_WATCHERS 8
 static PyFunction_WatchCallback qp_capi_func_watchers[QP_CAPI_FUNC_MAX_WATCHERS];
 
-static_assert(PyFunction_EVENT_CREATE == QP_FUNC_EVENT_CREATE &&
-              PyFunction_EVENT_DESTROY == QP_FUNC_EVENT_DESTROY &&
-              PyFunction_EVENT_MODIFY_CODE == QP_FUNC_EVENT_MODIFY_CODE &&
-              PyFunction_EVENT_MODIFY_DEFAULTS == QP_FUNC_EVENT_MODIFY_DEFAULTS &&
-              PyFunction_EVENT_MODIFY_KWDEFAULTS == QP_FUNC_EVENT_MODIFY_KWDEFAULTS &&
-              PyFunction_EVENT_MODIFY_QUALNAME == QP_FUNC_EVENT_MODIFY_QUALNAME,
+static_assert((int)PyFunction_EVENT_CREATE == QP_FUNC_EVENT_CREATE &&
+              (int)PyFunction_EVENT_DESTROY == QP_FUNC_EVENT_DESTROY &&
+              (int)PyFunction_EVENT_MODIFY_CODE == QP_FUNC_EVENT_MODIFY_CODE &&
+              (int)PyFunction_EVENT_MODIFY_DEFAULTS == QP_FUNC_EVENT_MODIFY_DEFAULTS &&
+              (int)PyFunction_EVENT_MODIFY_KWDEFAULTS == QP_FUNC_EVENT_MODIFY_KWDEFAULTS &&
+              (int)PyFunction_EVENT_MODIFY_QUALNAME == QP_FUNC_EVENT_MODIFY_QUALNAME,
               "function watcher events");
 
 static const char *qp_capi_func_event_name(PyFunction_WatchEvent event)

@@ -201,11 +201,14 @@ jobs:
         with:
           submodules: true
       - name: Install Cosmopolitan
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir ~/cosmocc
           cd ~/cosmocc
-          # a pinned release from GitHub: cosmo.zip is not reliably reachable
-          wget -q https://github.com/jart/cosmopolitan/releases/download/4.0.2/cosmocc-4.0.2.zip
+          # a pinned release from GitHub, through the API: cosmo.zip and the
+          # releases/download URL of the asset are not reliably reachable
+          gh release download 4.0.2 -R jart/cosmopolitan -p cosmocc-4.0.2.zip
           unzip -q cosmocc-4.0.2.zip
           echo "$HOME/cosmocc/bin" >> "$GITHUB_PATH"
       - name: Build

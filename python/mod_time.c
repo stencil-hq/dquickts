@@ -459,6 +459,7 @@ static int64_t qp_time_fraction_mul(int64_t ticks, int64_t numer, int64_t denom)
     return (ticks / denom) * numer + (ticks % denom) * numer / denom;
 }
 
+#if defined(__APPLE__)
 static int64_t qp_time_gcd(int64_t a, int64_t b)
 {
     while (b != 0) {
@@ -468,6 +469,7 @@ static int64_t qp_time_gcd(int64_t a, int64_t b)
     }
     return a;
 }
+#endif
 
 /* ---- clocks -------------------------------------------------------------- */
 

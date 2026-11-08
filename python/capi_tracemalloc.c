@@ -421,13 +421,14 @@ static int qp_capi_tm_alloc_traced(void *ptr, size_t size)
     return r;
 }
 
-/* ptr is resized to ptr2 (tracemalloc_realloc) */
-static void qp_capi_tm_realloc_traced(void *ptr, void *ptr2, size_t new_size)
+/* The block at old_addr is resized to ptr2 (tracemalloc_realloc); the
+   caller takes old_addr before the realloc, which ends the old pointer. */
+static void qp_capi_tm_realloc_traced(uintptr_t old_addr, void *ptr2, size_t new_size)
 {
     QP_CAPI_TM_LOCK();
     if (qp_capi_tm.tracing) {
-        if (ptr2 != ptr)
-            qp_capi_tm_remove_trace(QP_CAPI_TM_DEFAULT_DOMAIN, (uintptr_t)ptr);
+        if ((uintptr_t)ptr2 != old_addr)
+            qp_capi_tm_remove_trace(QP_CAPI_TM_DEFAULT_DOMAIN, old_addr);
         /* a trace entry was just released: the table has room; if not, the
            block stays untraced (CPython: fatal error) */
         (void)qp_capi_tm_add_trace(QP_CAPI_TM_DEFAULT_DOMAIN, (uintptr_t)ptr2, new_size);
@@ -464,6 +465,7 @@ static no_inline void *qp_capi_tm_js_alloc(JSRuntime *rt, size_t count, size_t s
 
 static no_inline void *qp_capi_tm_js_realloc(JSRuntime *rt, void *ptr, size_t size)
 {
+    uintptr_t addr = (uintptr_t)ptr;
     void *ptr2;
 
     if (qp_capi_tm_reentrant)
@@ -477,7 +479,7 @@ static no_inline void *qp_capi_tm_js_realloc(JSRuntime *rt, void *ptr, size_t si
     }
     ptr2 = __js_realloc(&rt->malloc_ctx, ptr, size);
     if (ptr2)
-        qp_capi_tm_realloc_traced(ptr, ptr2, size);
+        qp_capi_tm_realloc_traced(addr, ptr2, size);
     return ptr2;
 }
 
@@ -509,13 +511,14 @@ static void *qp_capi_tm_raw_alloc(size_t nelem, size_t elsize, BOOL zero)
 
 static void *qp_capi_tm_raw_realloc(void *ptr, size_t new_size)
 {
+    uintptr_t addr = (uintptr_t)ptr;
     void *ptr2;
 
     if (!ptr)
         return qp_capi_tm_raw_alloc(1, new_size, FALSE);
     ptr2 = qp_sys_realloc(ptr, new_size ? new_size : 1);
     if (ptr2 && !qp_capi_tm_reentrant)
-        qp_capi_tm_realloc_traced(ptr, ptr2, new_size);
+        qp_capi_tm_realloc_traced(addr, ptr2, new_size);
     return ptr2;
 }
 

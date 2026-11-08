@@ -1347,7 +1347,7 @@ static JSValue qp_type_from_spec(JSContext *ctx, const QPTypeSpec *spec)
 }
 
 /* D5 (CapiB) R3: PyType_Ready core for C-API types (see object.h). */
-static JSValue qp_type_new_from_spec_bases(JSContext *ctx, QPType *meta, const QPTypeSpec *spec,
+static __maybe_unused JSValue qp_type_new_from_spec_bases(JSContext *ctx, QPType *meta, const QPTypeSpec *spec,
                                            JSValueConst bases, JSValueConst dict)
 {
     QPType *t, *base;

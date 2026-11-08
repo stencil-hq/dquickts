@@ -478,7 +478,7 @@ static JSValue qp_weakref_new(JSContext *ctx, JSValueConst obj, JSValueConst cal
     return qp_wr_get_or_create(ctx, qp_wr_type(ms, QP_WR_T_REF), obj, callback);
 }
 
-static JSValue qp_weakref_new_proxy(JSContext *ctx, JSValueConst obj, JSValueConst callback)
+static __maybe_unused JSValue qp_weakref_new_proxy(JSContext *ctx, JSValueConst obj, JSValueConst callback)
 {
     QPModState *ms = qp_wr_state(ctx);
     int which;
@@ -490,7 +490,7 @@ static JSValue qp_weakref_new_proxy(JSContext *ctx, JSValueConst obj, JSValueCon
     return qp_wr_get_or_create(ctx, qp_wr_type(ms, which), obj, callback);
 }
 
-static BOOL qp_weakref_check(JSContext *ctx, JSValueConst v)
+static __maybe_unused BOOL qp_weakref_check(JSContext *ctx, JSValueConst v)
 {
     return qp_wr_rec(ctx, v) != NULL;
 }
@@ -629,7 +629,7 @@ static void qp_weakref_object_freed(JSRuntime *rt, JSObject *p)
 /* _PyWeakref_ClearWeakRefsNoCallbacks (PyUnstable_Object_ClearWeakRefsNoCallbacks):
    clear every weak reference to the live object p and drop the callbacks
    without calling them. */
-static void qp_weakref_clear_no_callbacks(JSRuntime *rt, JSObject *p)
+static __maybe_unused void qp_weakref_clear_no_callbacks(JSRuntime *rt, JSObject *p)
 {
     struct list_head *el;
 

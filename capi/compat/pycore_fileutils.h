@@ -31,6 +31,11 @@ PyAPI_FUNC(int) _Py_fstat_noraise(
     int fd,
     struct _Py_stat_struct *status);
 
+/* open() with O_CLOEXEC; errno set, no exception, on failure (readline) */
+PyAPI_FUNC(int) _Py_open_noraise(
+    const char *pathname,
+    int flags);
+
 PyAPI_FUNC(int) _Py_set_inheritable(int fd, int inheritable,
                                     int *atomic_flag_works);
 

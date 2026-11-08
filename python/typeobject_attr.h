@@ -227,7 +227,7 @@ fail:
 
 /* Put a new object p (no instance attributes yet) in dict mode with the
    existing dict d (the C extension object's tp_dictoffset dict). */
-static int qp_obj_adopt_dict(JSContext *ctx, JSObject *p, JSValueConst d)
+static __maybe_unused int qp_obj_adopt_dict(JSContext *ctx, JSObject *p, JSValueConst d)
 {
     JSProperty *pr;
     if (!QP_IS_NULL(qp_obj_dict_get(ctx, p)))

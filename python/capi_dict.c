@@ -830,12 +830,12 @@ PyObject *_PyDict_Pop(PyObject *dict, PyObject *key, PyObject *default_value)
 #define QP_CAPI_DICT_MAX_WATCHERS 8         /* DICT_MAX_WATCHERS */
 #define QP_CAPI_DICT_FIRST_WATCHER 3        /* FIRST_AVAILABLE_WATCHER: 0-2 are CPython's */
 
-static_assert(PyDict_EVENT_ADDED == QP_DC_EVENT_ADDED &&
-              PyDict_EVENT_MODIFIED == QP_DC_EVENT_MODIFIED &&
-              PyDict_EVENT_DELETED == QP_DC_EVENT_DELETED &&
-              PyDict_EVENT_CLONED == QP_DC_EVENT_CLONED &&
-              PyDict_EVENT_CLEARED == QP_DC_EVENT_CLEARED &&
-              PyDict_EVENT_DEALLOCATED == QP_DC_EVENT_DEALLOCATED,
+static_assert((int)PyDict_EVENT_ADDED == QP_DC_EVENT_ADDED &&
+              (int)PyDict_EVENT_MODIFIED == QP_DC_EVENT_MODIFIED &&
+              (int)PyDict_EVENT_DELETED == QP_DC_EVENT_DELETED &&
+              (int)PyDict_EVENT_CLONED == QP_DC_EVENT_CLONED &&
+              (int)PyDict_EVENT_CLEARED == QP_DC_EVENT_CLEARED &&
+              (int)PyDict_EVENT_DEALLOCATED == QP_DC_EVENT_DEALLOCATED,
               "dictcore watcher events");
 static_assert((1 << QP_CAPI_DICT_MAX_WATCHERS) - 1 == QP_DC_WATCHER_MASK,
               "dict watcher bits");

@@ -979,7 +979,7 @@ static JSValue qp_complex_tp_new(JSContext *ctx, QPType *type, JSValueConst *arg
     Py_ssize_t nkw = JS_IsUninitialized(kwnames) ? 0 : QP_TUPLE_SIZE(kwnames);
     JSValueConst arg, out[2];
     JSValue tmp, res;
-    QPComplex c;
+    QPComplex c = { 0 };
 
     if (nargs > 1 || nkw > 0) {
         if (qp_arg_parse(ctx, &spec, args, (int)nargs, kwnames, out) < 0)

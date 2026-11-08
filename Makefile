@@ -46,7 +46,8 @@ endif
 ifndef CONFIG_M32
 CONFIG_TEMPORAL_INTL=y
 endif
-# Python 3.15 front end (python/) and the qpy program
+# Python 3.15 front end (python/) and the qpy program (64-bit POSIX hosts,
+# turned off automatically elsewhere)
 CONFIG_PYTHON=y
 # Python C API and the CPython accelerator modules linked into qpy
 # (capi/, plan D5; 64-bit POSIX hosts, turned off automatically elsewhere).
@@ -55,6 +56,8 @@ CONFIG_PYTHON=y
 #   CONFIG_PYTHON_CAPI_NO_ZLIB=y CONFIG_PYTHON_CAPI_NO_BZ2=y
 #   CONFIG_PYTHON_CAPI_NO_LZMA=y CONFIG_PYTHON_CAPI_NO_SQLITE3=y
 #   CONFIG_PYTHON_CAPI_NO_SSL=y (OpenSSL >= 1.1.1: _ssl and _hashlib)
+#   CONFIG_PYTHON_CAPI_NO_ZSTD=y CONFIG_PYTHON_CAPI_NO_FFI=y
+#   CONFIG_PYTHON_CAPI_NO_READLINE=y CONFIG_PYTHON_CAPI_NO_LIBUUID=y
 #   CONFIG_PYTHON_CAPI_SYSTEM_EXPAT=y (pyexpat with -lexpat instead of the
 #   bundled capi/modules/expat)
 CONFIG_PYTHON_CAPI=y
@@ -189,20 +192,18 @@ endif
 ifdef CONFIG_DUMPS
 DEFINES+=-DENABLE_DUMPS
 endif
+# Python needs a host of the C API, a 64-bit POSIX one (the POSIX
+# pyconfig.h): its stdlib cannot do without the CPython modules that the
+# C API builds (itertools, _collections...)
+ifneq ($(CONFIG_M32)$(CONFIG_WIN32)$(CONFIG_COSMO),)
+CONFIG_PYTHON=
+endif
+ifneq ($(shell echo __LP64__ | $(CC) -E -P -x c - 2>/dev/null),1)
+CONFIG_PYTHON=
+endif
 ifdef CONFIG_PYTHON
 DEFINES+=-DCONFIG_PYTHON
-endif
-# the C API needs Python, a 64-bit host and the POSIX pyconfig.h
-ifndef CONFIG_PYTHON
-CONFIG_PYTHON_CAPI=
-endif
-ifdef CONFIG_M32
-CONFIG_PYTHON_CAPI=
-endif
-ifdef CONFIG_WIN32
-CONFIG_PYTHON_CAPI=
-endif
-ifdef CONFIG_COSMO
+else
 CONFIG_PYTHON_CAPI=
 endif
 ifdef CONFIG_PYTHON_CAPI
@@ -211,12 +212,6 @@ endif
 # qpy embeds the base snapshot of its startup (python/pythonrun.c,
 # doc/python-plan.md section 1), written at build time by running qpy:
 # CONFIG_QPY_NO_BASE=y builds a qpy without it (cross builds have none)
-ifdef CONFIG_WIN32
-CONFIG_QPY_NO_BASE=y
-endif
-ifdef CONFIG_COSMO
-CONFIG_QPY_NO_BASE=y
-endif
 
 CFLAGS+=$(DEFINES)
 CFLAGS_DEBUG=$(CFLAGS) -O0
@@ -321,9 +316,11 @@ LIBS=-lm -lpthread
 ifndef CONFIG_WIN32
 LIBS+=-ldl
 endif
-ifeq ($(shell uname -s),Linux)
+ifdef CONFIG_PYTHON
 # os.openpty / os.forkpty / os.login_tty (in libc since glibc 2.34)
+ifneq ($(filter Linux FreeBSD,$(shell uname -s)),)
 LIBS+=-lutil
+endif
 endif
 LIBS+=$(EXTRA_LIBS)
 
@@ -356,6 +353,19 @@ CAPI_BREW_PREFIXES:=$(shell brew --prefix openssl xz sqlite zlib bzip2 zstd 2>/d
 CAPI_PKG_CONFIG=PKG_CONFIG_PATH="$(subst $(CAPI_SPACE),:,$(addsuffix /lib/pkgconfig,$(CAPI_BREW_PREFIXES)))$${PKG_CONFIG_PATH:+:$$PKG_CONFIG_PATH}" $(PKG_CONFIG)
 else
 CAPI_PKG_CONFIG=$(PKG_CONFIG)
+endif
+# MemorySanitizer does not see the writes of the uninstrumented system
+# libraries (false reports): none of the modules that need one
+ifdef CONFIG_MSAN
+CONFIG_PYTHON_CAPI_NO_ZLIB=y
+CONFIG_PYTHON_CAPI_NO_BZ2=y
+CONFIG_PYTHON_CAPI_NO_LZMA=y
+CONFIG_PYTHON_CAPI_NO_SQLITE3=y
+CONFIG_PYTHON_CAPI_NO_SSL=y
+CONFIG_PYTHON_CAPI_NO_ZSTD=y
+CONFIG_PYTHON_CAPI_NO_FFI=y
+CONFIG_PYTHON_CAPI_NO_READLINE=y
+CONFIG_PYTHON_CAPI_NO_LIBUUID=y
 endif
 # conditions of capi/Setup.qp and the flags of each dependency
 CAPI_CONDS:=
@@ -427,10 +437,12 @@ endif
 endif
 # _uuid: libSystem on macOS, libuuid elsewhere
 ifndef CONFIG_DARWIN
+ifndef CONFIG_PYTHON_CAPI_NO_LIBUUID
 ifeq ($(shell $(CAPI_PKG_CONFIG) --exists uuid && echo y),y)
 CAPI_CONDS+=libuuid
 CAPI_LIBUUID_CFLAGS:=$(shell $(CAPI_PKG_CONFIG) --cflags uuid)
 CAPI_LIBS+=$(shell $(CAPI_PKG_CONFIG) --libs uuid)
+endif
 endif
 endif
 ifdef CONFIG_PYTHON_CAPI_SYSTEM_EXPAT

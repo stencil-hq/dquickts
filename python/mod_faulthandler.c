@@ -290,7 +290,7 @@ static void qp_fh_dump_traceback_self(int fd, JSContext *ctx)
 
 /* PyUnstable_DumpTraceback of the thread whose _thread.get_ident() is
    ident.  NULL or an error message. */
-static const char *qp_fh_dump_traceback_ident(int fd, JSContext *ctx, uint64_t ident)
+static __maybe_unused const char *qp_fh_dump_traceback_ident(int fd, JSContext *ctx, uint64_t ident)
 {
     QPThreads *thr = ctx->rt->py_threads;
     struct list_head *el;

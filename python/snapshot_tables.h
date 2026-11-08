@@ -13,7 +13,8 @@
  * each local header it includes (recursively, first inclusion only), every
  * line matching
  *   ^static const (QPMethodDef|QPGetSetDef|QPMemberDef|QPTypeSpec|QPModuleDef) NAME([...])?( __maybe_unused)? =
- * (not inside a macro definition) or
+ * (not inside a macro definition nor under a host #if: those tables are
+ * listed by hand in QP_SNAP_TABLES_HOST) or
  * ^(QP_ITER_SPEC|QP_DICTITER_SPEC|QP_ODICTVIEW_SPEC)(NAME,
  * gives A(Type, NAME) for arrays and S(Type, NAME) for single objects,
  * grouped by type in the order QPTypeSpec, QPModuleDef, QPMethodDef,
@@ -375,18 +376,29 @@
     A(QPMemberDef, qp_de_members) /* mod_posix.c */ \
     A(QPMemberDef, qp_ste_members) /* mod_symtable.c */
 
-/* Host-specific tables, outside the generated list: the kqueue objects of
-   mod_select.c exist on macOS/BSD only (QP_HAVE_KQUEUE).  Expanded after
-   QP_SNAP_TABLES. */
+/* Host-specific tables, outside the generated list (the tables defined
+   under a host #if).  Expanded after QP_SNAP_TABLES. */
+/* the kqueue objects of mod_select.c: macOS/BSD only */
 #ifdef QP_HAVE_KQUEUE
-#define QP_SNAP_TABLES_HOST(A, S) \
+#define QP_SNAP_TABLES_KQUEUE(A, S) \
     S(QPTypeSpec, qp_kevent_spec) /* mod_select.c */ \
     S(QPTypeSpec, qp_kqueue_spec) /* mod_select.c */ \
     A(QPMethodDef, qp_kq_methods) /* mod_select.c */ \
     A(QPGetSetDef, qp_kev_getsets) /* mod_select.c */ \
     A(QPGetSetDef, qp_kq_getsets) /* mod_select.c */
 #else
-#define QP_SNAP_TABLES_HOST(A, S)
+#define QP_SNAP_TABLES_KQUEUE(A, S)
 #endif
+/* os.sched_param of mod_posix.c: not on macOS */
+#ifdef QP_OS_HAVE_SCHED_PARAM
+#define QP_SNAP_TABLES_SCHED_PARAM(A, S) \
+    S(QPMethodDef, qp_os_sched_param_new_def) /* mod_posix.c */ \
+    S(QPMethodDef, qp_os_sched_param_reduce_def) /* mod_posix.c */
+#else
+#define QP_SNAP_TABLES_SCHED_PARAM(A, S)
+#endif
+#define QP_SNAP_TABLES_HOST(A, S) \
+    QP_SNAP_TABLES_KQUEUE(A, S) \
+    QP_SNAP_TABLES_SCHED_PARAM(A, S)
 
 #endif /* QP_SNAPSHOT_TABLES_H */

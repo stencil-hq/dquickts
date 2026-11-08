@@ -213,7 +213,7 @@ static void qp_exc_set_traceback_raw(JSContext *ctx, JSValueConst exc, JSValue t
 }
 
 /* Borrowed args tuple. */
-static JSValue qp_exc_args(JSValueConst exc)
+static __maybe_unused JSValue qp_exc_args(JSValueConst exc)
 {
     QPExcObject *e = qp_exc_obj(exc);
     return e ? e->args : QP_NULL;

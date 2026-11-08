@@ -44,6 +44,15 @@ static void qp_capi_runtime_reset(JSRuntime *rt);                       /* E2 */
    still referenced are leaked */
 static int qp_capi_dead;
 
+/* A block leaked on purpose (qp_capi_context_free) and what it references
+   are not reported by LeakSanitizer. */
+#ifdef __SANITIZE_ADDRESS__
+#include <sanitizer/lsan_interface.h>
+#define qp_capi_lsan_ignore(h) __lsan_ignore_object(h)
+#else
+#define qp_capi_lsan_ignore(h) ((void)(h))
+#endif
+
 /* The C API binds to one runtime at a time: qp_capi_owner is the runtime
    of the context being bound or bound (qp_capi.ctx), set by qp_capi_init
    and cleared at the end of qp_capi_context_free, under
@@ -1917,6 +1926,7 @@ static void qp_capi_context_free(JSContext *ctx)
         list_del(&h->live_link);
         init_list_head(&h->live_link);
         h->flags |= QP_CAPI_F_LEAKED;
+        qp_capi_lsan_ignore(h);
         if (owned)
             JS_FreeValueRT(rt, v);
     }
@@ -1924,6 +1934,7 @@ static void qp_capi_context_free(JSContext *ctx)
     list_for_each_safe(el, el1, &qp_capi.weak_list) {
         QPCapiHead *h = list_entry(el, QPCapiHead, live_link);
         init_list_head(&h->live_link);
+        qp_capi_lsan_ignore(h);
     }
     init_list_head(&qp_capi.weak_list);
     /* weak mirrors keep no JS reference; native payloads of J objects are

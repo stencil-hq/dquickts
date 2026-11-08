@@ -1191,7 +1191,13 @@ static int qpv_is_folded_constant(qpv *c, expr_ty e)
 /* ---------------------------------------------------------------------- */
 /* Compiler units and frame blocks (compile.c) */
 
-/* _PyCompile_EnterScope with an already looked-up entry. */
+/* _PyCompile_EnterScope with an already looked-up entry.  The units live on
+   the stack of their visitors, which always call qpv_exit_scope() before
+   returning: c->u never dangles (GCC's -Wdangling-pointer cannot see it). */
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 12
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdangling-pointer"
+#endif
 static void qpv_enter_scope_ste(qpv *c, qpv_unit *u, int scope_type, PySTEntryObject *ste)
 {
     u->prev = c->u;
@@ -1203,6 +1209,9 @@ static void qpv_enter_scope_ste(qpv *c, qpv_unit *u, int scope_type, PySTEntryOb
     u->deferred_cap = 0;
     c->u = u;
 }
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 12
+#pragma GCC diagnostic pop
+#endif
 
 /* _PyCompile_EnterScope: the unit's entry is st_blocks[key]. */
 static int qpv_enter_scope(qpv *c, qpv_unit *u, int scope_type, void *key)

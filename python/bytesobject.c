@@ -1176,7 +1176,7 @@ static int qp_bm_parse_hex_args(JSContext *ctx, const char *fname, JSValueConst 
 }
 
 /* Hex of a buffer with a validated sep object (QP_NULL = none). */
-static JSValue qp_bytes_strhex(JSContext *ctx, const uint8_t *data, Py_ssize_t len,
+static __maybe_unused JSValue qp_bytes_strhex(JSContext *ctx, const uint8_t *data, Py_ssize_t len,
                                JSValueConst sep, Py_ssize_t bytes_per_sep)
 {
     int sep_char;

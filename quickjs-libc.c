@@ -899,9 +899,9 @@ char *js_module_normalize(JSContext *ctx, const char *base_name,
         return js_strdup(ctx, name);
     }
 
-    p = strrchr(base_name, '/');
-    if (p && name[0] == '.')
-        len = p - base_name;
+    r = strrchr(base_name, '/');
+    if (r && name[0] == '.')
+        len = r - base_name;
     else
         len = 0;
 

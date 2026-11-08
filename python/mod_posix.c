@@ -39,6 +39,8 @@
 #ifdef __APPLE__
 #include <util.h>
 #include <copyfile.h>
+#elif defined(__FreeBSD__)
+#include <libutil.h>
 #else
 #include <pty.h>
 #include <utmp.h>
@@ -5937,7 +5939,11 @@ QP_OS_FN(qp_os_initgroups)
 /* os.setpgrp() */
 QP_OS_FN(qp_os_setpgrp)
 {
+#ifdef __FreeBSD__
+    if (setpgrp(0, 0) < 0)  /* SETPGRP_HAVE_ARG */
+#else
     if (setpgrp() < 0)
+#endif
         return qp_os_error(ctx, errno);
     return JS_UNDEFINED;
 }
@@ -6426,7 +6432,7 @@ QP_OS_FN(qp_os_preadv)
     return qp_long_from_int64(ctx, (int64_t)n);
 }
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__FreeBSD__)
 /* sendfile() headers / trailers: a sequence of buffers (cnt 0: none) */
 static int qp_os_sf_vec(JSContext *ctx, JSValueConst o, const char *what, JSValue *pseq,
                         struct iovec **piov, QPBuffer **pviews, int *pcnt)
@@ -6463,29 +6469,37 @@ static int qp_os_sf_vec(JSContext *ctx, JSValueConst o, const char *what, JSValu
 }
 
 /* os.sendfile(out_fd, in_fd, offset, count, headers=(), trailers=(),
-   flags=0): macOS sendfile(2), count 0 sends until the end of in_fd */
+   flags=0): macOS / FreeBSD sendfile(2), count 0 sends until the end of
+   in_fd */
 QP_OS_FN(qp_os_sendfile)
 {
     JSValue hseq = JS_UNDEFINED, tseq = JS_UNDEFINED;
     struct iovec *hiov = NULL, *tiov = NULL;
     QPBuffer *hviews = NULL, *tviews = NULL;
     struct sf_hdtr sf;
-    int out_fd, in_fd, flags, ret, err = 0, i;
-    off_t offset, sbytes;
+    int out_fd, in_fd, flags, ret, err = 0;
+    off_t offset, count, sbytes;
     QP_OS_PARSE("sendfile", 4, 7, "out_fd", "in_fd", "offset", "count", "headers",
                 "trailers", "flags");
     if (qp_os_int(ctx, a[0], &out_fd) < 0 || qp_os_int(ctx, a[1], &in_fd) < 0 ||
-        qp_os_off(ctx, a[2], &offset) < 0 || qp_os_off(ctx, a[3], &sbytes) < 0 ||
+        qp_os_off(ctx, a[2], &offset) < 0 || qp_os_off(ctx, a[3], &count) < 0 ||
         qp_os_opt_int(ctx, a[6], 0, &flags) < 0)
         return JS_EXCEPTION;
-    if (sbytes < 0)
+    if (count < 0)
         return qp_raise_value_error(ctx, "count cannot be negative");
+#ifdef __APPLE__
+    /* macOS: in/out length, headers included */
+    sbytes = count;
+#else
+    sbytes = 0;
+#endif
     memset(&sf, 0, sizeof(sf));
     if (qp_os_sf_vec(ctx, a[4], "headers", &hseq, &hiov, &hviews, &sf.hdr_cnt) < 0)
         return JS_EXCEPTION;
     if (sf.hdr_cnt) {
         sf.headers = hiov;
-        for (i = 0; i < sf.hdr_cnt; i++) {
+#ifdef __APPLE__
+        for (int i = 0; i < sf.hdr_cnt; i++) {
             Py_ssize_t blen = hiov[i].iov_len;
             if (sbytes >= 0x7fffffffffffffffLL - blen) {
                 qp_raise_overflow_error(ctx, "sendfile() header is too large");
@@ -6493,6 +6507,7 @@ QP_OS_FN(qp_os_sendfile)
             }
             sbytes += blen;
         }
+#endif
     }
     if (qp_os_sf_vec(ctx, a[5], "trailers", &tseq, &tiov, &tviews, &sf.trl_cnt) < 0)
         goto fail;
@@ -6500,7 +6515,11 @@ QP_OS_FN(qp_os_sendfile)
         sf.trailers = tiov;
     for (;;) {
         QP_BEGIN_ALLOW_THREADS(ctx)
+#ifdef __APPLE__
         ret = sendfile(in_fd, out_fd, offset, &sbytes, &sf, flags);
+#else
+        ret = sendfile(in_fd, out_fd, offset, (size_t)count, &sf, &sbytes, flags);
+#endif
         err = errno;
         QP_END_ALLOW_THREADS(ctx)
         if (ret >= 0 || err != EINTR)
@@ -6531,7 +6550,7 @@ fail:
     JS_FreeValue(ctx, tseq);
     return JS_EXCEPTION;
 }
-#else /* !__APPLE__ */
+#else /* !__APPLE__ && !__FreeBSD__ */
 /* os.sendfile(out_fd, in_fd, offset, count): Linux sendfile(2), offset
    None reads from the current position of in_fd */
 QP_OS_FN(qp_os_sendfile)
@@ -6565,7 +6584,7 @@ QP_OS_FN(qp_os_sendfile)
         return qp_os_error(ctx, err);
     return qp_long_from_int64(ctx, (int64_t)ret);
 }
-#endif /* __APPLE__ */
+#endif /* __APPLE__ || __FreeBSD__ */
 
 #ifdef QP_OS_HAVE_FCOPYFILE
 /* os._fcopyfile(in_fd, out_fd, flags, /) */
@@ -8380,7 +8399,7 @@ static const QPMethodDef qp_posix_methods[] = {
       "- RWF_ATOMIC\n"
       "\n"
       "Using non-zero flags requires Linux 4.7 or newer." },
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__FreeBSD__)
     { "sendfile", qp_os_sendfile, QP_METH_FASTCALL | QP_METH_KEYWORDS, 0,
       "sendfile($module, /, out_fd, in_fd, offset, count, headers=(),\n"
       "         trailers=(), flags=0)\n"

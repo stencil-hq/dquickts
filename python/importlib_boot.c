@@ -354,13 +354,14 @@ static JSValue qp_boot_make_sys_path(JSContext *ctx, const QPBootPaths *p)
 static char *qp_boot_venv_prefix(JSContext *ctx)
 {
     const char *exe = QP_STATE(ctx)->config.executable;
+    const char *exe_slash;
     char *dir, *cfg, *slash;
     int i;
 
     if (!exe || exe[0] != '/')
         return NULL;
-    slash = strrchr(exe, '/');
-    dir = qp_boot_strdup(ctx, exe, slash == exe ? 1 : (size_t)(slash - exe));
+    exe_slash = strrchr(exe, '/');
+    dir = qp_boot_strdup(ctx, exe, exe_slash == exe ? 1 : (size_t)(exe_slash - exe));
     for (i = 0; dir && i < 2; i++) {
         cfg = qp_boot_join(ctx, dir, "pyvenv.cfg");
         if (!cfg)

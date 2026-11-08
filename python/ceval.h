@@ -195,9 +195,11 @@ static int qp_thread_wait(JSContext *ctx, QPThreadReadyFunc *ready, JSValueConst
                           int64_t timeout_ns, BOOL handle_signals);
 static void qp_thread_notify(JSContext *ctx);
 static int *qp_rmutex_level_ptr(JSContext *ctx, int which);
+#ifdef CONFIG_PYTHON_CAPI
 static QPThreadState *qp_thread_attach(JSContext *ctx);
 static void qp_thread_detach_foreign(JSContext *ctx, QPThreadState *ts,
                                      void (*clear)(JSContext *ctx, QPThreadState *ts));
+#endif
 static void qp_rmutex_lock(JSContext *ctx, int which);
 static int qp_rmutex_unlock(JSContext *ctx, int which);
 /* python/mod_thread.c, python/mod_misc.c: os.fork() child */

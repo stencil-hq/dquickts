@@ -301,9 +301,17 @@
 #  define HAVE_BROKEN_SEM_GETVALUE 1
 #  define HAVE_DYLD_SHARED_CACHE_CONTAINS_PATH 1
 #elif defined(__linux__)
-#  define HAVE_LINUX_NETLINK_H 1
-#  define HAVE_LINUX_CAN_H 1
-#  define HAVE_LINUX_TIPC_H 1
+/* the kernel headers are a separate package on musl systems (Alpine:
+   linux-headers) */
+#  if __has_include(<linux/netlink.h>)
+#    define HAVE_LINUX_NETLINK_H 1
+#  endif
+#  if __has_include(<linux/can.h>)
+#    define HAVE_LINUX_CAN_H 1
+#  endif
+#  if __has_include(<linux/tipc.h>)
+#    define HAVE_LINUX_TIPC_H 1
+#  endif
 #  define HAVE_SYS_EPOLL_H 1
 #  define HAVE_EPOLL 1
 #  define HAVE_EPOLL_CREATE1 1
@@ -316,9 +324,15 @@
 #  define HAVE_GETHOSTBYNAME_R 1
 #  define HAVE_GETHOSTBYNAME_R_6_ARG 1
 #  define HAVE_NETPACKET_PACKET_H 1
-#  define HAVE_SOCKADDR_ALG 1
-#  define HAVE_LINUX_VM_SOCKETS_H 1
-#  define HAVE_LINUX_FS_H 1
+#  if __has_include(<linux/if_alg.h>)
+#    define HAVE_SOCKADDR_ALG 1
+#  endif
+#  if __has_include(<linux/vm_sockets.h>)
+#    define HAVE_LINUX_VM_SOCKETS_H 1
+#  endif
+#  if __has_include(<linux/fs.h>)
+#    define HAVE_LINUX_FS_H 1
+#  endif
 #  define HAVE_SEM_TIMEDWAIT 1
 #  define HAVE_SIGTIMEDWAIT 1
 #  define HAVE_SIGWAITINFO 1

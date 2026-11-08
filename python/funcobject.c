@@ -1374,7 +1374,7 @@ static QPCell *qp_fo_cell_data(JSValueConst v)
 /* PyFunction_SetClosure: func_closure = closure (a tuple, or JS_UNDEFINED
    for None; the items are not checked, as in CPython).  The free variables
    the code reads become the given cells. */
-static void qp_fo_set_closure(JSContext *ctx, JSValueConst func, JSValueConst closure)
+static __maybe_unused void qp_fo_set_closure(JSContext *ctx, JSValueConst func, JSValueConst closure)
 {
     JSObject *p = JS_VALUE_GET_OBJ(func);
     JSFunctionBytecode *b = p->u.func.function_bytecode;

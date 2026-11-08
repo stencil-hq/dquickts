@@ -126,6 +126,11 @@ function convertCompactPattern(cldrPat) {
     return cldrPat.replace(/(\d+)/g, '{0}');
 }
 
+/* Unicode bidirectional formatting controls (ALM, LRM, RLM, LRE..RLO,
+   LRI..PDI): emitted as \u escapes so that the generated source contains
+   no raw bidi characters (GCC -Wbidi-chars). */
+const BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+
 function escapeCString(s) {
     if (s === null || s === undefined) return '';
     if (typeof s !== 'string') s = String(s);
@@ -139,6 +144,9 @@ function escapeCString(s) {
         else if (ch === '\t') r += '\\t';
         else if (code < 0x20) {
             r += `\\x${code.toString(16).padStart(2, '0')}`;
+        }
+        else if (BIDI_CONTROLS.test(ch)) {
+            r += `\\u${code.toString(16).toUpperCase().padStart(4, '0')}`;
         }
         else r += ch;
     }

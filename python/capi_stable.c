@@ -1252,7 +1252,10 @@ void PySys_SetArgvEx(int argc, wchar_t **argv, int updatepath)
 
 void PySys_SetArgv(int argc, wchar_t **argv)
 {
+_Py_COMP_DIAG_PUSH
+_Py_COMP_DIAG_IGNORE_DEPR_DECLS
     PySys_SetArgvEx(argc, argv, 0);
+_Py_COMP_DIAG_POP
 }
 
 /* makepathobject: split at ':' */
@@ -1584,7 +1587,10 @@ static int qp_capi_locale_is_utf8(void)
     return 1;
 #else
     const char *cs = nl_langinfo(CODESET);
+_Py_COMP_DIAG_PUSH
+_Py_COMP_DIAG_IGNORE_DEPR_DECLS
     return Py_UTF8Mode || (cs && (!strcmp(cs, "UTF-8") || !strcmp(cs, "utf8")));
+_Py_COMP_DIAG_POP
 #endif
 }
 
@@ -2017,6 +2023,7 @@ PyAPI_FUNC(Py_ssize_t) _PyBytes_ReverseFind(const char *haystack, Py_ssize_t len
                                             Py_ssize_t offset);
 PyAPI_FUNC(int) _Py_fstat_noraise(int fd, struct stat *status);
 PyAPI_FUNC(int) _Py_fstat(int fd, struct stat *status);
+PyAPI_FUNC(int) _Py_open_noraise(const char *pathname, int flags);
 
 /* stringlib_find / stringlib_rfind on bytes: the position (plus offset)
    of the first / last occurrence, -1 when absent; an empty needle is
@@ -2049,6 +2056,11 @@ Py_ssize_t _PyBytes_ReverseFind(const char *haystack, Py_ssize_t len_haystack,
 int _Py_fstat_noraise(int fd, struct stat *status)
 {
     return fstat(fd, status);
+}
+
+int _Py_open_noraise(const char *pathname, int flags)
+{
+    return open(pathname, flags | O_CLOEXEC);
 }
 
 int _Py_fstat(int fd, struct stat *status)

@@ -1498,7 +1498,7 @@ static int qp_context_exit_ms(JSContext *ctx, QPModState *ms, JSValueConst conte
     return 0;
 }
 
-static int qp_context_enter(JSContext *ctx, JSValueConst context)
+static __maybe_unused int qp_context_enter(JSContext *ctx, JSValueConst context)
 {
     QPModState *ms = qp_ctxvar_state(ctx);
     if (!ms)
@@ -1506,7 +1506,7 @@ static int qp_context_enter(JSContext *ctx, JSValueConst context)
     return qp_context_enter_ms(ctx, ms, context);
 }
 
-static int qp_context_exit(JSContext *ctx, JSValueConst context)
+static __maybe_unused int qp_context_exit(JSContext *ctx, JSValueConst context)
 {
     QPModState *ms = qp_ctxvar_state(ctx);
     if (!ms)

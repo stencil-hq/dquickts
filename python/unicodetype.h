@@ -85,9 +85,9 @@ static int _PyUnicode_IsCased(Py_UCS4 ch);
 static int _PyUnicode_IsCaseIgnorable(Py_UCS4 ch);
 
 /* Simple case mappings: ch itself if no mapping. */
-static Py_UCS4 _PyUnicode_ToLowercase(Py_UCS4 ch);
-static Py_UCS4 _PyUnicode_ToUppercase(Py_UCS4 ch);
-static Py_UCS4 _PyUnicode_ToTitlecase(Py_UCS4 ch);
+static __maybe_unused Py_UCS4 _PyUnicode_ToLowercase(Py_UCS4 ch);
+static __maybe_unused Py_UCS4 _PyUnicode_ToUppercase(Py_UCS4 ch);
+static __maybe_unused Py_UCS4 _PyUnicode_ToTitlecase(Py_UCS4 ch);
 
 /* Full (SpecialCasing/CaseFolding) mappings: write 1..3 code points to res
    (caller provides >= 3 slots) and return the count. No final-sigma or
@@ -100,7 +100,7 @@ static int _PyUnicode_ToFoldedFull(Py_UCS4 ch, Py_UCS4 *res);
 /* Numeric values: digit 0..9 or -1; ToNumeric returns -1.0 if none. */
 static int _PyUnicode_ToDecimalDigit(Py_UCS4 ch);
 static int _PyUnicode_ToDigit(Py_UCS4 ch);
-static double _PyUnicode_ToNumeric(Py_UCS4 ch);
+static __maybe_unused double _PyUnicode_ToNumeric(Py_UCS4 ch);
 
 /* Locale-independent ASCII ctype (pyctype.h). Argument must be a
    (signed/unsigned) char value; QP_CHARMASK maps it to 0..255. */

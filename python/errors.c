@@ -11,6 +11,8 @@
  * Part of the quickjs.c translation unit: everything is static.
  */
 
+#include <ctype.h>
+
 /* ---- exceptions.c payload accessors (unit i, M2Exc) --------------------- */
 static JSValue qp_exc_context(JSValueConst exc);   /* borrowed, QP_NULL if unset */
 static JSValue qp_exc_cause(JSValueConst exc);     /* borrowed, QP_NULL if unset */
