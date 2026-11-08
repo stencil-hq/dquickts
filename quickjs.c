@@ -65270,7 +65270,7 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
 {
     StringBuffer b_s;
     JSONStringifyContext jsc_s, *jsc = &jsc_s;
-    JSValue val, v, space, ret, wrapper;
+    JSValue val, v, space, ret, wrapper, seen;
     int res;
     int64_t i, j, n;
 
@@ -65282,6 +65282,7 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
     jsc->empty = JS_AtomToString(ctx, JS_ATOM_empty_string);
     ret = JS_UNDEFINED;
     wrapper = JS_UNDEFINED;
+    seen = JS_UNDEFINED;
 
     string_buffer_init(ctx, jsc->b, 0);
     jsc->stack = JS_NewArray(ctx);
@@ -65298,10 +65299,17 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
             jsc->property_list = JS_NewArray(ctx);
             if (JS_IsException(jsc->property_list))
                 goto exception;
+            /* the properties of the list, found with the hash table of
+               the shape of 'seen' */
+            seen = JS_NewObjectProto(ctx, JS_NULL);
+            if (JS_IsException(seen))
+                goto exception;
             if (js_get_length64(ctx, &n, replacer))
                 goto exception;
             for (i = j = 0; i < n; i++) {
-                JSValue present;
+                JSProperty *pr;
+                JSAtom atom;
+                int ret1;
                 v = JS_GetPropertyInt64(ctx, replacer, i);
                 if (JS_IsException(v))
                     goto exception;
@@ -65324,17 +65332,26 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
                     JS_FreeValue(ctx, v);
                     continue;
                 }
-                present = js_array_includes(ctx, jsc->property_list,
-                                            1, (JSValueConst *)&v);
-                if (JS_IsException(present)) {
+                /* equal strings have the same atom */
+                atom = JS_ValueToAtom(ctx, v);
+                if (atom == JS_ATOM_NULL) {
                     JS_FreeValue(ctx, v);
                     goto exception;
                 }
-                if (!JS_ToBoolFree(ctx, present)) {
-                    JS_SetPropertyInt64(ctx, jsc->property_list, j++, v);
-                } else {
+                if (find_own_property(&pr, JS_VALUE_GET_OBJ(seen), atom)) {
+                    /* already in the list */
+                    JS_FreeAtom(ctx, atom);
                     JS_FreeValue(ctx, v);
+                    continue;
                 }
+                ret1 = JS_DefinePropertyValue(ctx, seen, atom, JS_NULL,
+                                              JS_PROP_C_W_E);
+                JS_FreeAtom(ctx, atom);
+                if (ret1 < 0) {
+                    JS_FreeValue(ctx, v);
+                    goto exception;
+                }
+                JS_SetPropertyInt64(ctx, jsc->property_list, j++, v);
             }
         }
     }
@@ -65402,6 +65419,7 @@ done:
     JS_FreeValue(ctx, jsc->empty);
     JS_FreeValue(ctx, jsc->gap);
     JS_FreeValue(ctx, jsc->property_list);
+    JS_FreeValue(ctx, seen);
     JS_FreeValue(ctx, jsc->stack);
     return ret;
 }
@@ -66272,17 +66290,6 @@ static int js_proxy_delete_property(JSContext *ctx, JSValueConst obj,
     return res;
 }
 
-/* return the index of the property or -1 if not found */
-static int find_prop_key(const JSPropertyEnum *tab, int n, JSAtom atom)
-{
-    int i;
-    for(i = 0; i < n; i++) {
-        if (tab[i].atom == atom)
-            return i;
-    }
-    return -1;
-}
-
 static int js_proxy_get_own_property_names(JSContext *ctx,
                                            JSPropertyEnum **ptab,
                                            uint32_t *plen,
@@ -66295,6 +66302,8 @@ static int js_proxy_get_own_property_names(JSContext *ctx,
     JSAtom atom;
     JSPropertyDescriptor desc;
     int res, is_extensible, idx;
+    JSValue keys = JS_UNDEFINED;
+    JSProperty *pr;
 
     s = get_proxy_method(ctx, &method, obj, JS_ATOM_ownKeys);
     if (!s)
@@ -66361,13 +66370,20 @@ static int js_proxy_get_own_property_names(JSContext *ctx,
         len++;
     }
 
-    /* check duplicate properties (XXX: inefficient, could store the
-     * properties an a temporary object to use the hash) */
-    for(i = 1; i < len; i++) {
-        if (find_prop_key(tab, i, tab[i].atom) >= 0) {
+    /* check duplicate properties. 'keys' maps each atom of 'tab' to its
+       index with the hash table of its shape, also used to look up the
+       target properties below */
+    keys = JS_NewObjectProto(ctx, JS_NULL);
+    if (JS_IsException(keys))
+        goto fail;
+    for(i = 0; i < len; i++) {
+        if (find_own_property(&pr, JS_VALUE_GET_OBJ(keys), tab[i].atom)) {
             JS_ThrowTypeError(ctx, "proxy: duplicate property");
             goto fail;
         }
+        if (JS_DefinePropertyValue(ctx, keys, tab[i].atom, JS_NewInt32(ctx, i),
+                                   JS_PROP_C_W_E) < 0)
+            goto fail;
     }
 
     is_extensible = JS_IsExtensible(ctx, s->target);
@@ -66394,7 +66410,10 @@ static int js_proxy_get_own_property_names(JSContext *ctx,
         if (res) {  /* safety, property should be found */
             js_free_desc(ctx, &desc);
             if (!(desc.flags & JS_PROP_CONFIGURABLE) || !is_extensible) {
-                idx = find_prop_key(tab, len, tab2[i].atom);
+                if (find_own_property(&pr, JS_VALUE_GET_OBJ(keys), tab2[i].atom))
+                    idx = JS_VALUE_GET_INT(pr->u.value);
+                else
+                    idx = -1;
                 if (idx < 0) {
                     JS_ThrowTypeError(ctx, "proxy: target property must be present in proxy ownKeys");
                     goto fail;
@@ -66419,8 +66438,10 @@ static int js_proxy_get_own_property_names(JSContext *ctx,
     JS_FreeValue(ctx, prop_array);
     *ptab = tab;
     *plen = len;
+    JS_FreeValue(ctx, keys);
     return 0;
  fail:
+    JS_FreeValue(ctx, keys);
     JS_FreePropertyEnum(ctx, tab2, len2);
     JS_FreePropertyEnum(ctx, tab, len);
     JS_FreeValue(ctx, prop_array);
