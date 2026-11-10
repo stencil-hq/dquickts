@@ -65930,6 +65930,11 @@ exception:
     return -1;
 }
 
+/* a replacer array with at most this number of elements is searched
+   linearly for its duplicate properties: it is faster than filling the
+   hash table of a temporary object */
+#define JSON_REPLACER_LINEAR_MAX 16
+
 JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
                          JSValueConst replacer, JSValueConst space0)
 {
@@ -65964,13 +65969,16 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
             jsc->property_list = JS_NewArray(ctx);
             if (JS_IsException(jsc->property_list))
                 goto exception;
-            /* the properties of the list, found with the hash table of
-               the shape of 'seen' */
-            seen = JS_NewObjectProto(ctx, JS_NULL);
-            if (JS_IsException(seen))
-                goto exception;
             if (js_get_length64(ctx, &n, replacer))
                 goto exception;
+            /* a short list is searched linearly. Otherwise its
+               properties are found with the hash table of the shape of
+               'seen' */
+            if (n > JSON_REPLACER_LINEAR_MAX) {
+                seen = JS_NewObjectProto(ctx, JS_NULL);
+                if (JS_IsException(seen))
+                    goto exception;
+            }
             for (i = j = 0; i < n; i++) {
                 JSProperty *pr;
                 JSAtom atom;
@@ -65997,24 +66005,39 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
                     JS_FreeValue(ctx, v);
                     continue;
                 }
-                /* equal strings have the same atom */
-                atom = JS_ValueToAtom(ctx, v);
-                if (atom == JS_ATOM_NULL) {
-                    JS_FreeValue(ctx, v);
-                    goto exception;
-                }
-                if (find_own_property(&pr, JS_VALUE_GET_OBJ(seen), atom)) {
-                    /* already in the list */
+                if (JS_IsUndefined(seen)) {
+                    JSValue present;
+                    present = js_array_includes(ctx, jsc->property_list,
+                                                1, (JSValueConst *)&v);
+                    if (JS_IsException(present)) {
+                        JS_FreeValue(ctx, v);
+                        goto exception;
+                    }
+                    if (JS_ToBoolFree(ctx, present)) {
+                        /* already in the list */
+                        JS_FreeValue(ctx, v);
+                        continue;
+                    }
+                } else {
+                    /* equal strings have the same atom */
+                    atom = JS_ValueToAtom(ctx, v);
+                    if (atom == JS_ATOM_NULL) {
+                        JS_FreeValue(ctx, v);
+                        goto exception;
+                    }
+                    if (find_own_property(&pr, JS_VALUE_GET_OBJ(seen), atom)) {
+                        /* already in the list */
+                        JS_FreeAtom(ctx, atom);
+                        JS_FreeValue(ctx, v);
+                        continue;
+                    }
+                    ret1 = JS_DefinePropertyValue(ctx, seen, atom, JS_NULL,
+                                                  JS_PROP_C_W_E);
                     JS_FreeAtom(ctx, atom);
-                    JS_FreeValue(ctx, v);
-                    continue;
-                }
-                ret1 = JS_DefinePropertyValue(ctx, seen, atom, JS_NULL,
-                                              JS_PROP_C_W_E);
-                JS_FreeAtom(ctx, atom);
-                if (ret1 < 0) {
-                    JS_FreeValue(ctx, v);
-                    goto exception;
+                    if (ret1 < 0) {
+                        JS_FreeValue(ctx, v);
+                        goto exception;
+                    }
                 }
                 JS_SetPropertyInt64(ctx, jsc->property_list, j++, v);
             }
@@ -66955,6 +66978,22 @@ static int js_proxy_delete_property(JSContext *ctx, JSValueConst obj,
     return res;
 }
 
+/* an ownKeys trap result with at most this number of keys is searched
+   linearly: it is faster than filling the hash table of a temporary
+   object */
+#define JS_PROXY_KEYS_LINEAR_MAX 96
+
+/* return the index of the property or -1 if not found */
+static int find_prop_key(const JSPropertyEnum *tab, int n, JSAtom atom)
+{
+    int i;
+    for(i = 0; i < n; i++) {
+        if (tab[i].atom == atom)
+            return i;
+    }
+    return -1;
+}
+
 static int js_proxy_get_own_property_names(JSContext *ctx,
                                            JSPropertyEnum **ptab,
                                            uint32_t *plen,
@@ -67035,20 +67074,30 @@ static int js_proxy_get_own_property_names(JSContext *ctx,
         len++;
     }
 
-    /* check duplicate properties. 'keys' maps each atom of 'tab' to its
-       index with the hash table of its shape, also used to look up the
-       target properties below */
-    keys = JS_NewObjectProto(ctx, JS_NULL);
-    if (JS_IsException(keys))
-        goto fail;
-    for(i = 0; i < len; i++) {
-        if (find_own_property(&pr, JS_VALUE_GET_OBJ(keys), tab[i].atom)) {
-            JS_ThrowTypeError(ctx, "proxy: duplicate property");
-            goto fail;
+    /* check duplicate properties. A short list is searched linearly.
+       Otherwise 'keys' maps each atom of 'tab' to its index with the
+       hash table of its shape, also used to look up the target
+       properties below */
+    if (len <= JS_PROXY_KEYS_LINEAR_MAX) {
+        for(i = 1; i < len; i++) {
+            if (find_prop_key(tab, i, tab[i].atom) >= 0) {
+                JS_ThrowTypeError(ctx, "proxy: duplicate property");
+                goto fail;
+            }
         }
-        if (JS_DefinePropertyValue(ctx, keys, tab[i].atom, JS_NewInt32(ctx, i),
-                                   JS_PROP_C_W_E) < 0)
+    } else {
+        keys = JS_NewObjectProto(ctx, JS_NULL);
+        if (JS_IsException(keys))
             goto fail;
+        for(i = 0; i < len; i++) {
+            if (find_own_property(&pr, JS_VALUE_GET_OBJ(keys), tab[i].atom)) {
+                JS_ThrowTypeError(ctx, "proxy: duplicate property");
+                goto fail;
+            }
+            if (JS_DefinePropertyValue(ctx, keys, tab[i].atom,
+                                       JS_NewInt32(ctx, i), JS_PROP_C_W_E) < 0)
+                goto fail;
+        }
     }
 
     is_extensible = JS_IsExtensible(ctx, s->target);
@@ -67075,7 +67124,9 @@ static int js_proxy_get_own_property_names(JSContext *ctx,
         if (res) {  /* safety, property should be found */
             js_free_desc(ctx, &desc);
             if (!(desc.flags & JS_PROP_CONFIGURABLE) || !is_extensible) {
-                if (find_own_property(&pr, JS_VALUE_GET_OBJ(keys), tab2[i].atom))
+                if (JS_IsUndefined(keys))
+                    idx = find_prop_key(tab, len, tab2[i].atom);
+                else if (find_own_property(&pr, JS_VALUE_GET_OBJ(keys), tab2[i].atom))
                     idx = JS_VALUE_GET_INT(pr->u.value);
                 else
                     idx = -1;

@@ -779,6 +779,30 @@ function test_duplicate_keys()
     assert(Reflect.ownKeys(p).length, 500);
     assert_throws(TypeError, () => Reflect.ownKeys(new Proxy({}, { ownKeys: () => ks })));
 
+    /* short lists are searched linearly, longer ones with a hash table:
+       same results on both sides of the limits (16 and 96 keys) */
+    for (n = 1; n <= 130; n++) {
+        ks = [];
+        o = {};
+        for (i = 0; i < n; i++) {
+            ks.push(i % 3 == 0 ? String(i) : "k" + i);
+            o[ks[i]] = i;
+        }
+        t = ks.slice().reverse();
+        assert(Reflect.ownKeys(new Proxy({}, { ownKeys: () => t })).join(), t.join());
+        assert_throws(TypeError, () => Reflect.ownKeys(new Proxy({}, { ownKeys: () => t.concat(t[0]) })));
+        assert_throws(TypeError, () => Reflect.ownKeys(new Proxy({}, { ownKeys: () => t.concat(t[n - 1]) })));
+        ne = Object.freeze(Object.assign({}, o));
+        assert(Reflect.ownKeys(new Proxy(ne, { ownKeys: () => t })).join(), t.join());
+        assert_throws(TypeError, () => Reflect.ownKeys(new Proxy(ne, { ownKeys: () => t.slice(1) })));
+        assert_throws(TypeError, () => Reflect.ownKeys(new Proxy(ne, { ownKeys: () => t.concat("z") })));
+        assert_throws(TypeError, () => Reflect.ownKeys(new Proxy(ne, { ownKeys: () => t.slice(1).concat(t[1]) })));
+        assert(JSON.stringify(o, t.concat(t[n - 1], "z", t[0])),
+               "{" + t.map(k => '"' + k + '":' + o[k]).join() + "}");
+        assert(JSON.stringify(o, [t[0]].concat(t)),
+               "{" + t.map(k => '"' + k + '":' + o[k]).join() + "}");
+    }
+
     /* large lists, O(n^2) before: they take seconds if this regresses */
     n = 100000;
     ks = [];

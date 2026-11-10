@@ -354,7 +354,8 @@ unreleased:
   treated as UTC on such hosts; unknown time zone names are rejected
 - the duplicate key checks of a Proxy ownKeys trap result and of the
   replacer array of JSON.stringify() use a hash table instead of a
-  linear search (80k keys took 0.6 s and 9.7 s, they were O(n^2))
+  linear search (80k keys took 0.6 s and 9.7 s, they were O(n^2));
+  short lists (up to 96 and 16 keys) are still searched linearly
 - faster embedding API (used by rquickjs): JS_DupContext() and
   JS_FreeContext() are inline; added JS_GetFastArray(),
   JS_GetStdArrayPrototypeFlag(), JS_GetStringData(),
