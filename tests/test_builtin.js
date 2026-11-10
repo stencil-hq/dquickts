@@ -1218,6 +1218,21 @@ function test_string_append()
     k += "z";
     assert(Object.keys(o)[0].length, 600);
     assert(o["k".repeat(600)], 1);
+    /* nor when the variable holds the last reference to the property
+       name (an atom): an equal string must still find the property */
+    for (i = 5; i <= 9000; i = i * 40 - 80) {
+        k = "k".repeat(i);
+        o = {};
+        o[k] = 1;
+        o = null;
+        k += "z";
+        o = {};
+        o[k] = 2;
+        assert(o["k".repeat(i) + "z"], 2);
+        o["k".repeat(i) + "z"] = 3;
+        assert(Object.keys(o).length, 1);
+        assert(o[k], 3);
+    }
     /* appends which make a rope again between two 's += x' (an element
        or a number on the right side): the rope is not copied by each
        's += x', which was O(n^2), the loops would take seconds. It is
