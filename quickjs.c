@@ -6018,9 +6018,14 @@ static JSValue JS_ConcatString1(JSContext *ctx,
    be flattened again by each read of the string between two appends
    (charCodeAt(), indexOf(), comparisons...), in O(n^2). The string is
    reallocated in place when possible; a rope, or an 8 bit string
-   receiving 16 bit characters, is copied once into a new string. Return
-   0 if done, -1 if exception, 1 if the fast path does not apply ('s' is
-   shared, an atom or short). */
+   receiving 16 bit characters, is copied once into a new string. Only a
+   rope which a read has flattened since the last append is taken (see
+   js_linearize_string_rope()), so each copy follows a copy the read
+   already made: the other ropes are still being built, e.g. by
+   's += f(); s += "\n"' where the first append makes a rope again each
+   time, and copying them at each append would be O(n^2). Return 0 if
+   done, -1 if exception, 1 if the fast path does not apply ('s' is
+   shared, an atom, short or a rope which was not read). */
 static int js_concat_string_grow(JSContext *ctx, JSValue *pv, JSValueConst op2)
 {
     JSString *p1, *p2 = JS_VALUE_GET_STRING(op2), *p;
@@ -6039,6 +6044,9 @@ static int js_concat_string_grow(JSContext *ctx, JSValue *pv, JSValueConst op2)
         is_wide_char = p1->is_wide_char;
     } else {
         JSStringRope *r = JS_VALUE_GET_STRING_ROPE(*pv);
+        if (JS_VALUE_GET_TAG(r->right) != JS_TAG_STRING ||
+            JS_VALUE_GET_STRING(r->right)->len != 0)
+            return 1;
         p1 = NULL;
         len1 = r->len;
         is_wide_char = r->is_wide_char;

@@ -1173,7 +1173,7 @@ function test_weak_map_cycles()
    take seconds if this regresses. */
 function test_string_append()
 {
-    var s, t, w, u, k, o, i, n = 200000;
+    var s, t, w, u, k, o, a, r, i, n = 200000;
     s = "";
     for (i = 0; i < n; i++) {
         s += "ab";
@@ -1218,6 +1218,29 @@ function test_string_append()
     k += "z";
     assert(Object.keys(o)[0].length, 600);
     assert(o["k".repeat(600)], 1);
+    /* appends which make a rope again between two 's += x' (an element
+       or a number on the right side): the rope is not copied by each
+       's += x', which was O(n^2), the loops would take seconds. It is
+       copied when it was read since the last append. */
+    a = ["alpha", "beta", "gamma"];
+    r = [];
+    s = "";
+    for (i = 0; i < n; i++) {
+        if (i > 0)
+            s += ", ";
+        s += a[i % 3];
+        r.push(a[i % 3]);
+        if (i % 20000 == 19999 && s.charCodeAt(s.length - 1) != 97)
+            throw_error("append after a read of a rope");
+    }
+    assert(s === r.join(", "));
+    s = "";
+    for (i = 0; i < n; i++) {
+        s += i;
+        s += ",";
+    }
+    assert(s.length, 1288890);
+    assert(s.slice(-14), "199998,199999,");
     /* a let variable */
     {
         let l = "", m;
