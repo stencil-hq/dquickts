@@ -175,6 +175,14 @@ function test_context() {
     class E { @n [sym]() {} @n ["a" + 1]() {} @n [2] = 1; @n accessor [String(sym)] }
     assert(names[0], sym);
     assert(names.slice(1).join(), "a1,Symbol(sym),2");
+    /* string ropes as computed keys */
+    const rope = "a".repeat(600) + "b".repeat(600);
+    names.length = 0;
+    class F { @n [rope]() {} @n accessor [rope + 1] = 1; accessor [rope + 2] = 2; }
+    assert(names.join(), rope + "," + rope + 1);
+    const f = new F();
+    assert(f[rope + 1], 1);
+    assert(f[rope + 2], 2);
 }
 
 function test_replacement() {

@@ -1254,8 +1254,26 @@ function test_template_rope()
     ({ [k]: f, ...rest } = { [k]: 5, z: 6 });
     assert(f, 5);
     assert(Object.keys(rest).join(), "z");
-    class D extends C { g() { return super[k + "m"](); } }
+    class D extends C {
+        g() { return super[k + "m"](); }
+        h() { super[k + "v"] += 9; return this[k + "v"]; }
+    }
     assert(new D().g(), 3);
+    C.prototype[k + "v"] = 1;
+    assert(new D().h(), 10);
+
+    /* accessors, class names and destructuring to a member */
+    o = { get [k + "g"]() { return 7; }, set [k + "g"](v) { f = v; },
+          [k + "c"]: class {} };
+    o[k + "g"] = 8;
+    assert(o[k + "g"], 7);
+    assert(f, 8);
+    assert(Object.getOwnPropertyDescriptor(o, k + "g").get.name,
+           "get " + k + "g");
+    assert(o[k + "c"].name, k + "c");
+    ({ [k]: o.d = 11, ...rest } = { z: 6 });
+    assert(o.d, 11);
+    assert(Object.keys(rest).join(), "z");
 }
 
 function eval_error(eval_str, expected_error, level)
