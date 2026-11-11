@@ -1196,6 +1196,28 @@ function test_string_append()
     }
     assert(s.length, 20000 + n);
     assert(s.slice(9999, 10001), "xy");
+    /* a rope flattened by a read: its flat string is appended to in
+       place unless something else references it or the rope */
+    s = "x".repeat(10000) + "y".repeat(10000);
+    t = s;
+    s.indexOf("q");
+    s += "z";
+    assert(t.length, 20000);
+    assert(s.slice(-2), "yz");
+    s = "x".repeat(10000) + "y".repeat(10000);
+    t = String(s);
+    s += "z";
+    s += "z";
+    assert(t.length, 20000);
+    assert(t.slice(-2), "yy");
+    assert(s.length, 20002);
+    assert(s.slice(9999, 10001) + s.slice(-3), "xyyzz");
+    s = "x".repeat(10000) + "y".repeat(10000);
+    s.indexOf("q");
+    s += "\u1234";
+    s += "z";
+    assert(s.length, 20002);
+    assert(s.slice(-3), "y\u1234z");
     /* 8 bit string receiving a 16 bit character, then 8 bit ones */
     w = "x".repeat(600);
     w += "\u1234";

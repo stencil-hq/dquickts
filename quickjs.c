@@ -6020,12 +6020,14 @@ static JSValue JS_ConcatString1(JSContext *ctx,
    reallocated in place when possible; a rope, or an 8 bit string
    receiving 16 bit characters, is copied once into a new string. Only a
    rope which a read has flattened since the last append is taken (see
-   js_linearize_string_rope()), so each copy follows a copy the read
-   already made: the other ropes are still being built, e.g. by
-   's += f(); s += "\n"' where the first append makes a rope again each
-   time, and copying them at each append would be O(n^2). Return 0 if
-   done, -1 if exception, 1 if the fast path does not apply ('s' is
-   shared, an atom, short or a rope which was not read). */
+   js_linearize_string_rope(); js_string_rope_take_flat() has already
+   replaced it with its flat string unless this string is shared), so
+   each copy follows a copy the read already made: the other ropes are
+   still being built, e.g. by 's += f(); s += "\n"' where the first
+   append makes a rope again each time, and copying them at each append
+   would be O(n^2). Return 0 if done, -1 if exception, 1 if the fast path
+   does not apply ('s' is shared, an atom, short or a rope which was not
+   read). */
 static int js_concat_string_grow(JSContext *ctx, JSValue *pv, JSValueConst op2)
 {
     JSString *p1, *p2 = JS_VALUE_GET_STRING(op2), *p;
@@ -6098,6 +6100,28 @@ static int js_concat_string_grow(JSContext *ctx, JSValue *pv, JSValueConst op2)
     JS_FreeValue(ctx, *pv);
     *pv = ret;
     return 0;
+}
+
+/* '*pv' is a rope. If a read has flattened it (see
+   js_linearize_string_rope()) and it holds the only reference to its
+   flat string, replace it with this string: 's += x' then appends to it
+   in place instead of copying it a second time after each read. */
+static void js_string_rope_take_flat(JSContext *ctx, JSValue *pv)
+{
+    JSStringRope *r = JS_VALUE_GET_STRING_ROPE(*pv);
+    JSString *p;
+
+    if (js_rc(r)->ref_count != 1 ||
+        JS_VALUE_GET_TAG(r->right) != JS_TAG_STRING ||
+        JS_VALUE_GET_STRING(r->right)->len != 0 ||
+        JS_VALUE_GET_TAG(r->left) != JS_TAG_STRING)
+        return;
+    p = JS_VALUE_GET_STRING(r->left);
+    if (js_rc(p)->ref_count != 1)
+        return;
+    JS_FreeValue(ctx, r->right);
+    js_free(ctx, r);
+    *pv = JS_MKPTR(JS_TAG_STRING, p);
 }
 
 static BOOL JS_ConcatStringInPlace(JSContext *ctx, JSString *p1, JSValueConst op2) {
@@ -25013,6 +25037,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     int ret;
                     sp--;
                     sf->cur_pc = pc;
+                    if (JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING_ROPE)
+                        js_string_rope_take_flat(ctx, pv);
                     if (JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING &&
                         JS_ConcatStringInPlace(ctx, JS_VALUE_GET_STRING(*pv), op2)) {
                         ret = 0;
