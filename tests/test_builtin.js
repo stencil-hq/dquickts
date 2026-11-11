@@ -232,6 +232,42 @@ function test_array()
     assert(err && a.toString() === "1,2,3,4");
 }
 
+/* setting the length of a sparse array removes all the elements above
+   it: removing many of them compacts the properties, which moves the
+   remaining ones */
+function test_array_length()
+{
+    var a, i, err;
+
+    a = [];
+    for(i = 0; i < 40; i++)
+        a[2 * i + 1] = i;
+    a.name = "sparse";
+    a.length = 4;
+    assert(a.length, 4);
+    assert(Object.keys(a).join(), "1,3,name");
+    assert(a[3], 1);
+    assert(79 in a, false);
+    a.length = 0;
+    assert(Object.keys(a).join(), "name");
+    assert(a.name, "sparse");
+
+    /* a non configurable element stops it */
+    a = [];
+    for(i = 0; i < 40; i++)
+        a[2 * i + 1] = i;
+    Object.defineProperty(a, "5", { configurable: false });
+    err = false;
+    try {
+        a.length = 0;
+    } catch(e) {
+        err = e instanceof TypeError;
+    }
+    assert(err);
+    assert(a.length, 6);
+    assert(Object.keys(a).join(), "1,3,5");
+}
+
 function test_string()
 {
     var a;
@@ -1871,6 +1907,7 @@ test();
 test_function();
 test_enum();
 test_array();
+test_array_length();
 test_array_shift();
 test_array_unshift();
 test_string();

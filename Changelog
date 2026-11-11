@@ -349,6 +349,9 @@ unreleased:
   JS_SetModuleAttributes(); js_std_eval_binary_json_module() takes the
   module type)
 - fixed a double free in JSON.parse() with a reviver when out of memory
+- fixed the decrease of the length of a sparse array keeping elements
+  above the new length when many of them were removed ('a.length = 0'
+  left half of 40 elements)
 - Array.prototype.unshift() of a fast array is amortized O(1): it fills
   the free slots before the elements and, when they are used up, moves
   the elements into the free slots after them or reserves more (an

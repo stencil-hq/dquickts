@@ -12667,16 +12667,21 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
                     }
                 }
 
-                for(i = 0, pr = get_shape_prop(sh); i < sh->prop_count;
-                    i++, pr++) {
+                for(i = 0; i < sh->prop_count; i++) {
+                    pr = get_shape_prop(sh) + i;
                     if (pr->atom != JS_ATOM_NULL &&
                         JS_AtomIsArrayIndex(ctx, &idx, pr->atom)) {
                         if (idx >= cur_len) {
+                            int prop_count = sh->prop_count;
                             /* remove the property */
                             delete_property(ctx, p, pr->atom);
                             /* WARNING: the shape may have been modified */
                             sh = p->shape;
-                            pr = get_shape_prop(sh) + i;
+                            /* compact_properties() moved the remaining
+                               properties to lower indices: scan them
+                               again from the start */
+                            if (sh->prop_count != prop_count)
+                                i = -1;
                         }
                     }
                 }
