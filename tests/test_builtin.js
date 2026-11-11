@@ -744,6 +744,56 @@ function test_json()
     assert_json_error('\n{ "a": @x }"');
 }
 
+/* duplicate keys found with a hash of their atoms */
+function test_duplicate_keys()
+{
+    var o, ks, i, t, ne, sym, p, n;
+    /* JSON.stringify() replacer array: first occurrence order, numbers
+       and String/Number objects converted to strings, others ignored */
+    o = { a: 1, b: 2, 1: 3, 2: 4 };
+    assert(JSON.stringify(o, ["b", "a", "b", 1, "1", new String("a"),
+                              new Number(2), {}, null, true]),
+           '{"b":2,"a":1,"1":3,"2":4}');
+    assert(JSON.stringify(o, []), "{}");
+    ks = [];
+    o = {};
+    for (i = 0; i < 1000; i++) {
+        ks.push("k" + (i % 500));
+        o["k" + i] = i;
+    }
+    assert(JSON.stringify(o, ks), JSON.stringify(o, ks.slice(0, 500)));
+
+    /* proxy ownKeys trap result */
+    assert_throws(TypeError, () => Reflect.ownKeys(new Proxy({}, { ownKeys: () => ["a", "b", "a"] })));
+    sym = Symbol();
+    assert_throws(TypeError, () => Reflect.ownKeys(new Proxy({}, { ownKeys: () => [sym, "a", sym] })));
+    t = {};
+    Object.defineProperty(t, "x", { value: 1, configurable: false });
+    assert_throws(TypeError, () => Reflect.ownKeys(new Proxy(t, { ownKeys: () => ["y"] })));
+    assert(Reflect.ownKeys(new Proxy(t, { ownKeys: () => ["y", "x"] })).join(), "y,x");
+    ne = Object.preventExtensions({ a: 1, b: 2 });
+    assert_throws(TypeError, () => Reflect.ownKeys(new Proxy(ne, { ownKeys: () => ["a"] })));
+    assert_throws(TypeError, () => Reflect.ownKeys(new Proxy(ne, { ownKeys: () => ["a", "b", "c"] })));
+    assert(Reflect.ownKeys(new Proxy(ne, { ownKeys: () => ["b", "a"] })).join(), "b,a");
+    p = new Proxy({}, { ownKeys: () => ks.slice(0, 500) });
+    assert(Reflect.ownKeys(p).length, 500);
+    assert_throws(TypeError, () => Reflect.ownKeys(new Proxy({}, { ownKeys: () => ks })));
+
+    /* large lists, O(n^2) before: they take seconds if this regresses */
+    n = 100000;
+    ks = [];
+    o = {};
+    for (i = 0; i < n; i++) {
+        ks.push("k" + i);
+        o["k" + i] = i;
+    }
+    ks.push("k0");
+    assert(JSON.stringify(o, ks), JSON.stringify(o));
+    assert_throws(TypeError, () => Reflect.ownKeys(new Proxy(o, { ownKeys: () => ks })));
+    ks.pop();
+    assert(Reflect.ownKeys(new Proxy(o, { ownKeys: () => ks })).length, n);
+}
+
 function test_date()
 {
     // Date Time String format is YYYY-MM-DDTHH:mm:ss.sssZ
@@ -1619,6 +1669,7 @@ test_eval();
 test_typed_array();
 test_immutable_array_buffer();
 test_json();
+test_duplicate_keys();
 test_date();
 test_regexp();
 test_symbol();
