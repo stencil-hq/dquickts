@@ -1167,6 +1167,69 @@ function test_weak_map_cycles()
     std.gc();
 }
 
+/* 's += x' grows a string held only by 's' in place: the other
+   references to it must not see the change. The loops read the string
+   between appends, which was O(n^2) when the string was a rope: they
+   take seconds if this regresses. */
+function test_string_append()
+{
+    var s, t, w, u, k, o, i, n = 200000;
+    s = "";
+    for (i = 0; i < n; i++) {
+        s += "ab";
+        if (s.charCodeAt(s.length - 1) != 98)
+            throw_error("append");
+    }
+    assert(s.length, 2 * n);
+    assert(s.slice(0, 6), "ababab");
+    t = s;
+    s += "c";
+    assert(t.length, 2 * n);
+    assert(s.length, 2 * n + 1);
+    assert(s.slice(-2), "bc");
+    /* starting from a rope */
+    s = "x".repeat(10000) + "y".repeat(10000);
+    for (i = 0; i < n; i++) {
+        s += "z";
+        if (s.indexOf("zz", s.length - 3) < 0 && i > 0)
+            throw_error("append to a rope");
+    }
+    assert(s.length, 20000 + n);
+    assert(s.slice(9999, 10001), "xy");
+    /* 8 bit string receiving a 16 bit character, then 8 bit ones */
+    w = "x".repeat(600);
+    w += "\u1234";
+    for (i = 0; i < n; i++) {
+        w += "a";
+        if (w.charCodeAt(w.length - 1) != 97)
+            throw_error("append after widening");
+    }
+    assert(w.length, 601 + n);
+    assert(w.charCodeAt(600), 0x1234);
+    /* 16 bit string + 8 bit string */
+    u = "\u1234".repeat(600);
+    u += "abc";
+    assert(u.length, 603);
+    assert(u.slice(-4), "\u1234abc");
+    /* the property name of an object is not modified */
+    k = "k".repeat(600);
+    o = {};
+    o[k] = 1;
+    k += "z";
+    assert(Object.keys(o)[0].length, 600);
+    assert(o["k".repeat(600)], 1);
+    /* a let variable */
+    {
+        let l = "", m;
+        for (i = 0; i < 1000; i++)
+            l += "ab";
+        m = l;
+        l += "c";
+        assert(m.length, 2000);
+        assert(l.length, 2001);
+    }
+}
+
 function test_weak_ref()
 {
     var w1, w2, o, i;
@@ -1700,6 +1763,7 @@ test_symbol();
 test_map();
 test_weak_map();
 test_weak_map_cycles();
+test_string_append();
 test_weak_ref();
 test_finalization_registry();
 test_generator();
