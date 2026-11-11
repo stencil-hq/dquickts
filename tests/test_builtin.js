@@ -1224,6 +1224,40 @@ function test_rope()
     rope_concat(100000, -1);
 }
 
+/* ropes flow unflattened through the ToPropertyKey of template
+   substitutions and computed property names. The loop was O(n^2) when
+   the substitution was flattened: it takes seconds if this regresses */
+function test_template_rope()
+{
+    var s, i, k, o, C, f, x, rest, n = 200000, len = 0;
+    s = "";
+    for (i = 0; i < n; i++) {
+        s = `${s}${i}`;
+        len += String(i).length;
+    }
+    assert(s.length, len);
+    assert(s.slice(0, 12), "012345678910");
+    assert(s.slice(-6), "199999");
+    assert(`<${s}>`.length, len + 2);
+    assert_throws(TypeError, () => `${Symbol()}`);
+
+    /* ropes as computed keys */
+    k = "a".repeat(10000) + "b".repeat(10000);
+    o = { [k]: 1, [k + "f"]: function() {} };
+    assert(o[k.slice(0)], 1);
+    assert(o[k + "f"].name, k + "f");
+    C = class { [k] = 2; [k + "m"]() { return 3; } static [k + "s"] = 4; };
+    x = new C();
+    assert(x[k], 2);
+    assert(x[k + "m"](), 3);
+    assert(C[k + "s"], 4);
+    ({ [k]: f, ...rest } = { [k]: 5, z: 6 });
+    assert(f, 5);
+    assert(Object.keys(rest).join(), "z");
+    class D extends C { g() { return super[k + "m"](); } }
+    assert(new D().g(), 3);
+}
+
 function eval_error(eval_str, expected_error, level)
 {
     var err = false;
@@ -1577,6 +1611,7 @@ test_weak_ref();
 test_finalization_registry();
 test_generator();
 test_rope();
+test_template_rope();
 test_line_column_numbers();
 test_sort_identical_values();
 test_queue_microtask();

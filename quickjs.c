@@ -25605,6 +25605,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             switch (JS_VALUE_GET_TAG(sp[-1])) {
             case JS_TAG_INT:
             case JS_TAG_STRING:
+            case JS_TAG_STRING_ROPE: /* flattened when made an atom */
             case JS_TAG_SYMBOL:
                 break;
             default:
