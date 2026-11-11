@@ -1803,11 +1803,63 @@ function test_array_shift()
     assert(a.join(), "1,2,3");
 }
 
+/* unshift() of a fast array uses the free slots before the elements.
+   Building an array with unshift() was O(n^2): it takes seconds if this
+   regresses */
+function test_array_unshift()
+{
+    var a, i, f, n = 200000;
+    a = [];
+    for (i = 0; i < n; i++)
+        a.unshift(i);
+    assert(a.length, n);
+    assert(a[0], n - 1);
+    assert(a[n - 1], 0);
+    a = [3, 4];
+    assert(a.unshift(1, 2), 4);
+    assert(a.join(), "1,2,3,4");
+    for (i = 0; i < 1000; i++)
+        a.unshift(-i);
+    assert(a.length, 1004);
+    assert(a[0], -999);
+    assert(a[1003], 4);
+    /* the free slots are kept by push() and shift() */
+    for (i = 0; i < 500; i++)
+        a.shift();
+    a.push(9);
+    a.unshift(8);
+    assert(a.length, 506);
+    assert(a[0], 8);
+    assert(a[505], 9);
+    /* deque at a constant size */
+    a = [];
+    for (i = 0; i < 10000; i++) {
+        a.unshift(i);
+        if (a.length > 50)
+            assert(a.pop(), i - 50);
+    }
+    assert(a[0], 9999);
+    assert(a.length, 50);
+    a = [];
+    assert(a.unshift(), 0);
+    assert(a.unshift(1), 1);
+    assert(a[0], 1);
+    /* the non extensible arrays and read-only lengths keep the
+       generic path */
+    f = Object.freeze([1]);
+    assert_throws(TypeError, () => f.unshift(0));
+    assert(f.join(), "1");
+    a = [1, 2];
+    Object.defineProperty(a, "length", { writable: false });
+    assert_throws(TypeError, () => a.unshift(0));
+}
+
 test();
 test_function();
 test_enum();
 test_array();
 test_array_shift();
+test_array_unshift();
 test_string();
 test_string_search();
 test_math();
