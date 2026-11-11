@@ -12733,34 +12733,48 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
     return 0;
 }
 
-/* make room for 'n' free slots before the elements (unshift()): the
+/* make room for 'n' free slots before the elements (unshift()), with
+   'n' larger than the current count of free slots before them: the
    block is reallocated with 'n + count / 2' free slots before the
    elements, so that a sequence of unshift() calls is amortized O(1), and
    the elements are moved after them. The free slots after the elements
    are kept. As with the 1.5 growth of push(), up to about half of the
-   element count can stay unused before the elements. Return -1 if
-   exception. */
+   element count can stay unused before the elements. When the block
+   already has that many free slots (pop() and the length decreases
+   leave them after the elements), it is not reallocated: otherwise the
+   block of a queue using unshift() and pop() would grow at each call.
+   The elements are moved so that half of the remaining free slots stay
+   after them, which keeps push() from moving them back at once. Return
+   -1 if exception. */
 static int expand_fast_array_front(JSContext *ctx, JSObject *p, uint32_t n)
 {
     uint32_t count = p->u.array.count;
     uint32_t offset = p->u.array.offset;
-    uint64_t front, total;
+    uint64_t front, total, free_slots;
     JSValue *base;
 
+    base = fast_array_base(p);
     front = (uint64_t)n + count / 2;
-    total = front + p->u.array.u1.size;
-    if (total > UINT32_MAX || total > SIZE_MAX / sizeof(JSValue)) {
-        JS_ThrowOutOfMemory(ctx);
-        return -1;
+    total = (uint64_t)offset + p->u.array.u1.size;
+    free_slots = total - count;
+    if (free_slots >= front && total <= UINT32_MAX) {
+        front = n + (free_slots - n) / 2;
+    } else {
+        total = front + p->u.array.u1.size;
+        if (total > UINT32_MAX || total > SIZE_MAX / sizeof(JSValue)) {
+            JS_ThrowOutOfMemory(ctx);
+            return -1;
+        }
+        /* a large block is usually grown in place (no copy) */
+        base = js_realloc(ctx, base, sizeof(JSValue) * total);
+        if (!base)
+            return -1;
     }
-    /* a large block is usually grown in place (no copy) */
-    base = js_realloc(ctx, fast_array_base(p), sizeof(JSValue) * total);
-    if (!base)
-        return -1;
     if (count != 0)
         memmove(base + front, base + offset, sizeof(JSValue) * count);
     p->u.array.u.values = base + front;
     p->u.array.offset = front;
+    p->u.array.u1.size = total - front;
     return 0;
 }
 

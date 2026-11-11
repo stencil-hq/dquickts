@@ -1671,6 +1671,44 @@ static void test_json_parse_oom(void)
     JS_FreeRuntime(rt); /* asserts that no object is leaked */
 }
 
+/* regression test: when the free slots before the elements of a fast
+   array were used up, unshift() always reallocated the block with more
+   of them, even if pop(), splice() or a length decrease had left enough
+   free slots after the elements: a queue of constant size filled with
+   unshift() grew by one slot per call */
+static void test_unshift_queue_memory(void)
+{
+    static const char *const loops[] = {
+        "for (i = 0; i < 200000; i++) { q.unshift(i); q.pop(); }",
+        "for (i = 0; i < 200000; i++) { q.unshift(i, i); q.length -= 2; }",
+        "for (i = 0; i < 200000; i++) { q.unshift(i); q.splice(500, 1); }",
+        "for (i = 0; i < 200000; i++) { q.unshift(i); q.pop(); q.push(i); q.pop(); }",
+    };
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSMemoryUsage stats;
+    JSValue v;
+    size_t i;
+
+    rt = JS_NewRuntime();
+    ctx = JS_NewContext(rt);
+    v = eval_str(ctx, "var i, q = []; for (i = 0; i < 1000; i++) q.push(i);");
+    CHECK(!JS_IsException(v));
+    JS_FreeValue(ctx, v);
+    for(i = 0; i < countof(loops); i++) {
+        JS_ComputeMemoryUsage(rt, &stats);
+        /* the 1000 elements use 16 kB: a slot per call is 1.6 MB or more */
+        JS_SetMemoryLimit(rt, stats.malloc_size + 256 * 1024);
+        v = eval_str(ctx, loops[i]);
+        JS_SetMemoryLimit(rt, -1);
+        CHECK(!JS_IsException(v));
+        JS_FreeValue(ctx, v);
+        CHECK(eval_bool(ctx, "q.length === 1000 && q[0] === 199999"));
+    }
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 /* regression test: out of memory errors during the compilation were
    ignored in some places (variable resolution, constant pool, lookahead,
    bytecode patches), which led to crashes and assertion failures or to
@@ -3327,6 +3365,7 @@ int main(void)
     test_with_resolvers_oom();
     test_autoinit_oom();
     test_json_parse_oom();
+    test_unshift_queue_memory();
     test_parser_oom();
     test_detect_module();
     printf("test_api: OK\n");

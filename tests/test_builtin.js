@@ -1840,6 +1840,19 @@ function test_array_unshift()
     }
     assert(a[0], 9999);
     assert(a.length, 50);
+    /* the free slots that pop() leaves after the elements are used
+       before the block is reallocated: the elements are moved */
+    a = [];
+    for (i = 0; i < 100; i++)
+        a.push(i);
+    for (i = 0; i < 60; i++)
+        a.pop();
+    assert(a.unshift(-3, -2, -1), 43);
+    a.push(40);
+    a.unshift(-4);
+    assert(a.length, 45);
+    for (i = 0; i < 45; i++)
+        assert(a[i], i - 4);
     a = [];
     assert(a.unshift(), 0);
     assert(a.unshift(1), 1);

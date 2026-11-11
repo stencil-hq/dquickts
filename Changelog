@@ -350,9 +350,9 @@ unreleased:
   module type)
 - fixed a double free in JSON.parse() with a reviver when out of memory
 - Array.prototype.unshift() of a fast array is amortized O(1): it fills
-  the free slots before the elements and reserves more when they are
-  used up (an array built with unshift() was O(n^2): 80k elements took
-  1.6 s)
+  the free slots before the elements and, when they are used up, moves
+  the elements into the free slots after them or reserves more (an
+  array built with unshift() was O(n^2): 80k elements took 1.6 s)
 - Temporal and Intl load the time zones missing from the embedded data
   from the system zoneinfo, so the default time zone is no longer
   treated as UTC on such hosts; unknown time zone names are rejected
