@@ -4114,9 +4114,12 @@ static int qp_capi_type_dict_setdefault(JSContext *ctx, QPType *t, const char *n
         return -1;
     }
     /* CPython adds the members before type_dict_set_doc, which fills
-       __doc__ only when missing: a __doc__ member (_tuplegetter) replaces
-       the doc that qp_type_new_from_spec_bases stored */
-    r = strcmp(name, "__doc__") ? qp_dict_get_item_atom(ctx, t->dict, a, &tmp) : 0;
+       __doc__ only when missing, and before PyType_FromMetaclass sets
+       __module__ when missing: a __doc__ member (_tuplegetter) or a
+       __module__ one (Cython's cyfunction, whose instances name their own
+       module) replaces what qp_type_new_from_spec_bases stored */
+    r = strcmp(name, "__doc__") && strcmp(name, "__module__") ?
+        qp_dict_get_item_atom(ctx, t->dict, a, &tmp) : 0;
     if (r > 0)
         JS_FreeValue(ctx, tmp);
     else if (r == 0)
