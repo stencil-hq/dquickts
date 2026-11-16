@@ -1,4 +1,16 @@
 unreleased:
+- Python C API: a str crossing into C code again reuses its mirror while
+  the string lives, instead of scanning its characters at each crossing:
+  re.match() on a 1M-character string went from about 250-500 us to
+  about 1-3 us per call.  The mirror is freed with the string (strings
+  with a mirror are not appended to in place).
+- Python C API: a Python class whose first C base in the MRO adds no
+  fields (class M(Mixin, Engine)) got that base's instance size instead
+  of its __base__'s, so the C code of the other base wrote past the end
+  of its instances.
+- Python C API: a __module__ member of a PyType_FromSpec type (Cython's
+  cyfunction) is no longer hidden by the __module__ taken from the type
+  name, so such functions name their own module (pickling them works).
 - qbun: a Bun/Node.js runtime (qbun.c, node/): runs TypeScript and
   JavaScript programs written for Bun or Node.js on a libuv event loop
   with Bun's module resolution (node_modules, package.json exports and

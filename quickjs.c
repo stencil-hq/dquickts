@@ -754,8 +754,12 @@ typedef enum {
 #define JS_ATOM_HASH_PRIVATE JS_ATOM_HASH_MASK
 
 struct JSString {
-    uint32_t len : 31;
+    uint32_t len : 30; /* <= JS_STRING_LEN_MAX */
     uint8_t is_wide_char : 1; /* 0 = 8 bits, 1 = 16 bits characters */
+    /* C API: a str mirror is registered for this string (qp_capi.str_map);
+       its free paths call qp_capi_string_freed and it is never modified in
+       place */
+    uint8_t py_has_mirror : 1;
     /* for JS_ATOM_TYPE_SYMBOL: hash = weakref_count, atom_type = 3,
        for JS_ATOM_TYPE_PRIVATE: hash = JS_ATOM_HASH_PRIVATE, atom_type = 3
        XXX: could change encoding to have one more bit in hash */
@@ -3076,11 +3080,14 @@ static inline JSAtomStruct *atom_set_free(uint32_t v)
 static JSString *js_alloc_string_rt(JSRuntime *rt, int max_len, int is_wide_char)
 {
     JSString *str;
+    if (unlikely(max_len > JS_STRING_LEN_MAX))
+        return NULL;    /* len has 30 bits */
     str = js_malloc_rt(rt, sizeof(JSString) + (max_len << is_wide_char) + 1 - is_wide_char);
     if (unlikely(!str))
         return NULL;
     js_rc(str)->ref_count = 1;
     str->is_wide_char = is_wide_char;
+    str->py_has_mirror = 0;
     str->len = max_len;
     str->atom_type = 0;
     str->hash = 0;          /* optional but costless */
@@ -3103,9 +3110,18 @@ static JSString *js_alloc_string(JSContext *ctx, int max_len, int is_wide_char)
 }
 
 /* same as JS_FreeValueRT() but faster */
+#ifdef CONFIG_PYTHON_CAPI
+static BOOL qp_capi_string_freed(JSRuntime *rt, JSString *s);
+#endif
+
 static inline void js_free_string(JSRuntime *rt, JSString *str)
 {
     if (--js_rc(str)->ref_count <= 0) {
+#ifdef CONFIG_PYTHON_CAPI
+        if (unlikely(str->py_has_mirror) && !str->atom_type &&
+            qp_capi_string_freed(rt, str))
+            return;
+#endif
         if (str->atom_type) {
             JS_FreeAtomStruct(rt, str);
         } else {
@@ -4124,6 +4140,7 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
                 goto fail;
             js_rc(p)->ref_count = 1;
             p->is_wide_char = str->is_wide_char;
+            p->py_has_mirror = 0;
             p->len = str->len;
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
             list_add_tail(&p->link, &rt->string_list);
@@ -4138,6 +4155,7 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
             return JS_ATOM_NULL;
         js_rc(p)->ref_count = 1;
         p->is_wide_char = 1;    /* Hack to represent NULL as a JSString */
+        p->py_has_mirror = 0;
         p->len = 0;
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
         list_add_tail(&p->link, &rt->string_list);
@@ -4275,7 +4293,13 @@ static void JS_FreeAtomStruct(JSRuntime *rt, JSAtomStruct *p)
         return;
     }
 #endif
-    uint32_t i = p->hash_next;  /* atom_index */
+    uint32_t i;
+#ifdef CONFIG_PYTHON_CAPI
+    if (unlikely(p->py_has_mirror) && p->atom_type != JS_ATOM_TYPE_SYMBOL &&
+        qp_capi_string_freed(rt, p))
+        return;
+#endif
+    i = p->hash_next;  /* atom_index */
     if (p->atom_type != JS_ATOM_TYPE_SYMBOL) {
         JSAtomStruct *p0, *p1;
         uint32_t h0;
@@ -6040,7 +6064,9 @@ static int js_concat_string_grow(JSContext *ctx, JSValue *pv, JSValueConst op2)
         return 1;
     if (JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING) {
         p1 = JS_VALUE_GET_STRING(*pv);
-        if (p1->atom_type != 0)
+        /* a string with a C API mirror is not modified: the mirror keeps
+           a copy of its characters */
+        if (p1->atom_type != 0 || p1->py_has_mirror)
             return 1;
         len1 = p1->len;
         is_wide_char = p1->is_wide_char;
@@ -6134,7 +6160,8 @@ static BOOL JS_ConcatStringInPlace(JSContext *ctx, JSString *p1, JSValueConst op
         /* an atom is never modified: it is found by its hash in the
            atom hash table, even when a variable holds its last
            reference (the name of a property whose object was freed) */
-        if (js_rc(p1)->ref_count != 1 || p1->atom_type != 0)
+        if (js_rc(p1)->ref_count != 1 || p1->atom_type != 0 || p1->py_has_mirror ||
+            p1->len + p2->len > JS_STRING_LEN_MAX)
             return FALSE;
         size1 = js_malloc_usable_size(ctx, p1);
         if (p1->is_wide_char) {
@@ -8293,6 +8320,10 @@ void __JS_FreeValueRT(JSRuntime *rt, JSValue v)
             if (p->atom_type) {
                 JS_FreeAtomStruct(rt, p);
             } else {
+#ifdef CONFIG_PYTHON_CAPI
+                if (unlikely(p->py_has_mirror) && qp_capi_string_freed(rt, p))
+                    break;
+#endif
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
                 list_del(&p->link);
 #endif

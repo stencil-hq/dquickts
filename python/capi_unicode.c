@@ -17,6 +17,12 @@
  *    PyUnicodeObject (kind_ops.size depends on the string).
  *  - C-primary strings (PyUnicode_New): CPython's compact layouts; the JS
  *    string is built at the first crossing (kind_ops.to_js).
+ * A str mirror stays registered (qp_capi.str_map) while its JS string
+ * lives, also after C released it: the string's next crossings find it in
+ * O(1) instead of scanning the characters (and copying the narrowed or
+ * widened kinds) again, and it is freed with the string
+ * (JSString.py_has_mirror, qp_capi_string_freed).  data.any stays valid:
+ * a string with a mirror is never appended to in place.
  * The utf8 cache (PyUnicode_AsUTF8AndSize) is a js_malloc_rt block owned
  * by the mirror, except for ASCII strings whose data is NUL-terminated
  * (shared, as in CPython).

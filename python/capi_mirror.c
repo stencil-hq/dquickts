@@ -539,6 +539,7 @@ static int qp_capi_register(QPCapiHead *h)
             if (qp_capi_map_put(qp_capi.str_map, (uintptr_t)s, h) < 0)
                 return -1;
             h->flags |= QP_CAPI_F_INTERNED;
+            s->py_has_mirror = 1;
         }
     }
     return 0;
@@ -563,8 +564,10 @@ static void qp_capi_unregister(QPCapiHead *h)
     }
     if (h->flags & QP_CAPI_F_INTERNED) {
         JSString *s = JS_VALUE_GET_STRING(h->v);
-        if (qp_capi_map_get(qp_capi.str_map, (uintptr_t)s) == h)
+        if (qp_capi_map_get(qp_capi.str_map, (uintptr_t)s) == h) {
             qp_capi_map_del(qp_capi.str_map, (uintptr_t)s);
+            s->py_has_mirror = 0;
+        }
         h->flags &= ~QP_CAPI_F_INTERNED;
     }
 }
@@ -1332,6 +1335,22 @@ static void qp_capi_native_dealloc(PyObject *op)
     }
 }
 
+/* _Py_Dealloc: the mirror h, whose ob_refcnt reached 0, stays bound
+   (WEAK) rather than being freed. */
+static BOOL qp_capi_keep_weak(QPCapiHead *h)
+{
+    int own = (h->flags & QP_CAPI_F_OWNS_V) ? 1 : 0;
+    if (QP_IS_NULL(h->v) || (h->flags & QP_CAPI_F_ORPHAN))
+        return FALSE;
+    if (qp_capi_v_is_object(h->v))
+        return (h->flags & QP_CAPI_F_PERSIST) ||
+            js_rc(JS_VALUE_GET_OBJ(h->v))->ref_count > own;
+    if (qp_capi_v_is_string(h->v))
+        return (h->flags & QP_CAPI_F_INTERNED) &&
+            js_rc(JS_VALUE_GET_STRING(h->v))->ref_count > own;
+    return FALSE;
+}
+
 /* release a non-native mirror whose last C reference is gone */
 static void qp_capi_mirror_free(PyObject *op)
 {
@@ -1378,14 +1397,15 @@ void _Py_Dealloc(PyObject *op)
         }
         return;
     }
-    if (!QP_IS_NULL(h->v) && !(h->flags & QP_CAPI_F_ORPHAN) && qp_capi_v_is_object(h->v) &&
-        ((h->flags & QP_CAPI_F_PERSIST) ||
-         js_rc(JS_VALUE_GET_OBJ(h->v))->ref_count > ((h->flags & QP_CAPI_F_OWNS_V) ? 1 : 0))) {
+    if (qp_capi_keep_weak(h)) {
         /* WEAK: kept while J lives, owns nothing of J.  A mirror whose J
            is still referenced elsewhere (a container or an attribute C
            stored it in) is kept as well: CPython's object stays at its
            address, and C code keeps using the pointer it stored and
-           released (PyDict_SetItem(d, k, v); Py_DECREF(v); use v). */
+           released (PyDict_SetItem(d, k, v); Py_DECREF(v); use v).  A
+           str mirror in str_map too, which also spares the string's next
+           crossing the scan and copy of its characters; it is released
+           with the string (qp_capi_string_freed). */
         h->flags |= QP_CAPI_F_PERSIST;
         if (h->flags & QP_CAPI_F_LIVE)
             qp_capi_node_unlink(h);
@@ -1766,6 +1786,36 @@ static BOOL qp_capi_object_revived(JSRuntime *rt, JSObject *p)
     return TRUE;
 }
 
+static BOOL qp_capi_string_freed(JSRuntime *rt, JSString *s)
+{
+    QPCapiHead *h = NULL;
+    PyObject *op;
+
+    if (!qp_capi_dead && rt == qp_capi.rt && qp_capi.str_map)
+        h = qp_capi_map_get(qp_capi.str_map, (uintptr_t)s);
+    if (!h) {
+        /* after teardown, or a stale bit: nothing to release */
+        s->py_has_mirror = 0;
+        return FALSE;
+    }
+    if (qp_capi_is_revived(h)) {
+        qp_capi_make_live(h);
+        return TRUE;
+    }
+    op = QP_CAPI_OBJ(h);
+    qp_capi_map_del(qp_capi.str_map, (uintptr_t)s);
+    s->py_has_mirror = 0;
+    h->flags &= ~(QP_CAPI_F_INTERNED | QP_CAPI_F_OWNS_V | _Py_QP_BOUND_FLAG);
+    h->v = QP_NULL;
+    if ((h->flags & (QP_CAPI_F_LIVE | QP_CAPI_F_DEALLOC)) || op->ob_refcnt > 0) {
+        /* C still holds a mirror that did not own the string (teardown
+           paths): it keeps its own copy of the characters */
+        return FALSE;
+    }
+    qp_capi_mirror_free(op);
+    return FALSE;
+}
+
 static void qp_capi_free_cycle_node(JSRuntime *rt, JSGCObjectHeader *gp)
 {
     QPCapiHead *h = container_of(gp, QPCapiHead, gc);
@@ -1917,6 +1967,8 @@ static void qp_capi_context_free(JSContext *ctx)
                     p->u.opaque = NULL;
                 p->py_has_mirror = 0;
             }
+        } else if (h->flags & QP_CAPI_F_INTERNED) {
+            JS_VALUE_GET_STRING(v)->py_has_mirror = 0;
         }
         h->flags &= ~(QP_CAPI_F_OWNS_V | QP_CAPI_F_INTERNED | _Py_QP_BOUND_FLAG);
         h->flags |= QP_CAPI_F_ORPHAN;
@@ -1930,9 +1982,12 @@ static void qp_capi_context_free(JSContext *ctx)
         if (owned)
             JS_FreeValueRT(rt, v);
     }
-    /* weak heads own nothing: just forget the list */
+    /* weak heads own nothing: just forget the list (the string of a weak
+       str mirror is alive: qp_capi_string_freed releases them together) */
     list_for_each_safe(el, el1, &qp_capi.weak_list) {
         QPCapiHead *h = list_entry(el, QPCapiHead, live_link);
+        if ((h->flags & QP_CAPI_F_INTERNED) && qp_capi_v_is_string(h->v))
+            JS_VALUE_GET_STRING(h->v)->py_has_mirror = 0;
         init_list_head(&h->live_link);
         qp_capi_lsan_ignore(h);
     }

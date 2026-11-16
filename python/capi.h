@@ -168,7 +168,7 @@ _Static_assert(_Py_STATICALLY_ALLOCATED_FLAG == (1 << 2), "_PyQp_HasFlag static 
 #define QP_CAPI_F_TRACKED   0x0010  /* PyObject_GC_Track'ed: tp_traverse is called */
 #define QP_CAPI_F_FINALIZED 0x0020  /* tp_finalize already ran (PEP 442) */
 #define QP_CAPI_F_ORPHAN    0x0040  /* bound JS object freed by cycle collection while LIVE: v is dead */
-#define QP_CAPI_F_INTERNED  0x0080  /* str mirror in qp_capi.str_map (identity while live) */
+#define QP_CAPI_F_INTERNED  0x0080  /* str mirror in qp_capi.str_map (identity while J lives) */
 #define QP_CAPI_F_DEALLOC   0x0100  /* tp_dealloc in progress (re-entrancy guard) */
 /* 0x1000 _Py_QP_BOUND_FLAG, 0x2000 _Py_QP_LIVE_SIZE_FLAG (capi/include/object.h,
    read by inline header code); 0x8000 QP_CAPI_F_LEAKED (capi_mirror.c) */
@@ -269,7 +269,8 @@ typedef struct QPCapiState {
     struct list_head weak_list;     /* weak heads (bound, ob_refcnt dropped to 0): revived by the sync pass
                                        when C took a reference back with an inline Py_INCREF */
     struct QPCapiMap *obj_map;      /* JSObject* -> head (objects with py_has_mirror) */
-    struct QPCapiMap *str_map;      /* JSString* -> live str head (identity of live str mirrors) */
+    struct QPCapiMap *str_map;      /* JSString* -> str head, kept while the string lives
+                                       (JSString.py_has_mirror) */
     struct QPCapiMap *id_map;       /* _Py_ID / _Py_STR / PyUnicode_InternFromString: name -> immortal interned str mirror */
     struct QPCapiMap *static_map;   /* statically allocated extension instance -> its PY_NATIVE JSObject* (owned) */
     QPCapiKindOps kind_ops[QP_CAPI_K__COUNT];
@@ -323,6 +324,10 @@ static void qp_capi_object_freed(JSRuntime *rt, JSObject *p);
    is gone: TRUE when a bare Py_INCREF revived its weak mirror, which then
    owns J again (J survives). */
 static BOOL qp_capi_object_revived(JSRuntime *rt, JSObject *p);
+/* A JSString with py_has_mirror lost its last JS reference: TRUE when a
+   bare Py_INCREF revived its weak mirror, which then owns the string again
+   (it survives); otherwise the mirror is released with it. */
+static BOOL qp_capi_string_freed(JSRuntime *rt, JSString *s);
 /* JS_FreeContext of the C-API context (before QPState is freed): drops the
    JS references of every live node and unlinks the nodes (C-side memory
    still referenced by extension globals is leaked), resets the
