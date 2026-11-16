@@ -3230,28 +3230,17 @@ static int qp_capi_bind_static_type(JSContext *ctx, PyTypeObject *tp, QPType *t)
 /* ========================================================================= */
 
 /* The PyTypeObject with C storage that defines the instance layout of t:
-   nearest type of the MRO bound statically or C-defined. */
+   nearest type of the __base__ chain bound statically or C-defined. The
+   chain, not the MRO: in class M(Mixin, Engine) a C Mixin without fields
+   comes first in the MRO, but Engine (CPython's best_base) owns the
+   layout. */
 static PyTypeObject *qp_capi_layout_base(QPType *t)
 {
-    Py_ssize_t i, n;
-    JSValue *items;
     PyTypeObject *tp;
 
-    if ((tp = qp_capi_type_map_get(t)))
-        return tp;
-    if (JS_VALUE_GET_TAG(t->mro) == JS_TAG_OBJECT) {
-        n = QP_TUPLE_SIZE(t->mro);
-        items = QP_TUPLE_ITEMS(t->mro);
-        for (i = 1; i < n; i++) {
-            QPType *u = qp_type_from_value(items[i]);
-            if (u && (tp = qp_capi_type_map_get(u)))
-                return tp;
-        }
-    } else {
-        for (t = t->base; t; t = t->base)
-            if ((tp = qp_capi_type_map_get(t)))
-                return tp;
-    }
+    for (; t; t = t->base)
+        if ((tp = qp_capi_type_map_get(t)))
+            return tp;
     return &PyBaseObject_Type;
 }
 
